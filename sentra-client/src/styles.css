@@ -338,3 +338,15 @@ body, #main-screen, #auth-screen, #settings-drawer > div, #devices-modal > div, 
 .dns-item:hover {
   transform: translateX(-2px);
 }
+
+/* Hyprland Smooth Bezier for Routing Mode Segmented Control */
+.routing-btn {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.routing-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+.routing-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+

@@ -106,6 +106,9 @@ pub struct ClientState {
     pub selected_mode: String,
     pub selected_protocol: String,
     pub selected_location: String,
+    pub routing_mode: String, // "tunnel" | "system_proxy" | "proxy"
+    pub local_socks5_port: u16,
+    pub local_http_port: u16,
     pub use_warp: bool,
     pub sandbox_loopback: bool,
     pub split_tunneling: bool,
@@ -132,6 +135,9 @@ impl Default for ClientState {
             selected_mode: "web_browsing".to_string(),
             selected_protocol: "openvpn_udp".to_string(),
             selected_location: "auto".to_string(),
+            routing_mode: "tunnel".to_string(),
+            local_socks5_port: 10808,
+            local_http_port: 10809,
             use_warp: false,
             sandbox_loopback: true, // Enabled for zero-cost testing
             split_tunneling: true,

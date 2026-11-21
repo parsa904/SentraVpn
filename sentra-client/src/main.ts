@@ -24,6 +24,9 @@ interface ClientState {
   selected_mode: string;
   selected_protocol?: string;
   selected_location: string;
+  routing_mode?: string;
+  local_socks5_port?: number;
+  local_http_port?: number;
   use_warp?: boolean;
   sandbox_loopback: boolean;
   split_tunneling: boolean;
@@ -126,6 +129,9 @@ let currentState: ClientState = {
   selected_mode: "web_browsing",
   selected_protocol: "openvpn_udp",
   selected_location: "auto",
+  routing_mode: "tunnel",
+  local_socks5_port: 10808,
+  local_http_port: 10809,
   use_warp: false,
   sandbox_loopback: true,
   split_tunneling: true,
@@ -281,6 +287,19 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
   if (cmd === 'set_use_warp') {
     currentState.use_warp = !!args.enabled;
     currentState.logs.push(`[WARP] Cloudflare WARP set to: ${currentState.use_warp ? 'ON' : 'OFF'}`);
+    return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'set_routing_mode') {
+    const mode = (args.routing_mode || 'tunnel').toLowerCase();
+    if (currentState.selected_mode === 'static_ip' && mode !== 'tunnel') {
+      throw new Error("در حالت آی‌پی ثابت، برای امنیت حساب‌های مالی فقط حالت Tunnel فعال است.");
+    }
+    if ((mode === 'proxy' || mode === 'system_proxy') && currentState.selected_protocol === 'ikev2') {
+      currentState.selected_protocol = 'openvpn_udp';
+      currentState.logs.push('[INFO] [Routing] پروتکل IKEv2 فقط از حالت Tunnel پشتیبانی می‌کند. پروتکل به OpenVPN تغییر یافت.');
+    }
+    currentState.routing_mode = mode;
+    currentState.logs.push(`[CONFIG] Network routing mode set to: ${mode}`);
     return { ...currentState } as unknown as T;
   }
 
@@ -503,10 +522,94 @@ function renderState() {
     }
   });
 
+  renderRoutingMode();
   updateModesUI();
   renderLocationSwitcher();
   renderPowerButton();
   renderLogs();
+}
+
+function renderRoutingMode() {
+  const rMode = currentState.routing_mode || 'tunnel';
+  const isStaticIp = currentState.selected_mode === 'static_ip';
+
+  const titleIcon = document.getElementById('routing-mode-icon');
+  const titleLabel = document.getElementById('routing-mode-label');
+  const staticNotice = document.getElementById('routing-static-notice');
+  const proxyEndpoints = document.getElementById('routing-proxy-endpoints');
+
+  // Title & Icon
+  if (titleIcon && titleLabel) {
+    if (rMode === 'proxy') {
+      titleIcon.textContent = '🔌';
+      titleLabel.textContent = 'پروکسی محلی (Proxy)';
+      titleLabel.className = 'text-[#F59E0B] font-bold';
+    } else if (rMode === 'system_proxy') {
+      titleIcon.textContent = '🔀';
+      titleLabel.textContent = 'پروکسی ویندوز (System Proxy)';
+      titleLabel.className = 'text-[#3B82F6] font-bold';
+    } else {
+      titleIcon.textContent = '🌐';
+      titleLabel.textContent = 'تونل کامل (Tunnel)';
+      titleLabel.className = 'text-[#10B981] font-bold';
+    }
+  }
+
+  // Static IP Enforcements
+  const btnTunnel = document.getElementById('routing-btn-tunnel') as HTMLButtonElement;
+  const btnSysProxy = document.getElementById('routing-btn-system_proxy') as HTMLButtonElement;
+  const btnProxy = document.getElementById('routing-btn-proxy') as HTMLButtonElement;
+
+  if (isStaticIp) {
+    staticNotice?.classList.remove('hidden');
+    proxyEndpoints?.classList.add('hidden');
+
+    if (btnSysProxy) {
+      btnSysProxy.disabled = true;
+      btnSysProxy.classList.add('opacity-40', 'cursor-not-allowed');
+    }
+    if (btnProxy) {
+      btnProxy.disabled = true;
+      btnProxy.classList.add('opacity-40', 'cursor-not-allowed');
+    }
+    if (btnTunnel) {
+      btnTunnel.disabled = false;
+      btnTunnel.classList.remove('opacity-40', 'cursor-not-allowed');
+    }
+  } else {
+    staticNotice?.classList.add('hidden');
+    [btnTunnel, btnSysProxy, btnProxy].forEach(b => {
+      if (b) {
+        b.disabled = false;
+        b.classList.remove('opacity-40', 'cursor-not-allowed');
+      }
+    });
+
+    if (rMode === 'proxy') {
+      proxyEndpoints?.classList.remove('hidden');
+    } else {
+      proxyEndpoints?.classList.add('hidden');
+    }
+  }
+
+  // Buttons Active Styling
+  const modes = ['tunnel', 'system_proxy', 'proxy'];
+  modes.forEach(m => {
+    const btn = document.getElementById(`routing-btn-${m}`);
+    if (btn) {
+      if (m === rMode) {
+        if (m === 'proxy') {
+          btn.className = 'routing-btn py-1.5 px-1 rounded-lg text-[10px] font-bold border border-[#F59E0B]/60 bg-[#F59E0B]/20 text-[#F59E0B] shadow-sm flex items-center justify-center space-x-1 space-x-reverse transition-all duration-200 scale-[1.02]';
+        } else if (m === 'system_proxy') {
+          btn.className = 'routing-btn py-1.5 px-1 rounded-lg text-[10px] font-bold border border-[#3B82F6]/60 bg-[#3B82F6]/20 text-[#3B82F6] shadow-sm flex items-center justify-center space-x-1 space-x-reverse transition-all duration-200 scale-[1.02]';
+        } else {
+          btn.className = 'routing-btn py-1.5 px-1 rounded-lg text-[10px] font-bold border border-[#10B981]/60 bg-[#10B981]/20 text-[#10B981] shadow-sm flex items-center justify-center space-x-1 space-x-reverse transition-all duration-200 scale-[1.02]';
+        }
+      } else {
+        btn.className = 'routing-btn py-1.5 px-1 rounded-lg text-[10px] font-medium border border-transparent bg-transparent text-[#94A3B8] hover:text-[#F8FAFC] flex items-center justify-center space-x-1 space-x-reverse transition-all duration-200';
+      }
+    }
+  });
 }
 
 function renderPowerButton() {
@@ -1351,6 +1454,46 @@ function initEventListeners() {
     } catch (err) {
       console.warn('Could not toggle WARP:', err);
     }
+  });
+
+  // 3-Way Network Routing Mode Selector (Tunnel / System Proxy / Proxy)
+  ['tunnel', 'system_proxy', 'proxy'].forEach(m => {
+    const btn = document.getElementById(`routing-btn-${m}`);
+    btn?.addEventListener('click', async () => {
+      if (currentState.selected_mode === 'static_ip' && m !== 'tunnel') {
+        alert('در حالت آی‌پی ثابت، برای امنیت حساب‌های مالی فقط حالت Tunnel فعال است.');
+        return;
+      }
+      try {
+        currentState = await invokeTauri<ClientState>('set_routing_mode', { routing_mode: m });
+        renderState();
+      } catch (err: any) {
+        alert(err?.toString() || 'خطا در تغییر حالت مسیریابی');
+      }
+    });
+  });
+
+  // Copy Buttons for Local Proxy Endpoints
+  const copySocksBtn = document.getElementById('copy-socks5-btn');
+  copySocksBtn?.addEventListener('click', () => {
+    navigator.clipboard.writeText('127.0.0.1:10808').then(() => {
+      const orig = copySocksBtn.textContent;
+      copySocksBtn.textContent = '✓ کپی شد';
+      setTimeout(() => {
+        copySocksBtn.textContent = orig;
+      }, 1500);
+    });
+  });
+
+  const copyHttpBtn = document.getElementById('copy-http-btn');
+  copyHttpBtn?.addEventListener('click', () => {
+    navigator.clipboard.writeText('127.0.0.1:10809').then(() => {
+      const orig = copyHttpBtn.textContent;
+      copyHttpBtn.textContent = '✓ کپی شد';
+      setTimeout(() => {
+        copyHttpBtn.textContent = orig;
+      }, 1500);
+    });
   });
 
   // Telegram Account Link Modal

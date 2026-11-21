@@ -212,6 +212,72 @@
         </div>
       </div>
 
+      <!-- 3-Way Routing Mode Segmented Control (Tunnel / System Proxy / Proxy) -->
+      <div id="routing-mode-card" class="mt-2 p-2 rounded-xl bg-[#1E293B]/90 border border-white/10 shadow-sm transition-all duration-300">
+        <div class="flex items-center justify-between text-[11px] text-[#94A3B8] mb-1.5 px-0.5">
+          <span class="font-medium">مسیر ترافیک ویندوز:</span>
+          <span id="active-routing-mode-title" class="text-[10px] font-mono text-[#10B981] flex items-center space-x-1 space-x-reverse">
+            <span id="routing-mode-icon">🌐</span>
+            <span id="routing-mode-label">تونل کامل (Tunnel)</span>
+          </span>
+        </div>
+
+        <!-- Segmented Control Container -->
+        <div class="grid grid-cols-3 gap-1 bg-[#0F172A] p-1 rounded-xl border border-white/10 relative" id="routing-segmented-control">
+          <!-- Option 1: Tunnel -->
+          <button type="button" data-routing="tunnel" id="routing-btn-tunnel"
+            class="routing-btn py-1.5 px-1 rounded-lg text-[10px] font-medium transition-all duration-200 flex items-center justify-center space-x-1 space-x-reverse cursor-pointer border border-[#10B981]/50 bg-[#10B981]/15 text-[#10B981]">
+            <span>🌐</span>
+            <span class="truncate">Tunnel</span>
+          </button>
+
+          <!-- Option 2: System Proxy -->
+          <button type="button" data-routing="system_proxy" id="routing-btn-system_proxy"
+            class="routing-btn py-1.5 px-1 rounded-lg text-[10px] font-medium transition-all duration-200 flex items-center justify-center space-x-1 space-x-reverse cursor-pointer border border-transparent text-[#94A3B8] hover:text-[#F8FAFC]">
+            <span>🔀</span>
+            <span class="truncate">System Proxy</span>
+          </button>
+
+          <!-- Option 3: Proxy (Local) -->
+          <button type="button" data-routing="proxy" id="routing-btn-proxy"
+            class="routing-btn py-1.5 px-1 rounded-lg text-[10px] font-medium transition-all duration-200 flex items-center justify-center space-x-1 space-x-reverse cursor-pointer border border-transparent text-[#94A3B8] hover:text-[#F8FAFC]">
+            <span>🔌</span>
+            <span class="truncate">Proxy</span>
+          </button>
+        </div>
+
+        <!-- Static IP Lock Notice -->
+        <div id="routing-static-notice" class="hidden mt-1.5 p-1.5 rounded-lg bg-[#8B5CF6]/15 border border-[#8B5CF6]/25 text-[10px] text-[#C084FC] flex items-center space-x-1.5 space-x-reverse">
+          <span>🔒</span>
+          <span>در حالت آی‌پی ثابت، برای امنیت حساب‌های مالی فقط حالت Tunnel فعال است.</span>
+        </div>
+
+        <!-- Local Proxy Endpoints (Visible only when Proxy mode is active) -->
+        <div id="routing-proxy-endpoints" class="hidden mt-2 p-2 rounded-xl bg-[#0F172A] border border-white/10 space-y-1.5 transition-all duration-300">
+          <div class="flex items-center justify-between text-[10px]">
+            <div class="flex items-center space-x-1.5 space-x-reverse font-mono">
+              <span class="px-1 py-0.5 rounded bg-[#10B981]/20 text-[#10B981] font-bold text-[9px]">SOCKS5</span>
+              <span id="endpoint-socks5-val" class="text-[#F8FAFC]">127.0.0.1:10808</span>
+            </div>
+            <button id="copy-socks5-btn" type="button" class="px-2 py-0.5 text-[9px] rounded bg-[#1E293B] hover:bg-[#273549] text-[#94A3B8] hover:text-white border border-white/10 transition cursor-pointer">
+              کپی
+            </button>
+          </div>
+          <div class="flex items-center justify-between text-[10px]">
+            <div class="flex items-center space-x-1.5 space-x-reverse font-mono">
+              <span class="px-1 py-0.5 rounded bg-[#3B82F6]/20 text-[#3B82F6] font-bold text-[9px]">HTTP</span>
+              <span id="endpoint-http-val" class="text-[#F8FAFC]">127.0.0.1:10809</span>
+            </div>
+            <button id="copy-http-btn" type="button" class="px-2 py-0.5 text-[9px] rounded bg-[#1E293B] hover:bg-[#273549] text-[#94A3B8] hover:text-white border border-white/10 transition cursor-pointer">
+              کپی
+            </button>
+          </div>
+          <div class="text-[9px] text-[#64748B] leading-tight pt-0.5 border-t border-white/5">
+            تنظیمات سیستم دست‌نخورده است. مناسب برای استفاده مستقیم در تلگرام یا یک مرورگر خاص.
+          </div>
+        </div>
+      </div>
+
       <!-- 4 Protocols Selector (Stealth, IKEv2, OpenVPN UDP, OpenVPN TCP) with Hyprland Animation -->
       <div class="mt-2 p-2 rounded-xl bg-[#1E293B]/90 border border-white/10 shadow-sm">
         <div class="flex items-center justify-between text-[11px] text-[#94A3B8] mb-1.5 px-0.5">

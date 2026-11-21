@@ -1,8 +1,10 @@
 pub mod auth;
 pub mod commands;
 pub mod error;
+pub mod local_proxy;
 pub mod sandbox;
 pub mod state;
+pub mod sysproxy;
 pub mod telemetry;
 pub mod vpn_manager;
 
@@ -24,6 +26,9 @@ pub fn run() {
         .init();
 
     info!("Initializing Sentra Connect Tauri v2 Desktop Application...");
+
+    // Safe startup reset: Ensure System Proxy is clean if prior run abnormal exit
+    let _ = sysproxy::disable_system_proxy();
 
     let mut initial_state = ClientState::default();
 
@@ -81,11 +86,13 @@ pub fn run() {
             commands::ping_dns_servers,
             commands::save_dns_settings,
             commands::get_dns_settings,
-            commands::set_use_warp
+            commands::set_use_warp,
+            commands::set_routing_mode
         ])
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 info!("Window close requested. Performing graceful VPN shutdown & interface cleanup...");
+                let _ = sysproxy::disable_system_proxy();
                 let vpn = Arc::clone(&vpn_manager_for_shutdown);
                 let state = Arc::clone(&app_state_for_shutdown);
                 let handle = window.app_handle().clone();

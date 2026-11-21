@@ -1,5 +1,7 @@
+use crate::local_proxy::LocalProxyService;
 use crate::sandbox::SandboxEngine;
 use crate::state::{AppState, ConnectionStatus};
+use crate::sysproxy;
 use crate::telemetry::TelemetryService;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -30,6 +32,13 @@ pub struct VpnManager {
     #[cfg(not(target_os = "android"))]
     child_process: Arc<Mutex<Option<Child>>>,
     is_running: Arc<AtomicBool>,
+    local_proxy: Arc<Mutex<Option<LocalProxyService>>>,
+}
+
+impl Drop for VpnManager {
+    fn drop(&mut self) {
+        let _ = sysproxy::disable_system_proxy();
+    }
 }
 
 impl VpnManager {
@@ -38,6 +47,7 @@ impl VpnManager {
             #[cfg(not(target_os = "android"))]
             child_process: Arc::new(Mutex::new(None)),
             is_running: Arc::new(AtomicBool::new(false)),
+            local_proxy: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -637,7 +647,7 @@ impl VpnManager {
 
         self.is_running.store(true, Ordering::SeqCst);
 
-        let (token, mode, protocol, split, sandbox, anti_dpi, location, dns_cfg, use_warp) = {
+        let (token, mode, protocol, split, sandbox, anti_dpi, location, dns_cfg, use_warp, routing_mode) = {
             let s = app_state.lock().await;
             (
                 s.subscription_token.clone().unwrap_or_else(|| "token_lite_sandbox_001".to_string()),
@@ -649,14 +659,16 @@ impl VpnManager {
                 s.selected_location.clone(),
                 s.dns_config.clone(),
                 s.use_warp,
+                s.routing_mode.clone(),
             )
         };
 
-        // Enforce Strict Leak Protection on Static IP
+        // Enforce Strict Leak Protection on Static IP (Tunnel mode mandatory)
         if mode == "static_ip" {
             let mut s = app_state.lock().await;
             s.kill_switch = true;
-            s.logs.push("[SECURITY] Strict Leak Protection engaged for Static IP (Kill-Switch enforced, IPv6 blocked, DNS locked).".to_string());
+            s.routing_mode = "tunnel".to_string();
+            s.logs.push("[SECURITY] Strict Leak Protection engaged for Static IP (Kill-Switch enforced, Tunnel mode locked, IPv6 blocked).".to_string());
         }
 
         // Perform crash-safe synchronization of any pending traffic from previous abnormal exit
@@ -710,7 +722,11 @@ impl VpnManager {
         let auth_path = app_dir.join("auth.txt");
 
         if let Some(ovpn_str) = config_json.get("ovpn_config").and_then(|v| v.as_str()) {
-            let _ = fs::write(&ovpn_path, ovpn_str);
+            let mut final_ovpn = ovpn_str.to_string();
+            if routing_mode == "proxy" || routing_mode == "system_proxy" {
+                final_ovpn.push_str("\n# Sentra Client - Proxy Mode (Do not replace system default gateway)\nroute-nopull\n");
+            }
+            let _ = fs::write(&ovpn_path, final_ovpn);
         }
         if let (Some(u), Some(p)) = (
             config_json.get("auth_username").and_then(|v| v.as_str()),
@@ -800,6 +816,9 @@ impl VpnManager {
                 command.arg("--config").arg(&ovpn_path);
                 command.arg("--auth-user-pass").arg(&auth_path);
                 command.arg("--verb").arg("3");
+                if routing_mode == "proxy" || routing_mode == "system_proxy" {
+                    command.arg("--route-nopull");
+                }
                 command.stdout(Stdio::piped());
                 command.stderr(Stdio::piped());
 
@@ -853,6 +872,38 @@ impl VpnManager {
                     Arc::clone(&self.is_running),
                 )
                 .await;
+            }
+
+            // Manage Local Proxy (SOCKS5/HTTP) & Windows System Proxy
+            if routing_mode == "proxy" || routing_mode == "system_proxy" {
+                match LocalProxyService::start(10808, 10809).await {
+                    Ok(srv) => {
+                        let mut lp = self.local_proxy.lock().await;
+                        *lp = Some(srv);
+                        let mut s = app_state.lock().await;
+                        s.logs.push("[INFO] [Proxy] Local SOCKS5 (127.0.0.1:10808) & HTTP (127.0.0.1:10809) active.".to_string());
+                    }
+                    Err(e) => {
+                        warn!("Failed to start in-process local proxy: {}", e);
+                        let mut s = app_state.lock().await;
+                        s.logs.push(format!("[WARN] [Proxy] Could not start proxy ports: {}", e));
+                    }
+                }
+
+                if routing_mode == "system_proxy" {
+                    if let Err(e) = sysproxy::enable_system_proxy("127.0.0.1:10809") {
+                        warn!("Failed to set Windows system proxy: {}", e);
+                    } else {
+                        let mut s = app_state.lock().await;
+                        s.logs.push("[INFO] [SystemProxy] Windows system proxy enabled (127.0.0.1:10809).".to_string());
+                    }
+                } else {
+                    let _ = sysproxy::disable_system_proxy();
+                }
+            } else {
+                let _ = sysproxy::disable_system_proxy();
+                let mut s = app_state.lock().await;
+                s.logs.push("[INFO] [Tunnel] Full system routing active via virtual adapter (Wintun).".to_string());
             }
         }
 
@@ -1038,6 +1089,15 @@ impl VpnManager {
                 let _ = child.kill().await;
                 info!("Sing-box child process terminated.");
             }
+
+            // Stop local SOCKS5 & HTTP proxy service
+            if let Some(mut srv) = self.local_proxy.lock().await.take() {
+                srv.stop();
+                info!("Local proxy service stopped.");
+            }
+
+            // Always revert Windows System Proxy
+            let _ = sysproxy::disable_system_proxy();
         }
 
         // Clean up shared state

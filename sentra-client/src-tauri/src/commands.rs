@@ -297,6 +297,11 @@ pub async fn set_connection_mode(
 ) -> Result<ClientState, String> {
     let mut app_state = state.lock().await;
     app_state.selected_mode = mode.clone();
+    if mode == "static_ip" {
+        app_state.routing_mode = "tunnel".to_string();
+        app_state.kill_switch = true;
+        app_state.logs.push("[SECURITY] در حالت آی‌پی ثابت، برای امنیت حساب‌های مالی فقط حالت Tunnel (همراه با Kill-Switch) فعال است.".to_string());
+    }
     let msg = format!("[CONFIG] Connection mode switched to [{}]", mode);
     app_state.logs.push(msg);
     Ok(app_state.clone())
@@ -308,10 +313,56 @@ pub async fn set_connection_protocol(
     state: State<'_, AppState>,
 ) -> Result<ClientState, String> {
     let mut app_state = state.lock().await;
+    if protocol == "ikev2" && app_state.routing_mode != "tunnel" {
+        app_state.routing_mode = "tunnel".to_string();
+        app_state.logs.push("[INFO] [Routing] با انتخاب پروتکل IKEv2، حالت مسیریابی به Tunnel تغییر یافت.".to_string());
+    }
     app_state.selected_protocol = protocol.clone();
     let msg = format!("[CONFIG] Connection protocol switched to [{}]", protocol);
     app_state.logs.push(msg);
     Ok(app_state.clone())
+}
+
+#[tauri::command]
+pub async fn set_routing_mode(
+    routing_mode: String,
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    vpn: State<'_, Arc<VpnManager>>,
+) -> Result<ClientState, String> {
+    let mode_lower = routing_mode.to_lowercase();
+    if mode_lower != "tunnel" && mode_lower != "system_proxy" && mode_lower != "proxy" {
+        return Err("حالت مسیریابی نامعتبر است. گزینه‌های مجاز: tunnel, system_proxy, proxy".to_string());
+    }
+
+    let is_connected = {
+        let mut s = state.lock().await;
+        if s.selected_mode == "static_ip" && mode_lower != "tunnel" {
+            return Err("در حالت آی‌پی ثابت، برای امنیت حساب‌های مالی فقط حالت Tunnel فعال است.".to_string());
+        }
+
+        // IKEv2 compatibility check
+        if (mode_lower == "proxy" || mode_lower == "system_proxy") && s.selected_protocol == "ikev2" {
+            s.selected_protocol = "openvpn_udp".to_string();
+            s.logs.push("[INFO] [Routing] پروتکل IKEv2 فقط از حالت Tunnel پشتیبانی می‌کند. پروتکل به OpenVPN (UDP) تغییر یافت.".to_string());
+        }
+
+        s.routing_mode = mode_lower.clone();
+        let log_msg = format!("[CONFIG] Network routing mode switched to [{}]", mode_lower);
+        s.logs.push(log_msg);
+
+        s.status == crate::state::ConnectionStatus::Connected
+    };
+
+    if is_connected {
+        tracing::info!("Reconnecting with new routing mode: {}", mode_lower);
+        let _ = vpn.stop_vpn(app_handle.clone(), state.inner().clone()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = vpn.start_vpn(app_handle, state.inner().clone()).await;
+    }
+
+    let s = state.lock().await;
+    Ok(s.clone())
 }
 
 #[tauri::command]
