@@ -1,0 +1,15 @@
+[package]
+name = "tauri-plugin-sentra-vpn"
+version = "1.0.0"
+authors = ["Sentra Systems Engineering"]
+description = "Tauri v2 Mobile VPN Plugin for Sentra Connect (Android VpnService & libbox)"
+edition = "2021"
+links = "tauri-plugin-sentra-vpn"
+
+[dependencies]
+tauri = { version = "2.0.0", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build-dependencies]
+tauri-plugin = { version = "2.0.0", features = ["build"] }

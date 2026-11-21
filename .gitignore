@@ -1,0 +1,11 @@
+target/
+node_modules/
+**/binaries/*.exe
+**/binaries/*.aar
+**/sing-box*
+!**/sing-box*.json
+!**/sing-box*.template.json
+*.db
+*.db*
+*.sqlite
+.env

@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Sentra Connect</string>
+    <string name="vpn_service_title">سنترا کانکت</string>
+    <string name="vpn_disconnect">قطع اتصال</string>
+</resources>

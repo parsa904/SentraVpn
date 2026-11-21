@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sentra Connect</title>
+  <link rel="stylesheet" href="./src/styles.css">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            slateBg: '#0F172A',
+            cardBg: '#1E293B',
+            cardHover: '#273549',
+            emeraldStatus: '#10B981',
+            amberStatus: '#F59E0B',
+            redStatus: '#EF4444',
+            blueStatus: '#3B82F6',
+            purpleStatus: '#8B5CF6'
+          }
+        }
+      }
+    }
+  </script>
+</head>
+<body class="bg-[#0F172A] text-[#F8FAFC] select-none flex flex-col justify-between h-[640px] w-[380px] overflow-hidden">
+
+  <!-- ========================================================================= -->
+  <!-- 1. AUTH SCREEN (Shown if not authenticated) -->
+  <!-- ========================================================================= -->
+  <div id="auth-screen" class="hidden flex-1 flex flex-col justify-between p-5">
+    <!-- Brand Header -->
+    <div class="text-center pt-2">
+      <div class="w-12 h-12 mx-auto mb-2 bg-[#1E293B] border border-white/10 rounded-2xl flex items-center justify-center shadow-lg relative">
+        <svg class="w-7 h-7 text-[#10B981]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+        </svg>
+      </div>
+      <h1 class="text-base font-bold tracking-tight text-[#F8FAFC]">سنترا کانکت</h1>
+      <p class="text-[11px] text-[#94A3B8]">کلاینت مهندسی‌شده ضدسانسور و شبکه امن</p>
+    </div>
+
+    <!-- Auth Tabs & Forms Container -->
+    <div class="my-auto space-y-2.5">
+      <!-- Tabs Switcher -->
+      <div class="flex items-center justify-between bg-[#1E293B] p-1 rounded-xl border border-white/10">
+        <button id="auth-tab-login" class="flex-1 py-1.5 text-[11px] font-medium rounded-lg text-white bg-[#0F172A] shadow-sm transition">
+          ورود
+        </button>
+        <button id="auth-tab-register" class="flex-1 py-1.5 text-[11px] font-medium rounded-lg text-[#94A3B8] hover:text-white transition">
+          ثبت‌نام رایگان
+        </button>
+        <button id="auth-tab-otp" class="flex-1 py-1.5 text-[11px] font-medium rounded-lg text-[#94A3B8] hover:text-white transition">
+          کد تلگرام
+        </button>
+      </div>
+
+      <!-- Tab 1: Username & Password Login Form -->
+      <div id="auth-form-login" class="space-y-2">
+        <div>
+          <label class="block text-[11px] text-[#94A3B8] mb-1 text-right">نام کاربری:</label>
+          <input id="login-username-input" type="text" placeholder="username" dir="ltr"
+            class="w-full bg-[#1E293B] border border-white/10 text-[#F8FAFC] text-sm font-mono rounded-xl px-3 py-2 focus:outline-none focus:border-[#10B981] transition">
+        </div>
+        <div>
+          <label class="block text-[11px] text-[#94A3B8] mb-1 text-right">رمز عبور:</label>
+          <input id="login-password-input" type="password" placeholder="••••••••" dir="ltr"
+            class="w-full bg-[#1E293B] border border-white/10 text-[#F8FAFC] text-sm font-mono rounded-xl px-3 py-2 focus:outline-none focus:border-[#10B981] transition">
+        </div>
+        <button id="login-submit-btn" class="w-full mt-1 bg-[#10B981] hover:bg-[#059669] active:scale-[0.99] text-white font-medium text-xs py-2.5 rounded-xl transition shadow-md flex items-center justify-center space-x-1 space-x-reverse cursor-pointer">
+          <span>ورود به حساب</span>
+        </button>
+      </div>
+
+      <!-- Tab 2: Register Free Account Form -->
+      <div id="auth-form-register" class="hidden space-y-2">
+        <div>
+          <label class="block text-[11px] text-[#94A3B8] mb-1 text-right">نام کاربری دلخواه (انگلیسی):</label>
+          <input id="register-username-input" type="text" placeholder="sentra_user" dir="ltr"
+            class="w-full bg-[#1E293B] border border-white/10 text-[#F8FAFC] text-sm font-mono rounded-xl px-3 py-2 focus:outline-none focus:border-[#10B981] transition">
+        </div>
+        <div>
+          <label class="block text-[11px] text-[#94A3B8] mb-1 text-right">رمز عبور (حداقل ۶ کاراکتر):</label>
+          <input id="register-password-input" type="password" placeholder="••••••••" dir="ltr"
+            class="w-full bg-[#1E293B] border border-white/10 text-[#F8FAFC] text-sm font-mono rounded-xl px-3 py-2 focus:outline-none focus:border-[#10B981] transition">
+        </div>
+        <button id="register-submit-btn" class="w-full mt-1 bg-[#3B82F6] hover:bg-[#2563eb] active:scale-[0.99] text-white font-medium text-xs py-2.5 rounded-xl transition shadow-md flex items-center justify-center space-x-1 space-x-reverse cursor-pointer">
+          <span>ساخت حساب کاربری رایگان</span>
+        </button>
+      </div>
+
+      <!-- Tab 3: Telegram 8-digit OTP Form -->
+      <div id="auth-form-otp" class="hidden space-y-2">
+        <div>
+          <label class="block text-[11px] text-[#94A3B8] mb-1 text-right">کد اتصال ۸ رقمی دریافتی از ربات تلگرام:</label>
+          <input id="auth-code-input" type="text" maxlength="8" placeholder="12345678"
+            class="w-full bg-[#1E293B] border border-white/10 text-[#F8FAFC] text-center text-xl tracking-[0.25em] font-mono rounded-xl px-3 py-2 focus:outline-none focus:border-[#10B981] transition">
+        </div>
+        <button id="auth-submit-btn" class="w-full bg-[#10B981] hover:bg-[#059669] active:scale-[0.99] text-white font-medium text-xs py-2.5 rounded-xl transition shadow-md flex items-center justify-center space-x-1 space-x-reverse cursor-pointer">
+          <span>ورود با کد تلگرام</span>
+        </button>
+
+        <!-- Sandbox Quick Test Codes -->
+        <div class="pt-1">
+          <div class="text-[10px] text-[#64748B] text-center mb-1">کدهای تست سریع لوکال:</div>
+          <div class="grid grid-cols-3 gap-1">
+            <button data-code="12345678" class="quick-code-btn bg-[#1E293B] hover:bg-[#273549] border border-white/10 text-[#94A3B8] hover:text-[#F8FAFC] text-[10px] py-1 rounded-lg transition">
+              Lite
+            </button>
+            <button data-code="88888888" class="quick-code-btn bg-[#1E293B] hover:bg-[#273549] border border-white/10 text-[#94A3B8] hover:text-[#F8FAFC] text-[10px] py-1 rounded-lg transition">
+              Pro
+            </button>
+            <button data-code="99999999" class="quick-code-btn bg-[#1E293B] hover:bg-[#273549] border border-white/10 text-[#8B5CF6] hover:text-[#F8FAFC] text-[10px] py-1 rounded-lg transition">
+              Flow+
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Error Message Banner -->
+      <p id="auth-error-msg" class="text-xs text-[#EF4444] mt-1 hidden text-center"></p>
+    </div>
+
+    <!-- Footer Help -->
+    <div class="text-center text-[10px] text-[#64748B] pb-1">
+      ربات تلگرام سنترا: 
+      <a href="https://t.me/SentraConnectBot" target="_blank" class="text-[#3B82F6] hover:underline font-medium">@SentraConnectBot</a>
+    </div>
+  </div>
+
+  <!-- ========================================================================= -->
+  <!-- 2. MAIN DASHBOARD SCREEN (Shown if authenticated) -->
+  <!-- ========================================================================= -->
+  <div id="main-screen" class="flex-1 flex flex-col justify-between overflow-hidden">
+    <!-- Top Bar (Windscribe-style Minimalist Navigation Header) -->
+    <header class="flex items-center justify-between px-3.5 py-2.5 border-b border-white/10 bg-[#0F172A]/90 backdrop-blur z-10">
+      <!-- Left: Subscription Badge & Expiration -->
+      <div class="flex items-center space-x-2 space-x-reverse min-w-0">
+        <span id="tier-badge" class="text-[10px] px-2 py-0.5 rounded-full font-semibold bg-[#1E293B] text-[#94A3B8] border border-white/10 tracking-wide">
+          Sentra Lite
+        </span>
+        <span id="expiry-display" class="text-[10px] text-[#94A3B8] font-mono truncate max-w-[100px]">
+          پلن رایگان
+        </span>
+      </div>
+
+      <!-- Right: Active Devices Quick Pill & Settings -->
+      <div class="flex items-center space-x-1.5 space-x-reverse">
+        <!-- Quick Device Management Pill Button (e.g. ۲ از ۳ دستگاه فعال) -->
+        <button id="quick-devices-btn" title="مدیریت دستگاه‌های متصل" class="flex items-center space-x-1 space-x-reverse bg-[#1E293B] hover:bg-[#273549] border border-white/10 text-[10px] px-2 py-1 rounded-lg transition cursor-pointer text-[#94A3B8] hover:text-[#F8FAFC]">
+          <span>📱</span>
+          <span id="top-devices-label" class="font-mono">۱ از ۳ فعال</span>
+        </button>
+
+        <!-- Settings Button -->
+        <button id="toggle-settings-btn" title="تنظیمات هسته و کنسول" class="p-1 rounded-lg text-[#94A3B8] hover:text-[#F8FAFC] hover:bg-[#1E293B] transition cursor-pointer">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Update Notification Banner (Version Check) -->
+    <div id="update-banner" class="hidden mx-3.5 mt-2 p-2 bg-[#3B82F6]/15 border border-[#3B82F6]/30 rounded-xl flex items-center justify-between z-20">
+      <div class="flex items-center space-x-2 space-x-reverse min-w-0">
+        <span class="text-sm">🚀</span>
+        <div class="min-w-0">
+          <div id="update-banner-title" class="text-[11px] font-bold text-[#F8FAFC]">نسخه جدید موجود است</div>
+          <div id="update-banner-desc" class="text-[9px] text-[#94A3B8] truncate max-w-[180px]">همگام‌سازی لحظه‌ای و ارتقای امنیت</div>
+        </div>
+      </div>
+      <a id="update-download-btn" href="#" target="_blank" class="bg-[#3B82F6] hover:bg-[#2563EB] text-[#F8FAFC] text-[10px] px-2.5 py-1 rounded-lg font-medium transition whitespace-nowrap">
+        دریافت آپدیت
+      </a>
+    </div>
+
+    <!-- Scrollable Center Workspace -->
+    <div class="flex-1 overflow-y-auto px-4 py-2 flex flex-col justify-between">
+      
+      <!-- Center Hero Connection Zone -->
+      <div class="flex flex-col items-center justify-center pt-1 pb-2">
+        <!-- Circular Power Button with Smooth Wave Ring Animation -->
+        <div class="relative my-2">
+          <button id="master-power-btn" class="w-28 h-28 rounded-full bg-[#1E293B] border-[3px] border-white/15 flex flex-col items-center justify-center transition-all duration-300 shadow-xl focus:outline-none cursor-pointer">
+            <svg id="power-icon" class="w-10 h-10 text-[#64748B] transition-colors duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 5.636a9 9 0 010 12.728m0 0l-2.829-2.829m2.829 2.829L21 21M15.536 8.464a5 5 0 010 7.072m0 0l-2.829-2.829m-4.243 2.829a4.978 4.978 0 01-1.414-2.83m-1.414 5.657a9 9 0 01-2.121-7.071m2.121 7.071L3 21M12 3v9"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- Connection State Label & Monospace Timer -->
+        <div class="text-center mt-1">
+          <div id="status-text" class="text-xs font-semibold text-[#94A3B8] transition-colors">قطع ارتباط</div>
+          <div id="connection-timer" class="text-xs text-[#64748B] font-mono mt-0.5 tracking-wider">00:00:00</div>
+        </div>
+
+        <!-- Dual Live Speed Counters & Ping Banner -->
+        <div class="w-full grid grid-cols-3 gap-1.5 mt-2.5">
+          <div class="bg-[#1E293B] border border-white/10 rounded-xl p-1.5 text-center">
+            <div class="text-[9px] text-[#94A3B8]">دانلود ↓</div>
+            <div id="down-speed" class="text-[11px] font-bold text-[#F8FAFC] font-mono mt-0.5">0.0 KB/s</div>
+          </div>
+          <div class="bg-[#1E293B] border border-white/10 rounded-xl p-1.5 text-center">
+            <div class="text-[9px] text-[#94A3B8]">آپلود ↑</div>
+            <div id="up-speed" class="text-[11px] font-bold text-[#F8FAFC] font-mono mt-0.5">0.0 KB/s</div>
+          </div>
+          <div class="bg-[#1E293B] border border-white/10 rounded-xl p-1.5 text-center">
+            <div class="text-[9px] text-[#94A3B8]">تاخیر پینگ</div>
+            <div id="ping-display" class="text-[11px] font-bold text-[#10B981] font-mono mt-0.5">- ms</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4 Protocols Selector (Stealth, IKEv2, OpenVPN UDP, OpenVPN TCP) with Hyprland Animation -->
+      <div class="mt-2 p-2 rounded-xl bg-[#1E293B]/90 border border-white/10 shadow-sm">
+        <div class="flex items-center justify-between text-[11px] text-[#94A3B8] mb-1.5 px-0.5">
+          <span class="font-medium">پروتکل امن اتصال:</span>
+          <span id="active-protocol-title" class="text-[10px] font-mono text-[#3B82F6]">OpenVPN (UDP)</span>
+        </div>
+        <div class="grid grid-cols-2 gap-1.5" id="protocols-container">
+          <button type="button" data-protocol="openvpn_udp" id="proto-btn-openvpn_udp" class="protocol-btn py-1.5 px-2 rounded-lg text-[10px] font-medium border border-[#3B82F6]/60 bg-[#3B82F6]/20 text-[#3B82F6] flex items-center justify-center space-x-1 space-x-reverse transition-all duration-200">
+            <span>🛡️</span>
+            <span>OpenVPN (UDP)</span>
+          </button>
+          <button type="button" data-protocol="openvpn_tcp" id="proto-btn-openvpn_tcp" class="protocol-btn py-1.5 px-2 rounded-lg text-[10px] font-medium border border-white/10 bg-[#0F172A] text-[#94A3B8] hover:text-white flex items-center justify-center space-x-1 space-x-reverse transition-all duration-200">
+            <span>🛡️</span>
+            <span>OpenVPN (TCP)</span>
+          </button>
+          <button type="button" data-protocol="stealth" id="proto-btn-stealth" class="protocol-btn py-1.5 px-2 rounded-lg text-[10px] font-medium border border-white/10 bg-[#0F172A] text-[#94A3B8] hover:text-white flex items-center justify-center space-x-1 space-x-reverse transition-all duration-200">
+            <span>🔒</span>
+            <span>Stealth (TLS 1.3)</span>
+          </button>
+          <button type="button" data-protocol="ikev2" id="proto-btn-ikev2" class="protocol-btn py-1.5 px-2 rounded-lg text-[10px] font-medium border border-white/10 bg-[#0F172A] text-[#94A3B8] hover:text-white flex items-center justify-center space-x-1 space-x-reverse transition-all duration-200">
+            <span>⚡</span>
+            <span>IKEv2 (Native)</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 4 Connection Modes Cards Section (Windscribe-style compact cards) -->
+      <div class="mt-1 pb-1">
+        <div class="flex items-center justify-between text-[11px] text-[#94A3B8] mb-1 px-1">
+          <span class="font-medium">حالت‌های اتصال سنترا:</span>
+          <span id="active-mode-title" class="text-[10px] font-mono text-[#10B981]">🌐 وب‌گردی</span>
+        </div>
+
+        <div class="space-y-1.5" id="modes-container">
+          <!-- 1. وب‌گردی (Web Browsing) -->
+          <div data-mode="web_browsing" id="card-mode-web_browsing" class="mode-item p-2 rounded-xl bg-[#1E293B] border border-white/10 hover:border-[#10B981]/60 cursor-pointer transition">
+            <div class="flex justify-between items-center">
+              <div class="flex items-center space-x-1.5 space-x-reverse">
+                <span class="text-xs">🌐</span>
+                <span class="text-xs font-semibold text-[#F8FAFC]">وب‌گردی (Web Browsing)</span>
+              </div>
+              <span class="text-[9px] px-1.5 py-0.5 rounded bg-[#10B981]/15 text-[#10B981] font-medium border border-[#10B981]/20">WS + Fragment</span>
+            </div>
+            <!-- Daily Quota Progress Bar for Free Tier -->
+            <div class="mt-1.5 flex justify-between items-center text-[10px] text-[#94A3B8]">
+              <span>مصرف امروز:</span>
+              <span id="wb-quota-text" class="font-mono text-[#F8FAFC]">0 / 2048 MB</span>
+            </div>
+            <div class="w-full bg-[#0F172A] h-1.5 rounded-full overflow-hidden mt-1 border border-white/5">
+              <div id="wb-quota-bar" class="bg-[#10B981] h-full rounded-full transition-all duration-300" style="width: 0%;"></div>
+            </div>
+          </div>
+
+          <!-- 2. دانلود پرسرعت (Download) -->
+          <div data-mode="download" id="card-mode-download" class="mode-item p-2 rounded-xl bg-[#1E293B] border border-white/10 hover:border-[#3B82F6]/60 cursor-pointer transition">
+            <div class="flex justify-between items-center">
+              <div class="flex items-center space-x-1.5 space-x-reverse">
+                <span class="text-xs">⚡</span>
+                <span class="text-xs font-semibold text-[#F8FAFC]">دانلود (Download)</span>
+              </div>
+              <span class="text-[9px] px-1.5 py-0.5 rounded bg-[#3B82F6]/15 text-[#3B82F6] font-medium border border-[#3B82F6]/20">Hysteria 2</span>
+            </div>
+            <!-- Daily Quota Progress Bar for Free Tier -->
+            <div class="mt-1.5 flex justify-between items-center text-[10px] text-[#94A3B8]">
+              <span>مصرف امروز:</span>
+              <span id="dl-quota-text" class="font-mono text-[#F8FAFC]">0 / 3072 MB</span>
+            </div>
+            <div class="w-full bg-[#0F172A] h-1.5 rounded-full overflow-hidden mt-1 border border-white/5">
+              <div id="dl-quota-bar" class="bg-[#3B82F6] h-full rounded-full transition-all duration-300" style="width: 0%;"></div>
+            </div>
+          </div>
+
+          <!-- 3. گیمینگ (Gaming) - Coming Soon -->
+          <div data-mode="gaming" id="card-mode-gaming" class="mode-item p-2 rounded-xl bg-[#1E293B]/60 border border-white/5 opacity-70 cursor-not-allowed transition">
+            <div class="flex justify-between items-center">
+              <div class="flex items-center space-x-1.5 space-x-reverse">
+                <span class="text-xs">🎮</span>
+                <span class="text-xs font-semibold text-[#94A3B8]">گیمینگ (Gaming)</span>
+              </div>
+              <span class="text-[9px] px-1.5 py-0.5 rounded bg-white/5 text-[#94A3B8] border border-white/10">به‌زودی</span>
+            </div>
+            <div class="text-[10px] text-[#64748B] mt-1 leading-tight">کاهش پینگ و تثبیت جیتر بازی‌های آنلاین</div>
+          </div>
+
+          <!-- 4. آی‌پی ثابت مسکونی (Static IP) - Locked for Free -->
+          <div data-mode="static_ip" id="card-mode-static_ip" class="mode-item p-2 rounded-xl bg-[#1E293B] border border-white/10 hover:border-[#8B5CF6]/60 cursor-pointer transition">
+            <div class="flex justify-between items-center">
+              <div class="flex items-center space-x-1.5 space-x-reverse">
+                <span id="static-ip-icon" class="text-xs">🔒</span>
+                <span class="text-xs font-semibold text-[#F8FAFC]">آی‌پی ثابت مسکونی (Static IP)</span>
+              </div>
+              <span id="static-ip-badge" class="text-[9px] px-1.5 py-0.5 rounded bg-[#8B5CF6]/15 text-[#8B5CF6] font-medium border border-[#8B5CF6]/20">ویژه Pro و Flow+</span>
+            </div>
+            <div class="text-[10px] text-[#94A3B8] mt-1 leading-tight">آی‌پی ثابت آمریکا جهت صرافی‌های ترید و Google Gemini</div>
+            <!-- Strict Leak Protection Badge -->
+            <div id="static-ip-leak-badge" class="hidden mt-1.5 p-1 px-2 rounded-lg bg-[#10B981]/15 border border-[#10B981]/30 flex items-center justify-between text-[10px] text-[#10B981]">
+              <span class="flex items-center space-x-1 space-x-reverse font-medium">
+                <span>🛡️</span>
+                <span>حفاظت نشت IP فعال برای ترید</span>
+              </span>
+              <span class="text-[9px] text-[#94A3B8] font-mono">Kill-Switch قفل • IPv6 مسدود</span>
+            </div>
+            <!-- Static IP Quota Meter (30 GB limit for Pro) -->
+            <div id="static-ip-quota-meter" class="hidden mt-1 pt-1 border-t border-white/5 flex items-center justify-between text-[9px] text-[#94A3B8]">
+              <span>سهمیه ۳۰ روزه:</span>
+              <span id="static-ip-quota-text" class="font-mono text-[#F8FAFC]">۳۰ / ۳۰ GB</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================= -->
+  <!-- 3. DEVICE MANAGEMENT MODAL (Max 3 Devices + Replace Device Button) -->
+  <!-- ========================================================================= -->
+  <div id="devices-modal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex flex-col justify-end">
+    <div class="bg-[#1E293B] border-t border-white/15 rounded-t-2xl p-4 max-h-[85vh] overflow-y-auto">
+      <div class="flex items-center justify-between pb-2.5 border-b border-white/10">
+        <div class="flex items-center space-x-1.5 space-x-reverse">
+          <h2 class="text-xs font-bold text-[#F8FAFC]">مدیریت دستگاه‌های متصل</h2>
+          <span id="modal-devices-count" class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-[#0F172A] border border-white/10 text-[#3B82F6]">۰ از ۳</span>
+        </div>
+        <button id="close-devices-modal" class="text-[#94A3B8] hover:text-[#F8FAFC] p-1 text-xs cursor-pointer">بستن ✕</button>
+      </div>
+
+      <p class="text-[11px] text-[#94A3B8] my-2 leading-relaxed">
+        سقف مجاز اشتراک شما حداکثر ۳ دستگاه است. برای فعال‌سازی اتصال روی این دستگاه، می‌توانید یکی از دستگاه‌های قبلی را مستقیماً حذف و جایگزین کنید:
+      </p>
+
+      <!-- Dynamic list of registered devices -->
+      <div id="devices-list" class="space-y-2 my-2">
+        <!-- Rendered by JS -->
+      </div>
+
+      <div class="pt-2 border-t border-white/10 flex justify-between items-center">
+        <button id="refresh-devices-modal-btn" class="text-[11px] text-[#94A3B8] hover:text-[#F8FAFC] transition">
+          🔄 بروزرسانی دستگاه‌ها
+        </button>
+        <span class="text-[10px] text-[#64748B]">بدون نیاز به خروج از اپلیکیشن</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================= -->
+  <!-- 4. SETTINGS & LIVE CONSOLE WINDOW (Tabbed Clean Interface) -->
+  <!-- ========================================================================= -->
+  <div id="settings-drawer" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex flex-col justify-end">
+    <div class="bg-[#1E293B] border-t border-white/15 rounded-t-2xl p-4 max-h-[88vh] flex flex-col">
+      <!-- Header -->
+      <div class="flex items-center justify-between pb-2.5 border-b border-white/10">
+        <h2 class="text-xs font-bold text-[#F8FAFC]">مرکز تنظیمات و کنسول هسته</h2>
+        <button id="close-settings-btn" class="text-[#94A3B8] hover:text-[#F8FAFC] p-1 text-xs cursor-pointer">بستن ✕</button>
+      </div>
+
+      <!-- Tabs Header: Network / Anti-DPI Lab / Theme Engine / Live Logs -->
+      <div class="flex space-x-1 space-x-reverse my-2.5 bg-[#0F172A] p-1 rounded-xl border border-white/5">
+        <button id="tab-btn-settings" class="tab-btn active flex-1 text-center py-1.5 text-[11px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
+          شبکه
+        </button>
+        <button id="tab-btn-antidpi" class="tab-btn flex-1 text-center py-1.5 text-[11px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
+          🛡 ضد DPI
+        </button>
+        <button id="tab-btn-theme" class="tab-btn flex-1 text-center py-1.5 text-[11px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
+          🎨 تم
+        </button>
+        <button id="tab-btn-logs" class="tab-btn flex-1 text-center py-1.5 text-[11px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
+          لاگ هسته
+        </button>
+      </div>
+
+      <!-- Tab Content 1: Network Settings -->
+      <div id="tab-content-settings" class="space-y-2.5 overflow-y-auto max-h-[46vh] pr-1">
+        <!-- Split Tunneling -->
+        <div class="flex items-center justify-between p-2 rounded-xl bg-[#0F172A]/50 border border-white/5">
+          <div>
+            <div class="text-xs font-medium text-[#F8FAFC]">تفکیک هوشمند (Split Tunneling)</div>
+            <div class="text-[10px] text-[#94A3B8]">عبور مستقیم و بدون فیلترشکن سایت‌های ایرانی (.ir)</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="split-tunnel-toggle" checked>
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <!-- TUN Mode -->
+        <div class="flex items-center justify-between p-2 rounded-xl bg-[#0F172A]/50 border border-white/5">
+          <div>
+            <div class="text-xs font-medium text-[#F8FAFC]">کارت شبکه مجازی (TUN Mode)</div>
+            <div class="text-[10px] text-[#94A3B8]">مسیریابی سیستمی با درایور سطح هسته Wintun</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="tun-mode-toggle" checked>
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <!-- Kill Switch -->
+        <div class="flex items-center justify-between p-2 rounded-xl bg-[#0F172A]/50 border border-white/5">
+          <div>
+            <div class="text-xs font-medium text-[#F8FAFC]">قطع اضطراری (Kill-Switch)</div>
+            <div class="text-[10px] text-[#94A3B8]">مسدودسازی اینترنت در صورت قطع ناگهانی ارتباط تانل</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="kill-switch-toggle">
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <!-- Sandbox Mode -->
+        <div class="flex items-center justify-between p-2 rounded-xl bg-[#0F172A]/50 border border-white/5">
+          <div>
+            <div class="text-xs font-medium text-[#8B5CF6]">حالت تست سندباکس (Sandbox)</div>
+            <div class="text-[10px] text-[#94A3B8]">شبیه‌سازی کامل شبکه لوپ‌بک بدون نیاز به اینترنت خارجی</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="sandbox-mode-toggle" checked>
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <!-- Telegram Account Link Button -->
+        <button id="open-link-modal-btn" class="w-full bg-[#0F172A] hover:bg-[#273549] border border-[#3B82F6]/30 text-xs py-2 rounded-xl text-[#3B82F6] font-medium transition cursor-pointer flex items-center justify-center space-x-1.5 space-x-reverse">
+          <svg class="w-4 h-4 ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg>
+          <span>اتصال به ربات تلگرام (دریافت کد ۶ رقمی)</span>
+        </button>
+
+        <!-- Test API Button -->
+        <button id="test-api-btn" class="w-full bg-[#0F172A] hover:bg-[#273549] border border-white/10 text-xs py-2 rounded-xl text-[#3B82F6] font-medium transition cursor-pointer">
+          بررسی سلامت اتصال به هسته (127.0.0.1:8080)
+        </button>
+        <div id="api-test-status" class="text-[10px] text-center hidden"></div>
+      </div>
+
+      <!-- Tab Content 2: Anti-DPI Lab (عبور از فیلترینگ شدید) -->
+      <div id="tab-content-antidpi" class="hidden space-y-2.5 overflow-y-auto max-h-[46vh] pr-1">
+        <div class="text-[11px] text-[#94A3B8] leading-tight">
+          پیکربندی پارامترهای پیشرفته فریب DPI اپراتورهای مخابراتی همراه اول، ایرانسل و مخابرات:
+        </div>
+
+        <!-- Presets -->
+        <div class="grid grid-cols-3 gap-1.5">
+          <button id="preset-normal-btn" class="preset-card active p-2 rounded-xl bg-[#0F172A] border border-white/10 text-right transition cursor-pointer">
+            <div class="text-[11px] font-bold text-[#F8FAFC]">عادی</div>
+            <div class="text-[9px] text-[#94A3B8]">پیش‌فرض پایدار</div>
+          </button>
+          <button id="preset-severe-btn" class="preset-card p-2 rounded-xl bg-[#0F172A] border border-white/10 text-right transition cursor-pointer">
+            <div class="text-[11px] font-bold text-[#10B981]">فیلترینگ شدید</div>
+            <div class="text-[9px] text-[#94A3B8]">TLS Fragment</div>
+          </button>
+          <button id="preset-national-btn" class="preset-card p-2 rounded-xl bg-[#0F172A] border border-white/10 text-right transition cursor-pointer">
+            <div class="text-[11px] font-bold text-[#F59E0B]">اینترنت ملی</div>
+            <div class="text-[9px] text-[#94A3B8]">اختلال UDP / TCP</div>
+          </button>
+        </div>
+
+        <!-- Manual Controls -->
+        <div class="p-2.5 rounded-xl bg-[#0F172A]/70 border border-white/5 space-y-2">
+          <!-- TLS Fragment Toggle -->
+          <div class="flex items-center justify-between">
+            <div>
+              <div class="text-xs font-medium text-[#F8FAFC]">تکه‌تکه‌سازی بسته (TLS Fragment)</div>
+              <div class="text-[9px] text-[#94A3B8]">شکستن بسته TLS ClientHello جهت عبور از DPI</div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="antidpi-fragment-toggle" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <!-- Fragment Size & Interval Grid -->
+          <div class="grid grid-cols-2 gap-2 pt-1 border-t border-white/5">
+            <div>
+              <label class="block text-[9px] text-[#94A3B8] mb-0.5">طول قطعات (Length):</label>
+              <select id="antidpi-fragment-len" class="w-full bg-[#1E293B] border border-white/10 text-[#F8FAFC] text-[10px] rounded-lg px-2 py-1 focus:outline-none">
+                <option value="10-30">۱۰-۳۰ بایت (بسیار سنگین)</option>
+                <option value="50-100">۵۰-۱۰۰ بایت (متوسط)</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-[9px] text-[#94A3B8] mb-0.5">فاصله تاخیر (Interval):</label>
+              <select id="antidpi-fragment-interval" class="w-full bg-[#1E293B] border border-white/10 text-[#F8FAFC] text-[10px] rounded-lg px-2 py-1 focus:outline-none">
+                <option value="10-20ms">۱۰-۲۰ میلی‌ثانیه</option>
+                <option value="20-40ms">۲۰-۴۰ میلی‌ثانیه</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Mux + Padding Toggle -->
+          <div class="flex items-center justify-between pt-1 border-t border-white/5">
+            <div>
+              <div class="text-xs font-medium text-[#F8FAFC]">مالتی‌پلکس و پرکننده (Mux + Padding)</div>
+              <div class="text-[9px] text-[#94A3B8]">ترکیب کانکشن‌ها در یک جریان با پکت‌های پدینگ رندوم</div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="antidpi-mux-toggle" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <!-- Anti-Poisoning DNS Selector -->
+          <div class="pt-1 border-t border-white/5">
+            <label class="block text-[10px] font-medium text-[#F8FAFC] mb-1">سامانه ضدمسمومیت دی‌ان‌اس (Anti-Poisoning DNS):</label>
+            <select id="antidpi-dns-select" class="w-full bg-[#1E293B] border border-white/10 text-[#F8FAFC] text-[11px] rounded-lg px-2.5 py-1.5 focus:outline-none">
+              <option value="cloudflare">Cloudflare DoH (1.1.1.1 - رمزنگاری HTTPS)</option>
+              <option value="google">Google DoH (8.8.8.8 - استاندارد جهانی)</option>
+              <option value="quad9">Quad9 DoH (9.9.9.9 - حریم خصوصی سخت‌گیرانه)</option>
+              <option value="fakeip">FakeIP Pool (لوکال بدون نشت خارجی)</option>
+            </select>
+          </div>
+
+          <!-- MTU Tuner -->
+          <div class="pt-1 border-t border-white/5">
+            <label class="block text-[10px] font-medium text-[#F8FAFC] mb-1">تنظیم اندازه سقف بسته شبکه (MTU Tuner):</label>
+            <select id="antidpi-mtu-select" class="w-full bg-[#1E293B] border border-white/10 text-[#F8FAFC] text-[11px] rounded-lg px-2.5 py-1.5 focus:outline-none">
+              <option value="1400">۱۴۰۰ بایت (استاندارد اینترنت پایدار)</option>
+              <option value="1280">۱۲۸۰ بایت (بهینه‌سازی ویژه همراه اول و ایرانسل)</option>
+              <option value="1200">۱۲۰۰ بایت (شرایط اختلال شدید زیرساخت و قطعی بسته)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Live Ping Test Button & Output -->
+        <button id="antidpi-test-ping-btn" class="w-full bg-[#10B981] hover:bg-[#059669] text-white text-xs font-semibold py-2 rounded-xl transition cursor-pointer shadow-md flex items-center justify-center space-x-1.5 space-x-reverse">
+          <span>⚡ تست سرعت و پینگ با تنظیمات فعلی</span>
+        </button>
+        <div id="antidpi-test-status" class="text-xs text-center p-2 rounded-xl bg-[#0F172A] border border-white/10 hidden font-mono"></div>
+      </div>
+
+      <!-- Tab Content 3: Theme Engine (ظاهر و تم برنامه) -->
+      <div id="tab-content-theme" class="hidden space-y-2.5 overflow-y-auto max-h-[46vh] pr-1">
+        <div class="text-[11px] text-[#94A3B8] leading-tight">
+          انتخاب تم ظاهری پوسته نرم‌افزار با قابلیت تغییر آنی رنگ‌ها و ذخیره خودکار:
+        </div>
+
+        <!-- 4 Theme Cards -->
+        <div class="grid grid-cols-2 gap-2">
+          <!-- 1. Dark (Default) -->
+          <div data-theme-name="dark" class="theme-card p-2.5 rounded-xl bg-[#0B0D10] border border-white/10 hover:border-[#10B981] transition">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs font-bold text-[#F1F5F9]">دارک (پیش‌فرض)</span>
+              <span class="w-2.5 h-2.5 rounded-full bg-[#10B981]"></span>
+            </div>
+            <div class="text-[9px] text-[#94A3B8] mb-2">کنتراست بالا و مهندسی تیره</div>
+            <div class="flex space-x-1 space-x-reverse">
+              <span class="w-4 h-4 rounded-md bg-[#0B0D10] border border-white/10"></span>
+              <span class="w-4 h-4 rounded-md bg-[#13161B]"></span>
+              <span class="w-4 h-4 rounded-md bg-[#10B981]"></span>
+            </div>
+          </div>
+
+          <!-- 2. Light -->
+          <div data-theme-name="light" class="theme-card p-2.5 rounded-xl bg-[#F8FAFC] border border-[#CBD5E1] hover:border-[#059669] transition">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs font-bold text-[#0F172A]">لایت (روشن)</span>
+              <span class="w-2.5 h-2.5 rounded-full bg-[#059669]"></span>
+            </div>
+            <div class="text-[9px] text-[#475569] mb-2">محیط شفاف و روزانه</div>
+            <div class="flex space-x-1 space-x-reverse">
+              <span class="w-4 h-4 rounded-md bg-[#F8FAFC] border border-[#E2E8F0]"></span>
+              <span class="w-4 h-4 rounded-md bg-[#FFFFFF] border border-[#E2E8F0]"></span>
+              <span class="w-4 h-4 rounded-md bg-[#059669]"></span>
+            </div>
+          </div>
+
+          <!-- 3. Classic (Navy) -->
+          <div data-theme-name="classic" class="theme-card p-2.5 rounded-xl bg-[#0F172A] border border-white/10 hover:border-[#3B82F6] transition">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs font-bold text-[#F8FAFC]">کلاسیک سنترا</span>
+              <span class="w-2.5 h-2.5 rounded-full bg-[#3B82F6]"></span>
+            </div>
+            <div class="text-[9px] text-[#94A3B8] mb-2">سرمه‌ای عمیق با آبی رویال</div>
+            <div class="flex space-x-1 space-x-reverse">
+              <span class="w-4 h-4 rounded-md bg-[#0F172A] border border-white/10"></span>
+              <span class="w-4 h-4 rounded-md bg-[#1E293B]"></span>
+              <span class="w-4 h-4 rounded-md bg-[#3B82F6]"></span>
+            </div>
+          </div>
+
+          <!-- 4. Fantasy (Purple) -->
+          <div data-theme-name="fantasy" class="theme-card p-2.5 rounded-xl bg-[#120D1D] border border-[#A855F7]/30 hover:border-[#A855F7] transition">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-xs font-bold text-[#FAF5FF]">فانتزی نئون</span>
+              <span class="w-2.5 h-2.5 rounded-full bg-[#A855F7]"></span>
+            </div>
+            <div class="text-[9px] text-[#D8B4FE] mb-2">بنفش سایبرپانک و فیروزه‌ای</div>
+            <div class="flex space-x-1 space-x-reverse">
+              <span class="w-4 h-4 rounded-md bg-[#120D1D] border border-[#A855F7]/30"></span>
+              <span class="w-4 h-4 rounded-md bg-[#1C152B]"></span>
+              <span class="w-4 h-4 rounded-md bg-[#A855F7]"></span>
+              <span class="w-4 h-4 rounded-md bg-[#06B6D4]"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab Content 4: Live Core Logs -->
+      <div id="tab-content-logs" class="hidden flex-col space-y-2 flex-1">
+        <div class="flex items-center justify-between text-[11px] text-[#94A3B8]">
+          <span>جریان لاگ‌های سیستمی هسته:</span>
+          <div class="flex space-x-1.5 space-x-reverse">
+            <button id="clear-logs-btn" class="text-[10px] bg-[#0F172A] border border-white/10 hover:bg-[#273549] px-2 py-0.5 rounded text-[#94A3B8] hover:text-[#F8FAFC] transition cursor-pointer">
+              پاکسازی
+            </button>
+            <button id="copy-logs-btn" class="text-[10px] bg-[#0F172A] border border-white/10 hover:bg-[#273549] px-2 py-0.5 rounded text-[#94A3B8] hover:text-[#F8FAFC] transition cursor-pointer">
+              📋 کپی لاگ‌ها
+            </button>
+          </div>
+        </div>
+
+        <div id="log-console" class="w-full h-44 bg-[#0F172A] border border-white/10 rounded-xl p-2.5 font-mono text-[10px] text-[#94A3B8] overflow-y-auto space-y-1">
+          <!-- Log stream lines -->
+        </div>
+      </div>
+
+      <!-- Footer & Logout -->
+      <div class="pt-3 border-t border-white/10 mt-3 flex items-center justify-between">
+        <span id="user-display" class="text-xs text-[#94A3B8] truncate max-w-[150px]">کاربر مهمان</span>
+        <button id="logout-btn" class="text-xs text-[#EF4444] hover:bg-[#EF4444]/15 px-3 py-1 rounded-lg border border-[#EF4444]/30 transition cursor-pointer">
+          خروج از حساب
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================= -->
+  <!-- 5. UPGRADE MODAL (Shown when Free user clicks locked Static IP) -->
+  <!-- ========================================================================= -->
+  <div id="upgrade-modal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex flex-col justify-center items-center p-5">
+    <div class="bg-[#1E293B] border border-white/15 rounded-2xl p-5 w-full max-w-[340px] shadow-2xl text-center">
+      <div class="w-12 h-12 mx-auto mb-3 bg-[#8B5CF6]/15 border border-[#8B5CF6]/30 rounded-2xl flex items-center justify-center text-xl">
+        🔒
+      </div>
+      <h3 class="text-sm font-bold text-[#F8FAFC] mb-1">دسترسی به آی‌پی ثابت نیازمند ارتقا است</h3>
+      <p class="text-xs text-[#94A3B8] leading-relaxed mb-4">
+        اتصال به آی‌پی تمیز مسکونی آمریکا مختص مشترکین <b>Sentra Pro</b> و <b>Sentra Flow+</b> است تا بدون ریسک بن یا محدودیت در صرافی‌های ارزدیجیتال و Google Gemini فعالیت کنید.
+      </p>
+
+      <div class="space-y-2">
+        <button id="upgrade-via-bot-btn" class="w-full bg-[#8B5CF6] hover:bg-[#7c4ce0] text-white text-xs font-semibold py-2.5 rounded-xl transition cursor-pointer shadow-md">
+          ارتقا اشتراک در ربات تلگرام (@SentraConnectBot)
+        </button>
+        <button id="close-upgrade-modal" class="w-full bg-[#0F172A] hover:bg-[#273549] border border-white/10 text-xs text-[#94A3B8] hover:text-[#F8FAFC] py-2 rounded-xl transition cursor-pointer">
+          انصراف
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================= -->
+  <!-- 6. ACCOUNT SUSPENDED MODAL (Anomaly Suspension Alert) -->
+  <!-- ========================================================================= -->
+  <div id="suspended-modal" class="fixed inset-0 bg-black/85 backdrop-blur-sm z-50 hidden flex flex-col justify-center items-center p-5">
+    <div class="bg-[#1E293B] border-2 border-[#EF4444] rounded-2xl p-5 w-full max-w-[340px] shadow-2xl text-center">
+      <div class="w-12 h-12 mx-auto mb-3 bg-[#EF4444]/15 border border-[#EF4444]/30 rounded-2xl flex items-center justify-center text-2xl">
+        ⛔
+      </div>
+      <h3 class="text-sm font-bold text-[#EF4444] mb-2">حساب کاربری مسدود شد</h3>
+      <p id="suspended-msg-text" class="text-xs text-[#F8FAFC] leading-relaxed mb-4 bg-[#0F172A] p-3 rounded-xl border border-white/5">
+        حساب شما به دلیل الگوی مصرف ترافیک غیرعادی موقتاً متوقف شده است. لطفاً با پشتیبانی در ارتباط باشید.
+      </p>
+      <div class="space-y-2">
+        <button id="suspended-support-btn" class="w-full bg-[#3B82F6] hover:bg-[#2563eb] text-white text-xs font-medium py-2.5 rounded-xl transition cursor-pointer">
+          ارتباط با پشتیبانی در تلگرام
+        </button>
+        <button id="close-suspended-modal" class="w-full bg-[#0F172A] hover:bg-[#273549] border border-white/10 text-xs text-[#94A3B8] hover:text-[#F8FAFC] py-2 rounded-xl transition cursor-pointer">
+          بستن
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================= -->
+  <!-- 7. TELEGRAM LINK MODAL -->
+  <!-- ========================================================================= -->
+  <div id="link-modal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex flex-col justify-center items-center p-5">
+    <div class="bg-[#1E293B] border border-white/15 rounded-2xl p-5 w-full max-w-[340px] shadow-2xl text-center">
+      <div class="w-12 h-12 mx-auto mb-3 bg-[#3B82F6]/15 border border-[#3B82F6]/30 rounded-2xl flex items-center justify-center text-xl">
+        🔗
+      </div>
+      <h3 class="text-sm font-bold text-[#F8FAFC] mb-1">اتصال حساب به ربات تلگرام</h3>
+      <p class="text-xs text-[#94A3B8] leading-relaxed mb-3">
+        کد موقت ۶ رقمی زیر را با دستور <code class="text-emerald-400">/link</code> در ربات بفرستید:
+      </p>
+
+      <div class="bg-[#0F172A] border border-white/10 rounded-xl p-3 mb-3">
+        <div id="link-code-display" class="text-2xl font-mono font-bold tracking-[0.25em] text-[#10B981] mb-1">------</div>
+        <div id="link-countdown" class="text-[10px] text-[#94A3B8]">اعتبار: ۵:۰۰ دقیقه</div>
+      </div>
+
+      <div class="space-y-2">
+        <button id="copy-link-cmd-btn" class="w-full bg-[#3B82F6] hover:bg-[#2563eb] text-white text-xs font-semibold py-2.5 rounded-xl transition cursor-pointer">
+          📋 کپی دستور (/link ...)
+        </button>
+        <button id="close-link-modal" class="w-full bg-[#0F172A] hover:bg-[#273549] border border-white/10 text-xs text-[#94A3B8] hover:text-[#F8FAFC] py-2 rounded-xl transition cursor-pointer">
+          بستن
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./src/main.ts"></script>
+</body>
+</html>

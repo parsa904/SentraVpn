@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "sentra-core",
+    "sentra-client/src-tauri",
+    "sentra-client/src-tauri/plugins/sentra-vpn",
+]
