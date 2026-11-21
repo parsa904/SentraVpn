@@ -1361,6 +1361,7 @@ pub async fn handle_admin_version_text(
 }
 
 /// Admin uploads Document installer file
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_admin_file_upload(
     bot: &Bot,
     msg: &Message,

@@ -610,6 +610,16 @@ function renderRoutingMode() {
       }
     }
   });
+
+  // Update Advanced Settings Accordion Summary Badge
+  const advBadge = document.getElementById('advanced-summary-badge');
+  if (advBadge) {
+    const rLabel = rMode === 'proxy' ? 'Proxy' : rMode === 'system_proxy' ? 'SysProxy' : 'Tunnel';
+    const proto = currentState.selected_protocol || 'openvpn_udp';
+    const pLabel = proto === 'stealth' ? 'Stealth' : proto === 'ikev2' ? 'IKEv2' : 'OpenVPN';
+    const wLabel = currentState.use_warp ? 'WARP ⚡' : '';
+    advBadge.textContent = [rLabel, pLabel, wLabel].filter(Boolean).join(' • ');
+  }
 }
 
 function renderPowerButton() {
@@ -927,6 +937,22 @@ async function loadUserDevices() {
 // ------------------------------------------------------------------------------
 // Error & Modal Handlers
 // ------------------------------------------------------------------------------
+function showFriendlyError(title: string, desc: string) {
+  const card = document.getElementById('quick-error-card');
+  const tEl = document.getElementById('quick-error-title');
+  const dEl = document.getElementById('quick-error-desc');
+  if (card && tEl && dEl) {
+    tEl.textContent = title;
+    dEl.textContent = desc;
+    card.classList.remove('hidden');
+  }
+}
+
+function hideFriendlyError() {
+  const card = document.getElementById('quick-error-card');
+  card?.classList.add('hidden');
+}
+
 function handleCoreError(errStr: string): boolean {
   if (errStr.includes('ACCOUNT_SUSPENDED')) {
     const suspendedModal = document.getElementById('suspended-modal');
@@ -939,7 +965,18 @@ function handleCoreError(errStr: string): boolean {
     loadUserDevices();
     return true;
   }
-  return false;
+
+  // Provide high-contrast friendly Persian troubleshooting guidance
+  if (errStr.toLowerCase().includes('openvpn') || errStr.toLowerCase().includes('handshake') || errStr.toLowerCase().includes('timeout') || errStr.includes('اتصال')) {
+    showFriendlyError(
+      'خطا در برقراری اتصال تانل',
+      'ارتباط با سرور به دلیل محدودیت‌های شبکه برقرار نشد. پیشنهاد می‌شود پروتکل Stealth (ضدفیلتر و پنهان‌ساز) یا لوکیشن دیگری را امتحان کنید.'
+    );
+    return true;
+  }
+
+  showFriendlyError('خطای موقت در اتصال', errStr);
+  return true;
 }
 
 // ------------------------------------------------------------------------------
@@ -1158,6 +1195,7 @@ function initEventListeners() {
       }
     } else {
       try {
+        hideFriendlyError();
         currentState.status = 'Connecting';
         renderPowerButton();
         const updated = await invokeTauri<ClientState>('connect_vpn');
@@ -1169,9 +1207,43 @@ function initEventListeners() {
         currentState.status = 'Disconnected';
         renderPowerButton();
         if (!handleCoreError(errStr)) {
-          alert('خطا در برقراری اتصال: ' + errStr);
+          showFriendlyError('خطا در اتصال تانل', errStr);
         }
       }
+    }
+  });
+
+  // Quick Error Card Action Buttons
+  const closeErrBtn = document.getElementById('close-quick-error-btn');
+  closeErrBtn?.addEventListener('click', hideFriendlyError);
+
+  const retryBtn = document.getElementById('quick-retry-btn');
+  retryBtn?.addEventListener('click', () => {
+    hideFriendlyError();
+    masterBtn?.click();
+  });
+
+  const switchStealthBtn = document.getElementById('quick-switch-stealth-btn');
+  switchStealthBtn?.addEventListener('click', async () => {
+    hideFriendlyError();
+    currentState = await invokeTauri<ClientState>('set_connection_protocol', { protocol: 'stealth' });
+    renderState();
+    masterBtn?.click();
+  });
+
+  // Advanced Network Settings Accordion Toggle
+  const toggleAdvBtn = document.getElementById('toggle-advanced-btn');
+  const advContent = document.getElementById('advanced-content');
+  const advChevron = document.getElementById('advanced-chevron-icon');
+
+  toggleAdvBtn?.addEventListener('click', () => {
+    const isHidden = advContent?.classList.contains('hidden');
+    if (isHidden) {
+      advContent?.classList.remove('hidden');
+      if (advChevron) advChevron.style.transform = 'rotate(180deg)';
+    } else {
+      advContent?.classList.add('hidden');
+      if (advChevron) advChevron.style.transform = 'rotate(0deg)';
     }
   });
 

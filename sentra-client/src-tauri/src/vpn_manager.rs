@@ -41,6 +41,12 @@ impl Drop for VpnManager {
     }
 }
 
+impl Default for VpnManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VpnManager {
     pub fn new() -> Self {
         Self {
@@ -199,6 +205,7 @@ impl VpnManager {
     }
 
     /// Fetch client config from backend API or build fallback (Shared Desktop & Android)
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_or_compile_config(
         token: &str,
         selected_mode: &str,

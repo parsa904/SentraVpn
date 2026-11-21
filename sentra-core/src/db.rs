@@ -2313,6 +2313,7 @@ impl Repository {
     }
 
     /// Save a newly analyzed donated outbound with deep SHA-256 fingerprint
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_donated_outbound(
         pool: &DbPool,
         donor_user_id: Option<i64>,
@@ -3196,6 +3197,7 @@ impl Repository {
     }
 
     /// Save or replace active Cloudflare WARP account
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_warp_account(
         pool: &DbPool,
         private_key: &str,

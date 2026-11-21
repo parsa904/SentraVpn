@@ -11,7 +11,7 @@ pub enum ConnectionStatus {
     Error(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TelemetryMetrics {
     pub download_speed_bps: u64, // Bytes per second
     pub upload_speed_bps: u64,   // Bytes per second
@@ -19,19 +19,6 @@ pub struct TelemetryMetrics {
     pub total_download_bytes: u64,
     pub total_upload_bytes: u64,
     pub uptime_seconds: u64,
-}
-
-impl Default for TelemetryMetrics {
-    fn default() -> Self {
-        Self {
-            download_speed_bps: 0,
-            upload_speed_bps: 0,
-            ping_ms: 0,
-            total_download_bytes: 0,
-            total_upload_bytes: 0,
-            uptime_seconds: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

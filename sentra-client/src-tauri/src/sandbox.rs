@@ -139,7 +139,7 @@ impl SandboxEngine {
                 state.metrics.uptime_seconds = second_counter;
                 state.remaining_bytes = (state.remaining_bytes - (dl_speed + ul_speed) as i64).max(0);
 
-                if second_counter % 15 == 0 {
+                if second_counter.is_multiple_of(15) {
                     let log_line = format!(
                         "[DEBUG] [Proxy] Encrypted stream alive ({:.1} MB/s down, ping: {}ms)",
                         dl_speed as f64 / 1_000_000.0,

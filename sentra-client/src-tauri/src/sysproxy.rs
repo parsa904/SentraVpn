@@ -10,7 +10,7 @@ pub fn enable_system_proxy(proxy_addr: &str) -> Result<(), String> {
 
     // 1. Set ProxyEnable = 1 (DWORD)
     let out1 = Command::new("reg.exe")
-        .args(&[
+        .args([
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
             "/v",
@@ -29,7 +29,7 @@ pub fn enable_system_proxy(proxy_addr: &str) -> Result<(), String> {
 
     // 2. Set ProxyServer = "127.0.0.1:10809" (REG_SZ)
     let out2 = Command::new("reg.exe")
-        .args(&[
+        .args([
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
             "/v",
@@ -48,7 +48,7 @@ pub fn enable_system_proxy(proxy_addr: &str) -> Result<(), String> {
 
     // 3. Set ProxyOverride = "<local>;localhost;127.*;10.*;172.16.*;192.168.*"
     let _ = Command::new("reg.exe")
-        .args(&[
+        .args([
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
             "/v",
@@ -74,7 +74,7 @@ pub fn disable_system_proxy() -> Result<(), String> {
     tracing::info!("Disabling Windows System Proxy (ProxyEnable=0)...");
 
     let out = Command::new("reg.exe")
-        .args(&[
+        .args([
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
             "/v",

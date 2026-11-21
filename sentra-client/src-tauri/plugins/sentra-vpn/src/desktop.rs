@@ -38,3 +38,9 @@ impl<R: Runtime> SentraVpn<R> {
         })
     }
 }
+
+impl<R: Runtime> Default for SentraVpn<R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}

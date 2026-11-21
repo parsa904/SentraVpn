@@ -89,8 +89,8 @@ pub async fn run_telegram_bot(
                                 // If admin sending a photo with caption starting with /broadcast
                                 if admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id) {
                                     if let Some(caption) = msg.caption() {
-                                        if caption.starts_with("/broadcast ") {
-                                            let broadcast_text = caption[11..].trim();
+                                        if let Some(stripped) = caption.strip_prefix("/broadcast ") {
+                                            let broadcast_text = stripped.trim();
                                             let best_photo = &photos[photos.len() - 1];
                                             if let Err(e) = admin_handlers::handle_admin_broadcast(
                                                 &bot,
@@ -251,8 +251,8 @@ pub async fn run_telegram_bot(
                                 if let Err(e) = user_handlers::handle_link_command(&bot, &msg, &pool, args).await {
                                     error!("Error in handle_link_command: {:?}", e);
                                 }
-                            } else if text.starts_with("/setpassword ") {
-                                let args = text[13..].trim();
+                            } else if let Some(stripped) = text.strip_prefix("/setpassword ") {
+                                let args = stripped.trim();
                                 if let Err(e) = user_handlers::handle_setpassword_command(&bot, &msg, &pool, args).await {
                                     error!("Error in handle_setpassword_command: {:?}", e);
                                 }
@@ -277,16 +277,16 @@ pub async fn run_telegram_bot(
                                     error!("Error in /admin: {:?}", e);
                                 }
                             } else if text.starts_with("/user ") || text.starts_with("/search ") {
-                                let query = if text.starts_with("/user ") {
-                                    text[6..].trim()
+                                let query = if let Some(stripped) = text.strip_prefix("/user ") {
+                                    stripped.trim()
                                 } else {
-                                    text[8..].trim()
+                                    text.strip_prefix("/search ").unwrap_or_default().trim()
                                 };
                                 if let Err(e) = admin_handlers::handle_admin_search_user(&bot, &msg, &pool, admin_chat_id, query).await {
                                     error!("Error in handle_admin_search_user: {:?}", e);
                                 }
-                            } else if text.starts_with("/broadcast ") {
-                                let broadcast_text = text[11..].trim();
+                            } else if let Some(stripped) = text.strip_prefix("/broadcast ") {
+                                let broadcast_text = stripped.trim();
                                 if let Err(e) = admin_handlers::handle_admin_broadcast(&bot, &msg, &pool, admin_chat_id, broadcast_text, None).await {
                                     error!("Error in handle_admin_broadcast: {:?}", e);
                                 }
@@ -587,8 +587,7 @@ pub async fn run_telegram_bot(
                                 if let Err(e) = user_handlers::handle_ios_back_to_modes(&bot, &q, &pool).await {
                                     error!("Error in ios back to modes: {:?}", e);
                                 }
-                            } else if data.starts_with("ticket_") {
-                                let category = &data[7..];
+                            } else if let Some(category) = data.strip_prefix("ticket_") {
                                 if let Err(e) = user_handlers::handle_ticket_callback(&bot, &q, &pool, category).await {
                                     error!("Error in ticket callback: {:?}", e);
                                 }

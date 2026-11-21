@@ -270,7 +270,7 @@ impl OutboundAnalyzer {
         for part in lower.split_whitespace() {
             let clean = part.trim_end_matches("gb").trim_end_matches('g');
             if let Ok(num) = clean.parse::<i64>() {
-                if num >= 10 && num <= 100_000 {
+                if (10..=100_000).contains(&num) {
                     return num;
                 }
             }
@@ -278,7 +278,7 @@ impl OutboundAnalyzer {
         // Check tag or URL query params (e.g. tag having 250GB)
         for segment in lower.split(|c: char| !c.is_alphanumeric()) {
             if let Ok(num) = segment.parse::<i64>() {
-                if num >= 200 && num <= 10_000 {
+                if (200..=10_000).contains(&num) {
                     return num;
                 }
             }
