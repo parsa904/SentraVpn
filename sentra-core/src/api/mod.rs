@@ -178,6 +178,7 @@ pub struct ConfigRequest {
     pub os: Option<String>,
     pub mode: Option<String>,
     pub protocol: Option<String>,
+    pub location_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,8 +254,9 @@ pub fn create_router(
         .route("/api/v1/auth/code-login", post(auth_code_login))
         .route("/api/v1/auth/exchange-code", post(auth_code_login))
         .route("/api/v1/auth/link-token", post(auth_link_token))
-        // 2. Client Connection Modes catalog
+        // 2. Client Connection Modes & Locations catalog
         .route("/api/v1/client/modes", get(get_client_modes))
+        .route("/api/v1/client/locations", get(get_client_locations))
         // 3. Client Sing-box dynamic config compiler
         .route("/api/v1/client/config", post(client_config))
         .route("/api/v1/client/connect", post(client_config))
@@ -602,6 +604,24 @@ async fn get_client_modes(
         .into_response())
 }
 
+/// GET /api/v1/client/locations
+/// Returns active online locations with ping and node count for client Location Switcher
+async fn get_client_locations(
+    State(state): State<AppState>,
+) -> Result<Response, CoreError> {
+    let locations = Repository::get_active_locations_for_free_modes(&state.pool).await?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        Json(json!({
+            "success": true,
+            "default": "auto",
+            "locations": locations
+        })),
+    )
+        .into_response())
+}
+
 /// POST /api/v1/client/config
 /// Generates valid Sing-box v1.10+ JSON according to PROTOCOL_SPEC.md tailored to user's tier & mode
 async fn client_config(
@@ -775,6 +795,24 @@ async fn client_config(
         None
     };
 
+    let requested_location = payload.location_code.as_deref().unwrap_or("auto");
+    let chosen_location_code = if requested_mode == "static_ip" {
+        "US"
+    } else {
+        requested_location
+    };
+    let _assigned_outbounds = Repository::get_active_outbounds_for_mode_and_location(&state.pool, requested_mode, Some(chosen_location_code)).await.unwrap_or_default();
+    let chosen_location_name = match chosen_location_code.to_uppercase().as_str() {
+        "US" => "آمریکا 🇺🇸",
+        "DE" => "آلمان 🇩🇪",
+        "NL" => "هلند 🇳🇱",
+        "FI" => "فنلاند 🇫🇮",
+        "FR" => "فرانسه 🇫🇷",
+        "GB" | "UK" => "انگلستان 🇬🇧",
+        "TR" => "ترکیه 🇹🇷",
+        _ => "⚡️ انتخاب خودکار سریع‌ترین لوکیشن (Auto)",
+    };
+
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
@@ -782,6 +820,8 @@ async fn client_config(
             "success": true,
             "protocol": requested_protocol,
             "mode": requested_mode,
+            "location_code": chosen_location_code,
+            "location_name": chosen_location_name,
             "remote_host": server_host,
             "remote_port": remote_port,
             "auth_username": sub.token,

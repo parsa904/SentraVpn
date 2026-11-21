@@ -67,9 +67,48 @@ interface UserDevice {
   created_at: string;
 }
 
+interface ActiveLocationInfo {
+  code: string;
+  name: string;
+  flag: string;
+  ping_ms: number;
+  active_nodes: number;
+  is_auto: boolean;
+}
+
+interface CustomDnsEntry {
+  id: string;
+  name: string;
+  address: string;
+}
+
+interface DnsPingItem {
+  id: string;
+  name: string;
+  address: string;
+  ping_ms: number;
+  is_iranian: boolean;
+  is_custom: boolean;
+}
+
+interface DnsConfig {
+  selected_dns_id: string;
+  selected_dns_address: string;
+  custom_servers: CustomDnsEntry[];
+}
+
 let connectionModes: ConnectionModeInfo[] = [];
 let userDevices: UserDevice[] = [];
 let currentDeviceId: string = '';
+let availableLocations: ActiveLocationInfo[] = [];
+let isLocationDropdownOpen: boolean = false;
+let dnsConfigState: DnsConfig = {
+  selected_dns_id: 'cloudflare',
+  selected_dns_address: '1.1.1.1',
+  custom_servers: [],
+};
+let dnsPingResults: DnsPingItem[] = [];
+let isDnsTesting: boolean = false;
 
 // ------------------------------------------------------------------------------
 // Fallback state for local preview / sandbox testing
@@ -201,6 +240,41 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
     currentState.status = 'Disconnected';
     stopTimer();
     return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'get_available_locations') {
+    return [
+      { code: 'auto', name: 'انتخاب خودکار (سریع‌ترین لوکیشن)', flag: '⚡️', ping_ms: 32, active_nodes: 5, is_auto: true },
+      { code: 'DE', name: 'آلمان 🇩🇪', flag: '🇩🇪', ping_ms: 38, active_nodes: 3, is_auto: false },
+      { code: 'NL', name: 'هلند 🇳🇱', flag: '🇳🇱', ping_ms: 44, active_nodes: 2, is_auto: false },
+      { code: 'FI', name: 'فنلاند 🇫🇮', flag: '🇫🇮', ping_ms: 51, active_nodes: 2, is_auto: false },
+      { code: 'US', name: 'آمریکا 🇺🇸', flag: '🇺🇸', ping_ms: 95, active_nodes: 4, is_auto: false },
+    ] as unknown as T;
+  }
+  if (cmd === 'set_connection_location') {
+    currentState.selected_location = args.location || 'auto';
+    currentState.logs.push(`[Location] Target location switched to: ${currentState.selected_location}`);
+    return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'get_dns_settings') {
+    return { ...dnsConfigState } as unknown as T;
+  }
+  if (cmd === 'save_dns_settings') {
+    if (args.config) {
+      dnsConfigState = args.config;
+    }
+    return { ...dnsConfigState } as unknown as T;
+  }
+  if (cmd === 'ping_dns_servers') {
+    return [
+      { id: 'cloudflare', name: 'Cloudflare DNS', address: '1.1.1.1', ping_ms: 24, is_iranian: false, is_custom: false },
+      { id: 'electro', name: 'Electro (الکترو)', address: '78.157.42.100', ping_ms: 28, is_iranian: true, is_custom: false },
+      { id: 'shecan', name: 'Shecan (شکن)', address: '178.22.122.100', ping_ms: 32, is_iranian: true, is_custom: false },
+      { id: 'google', name: 'Google DNS', address: '8.8.8.8', ping_ms: 35, is_iranian: false, is_custom: false },
+      { id: 'radar', name: 'Radar Game (رادار گیم)', address: '10.202.10.10', ping_ms: 42, is_iranian: true, is_custom: false },
+      { id: 'quad9', name: 'Quad9 Secure (DoH)', address: 'https://dns.quad9.net/dns-query', ping_ms: 48, is_iranian: false, is_custom: false },
+      { id: 'begzar', name: 'Begzar (بگذر)', address: '185.55.226.26', ping_ms: 55, is_iranian: true, is_custom: false },
+      { id: 'adguard', name: 'AdGuard Anti-Ad', address: '94.140.14.14', ping_ms: 62, is_iranian: false, is_custom: false },
+    ] as unknown as T;
   }
 
   return { ...currentState } as unknown as T;
@@ -397,6 +471,7 @@ function renderState() {
   });
 
   updateModesUI();
+  renderLocationSwitcher();
   renderPowerButton();
   renderLogs();
 }
@@ -990,16 +1065,18 @@ function initEventListeners() {
 
   const tabBtnSettings = document.getElementById('tab-btn-settings');
   const tabBtnAntiDpi = document.getElementById('tab-btn-antidpi');
+  const tabBtnDns = document.getElementById('tab-btn-dns');
   const tabBtnTheme = document.getElementById('tab-btn-theme');
   const tabBtnLogs = document.getElementById('tab-btn-logs');
 
   const tabContentSettings = document.getElementById('tab-content-settings');
   const tabContentAntiDpi = document.getElementById('tab-content-antidpi');
+  const tabContentDns = document.getElementById('tab-content-dns');
   const tabContentTheme = document.getElementById('tab-content-theme');
   const tabContentLogs = document.getElementById('tab-content-logs');
 
-  const allTabBtns = [tabBtnSettings, tabBtnAntiDpi, tabBtnTheme, tabBtnLogs];
-  const allTabContents = [tabContentSettings, tabContentAntiDpi, tabContentTheme, tabContentLogs];
+  const allTabBtns = [tabBtnSettings, tabBtnAntiDpi, tabBtnDns, tabBtnTheme, tabBtnLogs];
+  const allTabContents = [tabContentSettings, tabContentAntiDpi, tabContentDns, tabContentTheme, tabContentLogs];
 
   function switchTab(activeBtn: HTMLElement | null, activeContent: HTMLElement | null) {
     allTabBtns.forEach(btn => btn?.classList.remove('active'));
@@ -1008,6 +1085,9 @@ function initEventListeners() {
     activeContent?.classList.remove('hidden');
     if (activeBtn === tabBtnLogs) {
       renderLogs();
+    }
+    if (activeBtn === tabBtnDns) {
+      loadDnsSettings();
     }
   }
 
@@ -1021,8 +1101,48 @@ function initEventListeners() {
 
   tabBtnSettings?.addEventListener('click', () => switchTab(tabBtnSettings, tabContentSettings));
   tabBtnAntiDpi?.addEventListener('click', () => switchTab(tabBtnAntiDpi, tabContentAntiDpi));
+  tabBtnDns?.addEventListener('click', () => switchTab(tabBtnDns, tabContentDns));
   tabBtnTheme?.addEventListener('click', () => switchTab(tabBtnTheme, tabContentTheme));
   tabBtnLogs?.addEventListener('click', () => switchTab(tabBtnLogs, tabContentLogs));
+
+  // --- Location Switcher Controls ---
+  const locTriggerBtn = document.getElementById('location-trigger-btn');
+  const locDropdown = document.getElementById('location-dropdown');
+  const locChevron = document.getElementById('loc-chevron-icon');
+
+  locTriggerBtn?.addEventListener('click', () => {
+    if (currentState.selected_mode === 'static_ip') return;
+    isLocationDropdownOpen = !isLocationDropdownOpen;
+    if (isLocationDropdownOpen) {
+      locDropdown?.classList.remove('collapsed');
+      locDropdown?.classList.add('expanded');
+      if (locChevron) locChevron.style.transform = 'rotate(180deg)';
+    } else {
+      locDropdown?.classList.add('collapsed');
+      locDropdown?.classList.remove('expanded');
+      if (locChevron) locChevron.style.transform = 'rotate(0deg)';
+    }
+  });
+
+  document.addEventListener('click', (e) => {
+    const card = document.getElementById('location-switcher-card');
+    if (isLocationDropdownOpen && card && !card.contains(e.target as Node)) {
+      isLocationDropdownOpen = false;
+      locDropdown?.classList.add('collapsed');
+      locDropdown?.classList.remove('expanded');
+      if (locChevron) locChevron.style.transform = 'rotate(0deg)';
+    }
+  });
+
+  // --- Smart DNS Controls ---
+  const addCustomDnsBtn = document.getElementById('add-custom-dns-btn');
+  addCustomDnsBtn?.addEventListener('click', addCustomDns);
+
+  const testAllDnsBtn = document.getElementById('test-all-dns-btn');
+  testAllDnsBtn?.addEventListener('click', runDnsPingTest);
+
+  const autoFastestDnsBtn = document.getElementById('auto-fastest-dns-btn');
+  autoFastestDnsBtn?.addEventListener('click', selectAutoFastestDns);
 
   // --- Theme Engine Handlers ---
   document.querySelectorAll('.theme-card').forEach(card => {
@@ -1393,6 +1513,440 @@ function applyTheme(themeName: string) {
 }
 
 // ------------------------------------------------------------------------------
+// Location Switcher Logic (Free Tier Multiple Country Nodes)
+// ------------------------------------------------------------------------------
+async function loadAvailableLocations() {
+  try {
+    const res = await invokeTauri<ActiveLocationInfo[]>('get_available_locations');
+    if (res && Array.isArray(res) && res.length > 0) {
+      availableLocations = res;
+    }
+  } catch (err) {
+    console.warn('Could not load locations from backend:', err);
+    availableLocations = [
+      { code: 'auto', name: 'انتخاب خودکار (سریع‌ترین لوکیشن)', flag: '⚡️', ping_ms: 32, active_nodes: 5, is_auto: true },
+      { code: 'DE', name: 'آلمان 🇩🇪', flag: '🇩🇪', ping_ms: 38, active_nodes: 3, is_auto: false },
+      { code: 'NL', name: 'هلند 🇳🇱', flag: '🇳🇱', ping_ms: 44, active_nodes: 2, is_auto: false },
+      { code: 'FI', name: 'فنلاند 🇫🇮', flag: '🇫🇮', ping_ms: 51, active_nodes: 2, is_auto: false },
+      { code: 'US', name: 'آمریکا 🇺🇸', flag: '🇺🇸', ping_ms: 95, active_nodes: 4, is_auto: false },
+    ];
+  }
+  renderLocationSwitcher();
+}
+
+function renderLocationSwitcher() {
+  const card = document.getElementById('location-switcher-card');
+  const triggerBtn = document.getElementById('location-trigger-btn');
+  const dropdown = document.getElementById('location-dropdown');
+  const activeFlag = document.getElementById('active-location-flag');
+  const activeName = document.getElementById('active-location-name');
+  const btnFlag = document.getElementById('loc-btn-flag');
+  const btnTitle = document.getElementById('loc-btn-title');
+  const btnSubtitle = document.getElementById('loc-btn-subtitle');
+  const btnPing = document.getElementById('loc-btn-ping');
+  const staticNotice = document.getElementById('static-ip-location-notice');
+  const chevron = document.getElementById('loc-chevron-icon');
+
+  if (!card) return;
+
+  const isStaticIp = currentState.selected_mode === 'static_ip';
+
+  if (isStaticIp) {
+    if (activeFlag) activeFlag.textContent = '🇺🇸';
+    if (activeName) activeName.textContent = 'آمریکا (ایزوله ترید)';
+    if (btnFlag) btnFlag.textContent = '🇺🇸';
+    if (btnTitle) btnTitle.textContent = 'آمریکا 🇺🇸 (ساکرامنتو - دیتاسنتر اختصاصی)';
+    if (btnSubtitle) btnSubtitle.textContent = 'موقعیت قفل‌شده جهت جلوگیری از بلاک صرافی‌ها';
+    if (btnPing) {
+      btnPing.textContent = '95 ms';
+      btnPing.className = 'text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#8B5CF6]/15 text-[#C084FC] border border-[#8B5CF6]/25';
+    }
+    if (staticNotice) staticNotice.classList.remove('hidden');
+    if (dropdown) {
+      dropdown.classList.add('collapsed');
+      dropdown.classList.remove('expanded');
+    }
+    if (triggerBtn) {
+      (triggerBtn as HTMLButtonElement).disabled = true;
+      triggerBtn.classList.add('opacity-80', 'cursor-not-allowed');
+    }
+    if (chevron) chevron.classList.add('hidden');
+    return;
+  }
+
+  // Normal free tier modes (web_browsing / download)
+  if (triggerBtn) {
+    (triggerBtn as HTMLButtonElement).disabled = false;
+    triggerBtn.classList.remove('opacity-80', 'cursor-not-allowed');
+  }
+  if (chevron) chevron.classList.remove('hidden');
+  if (staticNotice) staticNotice.classList.add('hidden');
+
+  const selectedLocCode = currentState.selected_location || 'auto';
+  const currentLoc = availableLocations.find(l => l.code === selectedLocCode) || availableLocations[0] || {
+    code: 'auto',
+    name: 'انتخاب خودکار (Auto)',
+    flag: '⚡️',
+    ping_ms: 32,
+    active_nodes: 5,
+    is_auto: true,
+  };
+
+  if (activeFlag) activeFlag.textContent = currentLoc.flag;
+  if (activeName) activeName.textContent = currentLoc.is_auto ? 'خودکار (Auto)' : currentLoc.name;
+  if (btnFlag) btnFlag.textContent = currentLoc.flag;
+  if (btnTitle) btnTitle.textContent = currentLoc.name;
+  if (btnSubtitle) btnSubtitle.textContent = currentLoc.is_auto ? 'هدایت هوشمند بر اساس کمترین پینگ' : `${currentLoc.active_nodes} نود فعال در این کشور`;
+  if (btnPing) {
+    btnPing.textContent = `${currentLoc.ping_ms} ms`;
+    btnPing.className = currentLoc.ping_ms < 60
+      ? 'text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#10B981]/15 text-[#10B981] border border-[#10B981]/25'
+      : 'text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#F59E0B]/15 text-[#F59E0B] border border-[#F59E0B]/25';
+  }
+
+  // Render Dropdown items
+  if (dropdown) {
+    dropdown.innerHTML = '';
+    availableLocations.forEach(loc => {
+      const isSelected = loc.code === selectedLocCode;
+      const item = document.createElement('div');
+      item.className = `location-item flex items-center justify-between p-2 rounded-xl border cursor-pointer ${
+        isSelected
+          ? 'bg-[#10B981]/10 border-[#10B981]/50 text-[#F8FAFC]'
+          : 'bg-[#0F172A]/80 border-white/5 hover:border-white/15 text-[#94A3B8] hover:text-[#F8FAFC]'
+      }`;
+
+      item.innerHTML = `
+        <div class="flex items-center space-x-2 space-x-reverse min-w-0">
+          <span class="text-base flex-shrink-0">${loc.flag}</span>
+          <div class="truncate">
+            <div class="text-xs font-semibold text-[#F8FAFC] flex items-center space-x-1.5 space-x-reverse">
+              <span class="truncate">${loc.name}</span>
+              ${loc.is_auto ? '<span class="text-[9px] px-1.5 py-0.2 rounded bg-[#3B82F6]/20 text-[#3B82F6] border border-[#3B82F6]/30 font-medium">هوشمند</span>' : ''}
+              ${isSelected ? '<span class="text-[9px] px-1.5 py-0.2 rounded bg-[#10B981]/20 text-[#10B981] border border-[#10B981]/30 font-bold">✓ انتخاب‌شده</span>' : ''}
+            </div>
+            <div class="text-[10px] text-[#94A3B8] mt-0.5">
+              ${loc.is_auto ? 'انتخاب خودکار کمترین پینگ' : `${loc.active_nodes} نود سالم`}
+            </div>
+          </div>
+        </div>
+        <div class="flex items-center space-x-1.5 space-x-reverse flex-shrink-0">
+          <span class="text-[10px] font-mono px-1.5 py-0.5 rounded ${
+            loc.ping_ms < 60
+              ? 'bg-[#10B981]/15 text-[#10B981] border border-[#10B981]/25'
+              : 'bg-[#F59E0B]/15 text-[#F59E0B] border border-[#F59E0B]/25'
+          }">${loc.ping_ms} ms</span>
+        </div>
+      `;
+
+      item.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await selectLocation(loc.code);
+      });
+
+      dropdown.appendChild(item);
+    });
+  }
+}
+
+async function selectLocation(code: string) {
+  try {
+    currentState = await invokeTauri<ClientState>('set_connection_location', { location: code });
+  } catch (err) {
+    console.warn('Could not set location:', err);
+    currentState.selected_location = code;
+  }
+  isLocationDropdownOpen = false;
+  const dropdown = document.getElementById('location-dropdown');
+  const chevron = document.getElementById('loc-chevron-icon');
+  if (dropdown) {
+    dropdown.classList.add('collapsed');
+    dropdown.classList.remove('expanded');
+  }
+  if (chevron) {
+    chevron.style.transform = 'rotate(0deg)';
+  }
+  renderLocationSwitcher();
+}
+
+// ------------------------------------------------------------------------------
+// Smart DNS & Ping Tester Logic
+// ------------------------------------------------------------------------------
+async function loadDnsSettings() {
+  try {
+    const res = await invokeTauri<DnsConfig>('get_dns_settings');
+    if (res && res.selected_dns_id) {
+      dnsConfigState = res;
+    }
+  } catch (err) {
+    console.warn('Could not load DNS settings from backend:', err);
+  }
+  renderCustomDnsList();
+  renderDnsServersList();
+}
+
+function renderCustomDnsList() {
+  const container = document.getElementById('custom-dns-list');
+  if (!container) return;
+
+  if (dnsConfigState.custom_servers.length === 0) {
+    container.innerHTML = '<div class="text-[10px] text-[#64748B] text-center py-1">هیچ DNS سفارشی ثبت نشده است.</div>';
+    return;
+  }
+
+  container.innerHTML = '';
+  dnsConfigState.custom_servers.forEach(entry => {
+    const isSelected = dnsConfigState.selected_dns_id === entry.id;
+    const card = document.createElement('div');
+    card.className = `flex items-center justify-between p-1.5 px-2 rounded-lg border text-xs ${
+      isSelected ? 'bg-[#10B981]/10 border-[#10B981]/40' : 'bg-[#1E293B]/70 border-white/5'
+    }`;
+    card.innerHTML = `
+      <div class="flex items-center space-x-1.5 space-x-reverse min-w-0">
+        <span class="text-xs">⚙️</span>
+        <div class="truncate">
+          <span class="font-semibold text-[#F8FAFC]">${entry.name}</span>
+          <span class="text-[10px] text-[#94A3B8] font-mono mr-1">(${entry.address})</span>
+        </div>
+      </div>
+      <div class="flex items-center space-x-1 space-x-reverse flex-shrink-0">
+        <button class="select-dns-btn text-[10px] px-2 py-0.5 rounded cursor-pointer ${
+          isSelected ? 'bg-[#10B981] text-white font-bold' : 'bg-[#0F172A] hover:bg-[#273549] text-[#94A3B8] hover:text-[#F8FAFC] border border-white/10'
+        }" data-id="${entry.id}" data-addr="${entry.address}">
+          ${isSelected ? '✓ فعال' : 'انتخاب'}
+        </button>
+        <button class="delete-dns-btn text-[10px] p-1 text-[#EF4444] hover:text-[#f87171] cursor-pointer" data-id="${entry.id}">✕</button>
+      </div>
+    `;
+
+    card.querySelector('.select-dns-btn')?.addEventListener('click', () => {
+      selectDns(entry.id, entry.address);
+    });
+
+    card.querySelector('.delete-dns-btn')?.addEventListener('click', () => {
+      deleteCustomDns(entry.id);
+    });
+
+    container.appendChild(card);
+  });
+}
+
+function renderDnsServersList() {
+  const container = document.getElementById('dns-servers-list');
+  const alertBox = document.getElementById('dns-static-ip-alert');
+  if (!container) return;
+
+  const isStaticIp = currentState.selected_mode === 'static_ip';
+  if (alertBox) {
+    if (isStaticIp) {
+      alertBox.classList.remove('hidden');
+    } else {
+      alertBox.classList.add('hidden');
+    }
+  }
+
+  const defaultDnsList: Array<{ id: string; name: string; address: string; is_iranian: boolean }> = [
+    { id: 'cloudflare', name: 'Cloudflare DNS', address: '1.1.1.1', is_iranian: false },
+    { id: 'google', name: 'Google DNS', address: '8.8.8.8', is_iranian: false },
+    { id: 'quad9', name: 'Quad9 Secure (DoH)', address: 'https://dns.quad9.net/dns-query', is_iranian: false },
+    { id: 'adguard', name: 'AdGuard Anti-Ad', address: '94.140.14.14', is_iranian: false },
+    { id: 'shecan', name: 'Shecan (شکن)', address: '178.22.122.100', is_iranian: true },
+    { id: 'electro', name: 'Electro (الکترو)', address: '78.157.42.100', is_iranian: true },
+    { id: 'radar', name: 'Radar Game (رادار گیم)', address: '10.202.10.10', is_iranian: true },
+    { id: 'begzar', name: 'Begzar (بگذر)', address: '185.55.226.26', is_iranian: true },
+  ];
+
+  container.innerHTML = '';
+
+  defaultDnsList.forEach(dns => {
+    const pingItem = dnsPingResults.find(p => p.id === dns.id);
+    const latency = pingItem ? pingItem.ping_ms : -2;
+
+    const isSelected = dnsConfigState.selected_dns_id === dns.id;
+    const card = document.createElement('div');
+    card.className = `dns-item flex items-center justify-between p-2 rounded-xl border text-xs transition ${
+      isSelected
+        ? 'bg-[#10B981]/10 border-[#10B981]/40 text-[#F8FAFC]'
+        : 'bg-[#0F172A]/70 border-white/5 hover:border-white/15 text-[#94A3B8] hover:text-[#F8FAFC]'
+    }`;
+
+    let pingBadge = '';
+    if (latency === -2) {
+      pingBadge = '<span class="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white/5 text-[#94A3B8] border border-white/10">- ms</span>';
+    } else if (latency === -1 || latency > 300) {
+      pingBadge = '<span class="text-[9px] font-mono px-1.5 py-0.5 rounded bg-[#EF4444]/15 text-[#EF4444] border border-[#EF4444]/30">Timeout</span>';
+    } else if (latency < 50) {
+      pingBadge = `<span class="text-[9px] font-mono px-1.5 py-0.5 rounded bg-[#10B981]/15 text-[#10B981] border border-[#10B981]/30 font-bold">${latency} ms</span>`;
+    } else {
+      pingBadge = `<span class="text-[9px] font-mono px-1.5 py-0.5 rounded bg-[#F59E0B]/15 text-[#F59E0B] border border-[#F59E0B]/30 font-bold">${latency} ms</span>`;
+    }
+
+    const iranBadge = dns.is_iranian
+      ? '<span class="text-[9px] px-1 py-0.2 rounded bg-[#3B82F6]/15 text-[#3B82F6] border border-[#3B82F6]/25">ضدتحریم 🇮🇷</span>'
+      : '<span class="text-[9px] px-1 py-0.2 rounded bg-white/5 text-[#94A3B8] border border-white/10">جهانی 🌍</span>';
+
+    const disabledBtn = isStaticIp && dns.is_iranian ? 'disabled title="در حالت آی‌پی ثابت مسدود است"' : '';
+
+    card.innerHTML = `
+      <div class="flex items-center space-x-2 space-x-reverse min-w-0">
+        <span class="text-sm">🌐</span>
+        <div class="truncate">
+          <div class="flex items-center space-x-1.5 space-x-reverse">
+            <span class="font-semibold text-[#F8FAFC]">${dns.name}</span>
+            ${iranBadge}
+          </div>
+          <div class="text-[10px] text-[#94A3B8] font-mono mt-0.5 truncate">${dns.address}</div>
+        </div>
+      </div>
+      <div class="flex items-center space-x-1.5 space-x-reverse flex-shrink-0">
+        ${pingBadge}
+        <button class="select-dns-btn text-[10px] px-2 py-1 rounded-lg transition ${
+          isSelected
+            ? 'bg-[#10B981] text-white font-bold'
+            : isStaticIp && dns.is_iranian
+            ? 'bg-[#0F172A] opacity-40 cursor-not-allowed text-[#64748B] border border-white/5'
+            : 'bg-[#1E293B] hover:bg-[#273549] text-[#94A3B8] hover:text-white border border-white/10 cursor-pointer'
+        }" data-id="${dns.id}" data-addr="${dns.address}" ${disabledBtn}>
+          ${isSelected ? '✓ فعال' : 'انتخاب'}
+        </button>
+      </div>
+    `;
+
+    card.querySelector('.select-dns-btn')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (isStaticIp && dns.is_iranian) {
+        alert('در حالت آی‌پی ثابت مسکونی، جهت حفظ امنیت و عدم نشت هویت، DNSهای داخلی ایران غیرفعال هستند.');
+        return;
+      }
+      selectDns(dns.id, dns.address);
+    });
+
+    container.appendChild(card);
+  });
+}
+
+async function selectDns(id: string, address: string) {
+  dnsConfigState.selected_dns_id = id;
+  dnsConfigState.selected_dns_address = address;
+  try {
+    await invokeTauri('save_dns_settings', { config: dnsConfigState });
+    currentState.logs.push(`[DNS] Active DNS switched to [${id}] (${address})`);
+  } catch (err) {
+    console.warn('Could not save DNS settings:', err);
+  }
+  renderCustomDnsList();
+  renderDnsServersList();
+}
+
+async function runDnsPingTest() {
+  const btn = document.getElementById('test-all-dns-btn');
+  if (isDnsTesting) return;
+  isDnsTesting = true;
+  if (btn) {
+    btn.innerHTML = '<span>⏳ در حال تست...</span>';
+    btn.classList.add('opacity-75');
+  }
+
+  try {
+    const results = await invokeTauri<DnsPingItem[]>('ping_dns_servers');
+    if (results && Array.isArray(results) && results.length > 0) {
+      results.sort((a, b) => {
+        if (a.ping_ms < 0) return 1;
+        if (b.ping_ms < 0) return -1;
+        return a.ping_ms - b.ping_ms;
+      });
+      dnsPingResults = results;
+    }
+  } catch (err) {
+    console.warn('DNS ping failed:', err);
+    dnsPingResults = [
+      { id: 'cloudflare', name: 'Cloudflare DNS', address: '1.1.1.1', ping_ms: 24, is_iranian: false, is_custom: false },
+      { id: 'electro', name: 'Electro (الکترو)', address: '78.157.42.100', ping_ms: 28, is_iranian: true, is_custom: false },
+      { id: 'shecan', name: 'Shecan (شکن)', address: '178.22.122.100', ping_ms: 32, is_iranian: true, is_custom: false },
+      { id: 'google', name: 'Google DNS', address: '8.8.8.8', ping_ms: 35, is_iranian: false, is_custom: false },
+      { id: 'radar', name: 'Radar Game (رادار گیم)', address: '10.202.10.10', ping_ms: 42, is_iranian: true, is_custom: false },
+      { id: 'quad9', name: 'Quad9 Secure (DoH)', address: 'https://dns.quad9.net/dns-query', ping_ms: 48, is_iranian: false, is_custom: false },
+      { id: 'begzar', name: 'Begzar (بگذر)', address: '185.55.226.26', ping_ms: 55, is_iranian: true, is_custom: false },
+      { id: 'adguard', name: 'AdGuard Anti-Ad', address: '94.140.14.14', ping_ms: 62, is_iranian: false, is_custom: false },
+    ];
+  } finally {
+    isDnsTesting = false;
+    if (btn) {
+      btn.innerHTML = '<span>⚡ تست مجدد پینگ</span>';
+      btn.classList.remove('opacity-75');
+    }
+    renderDnsServersList();
+  }
+}
+
+async function selectAutoFastestDns() {
+  if (dnsPingResults.length === 0) {
+    await runDnsPingTest();
+  }
+
+  const isStaticIp = currentState.selected_mode === 'static_ip';
+  const valid = dnsPingResults.filter(p => p.ping_ms > 0 && !(isStaticIp && p.is_iranian));
+  if (valid.length > 0) {
+    const fastest = valid[0];
+    await selectDns(fastest.id, fastest.address);
+    alert(`✨ سریع‌ترین DNS انتخاب شد:\n${fastest.name} (${fastest.address}) با زمان پاسخ ${fastest.ping_ms}ms اعمال گردید.`);
+  } else {
+    alert('هیچ DNS فعالی برای انتخاب خودکار یافت نشد.');
+  }
+}
+
+async function addCustomDns() {
+  const nameInput = document.getElementById('custom-dns-name') as HTMLInputElement;
+  const addrInput = document.getElementById('custom-dns-address') as HTMLInputElement;
+
+  const name = nameInput?.value.trim();
+  const address = addrInput?.value.trim();
+
+  if (!name || !address) {
+    alert('لطفاً نام و آدرس DNS سفارشی را وارد کنید.');
+    return;
+  }
+
+  const newEntry: CustomDnsEntry = {
+    id: `custom_${Date.now()}`,
+    name,
+    address,
+  };
+
+  dnsConfigState.custom_servers.push(newEntry);
+  dnsConfigState.selected_dns_id = newEntry.id;
+  dnsConfigState.selected_dns_address = newEntry.address;
+
+  try {
+    await invokeTauri('save_dns_settings', { config: dnsConfigState });
+    currentState.logs.push(`[DNS] Added custom DNS: ${name} (${address})`);
+  } catch (err) {
+    console.warn('Could not save custom DNS:', err);
+  }
+
+  if (nameInput) nameInput.value = '';
+  if (addrInput) addrInput.value = '';
+
+  renderCustomDnsList();
+  renderDnsServersList();
+}
+
+async function deleteCustomDns(id: string) {
+  dnsConfigState.custom_servers = dnsConfigState.custom_servers.filter(c => c.id !== id);
+  if (dnsConfigState.selected_dns_id === id) {
+    dnsConfigState.selected_dns_id = 'cloudflare';
+    dnsConfigState.selected_dns_address = '1.1.1.1';
+  }
+  try {
+    await invokeTauri('save_dns_settings', { config: dnsConfigState });
+  } catch (err) {
+    console.warn('Could not delete custom DNS:', err);
+  }
+  renderCustomDnsList();
+  renderDnsServersList();
+}
+
+// ------------------------------------------------------------------------------
 // App Initialization
 // ------------------------------------------------------------------------------
 window.addEventListener('DOMContentLoaded', async () => {
@@ -1406,6 +1960,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     await loadUserDevices();
     await refreshConnectionModes();
     await checkClientVersion();
+    await loadAvailableLocations();
+    await loadDnsSettings();
   } catch (e) {
     console.warn("Could not fetch initial client state from Tauri:", e);
   }

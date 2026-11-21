@@ -393,6 +393,12 @@ pub async fn run_telegram_bot(
                                         error!("Error in adm_ob_del: {:?}", e);
                                     }
                                 }
+                            } else if let Some(id_str) = data.strip_prefix("adm_sub_resync_") {
+                                if let Ok(source_id) = id_str.parse::<i64>() {
+                                    if let Err(e) = admin_handlers::handle_resync_subscription_callback(&bot, &q, &pool, admin_chat_id, source_id).await {
+                                        error!("Error in adm_sub_resync: {:?}", e);
+                                    }
+                                }
                             } else if data == "adm_action_upload_app" {
                                 if let Err(e) = admin_handlers::handle_app_upload_menu_callback(&bot, &q, admin_chat_id).await {
                                     error!("Error in adm_action_upload_app: {:?}", e);

@@ -603,3 +603,192 @@ pub async fn save_anti_dpi_settings(
     app_state.logs.push("[Anti-DPI] Laboratory settings saved.".to_string());
     Ok(app_state.clone())
 }
+
+#[tauri::command]
+pub async fn set_connection_location(
+    location: String,
+    state: State<'_, AppState>,
+) -> Result<ClientState, String> {
+    let mut app_state = state.lock().await;
+    app_state.selected_location = location.clone();
+    let msg = format!("[LOCATION] Connection location set to [{}]", location);
+    app_state.logs.push(msg);
+    Ok(app_state.clone())
+}
+
+#[tauri::command]
+pub async fn get_available_locations(
+    token: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client.get("http://127.0.0.1:8080/api/v1/client/locations");
+    if let Some(t) = token {
+        req = req.header("X-Subscription-Token", t);
+    }
+
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            Ok(json)
+        }
+        _ => {
+            // Local dev fallback
+            Ok(serde_json::json!({
+                "success": true,
+                "default": "auto",
+                "locations": [
+                    {
+                        "code": "auto",
+                        "name": "⚡️ انتخاب خودکار سریع‌ترین لوکیشن (Auto)",
+                        "country_code": "AUTO",
+                        "flag": "⚡️",
+                        "ping_ms": 42,
+                        "active_nodes": 6,
+                        "is_auto": true
+                    },
+                    {
+                        "code": "DE",
+                        "name": "آلمان 🇩🇪",
+                        "country_code": "DE",
+                        "flag": "🇩🇪",
+                        "ping_ms": 48,
+                        "active_nodes": 3,
+                        "is_auto": false
+                    },
+                    {
+                        "code": "NL",
+                        "name": "هلند 🇳🇱",
+                        "country_code": "NL",
+                        "flag": "🇳🇱",
+                        "ping_ms": 62,
+                        "active_nodes": 2,
+                        "is_auto": false
+                    },
+                    {
+                        "code": "FI",
+                        "name": "فنلاند 🇫🇮",
+                        "country_code": "FI",
+                        "flag": "🇫🇮",
+                        "ping_ms": 71,
+                        "active_nodes": 1,
+                        "is_auto": false
+                    }
+                ]
+            }))
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn ping_dns_servers(
+    servers: Vec<crate::state::DnsPingItem>,
+) -> Result<Vec<crate::state::DnsPingItem>, String> {
+    use std::time::{Duration, Instant};
+    use tokio::time::timeout;
+
+    let mut tasks = Vec::new();
+
+    for mut s in servers {
+        tasks.push(tokio::spawn(async move {
+            let addr = s.address.trim().to_string();
+            let start = Instant::now();
+
+            let ping = if addr.starts_with("http://") || addr.starts_with("https://") {
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_millis(3000))
+                    .build();
+                match client {
+                    Ok(c) => {
+                        let query_url = if addr.contains('?') {
+                            format!("{}&name=cloudflare.com", addr)
+                        } else {
+                            format!("{}?name=cloudflare.com", addr)
+                        };
+                        match timeout(Duration::from_millis(3000), c.get(&query_url).send()).await {
+                            Ok(Ok(resp)) if resp.status().is_success() || resp.status().as_u16() < 500 => {
+                                start.elapsed().as_millis() as i64
+                            }
+                            _ => -1,
+                        }
+                    }
+                    _ => -1,
+                }
+            } else {
+                let target = if addr.contains(':') { addr.clone() } else { format!("{}:53", addr) };
+                let connect_res = timeout(
+                    Duration::from_millis(2500),
+                    tokio::net::TcpStream::connect(&target)
+                ).await;
+
+                match connect_res {
+                    Ok(Ok(_)) => start.elapsed().as_millis() as i64,
+                    _ => {
+                        let udp_res = timeout(Duration::from_millis(1500), async {
+                            let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+                            socket.connect(&target).await?;
+                            let dummy_query = [
+                                0xaa, 0xbb, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x07, b'e', b'x', b'a',
+                                b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+                                0x00, 0x00, 0x01, 0x00, 0x01
+                            ];
+                            socket.send(&dummy_query).await?;
+                            let mut buf = [0u8; 512];
+                            socket.recv(&mut buf).await?;
+                            Ok::<(), std::io::Error>(())
+                        }).await;
+
+                        match udp_res {
+                            Ok(Ok(_)) => start.elapsed().as_millis() as i64,
+                            _ => -1,
+                        }
+                    }
+                }
+            };
+
+            s.ping_ms = ping;
+            s
+        }));
+    }
+
+    let mut results = Vec::new();
+    for t in tasks {
+        if let Ok(item) = t.await {
+            results.push(item);
+        }
+    }
+
+    results.sort_by(|a, b| {
+        match (a.ping_ms >= 0, b.ping_ms >= 0) {
+            (true, true) => a.ping_ms.cmp(&b.ping_ms),
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => a.name.cmp(&b.name),
+        }
+    });
+
+    Ok(results)
+}
+
+#[tauri::command]
+pub async fn save_dns_settings(
+    config: crate::state::DnsConfig,
+    state: State<'_, AppState>,
+) -> Result<ClientState, String> {
+    let mut app_state = state.lock().await;
+    app_state.dns_config = config;
+    app_state.logs.push("[DNS] Smart DNS configuration saved.".to_string());
+    Ok(app_state.clone())
+}
+
+#[tauri::command]
+pub async fn get_dns_settings(
+    state: State<'_, AppState>,
+) -> Result<crate::state::DnsConfig, String> {
+    let app_state = state.lock().await;
+    Ok(app_state.dns_config.clone())
+}

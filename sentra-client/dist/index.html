@@ -23,8 +23,8 @@
       }
     }
   </script>
-  <script type="module" crossorigin src="/assets/index-CY_kRIl2.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/index-DZDbMv9W.css">
+  <script type="module" crossorigin src="/assets/index-zc8V0SR-.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-jY6oJp1r.css">
 </head>
 <body class="bg-[#0F172A] text-[#F8FAFC] select-none flex flex-col justify-between h-[640px] w-[380px] overflow-hidden">
 
@@ -322,6 +322,45 @@
             </div>
           </div>
         </div>
+
+        <!-- Location Switcher Component (Hyprland Smooth Dropdown) -->
+        <div id="location-switcher-card" class="mt-2 p-2 rounded-xl bg-[#1E293B]/90 border border-white/10 shadow-sm transition-all duration-300">
+          <div class="flex items-center justify-between text-[11px] text-[#94A3B8] mb-1.5 px-0.5">
+            <span class="font-medium">🌍 موقعیت سرور (لوکیشن):</span>
+            <span id="active-location-badge" class="text-[10px] font-mono text-[#10B981] flex items-center space-x-1 space-x-reverse">
+              <span id="active-location-flag">⚡️</span>
+              <span id="active-location-name">خودکار (Auto)</span>
+            </span>
+          </div>
+
+          <!-- Trigger Button -->
+          <button id="location-trigger-btn" type="button" class="w-full flex items-center justify-between p-2 rounded-xl bg-[#0F172A] border border-white/10 hover:border-white/20 transition cursor-pointer text-right group">
+            <div class="flex items-center space-x-2 space-x-reverse min-w-0">
+              <span id="loc-btn-flag" class="text-base flex-shrink-0">⚡️</span>
+              <div class="min-w-0">
+                <div id="loc-btn-title" class="text-xs font-semibold text-[#F8FAFC] truncate">⚡️ خودکار (سریع‌ترین لوکیشن)</div>
+                <div id="loc-btn-subtitle" class="text-[10px] text-[#94A3B8] truncate">هدایت هوشمند بر اساس کمترین پینگ</div>
+              </div>
+            </div>
+            <div class="flex items-center space-x-1.5 space-x-reverse flex-shrink-0">
+              <span id="loc-btn-ping" class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#10B981]/15 text-[#10B981] border border-[#10B981]/25">- ms</span>
+              <svg id="loc-chevron-icon" class="w-3.5 h-3.5 text-[#94A3B8] transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+              </svg>
+            </div>
+          </button>
+
+          <!-- Collapsible Dropdown Container with Hyprland Animation -->
+          <div id="location-dropdown" class="location-dropdown collapsed mt-2 space-y-1 overflow-y-auto max-h-[180px] pr-0.5">
+            <!-- Dynamic items rendered by JS -->
+          </div>
+
+          <!-- Static IP Fixed Location Notice (shown when static_ip mode is active) -->
+          <div id="static-ip-location-notice" class="hidden mt-1.5 p-1.5 rounded-lg bg-[#8B5CF6]/15 border border-[#8B5CF6]/25 text-[10px] text-[#C084FC] flex items-center space-x-1.5 space-x-reverse">
+            <span>🔒</span>
+            <span>در حالت آی‌پی ثابت، سرور به دیتاسنتر اختصاصی آمریکا (ساکرامنتو) قفل است.</span>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -368,18 +407,21 @@
         <button id="close-settings-btn" class="text-[#94A3B8] hover:text-[#F8FAFC] p-1 text-xs cursor-pointer">بستن ✕</button>
       </div>
 
-      <!-- Tabs Header: Network / Anti-DPI Lab / Theme Engine / Live Logs -->
+      <!-- Tabs Header: Network / Anti-DPI Lab / Smart DNS / Theme Engine / Live Logs -->
       <div class="flex space-x-1 space-x-reverse my-2.5 bg-[#0F172A] p-1 rounded-xl border border-white/5">
-        <button id="tab-btn-settings" class="tab-btn active flex-1 text-center py-1.5 text-[11px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
+        <button id="tab-btn-settings" class="tab-btn active flex-1 text-center py-1.5 text-[10px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
           شبکه
         </button>
-        <button id="tab-btn-antidpi" class="tab-btn flex-1 text-center py-1.5 text-[11px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
+        <button id="tab-btn-antidpi" class="tab-btn flex-1 text-center py-1.5 text-[10px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
           🛡 ضد DPI
         </button>
-        <button id="tab-btn-theme" class="tab-btn flex-1 text-center py-1.5 text-[11px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
+        <button id="tab-btn-dns" class="tab-btn flex-1 text-center py-1.5 text-[10px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
+          🌐 DNS هوشمند
+        </button>
+        <button id="tab-btn-theme" class="tab-btn flex-1 text-center py-1.5 text-[10px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
           🎨 تم
         </button>
-        <button id="tab-btn-logs" class="tab-btn flex-1 text-center py-1.5 text-[11px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
+        <button id="tab-btn-logs" class="tab-btn flex-1 text-center py-1.5 text-[10px] font-medium rounded-lg text-[#94A3B8] transition cursor-pointer border border-transparent">
           لاگ هسته
         </button>
       </div>
@@ -542,7 +584,56 @@
         <div id="antidpi-test-status" class="text-xs text-center p-2 rounded-xl bg-[#0F172A] border border-white/10 hidden font-mono"></div>
       </div>
 
-      <!-- Tab Content 3: Theme Engine (ظاهر و تم برنامه) -->
+      <!-- Tab Content 3: Smart DNS Management & Ping Tester (تنظیمات DNS و تست پینگ هوشمند) -->
+      <div id="tab-content-dns" class="hidden space-y-2.5 overflow-y-auto max-h-[46vh] pr-1">
+        <!-- Static IP Anti-Leak Notice -->
+        <div id="dns-static-ip-alert" class="p-2 rounded-xl bg-[#8B5CF6]/15 border border-[#8B5CF6]/30 text-[10px] text-[#C084FC] flex items-start space-x-1.5 space-x-reverse leading-relaxed">
+          <span class="text-xs mt-0.5">🛡️</span>
+          <span><b>حفاظت ضد نشت (Anti-Leak):</b> در حالت آی‌پی ثابت، DNSهای داخلی ایران کاملاً نادیده گرفته شده و جهت جلوگیری از نشت موقعیت مکانی و بن در صرافی‌ها، Clean Global DoH اختصاصی آمریکا اعمال می‌گردد.</span>
+        </div>
+
+        <!-- Custom DNS Add/Edit Card -->
+        <div class="p-2.5 rounded-xl bg-[#0F172A]/70 border border-white/5 space-y-2">
+          <div class="flex items-center justify-between text-xs font-semibold text-[#F8FAFC]">
+            <span>➕ افزودن DNS سفارشی (IPv4 یا DoH)</span>
+          </div>
+          <div class="grid grid-cols-2 gap-1.5">
+            <input id="custom-dns-name" type="text" placeholder="نام (مثلاً Quad9)" class="bg-[#1E293B] border border-white/10 rounded-lg px-2 py-1.5 text-xs text-[#F8FAFC] placeholder-[#64748B] focus:outline-none focus:border-[#3B82F6]" />
+            <input id="custom-dns-address" type="text" placeholder="IP یا لینک DoH" class="bg-[#1E293B] border border-white/10 rounded-lg px-2 py-1.5 text-xs text-[#F8FAFC] placeholder-[#64748B] font-mono focus:outline-none focus:border-[#3B82F6]" />
+          </div>
+          <button id="add-custom-dns-btn" type="button" class="w-full bg-[#3B82F6]/20 hover:bg-[#3B82F6]/30 border border-[#3B82F6]/40 text-[#3B82F6] hover:text-white text-[11px] py-1.5 rounded-lg transition font-medium cursor-pointer">
+            ذخیره DNS سفارشی
+          </button>
+          <!-- Saved Custom DNS List -->
+          <div id="custom-dns-list" class="space-y-1 mt-1">
+            <!-- Dynamic Custom DNS entries rendered by JS -->
+          </div>
+        </div>
+
+        <!-- Smart DNS Ping Tester Tools Header -->
+        <div class="flex items-center justify-between pt-1">
+          <span class="text-xs font-bold text-[#F8FAFC]">لیست DNSهای رایگان و ضدتحریم:</span>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="grid grid-cols-2 gap-1.5">
+          <button id="test-all-dns-btn" type="button" class="bg-[#10B981]/20 hover:bg-[#10B981]/30 border border-[#10B981]/40 text-[#10B981] hover:text-white text-[10px] py-1.5 px-2 rounded-lg transition font-medium cursor-pointer flex items-center justify-center space-x-1 space-x-reverse">
+            <span>⚡</span>
+            <span>تست پینگ همه DNSها</span>
+          </button>
+          <button id="auto-fastest-dns-btn" type="button" class="bg-[#8B5CF6]/20 hover:bg-[#8B5CF6]/30 border border-[#8B5CF6]/40 text-[#C084FC] hover:text-white text-[10px] py-1.5 px-2 rounded-lg transition font-medium cursor-pointer flex items-center justify-center space-x-1 space-x-reverse">
+            <span>✨</span>
+            <span>انتخاب کمترین پینگ</span>
+          </button>
+        </div>
+
+        <!-- DNS Servers Ping Table / List -->
+        <div id="dns-servers-list" class="space-y-1.5">
+          <!-- Rendered dynamically with live ping badges by JS -->
+        </div>
+      </div>
+
+      <!-- Tab Content 4: Theme Engine (ظاهر و تم برنامه) -->
       <div id="tab-content-theme" class="hidden space-y-2.5 overflow-y-auto max-h-[46vh] pr-1">
         <div class="text-[11px] text-[#94A3B8] leading-tight">
           انتخاب تم ظاهری پوسته نرم‌افزار با قابلیت تغییر آنی رنگ‌ها و ذخیره خودکار:

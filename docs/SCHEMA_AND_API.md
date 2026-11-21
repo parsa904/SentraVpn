@@ -172,6 +172,8 @@ CREATE TABLE IF NOT EXISTS donated_outbounds (
     clawback_executed       INTEGER NOT NULL DEFAULT 0, -- آیا پس‌گرفتن پاداش اجرا شده است؟
     is_official             INTEGER NOT NULL DEFAULT 0, -- ۱: نود رسمی ادمین، ۰: نود اهدایی کاربر
     label                   TEXT,                -- برچسب سفارشی نود رسمی (مانند US-Static-01 یا DE-Download-01)
+    country_code            TEXT NOT NULL DEFAULT 'XX', -- کد کشور (مانند DE, NL, FI, US)
+    country_name            TEXT NOT NULL DEFAULT 'جهانی 🌍', -- نام و پرچم کشور
     last_checked_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -182,7 +184,24 @@ CREATE INDEX IF NOT EXISTS idx_donated_status ON donated_outbounds(status);
 CREATE INDEX IF NOT EXISTS idx_donated_assigned_tier ON donated_outbounds(assigned_tier);
 CREATE INDEX IF NOT EXISTS idx_donated_server ON donated_outbounds(server_address, server_port);
 CREATE INDEX IF NOT EXISTS idx_donated_is_official ON donated_outbounds(is_official);
+CREATE INDEX IF NOT EXISTS idx_donated_country_code ON donated_outbounds(country_code);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_donated_fingerprint ON donated_outbounds(fingerprint_sha256);
+
+-- ============================================================================
+-- 4.2. جدول منابع سابسکریپشن‌های ادمین (SUBSCRIPTION_SOURCES)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS subscription_sources (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    category                TEXT NOT NULL CHECK(category IN ('web_browsing', 'download', 'static_ip')),
+    sub_url                 TEXT NOT NULL,       -- آدرس امن https://...
+    tag                     TEXT,                -- تگ یا برچسب سابسکریپشن
+    total_nodes             INTEGER NOT NULL DEFAULT 0,
+    healthy_nodes           INTEGER NOT NULL DEFAULT 0,
+    last_sync_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sub_sources_category ON subscription_sources(category);
 
 -- ============================================================================
 -- 4.2. جدول حمایت‌های مالی (DONATIONS)
@@ -483,8 +502,43 @@ END;
 }
 ```
 
-### ۲.۳. دریافت کانفیگ چندپروتکلی کلاینت (`POST /api/v1/client/config`)
-کلاینت سنترا برای برقراری اتصال امن، این اندپوینت را فراخوانی می‌کند. هیچ‌گونه آدرس یا جزییات V2Ray/sing-box به کاربر ارسال نشده و ارتباط از طریق یکی از ۴ پروتکل امن (`openvpn_udp`، `openvpn_tcp`، `stealth`، `ikev2`) برقرار می‌گردد.
+### ۲.۳. دریافت لیست لوکیشن‌های فعال خروجی (`GET /api/v1/client/locations`)
+این اندپوینت لیست کشورها و لوکیشن‌های آنلاین و دارای نود فعال را به همراه زمان پاسخ‌گویی (Ping) و تعداد نودهای فعال برمی‌گرداند. گزینه پیش‌فرض `⚡️ خودکار (سریع‌ترین لوکیشن)` همیشه به عنوان اولین آیتم وجود دارد.
+
+- **مسیر:** `/api/v1/client/locations`
+- **روش:** `GET`
+- **پاسخ موفق (200 OK):**
+```json
+[
+  {
+    "code": "auto",
+    "name": "⚡️ انتخاب خودکار (سریع‌ترین لوکیشن)",
+    "flag": "⚡️",
+    "ping_ms": 32,
+    "active_nodes": 5,
+    "is_auto": true
+  },
+  {
+    "code": "DE",
+    "name": "آلمان 🇩🇪",
+    "flag": "🇩🇪",
+    "ping_ms": 38,
+    "active_nodes": 3,
+    "is_auto": false
+  },
+  {
+    "code": "NL",
+    "name": "هلند 🇳🇱",
+    "flag": "🇳🇱",
+    "ping_ms": 44,
+    "active_nodes": 2,
+    "is_auto": false
+  }
+]
+```
+
+### ۲.۴. دریافت کانفیگ چندپروتکلی کلاینت (`POST /api/v1/client/config`)
+کلاینت سنترا برای برقراری اتصال امن، این اندپوینت را فراخوانی می‌کند. هیچ‌گونه آدرس یا جزییات V2Ray/sing-box به کاربر ارسال نشده و ارتباط از طریق یکی از ۴ پروتکل امن (`openvpn_udp`، `openvpn_tcp`، `stealth`، `ikev2`) برقرار می‌گردد. پارامتر اختیاری `location_code` امکان انتخاب موقعیت جغرافیایی خروجی را برای حالات وب‌گردی و دانلود فراهم می‌سازد.
 
 - **مسیر:** `/api/v1/client/config`
 - **روش:** `POST`
@@ -495,7 +549,8 @@ END;
   "device_id": "desktop-client-001",
   "os": "windows",
   "mode": "web_browsing",
-  "protocol": "openvpn_udp"
+  "protocol": "openvpn_udp",
+  "location_code": "DE"
 }
 ```
 
@@ -505,6 +560,8 @@ END;
   "success": true,
   "protocol": "openvpn_udp",
   "mode": "web_browsing",
+  "location_code": "DE",
+  "location_name": "آلمان 🇩🇪",
   "remote_host": "127.0.0.1",
   "remote_port": 1194,
   "auth_username": "token_lite_sandbox_001",

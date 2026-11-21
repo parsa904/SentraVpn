@@ -50,6 +50,8 @@ pub struct DonatedOutbound {
     pub clawback_executed: i64,
     pub is_official: i64,
     pub label: Option<String>,
+    pub country_code: String,
+    pub country_name: String,
     pub last_checked_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -191,4 +193,27 @@ pub struct AppRelease {
     pub file_size_mb: f64,
     pub changelog: String,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct SubscriptionSource {
+    pub id: i64,
+    pub category: String,
+    pub url: String,
+    pub label: Option<String>,
+    pub node_count: i64,
+    pub healthy_count: i64,
+    pub last_synced_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveLocationInfo {
+    pub code: String,
+    pub name: String,
+    pub country_code: String,
+    pub flag: String,
+    pub ping_ms: i64,
+    pub active_nodes: i64,
+    pub is_auto: bool,
 }

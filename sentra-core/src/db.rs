@@ -343,6 +343,8 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
             monthly_reward_granted  INTEGER NOT NULL DEFAULT 0,
             is_official             INTEGER NOT NULL DEFAULT 0,
             label                   TEXT,
+            country_code            TEXT NOT NULL DEFAULT 'XX',
+            country_name            TEXT NOT NULL DEFAULT 'Unknown',
             last_checked_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             created_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -369,8 +371,28 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN clawback_executed INTEGER NOT NULL DEFAULT 0").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN is_official INTEGER NOT NULL DEFAULT 0").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN label TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN country_code TEXT NOT NULL DEFAULT 'XX'").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN country_name TEXT NOT NULL DEFAULT 'Unknown'").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE outbounds ADD COLUMN country_name TEXT NOT NULL DEFAULT 'Unknown'").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_is_official ON donated_outbounds(is_official)").execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_country_code ON donated_outbounds(country_code)").execute(pool).await;
     let _ = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_donated_fingerprint ON donated_outbounds(fingerprint_sha256)").execute(pool).await;
+
+    // Subscription sources table (Admin Sub URLs with periodic re-sync)
+    let _ = sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS subscription_sources (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            category            TEXT NOT NULL,
+            url                 TEXT NOT NULL UNIQUE,
+            label               TEXT,
+            node_count          INTEGER NOT NULL DEFAULT 0,
+            healthy_count       INTEGER NOT NULL DEFAULT 0,
+            last_synced_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        "#
+    ).execute(pool).await;
 
     // Check if existing donated_outbounds table includes static_ip in CHECK constraint
     let table_sql: Option<String> = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='donated_outbounds'")
@@ -409,6 +431,8 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
                     clawback_executed       INTEGER NOT NULL DEFAULT 0,
                     is_official             INTEGER NOT NULL DEFAULT 0,
                     label                   TEXT,
+                    country_code            TEXT NOT NULL DEFAULT 'XX',
+                    country_name            TEXT NOT NULL DEFAULT 'Unknown',
                     last_checked_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     created_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -417,13 +441,14 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
                     id, donor_user_id, tag, protocol, server_address, server_port, config_json, latency_ms, speed_mbps,
                     assigned_tier, health_score, status, fail_count, reward_granted, raw_link, rejection_reason,
                     declared_or_detected_gb, bytes_served, first_used_at, monthly_reward_granted, fingerprint_sha256,
-                    offline_since, clawback_executed, is_official, label, last_checked_at, created_at, updated_at
+                    offline_since, clawback_executed, is_official, label, country_code, country_name, last_checked_at, created_at, updated_at
                 )
                 SELECT 
                     id, donor_user_id, tag, protocol, server_address, server_port, config_json, latency_ms, speed_mbps,
                     assigned_tier, health_score, status, fail_count, reward_granted, raw_link, rejection_reason,
                     declared_or_detected_gb, bytes_served, first_used_at, monthly_reward_granted, fingerprint_sha256,
-                    offline_since, clawback_executed, COALESCE(is_official, 0), label, last_checked_at, created_at, updated_at
+                    offline_since, clawback_executed, COALESCE(is_official, 0), label,
+                    COALESCE(country_code, 'XX'), COALESCE(country_name, 'Unknown'), last_checked_at, created_at, updated_at
                 FROM donated_outbounds;
                 DROP TABLE donated_outbounds;
                 ALTER TABLE donated_outbounds_mig RENAME TO donated_outbounds;
@@ -2279,6 +2304,8 @@ impl Repository {
         rejection_reason: Option<&str>,
         declared_or_detected_gb: i64,
         fingerprint_sha256: Option<&str>,
+        country_code: &str,
+        country_name: &str,
     ) -> Result<DonatedOutbound, CoreError> {
         let row = sqlx::query_as::<_, DonatedOutbound>(
             r#"
@@ -2286,9 +2313,9 @@ impl Repository {
                 donor_user_id, tag, protocol, server_address, server_port, config_json,
                 latency_ms, speed_mbps, assigned_tier, health_score, status, raw_link,
                 rejection_reason, declared_or_detected_gb, bytes_served, monthly_reward_granted,
-                fingerprint_sha256, last_checked_at
+                fingerprint_sha256, country_code, country_name, last_checked_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 100, ?, ?, ?, ?, 0, 0, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 100, ?, ?, ?, ?, 0, 0, ?, ?, ?, CURRENT_TIMESTAMP)
             RETURNING *
             "#
         )
@@ -2306,6 +2333,8 @@ impl Repository {
         .bind(rejection_reason)
         .bind(declared_or_detected_gb)
         .bind(fingerprint_sha256)
+        .bind(country_code)
+        .bind(country_name)
         .fetch_one(pool)
         .await?;
 
@@ -2741,6 +2770,8 @@ impl Repository {
         fingerprint_sha256: &str,
         status: &str,
         health_score: i64,
+        country_code: &str,
+        country_name: &str,
     ) -> Result<DonatedOutbound, CoreError> {
         sqlx::query(
             r#"
@@ -2750,7 +2781,7 @@ impl Repository {
                 status, fail_count, reward_granted, raw_link, rejection_reason,
                 declared_or_detected_gb, bytes_served, first_used_at, monthly_reward_granted,
                 fingerprint_sha256, offline_since, clawback_executed, is_official, label,
-                last_checked_at, created_at, updated_at
+                country_code, country_name, last_checked_at, created_at, updated_at
             )
             VALUES (
                 NULL, ?, ?, ?, ?,
@@ -2758,7 +2789,7 @@ impl Repository {
                 ?, 0, 0, ?, NULL,
                 10000, 0, NULL, 0,
                 ?, NULL, 0, 1, ?,
-                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             )
             ON CONFLICT(fingerprint_sha256) DO UPDATE SET
                 label = excluded.label,
@@ -2774,6 +2805,8 @@ impl Repository {
                 status = excluded.status,
                 raw_link = excluded.raw_link,
                 is_official = 1,
+                country_code = excluded.country_code,
+                country_name = excluded.country_name,
                 last_checked_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
             "#,
@@ -2791,6 +2824,8 @@ impl Repository {
         .bind(raw_link)
         .bind(fingerprint_sha256)
         .bind(label)
+        .bind(country_code)
+        .bind(country_name)
         .execute(pool)
         .await?;
 
@@ -2948,6 +2983,191 @@ impl Repository {
         .fetch_all(pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Retrieve active outbounds for a mode and optional location code (with auto fallback)
+    pub async fn get_active_outbounds_for_mode_and_location(
+        pool: &DbPool,
+        mode: &str,
+        location_code: Option<&str>,
+    ) -> Result<Vec<DonatedOutbound>, CoreError> {
+        let code = location_code.unwrap_or("auto").trim();
+        if !code.is_empty() && !code.eq_ignore_ascii_case("auto") {
+            let loc_rows = sqlx::query_as::<_, DonatedOutbound>(
+                r#"
+                SELECT * FROM donated_outbounds 
+                WHERE status = 'active' AND assigned_tier = ? AND UPPER(country_code) = UPPER(?)
+                ORDER BY is_official DESC, health_score DESC, latency_ms ASC, speed_mbps DESC
+                LIMIT 15
+                "#
+            )
+            .bind(mode)
+            .bind(code)
+            .fetch_all(pool)
+            .await?;
+
+            if !loc_rows.is_empty() {
+                return Ok(loc_rows);
+            }
+        }
+
+        // Default or fallback to fastest active nodes
+        Self::get_active_outbounds_for_mode_prioritized(pool, mode).await
+    }
+
+    /// Retrieve active locations list for client location switcher
+    pub async fn get_active_locations_for_free_modes(
+        pool: &DbPool,
+    ) -> Result<Vec<crate::models::ActiveLocationInfo>, CoreError> {
+        use sqlx::Row;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT 
+                country_code,
+                country_name,
+                MIN(latency_ms) as min_ping,
+                COUNT(*) as active_count
+            FROM donated_outbounds
+            WHERE status = 'active' 
+              AND assigned_tier IN ('web_browsing', 'download')
+              AND country_code != 'XX'
+            GROUP BY country_code, country_name
+            HAVING active_count > 0
+            ORDER BY min_ping ASC
+            "#
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let mut locations = Vec::new();
+        let mut total_active_nodes = 0i64;
+        let mut best_auto_ping = 45i64;
+
+        for (idx, r) in rows.iter().enumerate() {
+            let code: String = r.try_get("country_code").unwrap_or_else(|_| "XX".to_string());
+            let name_raw: String = r.try_get("country_name").unwrap_or_else(|_| "Unknown".to_string());
+            let ping: i64 = r.try_get("min_ping").unwrap_or(99);
+            let count: i64 = r.try_get("active_count").unwrap_or(1);
+
+            total_active_nodes += count;
+            if idx == 0 {
+                best_auto_ping = ping;
+            }
+
+            let name = if name_raw.is_empty() || name_raw == "Unknown" {
+                crate::outbound_analyzer::OutboundAnalyzer::country_code_to_name(&code)
+            } else {
+                name_raw
+            };
+            let flag = crate::outbound_analyzer::OutboundAnalyzer::country_code_to_flag(&code);
+
+            locations.push(crate::models::ActiveLocationInfo {
+                code: code.clone(),
+                name,
+                country_code: code,
+                flag,
+                ping_ms: ping,
+                active_nodes: count,
+                is_auto: false,
+            });
+        }
+
+        // Add Auto option as the very first choice
+        let mut final_locations = Vec::new();
+        final_locations.push(crate::models::ActiveLocationInfo {
+            code: "auto".to_string(),
+            name: "⚡️ انتخاب خودکار سریع‌ترین لوکیشن (Auto)".to_string(),
+            country_code: "AUTO".to_string(),
+            flag: "⚡️".to_string(),
+            ping_ms: best_auto_ping,
+            active_nodes: total_active_nodes.max(1),
+            is_auto: true,
+        });
+        final_locations.extend(locations);
+
+        // If no locations configured yet in local dev environment, provide default fast locations
+        if final_locations.len() <= 1 {
+            final_locations.push(crate::models::ActiveLocationInfo {
+                code: "DE".to_string(),
+                name: "آلمان 🇩🇪".to_string(),
+                country_code: "DE".to_string(),
+                flag: "🇩🇪".to_string(),
+                ping_ms: 48,
+                active_nodes: 3,
+                is_auto: false,
+            });
+            final_locations.push(crate::models::ActiveLocationInfo {
+                code: "NL".to_string(),
+                name: "هلند 🇳🇱".to_string(),
+                country_code: "NL".to_string(),
+                flag: "🇳🇱".to_string(),
+                ping_ms: 62,
+                active_nodes: 2,
+                is_auto: false,
+            });
+            final_locations.push(crate::models::ActiveLocationInfo {
+                code: "FI".to_string(),
+                name: "فنلاند 🇫🇮".to_string(),
+                country_code: "FI".to_string(),
+                flag: "🇫🇮".to_string(),
+                ping_ms: 70,
+                active_nodes: 1,
+                is_auto: false,
+            });
+        }
+
+        Ok(final_locations)
+    }
+
+    /// Save or update subscription source URL in database
+    pub async fn save_subscription_source(
+        pool: &DbPool,
+        category: &str,
+        url: &str,
+        label: Option<&str>,
+        node_count: i64,
+        healthy_count: i64,
+    ) -> Result<i64, CoreError> {
+        use sqlx::Row;
+        let row = sqlx::query(
+            r#"
+            INSERT INTO subscription_sources (category, url, label, node_count, healthy_count, last_synced_at, created_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(url) DO UPDATE SET
+                category = excluded.category,
+                label = excluded.label,
+                node_count = excluded.node_count,
+                healthy_count = excluded.healthy_count,
+                last_synced_at = CURRENT_TIMESTAMP
+            RETURNING id
+            "#
+        )
+        .bind(category)
+        .bind(url)
+        .bind(label)
+        .bind(node_count)
+        .bind(healthy_count)
+        .fetch_one(pool)
+        .await?;
+
+        let id: i64 = row.try_get("id").unwrap_or(1);
+        Ok(id)
+    }
+
+    /// Retrieve subscription source by ID
+    pub async fn get_subscription_source_by_id(
+        pool: &DbPool,
+        id: i64,
+    ) -> Result<Option<crate::models::SubscriptionSource>, CoreError> {
+        let row = sqlx::query_as::<_, crate::models::SubscriptionSource>(
+            "SELECT * FROM subscription_sources WHERE id = ?"
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row)
     }
 }
 

@@ -75,7 +75,12 @@ pub fn run() {
             commands::check_client_version,
             commands::check_admin_privileges,
             commands::test_anti_dpi_settings,
-            commands::save_anti_dpi_settings
+            commands::save_anti_dpi_settings,
+            commands::set_connection_location,
+            commands::get_available_locations,
+            commands::ping_dns_servers,
+            commands::save_dns_settings,
+            commands::get_dns_settings
         ])
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

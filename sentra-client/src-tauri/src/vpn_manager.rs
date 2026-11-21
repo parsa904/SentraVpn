@@ -195,6 +195,8 @@ impl VpnManager {
         selected_protocol: &str,
         split_tunneling: bool,
         anti_dpi: &crate::state::AntiDpiSettings,
+        selected_location: Option<&str>,
+        dns_config: &crate::state::DnsConfig,
     ) -> Result<Value, String> {
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
@@ -211,7 +213,7 @@ impl VpnManager {
             "Windows PC"
         };
 
-        let request_body = json!({
+        let mut request_body = json!({
             "token": token,
             "device_id": dev_id,
             "device_name": dev_name,
@@ -219,6 +221,11 @@ impl VpnManager {
             "mode": selected_mode,
             "protocol": selected_protocol
         });
+        if let Some(loc) = selected_location {
+            if !loc.is_empty() && loc != "auto" {
+                request_body["location_code"] = json!(loc);
+            }
+        }
 
         let mut config_resp = None;
         let mut last_status = None;
@@ -310,7 +317,7 @@ impl VpnManager {
 
         // Strict Leak Protection for Static IP (Trade & Crypto Protection)
         if selected_mode == "static_ip" {
-            info!("Enforcing Strict Leak Protection for Static IP (IPv6 blocked, Remote DNS enforced).");
+            info!("Enforcing Strict Leak Protection for Static IP (IPv6 blocked, Remote Clean Global DoH enforced).");
             if let Some(dns) = config_val.get_mut("dns") {
                 dns["servers"] = json!([
                     {
@@ -333,6 +340,33 @@ impl VpnManager {
                     "ip_version": 6,
                     "outbound": "block"
                 }));
+            }
+        } else {
+            // Apply Custom / Selected DNS for free modes
+            let target_dns = if !dns_config.selected_dns_address.is_empty() && dns_config.selected_dns_id != "auto" {
+                Some(dns_config.selected_dns_address.as_str())
+            } else {
+                None
+            };
+
+            if let Some(dns_addr) = target_dns {
+                info!("Injecting customized DNS into connection profile: {}", dns_addr);
+                if let Some(dns) = config_val.get_mut("dns") {
+                    if let Some(servers) = dns.get_mut("servers").and_then(|s| s.as_array_mut()) {
+                        for s in servers {
+                            if s.get("tag").and_then(|t| t.as_str()) == Some("dns-remote") {
+                                s["address"] = json!(dns_addr);
+                            }
+                        }
+                    }
+                }
+                if let Some(ovpn_str) = config_val.get_mut("ovpn_config").and_then(|o| o.as_str()) {
+                    let mut new_ovpn = ovpn_str.to_string();
+                    if !dns_addr.starts_with("http") {
+                        new_ovpn.push_str(&format!("\ndhcp-option DNS {}\n", dns_addr));
+                    }
+                    config_val["ovpn_config"] = json!(new_ovpn);
+                }
             }
         }
 
@@ -601,7 +635,7 @@ impl VpnManager {
 
         self.is_running.store(true, Ordering::SeqCst);
 
-        let (token, mode, protocol, split, sandbox, anti_dpi) = {
+        let (token, mode, protocol, split, sandbox, anti_dpi, location, dns_cfg) = {
             let s = app_state.lock().await;
             (
                 s.subscription_token.clone().unwrap_or_else(|| "token_lite_sandbox_001".to_string()),
@@ -610,6 +644,8 @@ impl VpnManager {
                 s.split_tunneling,
                 s.sandbox_loopback,
                 s.anti_dpi.clone(),
+                s.selected_location.clone(),
+                s.dns_config.clone(),
             )
         };
 
@@ -638,7 +674,15 @@ impl VpnManager {
         );
 
         // Fetch / compile config
-        let config_json = match Self::fetch_or_compile_config(&token, &mode, &protocol, split, &anti_dpi).await {
+        let config_json = match Self::fetch_or_compile_config(
+            &token,
+            &mode,
+            &protocol,
+            split,
+            &anti_dpi,
+            Some(&location),
+            &dns_cfg,
+        ).await {
             Ok(cfg) => cfg,
             Err(e) => {
                 self.is_running.store(false, Ordering::SeqCst);

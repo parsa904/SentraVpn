@@ -1609,15 +1609,19 @@ pub async fn handle_target_category_chosen(
     let text = format!(
         r#"➕ <b>ثبت اوتباند جدید برای بخش [{}]</b>
 
-لطفاً <b>نام دلخواه نود (Label)</b> را به همراه <b>لینک اوتباند یا بلاک JSON سینگ‌باکس</b> در یک پیام ارسال نمایید.
+لطفاً <b>نام دلخواه نود (Label)</b> را به همراه <b>لینک اوتباند، بلاک JSON یا آدرس سابسکریپشن (Sub URL)</b> ارسال نمایید.
 
-<i>فرمت پیشنهادی ۱ (نام + لینک):</i>
+<i>روش ۱ (لینک سابسکریپشن یکجا):</i>
+<code>https://sub.example.com/api/v1/sub?token=...</code>
+<i>(پشتیبانی از Base64، چندخطی و Sing-box JSON با محافظت Anti-SSRF و تست پینگ خودکار)</i>
+
+<i>روش ۲ (نام + لینک تکی):</i>
 <code>US-Static-01 vless://uuid@server:443?security=reality...#US-Node</code>
 
-<i>فرمت پیشنهادی ۲ (نام + کانفیگ JSON):</i>
+<i>روش ۳ (نام + کانفیگ JSON):</i>
 <code>DE-Download-01 {{"type": "vless", "server": "1.2.3.4", ...}}</code>
 
-<i>فرمت ۳ (فقط لینک، نام به صورت خودکار از تگ لینک استخراج می‌شود):</i>
+<i>روش ۴ (فقط لینک، نام و کشور به صورت خودکار تشخیص داده می‌شود):</i>
 <code>vless://uuid@server:443?security=reality...#MyNode</code>
 
 (جهت انصراف ارسال نمایید: /cancel)"#,
@@ -1656,6 +1660,83 @@ pub async fn handle_admin_outbound_text_input(
     }
 
     let trimmed = text.trim();
+
+    // 0. Check if input is a Subscription URL (https://...)
+    if trimmed.starts_with("https://") || (trimmed.contains("https://") && !trimmed.starts_with("vless://") && !trimmed.starts_with("vmess://") && !trimmed.starts_with("trojan://") && !trimmed.starts_with('{')) {
+        let sub_url = if let Some(idx) = trimmed.find("https://") {
+            &trimmed[idx..]
+        } else {
+            trimmed
+        };
+
+        bot.send_message(msg.chat.id, "⏳ <b>در حال تحلیل امنیتی و استخراج نودهای سابسکریپشن...</b>\n<i>(بررسی Anti-SSRF، تست پینگ خودکار و تشخیص کشور نودها)</i>")
+            .parse_mode(ParseMode::Html)
+            .await?;
+
+        match OutboundAnalyzer::import_subscription_url(pool, category, sub_url).await {
+            Ok(res) => {
+                clear_admin_outbound_state(telegram_user_id).await;
+
+                let mut country_summary = String::new();
+                for (country, count) in &res.country_counts {
+                    country_summary.push_str(&format!("• {}: <b>{} نود</b>\n", country, count));
+                }
+                if country_summary.is_empty() {
+                    country_summary = "• نامشخص / محلی\n".to_string();
+                }
+
+                let cat_fa = match category {
+                    "web_browsing" => "🌐 وب‌گردی (Web Browsing)",
+                    "download" => "📥 دانلود (Download)",
+                    "static_ip" => "🔒 آی‌پی ثابت مسکونی (Static IP)",
+                    _ => category,
+                };
+
+                let success_msg = format!(
+                    r#"✅ <b>همگام‌سازی سابسکریپشن برای [{}] با موفقیت انجام شد</b>
+
+📦 <b>گزارش استخراج نودها:</b>
+• کل کانفیگ‌های بررسی‌شده: <b>{} نود</b>
+• نودهای سالم و فعال ثبت‌شده: <b>{} نود</b>
+• نودهای نامعتبر / تایم‌اوت / ردشده: <b>{} نود</b>
+
+🌍 <b>تفکیک جغرافیایی نودهای سالم:</b>
+{}
+⚡️ پل ارتباطی سرور (Sing-box Bridge) به صورت خودکار بروزرسانی شد."#,
+                    cat_fa,
+                    res.total_nodes,
+                    res.healthy_nodes,
+                    res.invalid_nodes,
+                    country_summary
+                );
+
+                let kb = InlineKeyboardMarkup::new(vec![
+                    vec![
+                        InlineKeyboardButton::callback("🔄 بروزرسانی مجدد این سابلینک", format!("adm_sub_resync_{}", res.source_id)),
+                    ],
+                    vec![
+                        InlineKeyboardButton::callback("📋 مشاهده لیست نودها", format!("adm_ob_list_{}", category)),
+                        InlineKeyboardButton::callback("🔙 بازگشت به منوی اوتباندها", "adm_action_official_outbounds"),
+                    ],
+                ]);
+
+                bot.send_message(msg.chat.id, success_msg)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(kb)
+                    .await?;
+
+                return Ok(());
+            }
+            Err(e) => {
+                let err_msg = format!("❌ <b>خطا در پردازش سابسکریپشن:</b>\n{}\n\nلطفاً لینک را بررسی فرمایید یا /cancel را بفرستید.", e);
+                bot.send_message(msg.chat.id, err_msg)
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                return Ok(());
+            }
+        }
+    }
+
     let (label, link_or_json) = if let Some(first_space) = trimmed.find(|c: char| c.is_whitespace() || c == '\n') {
         let first_word = trimmed[..first_space].trim();
         let rest = trimmed[first_space..].trim();
@@ -1723,10 +1804,12 @@ pub async fn handle_admin_outbound_text_input(
     let status = if is_online { "active" } else { "inactive" };
     let health_score = if is_online { 100 } else { 20 };
 
-    // 4. Compute fingerprint
+    // 4. Compute fingerprint and detect country
     let mut hasher = Sha256::new();
     hasher.update(format!("{}:{}:{}", parsed.protocol, parsed.server_address, parsed.server_port).as_bytes());
     let fingerprint = format!("{:x}", hasher.finalize());
+
+    let (country_code, country_name) = OutboundAnalyzer::detect_country(ip, &parsed.tag).await;
 
     // 5. Insert or replace in database
     Repository::insert_official_outbound(
@@ -1744,6 +1827,8 @@ pub async fn handle_admin_outbound_text_input(
         &fingerprint,
         status,
         health_score,
+        &country_code,
+        &country_name,
     )
     .await?;
 
@@ -1770,6 +1855,7 @@ pub async fn handle_admin_outbound_text_input(
 
 📌 <b>مشخصات نود:</b>
 • نام نود (Label): <b>{}</b>
+• لوکیشن کشور: <b>{} ({})</b>
 • بخش اختصاصی: <b>{}</b>
 • پروتکل: <code>{}</code>
 • آدرس و پورت: <code>{}:{}</code>
@@ -1778,7 +1864,7 @@ pub async fn handle_admin_outbound_text_input(
 • وضعیت: <b>{}</b>
 
 ✨ این نود هم‌اکنون به صورت اولویت‌دار در مدار اتصال و تولید کانفیگ کلاینت‌ها قرار دارد."#,
-        final_label, cat_fa, parsed.protocol, parsed.server_address, parsed.server_port,
+        final_label, country_name, country_code, cat_fa, parsed.protocol, parsed.server_address, parsed.server_port,
         latency_ms, speed_mbps, status_badge
     );
 
@@ -2028,6 +2114,93 @@ pub async fn handle_delete_official_outbound_callback(
         }
     } else {
         bot.answer_callback_query(q.id.clone()).text("خطا در حذف نود یا نود یافت نشد.").show_alert(true).await?;
+    }
+
+    Ok(())
+}
+
+/// Re-sync all nodes from a saved subscription source URL
+pub async fn handle_resync_subscription_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+    admin_chat_id: i64,
+    source_id: i64,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone()).text("⛔ دسترسی غیرمجاز!").show_alert(true).await?;
+        return Ok(());
+    }
+
+    let source = match Repository::get_subscription_source_by_id(pool, source_id).await? {
+        Some(s) => s,
+        None => {
+            bot.answer_callback_query(q.id.clone()).text("منبع سابسکریپشن یافت نشد.").show_alert(true).await?;
+            return Ok(());
+        }
+    };
+
+    bot.answer_callback_query(q.id.clone()).text("⏳ در حال دریافت مجدد و همگام‌سازی نودها...").await?;
+
+    match OutboundAnalyzer::import_subscription_url(pool, &source.category, &source.url).await {
+        Ok(res) => {
+            let mut country_summary = String::new();
+            for (country, count) in &res.country_counts {
+                country_summary.push_str(&format!("• {}: <b>{} نود</b>\n", country, count));
+            }
+            if country_summary.is_empty() {
+                country_summary = "• نامشخص / محلی\n".to_string();
+            }
+
+            let cat_fa = match source.category.as_str() {
+                "web_browsing" => "🌐 وب‌گردی",
+                "download" => "📥 دانلود",
+                "static_ip" => "🔒 آی‌پی ثابت",
+                _ => &source.category,
+            };
+
+            let msg_text = format!(
+                r#"🔄 <b>همگام‌سازی مجدد سابسکریپشن [{}] تکمیل شد</b>
+
+📦 <b>وضعیت بروزرسانی:</b>
+• کل کانفیگ‌ها: <b>{} نود</b>
+• نودهای سالم و فعال: <b>{} نود</b>
+• نامعتبر / آفلاین: <b>{} نود</b>
+
+🌍 <b>تفکیک جغرافیایی:</b>
+{}
+<i>(بروزرسانی‌شده در همین لحظه)</i>"#,
+                cat_fa,
+                res.total_nodes,
+                res.healthy_nodes,
+                res.invalid_nodes,
+                country_summary
+            );
+
+            let kb = InlineKeyboardMarkup::new(vec![
+                vec![
+                    InlineKeyboardButton::callback("🔄 بروزرسانی مجدد این سابلینک", format!("adm_sub_resync_{}", source_id)),
+                ],
+                vec![
+                    InlineKeyboardButton::callback("📋 مشاهده لیست نودها", format!("adm_ob_list_{}", source.category)),
+                    InlineKeyboardButton::callback("🔙 بازگشت به منوی اوتباندها", "adm_action_official_outbounds"),
+                ],
+            ]);
+
+            if let Some(msg) = &q.message {
+                let _ = bot.edit_message_text(msg.chat().id, msg.id(), msg_text)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(kb)
+                    .await;
+            }
+        }
+        Err(e) => {
+            let err_text = format!("❌ خطا در همگام‌سازی مجدد سابسکریپشن:\n{}", e);
+            if let Some(msg) = &q.message {
+                let _ = bot.send_message(msg.chat().id, err_text).await;
+            }
+        }
     }
 
     Ok(())

@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS outbounds (
     min_tier            TEXT NOT NULL CHECK(min_tier IN ('Sentra Lite', 'Sentra Pro', 'Sentra Flow+')),
     mode_category       TEXT NOT NULL CHECK(mode_category IN ('web_browsing', 'download', 'gaming', 'static_ip', 'Hydra', 'Shadow', 'Stealth', 'Pulse', 'Warp', 'Direct')),
     country_code        TEXT NOT NULL DEFAULT 'XX',
+    country_name        TEXT NOT NULL DEFAULT 'Unknown',
     is_active           INTEGER NOT NULL DEFAULT 1,
     weight              INTEGER NOT NULL DEFAULT 1,
     created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -155,3 +156,57 @@ CREATE TRIGGER IF NOT EXISTS trg_app_releases_updated_at AFTER UPDATE ON app_rel
 FOR EACH ROW BEGIN
     UPDATE app_releases SET updated_at = CURRENT_TIMESTAMP WHERE platform = OLD.platform;
 END;
+
+-- ============================================================================
+-- 9. DONATED_OUTBOUNDS TABLE (Community & Official Nodes with Country Support)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS donated_outbounds (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    donor_user_id           INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    tag                     TEXT NOT NULL,
+    protocol                TEXT NOT NULL,
+    server_address          TEXT NOT NULL,
+    server_port             INTEGER NOT NULL,
+    config_json             TEXT NOT NULL,
+    latency_ms              INTEGER NOT NULL DEFAULT 9999,
+    speed_mbps              REAL NOT NULL DEFAULT 0.0,
+    assigned_tier           TEXT NOT NULL CHECK(assigned_tier IN ('web_browsing', 'download', 'static_ip', 'rejected')),
+    health_score            INTEGER NOT NULL DEFAULT 100,
+    status                  TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('pending', 'active', 'inactive', 'rejected')),
+    fail_count              INTEGER NOT NULL DEFAULT 0,
+    reward_granted          INTEGER NOT NULL DEFAULT 0,
+    raw_link                TEXT,
+    rejection_reason        TEXT,
+    declared_or_detected_gb BIGINT NOT NULL DEFAULT 0,
+    bytes_served            BIGINT NOT NULL DEFAULT 0,
+    first_used_at           DATETIME,
+    monthly_reward_granted  INTEGER NOT NULL DEFAULT 0,
+    fingerprint_sha256      TEXT,
+    offline_since           DATETIME,
+    clawback_executed       INTEGER NOT NULL DEFAULT 0,
+    is_official             INTEGER NOT NULL DEFAULT 0,
+    label                   TEXT,
+    country_code            TEXT NOT NULL DEFAULT 'XX',
+    country_name            TEXT NOT NULL DEFAULT 'Unknown',
+    last_checked_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_donated_status ON donated_outbounds(status);
+CREATE INDEX IF NOT EXISTS idx_donated_assigned_tier ON donated_outbounds(assigned_tier);
+CREATE INDEX IF NOT EXISTS idx_donated_country_code ON donated_outbounds(country_code);
+
+-- ============================================================================
+-- 10. SUBSCRIPTION_SOURCES TABLE (Admin Subscription URLs with Periodic Re-Sync)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS subscription_sources (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    category            TEXT NOT NULL,
+    url                 TEXT NOT NULL UNIQUE,
+    label               TEXT,
+    node_count          INTEGER NOT NULL DEFAULT 0,
+    healthy_count       INTEGER NOT NULL DEFAULT 0,
+    last_synced_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

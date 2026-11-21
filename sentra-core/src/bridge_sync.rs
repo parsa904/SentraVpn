@@ -28,8 +28,8 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
         .unwrap_or_default();
 
     let mut singbox_outbounds: Vec<Value> = Vec::new();
-    let mut web_target_tag = "direct-out".to_string();
-    let mut dl_target_tag = "direct-out".to_string();
+    let mut web_outbound_tags: Vec<String> = Vec::new();
+    let mut dl_outbound_tags: Vec<String> = Vec::new();
     let mut static_target_tag = "direct-out".to_string();
 
     // Default direct outbound fallback
@@ -38,27 +38,27 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
         "tag": "direct-out"
     }));
 
-    // Register web outbound
-    if let Some(dob) = web_outbounds.first() {
+    // Register all active web outbounds with country tags
+    for dob in &web_outbounds {
         if let Ok(mut parsed) = serde_json::from_str::<Value>(&dob.config_json) {
-            let tag = format!("out-web-{}", dob.id);
+            let tag = format!("out-web-{}-{}", dob.country_code.to_lowercase(), dob.id);
             if let Some(obj) = parsed.as_object_mut() {
                 obj.insert("tag".to_string(), json!(tag));
             }
             singbox_outbounds.push(parsed);
-            web_target_tag = tag;
+            web_outbound_tags.push(tag);
         }
     }
 
-    // Register download outbound
-    if let Some(dob) = dl_outbounds.first() {
+    // Register all active download outbounds with country tags
+    for dob in &dl_outbounds {
         if let Ok(mut parsed) = serde_json::from_str::<Value>(&dob.config_json) {
-            let tag = format!("out-dl-{}", dob.id);
+            let tag = format!("out-dl-{}-{}", dob.country_code.to_lowercase(), dob.id);
             if let Some(obj) = parsed.as_object_mut() {
                 obj.insert("tag".to_string(), json!(tag));
             }
             singbox_outbounds.push(parsed);
-            dl_target_tag = tag;
+            dl_outbound_tags.push(tag);
         }
     }
 
@@ -73,6 +73,35 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
             static_target_tag = tag;
         }
     }
+
+    // Create urltest Auto groups for web and download
+    let web_target_tag = if !web_outbound_tags.is_empty() {
+        singbox_outbounds.push(json!({
+            "type": "urltest",
+            "tag": "out-web-auto",
+            "outbounds": web_outbound_tags,
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": "3m",
+            "tolerance": 50
+        }));
+        "out-web-auto".to_string()
+    } else {
+        "direct-out".to_string()
+    };
+
+    let dl_target_tag = if !dl_outbound_tags.is_empty() {
+        singbox_outbounds.push(json!({
+            "type": "urltest",
+            "tag": "out-dl-auto",
+            "outbounds": dl_outbound_tags,
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": "3m",
+            "tolerance": 50
+        }));
+        "out-dl-auto".to_string()
+    } else {
+        "direct-out".to_string()
+    };
 
     let config = json!({
         "log": {

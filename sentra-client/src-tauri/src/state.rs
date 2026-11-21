@@ -60,6 +60,40 @@ impl Default for AntiDpiSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomDnsEntry {
+    pub id: String,
+    pub name: String,
+    pub address: String, // IPv4 or DoH URL
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsPingItem {
+    pub id: String,
+    pub name: String,
+    pub address: String,
+    pub ping_ms: i64,
+    pub is_iranian: bool,
+    pub is_custom: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsConfig {
+    pub selected_dns_id: String,
+    pub selected_dns_address: String,
+    pub custom_servers: Vec<CustomDnsEntry>,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            selected_dns_id: "cloudflare".to_string(),
+            selected_dns_address: "1.1.1.1".to_string(),
+            custom_servers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientState {
     pub is_authenticated: bool,
     pub auth_token: Option<String>,
@@ -77,6 +111,7 @@ pub struct ClientState {
     pub tun_mode: bool,
     pub kill_switch: bool,
     pub anti_dpi: AntiDpiSettings,
+    pub dns_config: DnsConfig,
     pub connected_since: Option<DateTime<Utc>>,
     pub metrics: TelemetryMetrics,
     pub logs: Vec<String>,
@@ -95,12 +130,13 @@ impl Default for ClientState {
             status: ConnectionStatus::Disconnected,
             selected_mode: "web_browsing".to_string(),
             selected_protocol: "openvpn_udp".to_string(),
-            selected_location: "US 🇺🇸 سرور مسکونی آمریکا".to_string(),
+            selected_location: "auto".to_string(),
             sandbox_loopback: true, // Enabled for zero-cost testing
             split_tunneling: true,
             tun_mode: false, // Default to System Proxy mode (Windows safe unprivileged execution)
             kill_switch: false,
             anti_dpi: AntiDpiSettings::default(),
+            dns_config: DnsConfig::default(),
             connected_since: None,
             metrics: TelemetryMetrics::default(),
             logs: vec![

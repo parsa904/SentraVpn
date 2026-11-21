@@ -21,6 +21,15 @@ pub struct ParsedProxy {
     pub config_json: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionImportResult {
+    pub source_id: i64,
+    pub total_nodes: usize,
+    pub healthy_nodes: usize,
+    pub invalid_nodes: usize,
+    pub country_counts: std::collections::HashMap<String, usize>,
+}
+
 pub struct OutboundAnalyzer;
 
 impl OutboundAnalyzer {
@@ -579,6 +588,9 @@ impl OutboundAnalyzer {
             false
         };
 
+        // Automatically detect country code and localized name
+        let (country_code, country_name) = Self::detect_country(ip, &parsed.tag).await;
+
         // 6. Save to database with fingerprint
         let save_res = Repository::save_donated_outbound(
             &pool,
@@ -596,6 +608,8 @@ impl OutboundAnalyzer {
             reject_reason.as_deref(),
             declared_gb,
             Some(&fingerprint),
+            &country_code,
+            &country_name,
         ).await;
 
         match save_res {
@@ -668,6 +682,343 @@ impl OutboundAnalyzer {
                 }
             }
         }
+    }
+
+    /// Converts standard 2-letter ISO country code to Persian title with flag emoji
+    pub fn country_code_to_name(code: &str) -> String {
+        match code.to_uppercase().as_str() {
+            "DE" => "آلمان 🇩🇪",
+            "NL" => "هلند 🇳🇱",
+            "FI" => "فنلاند 🇫🇮",
+            "US" => "آمریکا 🇺🇸",
+            "FR" => "فرانسه 🇫🇷",
+            "GB" | "UK" => "انگلستان 🇬🇧",
+            "TR" => "ترکیه 🇹🇷",
+            "SE" => "سوئد 🇸🇪",
+            "CH" => "سوئیس 🇨🇭",
+            "SG" => "سنگاپور 🇸🇬",
+            "JP" => "ژاپن 🇯🇵",
+            "CA" => "کانادا 🇨🇦",
+            "AE" => "امارات 🇦🇪",
+            "AT" => "اتریش 🇦🇹",
+            "PL" => "لهستان 🇵🇱",
+            "IT" => "ایتالیا 🇮🇹",
+            "ES" => "اسپانیا 🇪🇸",
+            "NO" => "نروژ 🇳🇴",
+            "RO" => "رومانی 🇷🇴",
+            "UA" => "اوکراین 🇺🇦",
+            "IR" => "ایران 🇮🇷",
+            other => return format!("{} 🌐", other),
+        }
+        .to_string()
+    }
+
+    /// Converts ISO country code to flag emoji
+    pub fn country_code_to_flag(code: &str) -> String {
+        match code.to_uppercase().as_str() {
+            "DE" => "🇩🇪",
+            "NL" => "🇳🇱",
+            "FI" => "🇫🇮",
+            "US" => "🇺🇸",
+            "FR" => "🇫🇷",
+            "GB" | "UK" => "🇬🇧",
+            "TR" => "🇹🇷",
+            "SE" => "🇸🇪",
+            "CH" => "🇨🇭",
+            "SG" => "🇸🇬",
+            "JP" => "🇯🇵",
+            "CA" => "🇨🇦",
+            "AE" => "🇦🇪",
+            "AT" => "🇦🇹",
+            "PL" => "🇵🇱",
+            "IT" => "🇮🇹",
+            "ES" => "🇪🇸",
+            "NO" => "🇳🇴",
+            "RO" => "🇷🇴",
+            "UA" => "🇺🇦",
+            "IR" => "🇮🇷",
+            _ => "🌐",
+        }
+        .to_string()
+    }
+
+    /// Automatically detects country code and Persian name with flag based on tag and online IP Geo lookup
+    pub async fn detect_country(ip: IpAddr, tag: &str) -> (String, String) {
+        let tag_lower = tag.to_lowercase();
+
+        // 1. Check tag heuristics (flags, country names, abbreviations)
+        if tag.contains("🇩🇪") || tag_lower.contains("germany") || tag_lower.contains("de-") || tag_lower.contains("-de") || tag_lower.contains("frankfurt") || tag_lower.contains("آلمان") {
+            return ("DE".to_string(), Self::country_code_to_name("DE"));
+        }
+        if tag.contains("🇳🇱") || tag_lower.contains("netherlands") || tag_lower.contains("holland") || tag_lower.contains("nl-") || tag_lower.contains("-nl") || tag_lower.contains("amsterdam") || tag_lower.contains("هلند") {
+            return ("NL".to_string(), Self::country_code_to_name("NL"));
+        }
+        if tag.contains("🇫🇮") || tag_lower.contains("finland") || tag_lower.contains("fi-") || tag_lower.contains("-fi") || tag_lower.contains("helsinki") || tag_lower.contains("فنلاند") {
+            return ("FI".to_string(), Self::country_code_to_name("FI"));
+        }
+        if tag.contains("🇺🇸") || tag_lower.contains("usa") || tag_lower.contains("united states") || tag_lower.contains("us-") || tag_lower.contains("-us") || tag_lower.contains("america") || tag_lower.contains("آمریکا") {
+            return ("US".to_string(), Self::country_code_to_name("US"));
+        }
+        if tag.contains("🇫🇷") || tag_lower.contains("france") || tag_lower.contains("fr-") || tag_lower.contains("-fr") || tag_lower.contains("paris") || tag_lower.contains("فرانسه") {
+            return ("FR".to_string(), Self::country_code_to_name("FR"));
+        }
+        if tag.contains("🇬🇧") || tag_lower.contains("uk") || tag_lower.contains("united kingdom") || tag_lower.contains("london") || tag_lower.contains("انگلیس") {
+            return ("GB".to_string(), Self::country_code_to_name("GB"));
+        }
+        if tag.contains("🇹🇷") || tag_lower.contains("turkey") || tag_lower.contains("istanbul") || tag_lower.contains("tr-") || tag_lower.contains("-tr") || tag_lower.contains("ترکیه") {
+            return ("TR".to_string(), Self::country_code_to_name("TR"));
+        }
+        if tag.contains("🇸🇪") || tag_lower.contains("sweden") || tag_lower.contains("سوئد") {
+            return ("SE".to_string(), Self::country_code_to_name("SE"));
+        }
+        if tag.contains("🇨🇭") || tag_lower.contains("switzerland") || tag_lower.contains("سوئیس") {
+            return ("CH".to_string(), Self::country_code_to_name("CH"));
+        }
+        if tag.contains("🇸🇬") || tag_lower.contains("singapore") || tag_lower.contains("سنگاپور") {
+            return ("SG".to_string(), Self::country_code_to_name("SG"));
+        }
+        if tag.contains("🇯🇵") || tag_lower.contains("japan") || tag_lower.contains("tokyo") || tag_lower.contains("ژاپن") {
+            return ("JP".to_string(), Self::country_code_to_name("JP"));
+        }
+        if tag.contains("🇨🇦") || tag_lower.contains("canada") || tag_lower.contains("کانادا") {
+            return ("CA".to_string(), Self::country_code_to_name("CA"));
+        }
+
+        // 2. Perform online GeoIP lookup with a short timeout if IP is public
+        if !is_private_or_restricted(&ip) {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_millis(2500))
+                .build();
+            if let Ok(c) = client {
+                let url = format!("http://ip-api.com/json/{}?fields=status,country,countryCode", ip);
+                if let Ok(resp) = c.get(&url).send().await {
+                    if let Ok(json_val) = resp.json::<serde_json::Value>().await {
+                        if json_val.get("status").and_then(|s| s.as_str()) == Some("success") {
+                            if let Some(code) = json_val.get("countryCode").and_then(|c| c.as_str()) {
+                                let code_upper = code.to_uppercase();
+                                let name = Self::country_code_to_name(&code_upper);
+                                return (code_upper, name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback default
+        ("DE".to_string(), "آلمان 🇩🇪".to_string())
+    }
+
+    /// Import official outbounds from a Subscription URL with Anti-SSRF, 2MB size limit,
+    /// 10s timeout, max 50 nodes limit, automated ping test, and country persistence.
+    pub async fn import_subscription_url(
+        pool: &DbPool,
+        category: &str,
+        sub_url: &str,
+    ) -> Result<SubscriptionImportResult, String> {
+        let trimmed_url = sub_url.trim();
+
+        // 1. Validate URL scheme strictly https
+        let parsed_url = Url::parse(trimmed_url).map_err(|e| format!("آدرس سابسکریپشن نامعتبر است: {}", e))?;
+        if parsed_url.scheme().to_lowercase() != "https" {
+            return Err("امنیت Anti-SSRF: فقط پروتکل امن https:// برای دریافت سابسکریپشن مجاز است.".to_string());
+        }
+
+        let host = parsed_url.host_str().ok_or("دامنه در آدرس سابسکریپشن موجود نیست.")?;
+
+        // 2. Anti-SSRF Protection: resolve domain and verify each IP is public
+        let addrs: Vec<SocketAddr> = timeout(
+            Duration::from_secs(5),
+            tokio::net::lookup_host(format!("{}:443", host))
+        )
+        .await
+        .map_err(|_| "تایم‌اوت در بررسی دامنه سابسکریپشن (DNS Timeout)".to_string())?
+        .map_err(|e| format!("دامنه سابسکریپشن قابل Resolve نیست: {}", e))?
+        .collect();
+
+        if addrs.is_empty() {
+            return Err("هیچ آدرس IP برای دامنه سابسکریپشن یافت نشد.".to_string());
+        }
+
+        for addr in &addrs {
+            if is_private_or_restricted(&addr.ip()) {
+                return Err(format!(
+                    "امنیت SSRF: دامنه سابسکریپشن به IP غیرمجاز ({}) اشاره می‌کند و مسدود شد.",
+                    addr.ip()
+                ));
+            }
+        }
+
+        // 3. Fetch Subscription body with 10s timeout and 2MB max response size
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent("SentraCore/1.0 (SubscriptionClient)")
+            .build()
+            .map_err(|e| format!("خطا در ایجاد کلاینت HTTP: {}", e))?;
+
+        let resp = client.get(trimmed_url)
+            .send()
+            .await
+            .map_err(|e| format!("خطا در اتصال به سرور سابسکریپشن: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("سرور سابسکریپشن خطای HTTP {} را بازگرداند.", resp.status()));
+        }
+
+        let bytes = resp.bytes().await.map_err(|e| format!("خطا در دریافت دیتای سابسکریپشن: {}", e))?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            return Err("امنیت: حجم فایل سابسکریپشن بیش از سقف مجاز ۲ مگابایت است.".to_string());
+        }
+
+        let raw_text = String::from_utf8_lossy(&bytes).to_string();
+
+        // 4. Extract individual proxy definitions
+        let mut node_strings: Vec<String> = Vec::new();
+
+        // Try decoding as base64 first
+        if let Ok(decoded_bytes) = decode_b64(raw_text.trim()) {
+            let decoded_str = String::from_utf8_lossy(&decoded_bytes).to_string();
+            for line in decoded_str.lines() {
+                let l = line.trim();
+                if !l.is_empty() {
+                    node_strings.push(l.to_string());
+                }
+            }
+        } else if raw_text.trim().starts_with('[') || raw_text.trim().starts_with('{') {
+            // Sing-box JSON array or JSON config
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw_text.trim()) {
+                if let Some(arr) = val.as_array() {
+                    for item in arr {
+                        node_strings.push(item.to_string());
+                    }
+                } else if let Some(outbounds) = val.get("outbounds").and_then(|o| o.as_array()) {
+                    for item in outbounds {
+                        node_strings.push(item.to_string());
+                    }
+                } else {
+                    node_strings.push(val.to_string());
+                }
+            }
+        }
+
+        // If not base64 or json array, split lines as plaintext
+        if node_strings.is_empty() {
+            for line in raw_text.lines() {
+                let l = line.trim();
+                if !l.is_empty() {
+                    node_strings.push(l.to_string());
+                }
+            }
+        }
+
+        let total_nodes = node_strings.len();
+        if total_nodes == 0 {
+            return Err("هیچ کانفیگ پروکسی در محتوای سابسکریپشن یافت نشد.".to_string());
+        }
+
+        // Enforce maximum 50 nodes per subscription
+        let limited_nodes: Vec<String> = node_strings.into_iter().take(50).collect();
+
+        let mut healthy_nodes = 0;
+        let mut invalid_nodes = 0;
+        let mut country_counts = std::collections::HashMap::new();
+
+        for raw_node in &limited_nodes {
+            let parsed = match Self::parse_input(raw_node) {
+                Ok(p) => p,
+                Err(_) => {
+                    invalid_nodes += 1;
+                    continue;
+                }
+            };
+
+            // Security & Anti-Hijack validation
+            if Self::validate_security_and_encryption(&parsed).is_err() {
+                invalid_nodes += 1;
+                continue;
+            }
+
+            // Anti-SSRF check on node server address
+            let ip = match Self::check_anti_ssrf(&parsed.server_address).await {
+                Ok(ip) => ip,
+                Err(_) => {
+                    invalid_nodes += 1;
+                    continue;
+                }
+            };
+
+            // Latency & benchmark
+            let (latency_ms, speed_mbps, is_online, _err) = Self::benchmark_proxy(ip, parsed.server_port).await;
+            if !is_online || latency_ms > 2500 {
+                invalid_nodes += 1;
+                continue;
+            }
+
+            // Country detection
+            let (country_code, country_name) = Self::detect_country(ip, &parsed.tag).await;
+
+            // Generate fingerprint
+            let mut hasher = Sha256::new();
+            hasher.update(format!("{}:{}:{}", parsed.protocol, parsed.server_address, parsed.server_port).as_bytes());
+            let fingerprint = format!("{:x}", hasher.finalize());
+
+            let label = if !parsed.tag.is_empty() && parsed.tag != "donated-singbox" && parsed.tag != "donated-node" {
+                parsed.tag.clone()
+            } else {
+                format!("{}-{}", country_code, parsed.protocol)
+            };
+
+            // Insert official outbound
+            let insert_res = Repository::insert_official_outbound(
+                pool,
+                &label,
+                &parsed.tag,
+                &parsed.protocol,
+                &parsed.server_address,
+                parsed.server_port as i64,
+                &parsed.config_json.to_string(),
+                latency_ms,
+                speed_mbps,
+                category,
+                Some(raw_node),
+                &fingerprint,
+                "active",
+                100,
+                &country_code,
+                &country_name,
+            )
+            .await;
+
+            if insert_res.is_ok() {
+                healthy_nodes += 1;
+                *country_counts.entry(country_name).or_insert(0) += 1;
+            } else {
+                invalid_nodes += 1;
+            }
+        }
+
+        // Save subscription source for periodic re-sync
+        let source_id = Repository::save_subscription_source(
+            pool,
+            category,
+            trimmed_url,
+            Some(&format!("سابلینک {}", category)),
+            total_nodes as i64,
+            healthy_nodes as i64,
+        )
+        .await
+        .map_err(|e| format!("خطا در ذخیره منبع سابسکریپشن: {}", e))?;
+
+        // Re-sync server bridge sing-box
+        let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
+
+        Ok(SubscriptionImportResult {
+            source_id,
+            total_nodes,
+            healthy_nodes,
+            invalid_nodes,
+            country_counts,
+        })
     }
 }
 
