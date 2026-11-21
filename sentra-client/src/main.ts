@@ -1300,11 +1300,18 @@ function initEventListeners() {
   }
 
   settingsBtn?.addEventListener('click', () => {
-    settingsDrawer?.classList.remove('hidden');
+    if (settingsDrawer?.classList.contains('hidden')) {
+      settingsDrawer?.classList.remove('hidden');
+      settingsBtn?.classList.add('active');
+    } else {
+      settingsDrawer?.classList.add('hidden');
+      settingsBtn?.classList.remove('active');
+    }
   });
 
   closeSettingsBtn?.addEventListener('click', () => {
     settingsDrawer?.classList.add('hidden');
+    settingsBtn?.classList.remove('active');
   });
 
   tabBtnSettings?.addEventListener('click', () => switchTab(tabBtnSettings, tabContentSettings));
@@ -1764,10 +1771,26 @@ async function checkClientVersion() {
 }
 
 // ------------------------------------------------------------------------------
-// Theme Engine Handlers
+// Animated Splash Screen (GPU-Accelerated 60/120fps Hyprland Bezier)
+// ------------------------------------------------------------------------------
+function initSplashScreen() {
+  const splash = document.getElementById('splash-screen');
+  if (!splash) return;
+
+  // Keep visible during initial load (~1.2s - 1.4s), then fade-out and unmount from DOM
+  setTimeout(() => {
+    splash.classList.add('splash-hide');
+    setTimeout(() => {
+      splash.remove();
+    }, 450);
+  }, 1250);
+}
+
+// ------------------------------------------------------------------------------
+// Theme Engine Handlers (Default Minimalist White Light Theme)
 // ------------------------------------------------------------------------------
 function initTheme() {
-  const savedTheme = localStorage.getItem('sentra_theme') || 'dark';
+  const savedTheme = localStorage.getItem('sentra_theme') || 'light';
   applyTheme(savedTheme);
 }
 
@@ -2223,6 +2246,7 @@ async function deleteCustomDns(id: string) {
 // App Initialization
 // ------------------------------------------------------------------------------
 window.addEventListener('DOMContentLoaded', async () => {
+  initSplashScreen();
   initTheme();
   initEventListeners();
   await setupTauriEventListeners();

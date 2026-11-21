@@ -1,6 +1,26 @@
 @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
-:root, [data-theme="dark"] {
+:root, [data-theme="light"] {
+  --bg-canvas: #FFFFFF;
+  --bg-card: #F8FAFC;
+  --bg-card-hover: #F1F5F9;
+  --border-subtle: #E2E8F0;
+  --border-active: #CBD5E1;
+  --text-primary: #0F172A;
+  --text-secondary: #475569;
+  --text-muted: #64748B;
+  --color-accent: #059669;
+  --color-accent-glow: rgba(5, 150, 105, 0.15);
+  --color-emerald: #059669;
+  --color-emerald-glow: rgba(5, 150, 105, 0.15);
+  --color-amber: #D97706;
+  --color-amber-glow: rgba(217, 119, 6, 0.15);
+  --color-red: #DC2626;
+  --color-blue: #2563EB;
+  --color-purple: #7C3AED;
+}
+
+[data-theme="dark"] {
   --bg-canvas: #0B0D10;
   --bg-card: #13161B;
   --bg-card-hover: #1C212B;
@@ -18,26 +38,6 @@
   --color-red: #EF4444;
   --color-blue: #3B82F6;
   --color-purple: #8B5CF6;
-}
-
-[data-theme="light"] {
-  --bg-canvas: #F8FAFC;
-  --bg-card: #FFFFFF;
-  --bg-card-hover: #F1F5F9;
-  --border-subtle: #E2E8F0;
-  --border-active: #CBD5E1;
-  --text-primary: #0F172A;
-  --text-secondary: #475569;
-  --text-muted: #94A3B8;
-  --color-accent: #059669;
-  --color-accent-glow: rgba(5, 150, 105, 0.2);
-  --color-emerald: #059669;
-  --color-emerald-glow: rgba(5, 150, 105, 0.2);
-  --color-amber: #D97706;
-  --color-amber-glow: rgba(217, 119, 6, 0.2);
-  --color-red: #DC2626;
-  --color-blue: #2563EB;
-  --color-purple: #7C3AED;
 }
 
 [data-theme="classic"] {
@@ -209,6 +209,95 @@ input:checked + .slider:before {
   border-color: var(--color-accent);
 }
 
+/* Logo Styling with Adaptive Inversion for Themes */
+.sentra-logo {
+  transition: transform 0.25s cubic-bezier(0.05, 0.9, 0.1, 1.05), filter 0.2s ease, opacity 0.2s ease;
+  display: inline-block;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+[data-theme="light"] .sentra-logo {
+  filter: none;
+  mix-blend-mode: multiply;
+}
+
+:root:not([data-theme="light"]) .sentra-logo,
+[data-theme="dark"] .sentra-logo,
+[data-theme="classic"] .sentra-logo,
+[data-theme="fantasy"] .sentra-logo {
+  filter: invert(1) brightness(1.2);
+  mix-blend-mode: screen;
+}
+
+/* GPU-Accelerated Animated Splash Screen (Hyprland Smooth Bezier) */
+#splash-screen {
+  background-color: #FFFFFF;
+  transition: opacity 0.4s cubic-bezier(0.05, 0.9, 0.1, 1.05), transform 0.4s cubic-bezier(0.05, 0.9, 0.1, 1.05);
+  will-change: opacity, transform;
+}
+
+#splash-screen.splash-hide {
+  opacity: 0 !important;
+  transform: scale(1.03) translateZ(0) !important;
+  pointer-events: none !important;
+}
+
+.sentra-logo-splash {
+  animation: splash-intro 0.7s cubic-bezier(0.05, 0.9, 0.1, 1.05) forwards;
+  will-change: transform, opacity;
+  transform: translateZ(0);
+}
+
+@keyframes splash-intro {
+  0% {
+    opacity: 0;
+    transform: scale(0.85) translateZ(0);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateZ(0);
+  }
+}
+
+/* Logo Sidebar Trigger Button (Hyprland Smooth Bezier) */
+.logo-menu-trigger {
+  transition: transform 0.25s cubic-bezier(0.05, 0.9, 0.1, 1.05), background-color 0.2s ease, border-color 0.2s ease;
+  will-change: transform;
+}
+
+.logo-menu-trigger:hover .logo-trigger-img {
+  transform: scale(1.06) translateZ(0);
+}
+
+.logo-menu-trigger:active .logo-trigger-img {
+  transform: scale(0.96) translateZ(0);
+}
+
+.logo-menu-trigger.active {
+  background-color: rgba(5, 150, 105, 0.1);
+  border-color: rgba(5, 150, 105, 0.25) !important;
+}
+
+.logo-menu-trigger.active .logo-trigger-img {
+  transform: rotate(-10deg) scale(1.04) translateZ(0);
+}
+
+.logo-trigger-img {
+  transition: transform 0.25s cubic-bezier(0.05, 0.9, 0.1, 1.05);
+  will-change: transform;
+}
+
+/* Settings Drawer Smooth Slide Animation (Hyprland Bezier) */
+#settings-drawer {
+  transition: opacity 0.3s cubic-bezier(0.05, 0.9, 0.1, 1.05), visibility 0.3s cubic-bezier(0.05, 0.9, 0.1, 1.05);
+}
+
+#settings-drawer > div {
+  transition: transform 0.35s cubic-bezier(0.05, 0.9, 0.1, 1.05);
+  will-change: transform;
+}
+
 /* Dynamic theme support overrides */
 body, #main-screen, #auth-screen, #settings-drawer > div, #devices-modal > div, #upgrade-modal > div, #link-modal > div {
   background-color: var(--bg-canvas);
@@ -220,16 +309,16 @@ body, #main-screen, #auth-screen, #settings-drawer > div, #devices-modal > div, 
 [data-theme="light"] #main-screen,
 [data-theme="light"] header,
 [data-theme="light"] footer {
-  background-color: #F8FAFC !important;
+  background-color: #FFFFFF !important;
   color: #0F172A !important;
 }
 
 [data-theme="light"] .bg-\[\#0F172A\] {
-  background-color: #F1F5F9 !important;
+  background-color: #F8FAFC !important;
 }
 
 [data-theme="light"] .bg-\[\#1E293B\] {
-  background-color: #FFFFFF !important;
+  background-color: #F8FAFC !important;
   border-color: #E2E8F0 !important;
   color: #0F172A !important;
 }
@@ -244,7 +333,8 @@ body, #main-screen, #auth-screen, #settings-drawer > div, #devices-modal > div, 
 
 [data-theme="light"] .border-white\/10,
 [data-theme="light"] .border-white\/5,
-[data-theme="light"] .border-white\/15 {
+[data-theme="light"] .border-white\/15,
+[data-theme="light"] .border-white\/20 {
   border-color: #E2E8F0 !important;
 }
 
