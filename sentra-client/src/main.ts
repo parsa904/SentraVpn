@@ -24,6 +24,7 @@ interface ClientState {
   selected_mode: string;
   selected_protocol?: string;
   selected_location: string;
+  use_warp?: boolean;
   sandbox_loopback: boolean;
   split_tunneling: boolean;
   tun_mode: boolean;
@@ -124,7 +125,8 @@ let currentState: ClientState = {
   status: 'Disconnected',
   selected_mode: "web_browsing",
   selected_protocol: "openvpn_udp",
-  selected_location: "US 🇺🇸 سرور مسکونی آمریکا",
+  selected_location: "auto",
+  use_warp: false,
   sandbox_loopback: true,
   split_tunneling: true,
   tun_mode: true,
@@ -275,6 +277,11 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
       { id: 'begzar', name: 'Begzar (بگذر)', address: '185.55.226.26', ping_ms: 55, is_iranian: true, is_custom: false },
       { id: 'adguard', name: 'AdGuard Anti-Ad', address: '94.140.14.14', ping_ms: 62, is_iranian: false, is_custom: false },
     ] as unknown as T;
+  }
+  if (cmd === 'set_use_warp') {
+    currentState.use_warp = !!args.enabled;
+    currentState.logs.push(`[WARP] Cloudflare WARP set to: ${currentState.use_warp ? 'ON' : 'OFF'}`);
+    return { ...currentState } as unknown as T;
   }
 
   return { ...currentState } as unknown as T;
@@ -431,6 +438,32 @@ function renderState() {
 
   const sandboxToggle = document.getElementById('sandbox-mode-toggle') as HTMLInputElement;
   if (sandboxToggle) sandboxToggle.checked = currentState.sandbox_loopback;
+
+  // Cloudflare WARP Toggle & Badge State
+  const warpToggle = document.getElementById('warp-toggle') as HTMLInputElement;
+  const warpBadge = document.getElementById('warp-badge');
+  const warpNotice = document.getElementById('warp-static-notice');
+
+  if (warpToggle && warpBadge) {
+    if (currentState.selected_mode === 'static_ip') {
+      warpToggle.checked = false;
+      warpToggle.disabled = true;
+      warpBadge.textContent = 'غیرفعال';
+      warpBadge.className = 'text-[9px] px-1.5 py-0.2 rounded bg-white/5 text-[#64748B] border border-white/5 font-mono';
+      warpNotice?.classList.remove('hidden');
+    } else {
+      warpToggle.disabled = false;
+      warpToggle.checked = !!currentState.use_warp;
+      warpNotice?.classList.add('hidden');
+      if (currentState.use_warp) {
+        warpBadge.textContent = 'فعال ⚡️';
+        warpBadge.className = 'text-[9px] px-1.5 py-0.2 rounded bg-[#F59E0B]/20 text-[#F59E0B] border border-[#F59E0B]/30 font-bold';
+      } else {
+        warpBadge.textContent = 'خاموش';
+        warpBadge.className = 'text-[9px] px-1.5 py-0.2 rounded bg-white/5 text-[#94A3B8] border border-white/10 font-mono';
+      }
+    }
+  }
 
   const userDisplay = document.getElementById('user-display');
   if (userDisplay) userDisplay.textContent = currentState.username;
@@ -1293,6 +1326,31 @@ function initEventListeners() {
   sandboxToggle?.addEventListener('change', async (e) => {
     const val = (e.target as HTMLInputElement).checked;
     currentState = await invokeTauri<ClientState>('toggle_sandbox_mode', { enabled: val });
+  });
+
+  // Cloudflare WARP Optional Toggle
+  const warpToggle = document.getElementById('warp-toggle') as HTMLInputElement;
+  warpToggle?.addEventListener('change', async (e) => {
+    if (currentState.selected_mode === 'static_ip') {
+      warpToggle.checked = false;
+      return;
+    }
+    const val = (e.target as HTMLInputElement).checked;
+    try {
+      currentState = await invokeTauri<ClientState>('set_use_warp', { enabled: val });
+      renderState();
+
+      // If VPN is currently connected, gracefully reconnect to apply new WARP routing profile
+      if (currentState.status === 'Connected') {
+        currentState.logs.push('[WARP] بازنشانی اتصال جهت اعمال تغییر مسیر تونل Cloudflare WARP...');
+        await invokeTauri('disconnect_vpn');
+        setTimeout(async () => {
+          await invokeTauri('connect_vpn');
+        }, 500);
+      }
+    } catch (err) {
+      console.warn('Could not toggle WARP:', err);
+    }
   });
 
   // Telegram Account Link Modal

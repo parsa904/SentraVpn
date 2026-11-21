@@ -80,7 +80,8 @@ pub fn run() {
             commands::get_available_locations,
             commands::ping_dns_servers,
             commands::save_dns_settings,
-            commands::get_dns_settings
+            commands::get_dns_settings,
+            commands::set_use_warp
         ])
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

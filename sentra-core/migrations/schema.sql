@@ -210,3 +210,23 @@ CREATE TABLE IF NOT EXISTS subscription_sources (
     last_synced_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ============================================================================
+-- 11. WARP_ACCOUNTS TABLE (Cloudflare WARP WireGuard Accounts Pool)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS warp_accounts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    private_key         TEXT NOT NULL,
+    public_key          TEXT NOT NULL,
+    address_v4          TEXT NOT NULL,
+    address_v6          TEXT NOT NULL,
+    reserved            TEXT NOT NULL, -- JSON array string e.g. "[0,0,0]"
+    account_id          TEXT,
+    token               TEXT,
+    license_key         TEXT,
+    account_type        TEXT NOT NULL DEFAULT 'free', -- 'free' or 'plus'
+    is_active           INTEGER NOT NULL DEFAULT 1,
+    created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_warp_accounts_is_active ON warp_accounts(is_active);

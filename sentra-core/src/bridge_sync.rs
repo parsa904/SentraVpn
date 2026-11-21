@@ -103,56 +103,131 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
         "direct-out".to_string()
     };
 
+    // 2. Fetch active Cloudflare WARP account for dual-chain routing
+    let warp_opt = Repository::get_active_warp_account(pool).await.unwrap_or(None);
+
+    let mut inbounds = vec![
+        json!({
+            "type": "tun",
+            "tag": "tun-web",
+            "interface_name": "tun-web",
+            "inet4_address": "10.10.0.1/30",
+            "auto_route": false,
+            "strict_route": false,
+            "stack": "system"
+        }),
+        json!({
+            "type": "tun",
+            "tag": "tun-dl",
+            "interface_name": "tun-dl",
+            "inet4_address": "10.10.1.1/30",
+            "auto_route": false,
+            "strict_route": false,
+            "stack": "system"
+        }),
+        json!({
+            "type": "tun",
+            "tag": "tun-static",
+            "interface_name": "tun-static",
+            "inet4_address": "10.10.2.1/30",
+            "auto_route": false,
+            "strict_route": false,
+            "stack": "system"
+        }),
+    ];
+
+    let mut route_rules = vec![
+        json!({
+            "inbound": ["tun-web"],
+            "outbound": web_target_tag
+        }),
+        json!({
+            "inbound": ["tun-dl"],
+            "outbound": dl_target_tag
+        }),
+        json!({
+            "inbound": ["tun-static"],
+            "outbound": static_target_tag
+        }),
+    ];
+
+    if let Some(warp) = warp_opt {
+        let reserved_val: Value = serde_json::from_str(&warp.reserved).unwrap_or_else(|_| json!([0, 0, 0]));
+
+        // WARP chained outbound for Web Browsing (detour -> out-web-auto)
+        singbox_outbounds.push(json!({
+            "type": "wireguard",
+            "tag": "out-web-warp",
+            "server": "162.159.192.1",
+            "server_port": 2408,
+            "local_address": [
+                format!("{}/32", warp.address_v4),
+                format!("{}/128", warp.address_v6)
+            ],
+            "private_key": warp.private_key,
+            "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+            "reserved": reserved_val,
+            "mtu": 1280,
+            "detour": web_target_tag
+        }));
+
+        // WARP chained outbound for Download (detour -> out-dl-auto)
+        singbox_outbounds.push(json!({
+            "type": "wireguard",
+            "tag": "out-dl-warp",
+            "server": "162.159.192.1",
+            "server_port": 2408,
+            "local_address": [
+                format!("{}/32", warp.address_v4),
+                format!("{}/128", warp.address_v6)
+            ],
+            "private_key": warp.private_key,
+            "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+            "reserved": reserved_val,
+            "mtu": 1280,
+            "detour": dl_target_tag
+        }));
+
+        // Add dedicated TUN inbounds for WARP traffic
+        inbounds.push(json!({
+            "type": "tun",
+            "tag": "tun-web-warp",
+            "interface_name": "tun-web-warp",
+            "inet4_address": "10.10.10.1/30",
+            "auto_route": false,
+            "strict_route": false,
+            "stack": "system"
+        }));
+        inbounds.push(json!({
+            "type": "tun",
+            "tag": "tun-dl-warp",
+            "interface_name": "tun-dl-warp",
+            "inet4_address": "10.10.11.1/30",
+            "auto_route": false,
+            "strict_route": false,
+            "stack": "system"
+        }));
+
+        // Direct WARP inbounds through chained wireguard outbounds
+        route_rules.insert(0, json!({
+            "inbound": ["tun-web-warp"],
+            "outbound": "out-web-warp"
+        }));
+        route_rules.insert(1, json!({
+            "inbound": ["tun-dl-warp"],
+            "outbound": "out-dl-warp"
+        }));
+    }
+
     let config = json!({
         "log": {
             "level": "warn",
             "timestamp": true
         },
-        "inbounds": [
-            {
-                "type": "tun",
-                "tag": "tun-web",
-                "interface_name": "tun-web",
-                "inet4_address": "10.10.0.1/30",
-                "auto_route": false,
-                "strict_route": false,
-                "stack": "system"
-            },
-            {
-                "type": "tun",
-                "tag": "tun-dl",
-                "interface_name": "tun-dl",
-                "inet4_address": "10.10.1.1/30",
-                "auto_route": false,
-                "strict_route": false,
-                "stack": "system"
-            },
-            {
-                "type": "tun",
-                "tag": "tun-static",
-                "interface_name": "tun-static",
-                "inet4_address": "10.10.2.1/30",
-                "auto_route": false,
-                "strict_route": false,
-                "stack": "system"
-            }
-        ],
+        "inbounds": inbounds,
         "outbounds": singbox_outbounds,
         "route": {
-            "rules": [
-                {
-                    "inbound": ["tun-web"],
-                    "outbound": web_target_tag
-                },
-                {
-                    "inbound": ["tun-dl"],
-                    "outbound": dl_target_tag
-                },
-                {
-                    "inbound": ["tun-static"],
-                    "outbound": static_target_tag
-                }
-            ],
+            "rules": route_rules,
             "final": "direct-out"
         }
     });

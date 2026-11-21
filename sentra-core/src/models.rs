@@ -217,3 +217,19 @@ pub struct ActiveLocationInfo {
     pub active_nodes: i64,
     pub is_auto: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct WarpAccount {
+    pub id: i64,
+    pub private_key: String,
+    pub public_key: String,
+    pub address_v4: String,
+    pub address_v6: String,
+    pub reserved: String, // JSON array string e.g. "[0,0,0]"
+    pub account_id: Option<String>,
+    pub token: Option<String>,
+    pub license_key: Option<String>,
+    pub account_type: String, // "free" or "plus"
+    pub is_active: i64,
+    pub created_at: DateTime<Utc>,
+}

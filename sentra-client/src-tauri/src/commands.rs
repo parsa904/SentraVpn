@@ -792,3 +792,18 @@ pub async fn get_dns_settings(
     let app_state = state.lock().await;
     Ok(app_state.dns_config.clone())
 }
+
+#[tauri::command]
+pub async fn set_use_warp(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<ClientState, String> {
+    let mut app_state = state.lock().await;
+    if app_state.selected_mode == "static_ip" {
+        app_state.use_warp = false;
+        return Ok(app_state.clone());
+    }
+    app_state.use_warp = enabled;
+    app_state.logs.push(format!("[WARP] Cloudflare WARP tunnel set to: {}", if enabled { "روشن (Enabled)" } else { "خاموش (Disabled)" }));
+    Ok(app_state.clone())
+}

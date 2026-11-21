@@ -8,6 +8,7 @@ mod db;
 mod error;
 mod models;
 pub mod outbound_analyzer;
+pub mod warp_gen;
 
 use config::Config;
 use std::net::SocketAddr;

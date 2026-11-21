@@ -179,6 +179,7 @@ pub struct ConfigRequest {
     pub mode: Option<String>,
     pub protocol: Option<String>,
     pub location_code: Option<String>,
+    pub use_warp: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -813,6 +814,20 @@ async fn client_config(
         _ => "⚡️ انتخاب خودکار سریع‌ترین لوکیشن (Auto)",
     };
 
+    // Cloudflare WARP opt-in: Strictly disabled in static_ip mode, opt-in for web & download
+    let use_warp = if requested_mode == "static_ip" {
+        false
+    } else {
+        payload.use_warp.unwrap_or(false)
+    };
+    let _ = Repository::update_device_use_warp(&state.pool, sub.id, device_id, use_warp).await;
+
+    let warp_subnet = if use_warp {
+        if requested_mode == "download" { "10.8.11.0/24" } else { "10.8.10.0/24" }
+    } else {
+        "10.8.0.0/24"
+    };
+
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
@@ -822,6 +837,8 @@ async fn client_config(
             "mode": requested_mode,
             "location_code": chosen_location_code,
             "location_name": chosen_location_name,
+            "use_warp": use_warp,
+            "warp_subnet": warp_subnet,
             "remote_host": server_host,
             "remote_port": remote_port,
             "auth_username": sub.token,

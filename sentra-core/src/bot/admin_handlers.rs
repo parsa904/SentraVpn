@@ -1479,6 +1479,12 @@ pub async fn handle_official_outbounds_hub(
     let web_nodes = Repository::get_official_outbounds_by_category(pool, "web_browsing").await.unwrap_or_default();
     let dl_nodes = Repository::get_official_outbounds_by_category(pool, "download").await.unwrap_or_default();
     let static_nodes = Repository::get_official_outbounds_by_category(pool, "static_ip").await.unwrap_or_default();
+    let warp_account = Repository::get_active_warp_account(pool).await.unwrap_or(None);
+    let warp_status = if let Some(ref w) = warp_account {
+        format!("فعال ⚡️ ({})", if w.account_type == "plus" { "WARP+ 🌟" } else { "رایگان" })
+    } else {
+        "تنظیم‌نشده (خاموش)".to_string()
+    };
 
     let text = format!(
         r#"🌐 <b>مرکز مدیریت اوتباندهای رسمی و اختصاصی سنترا (Official Outbounds Hub)</b>
@@ -1489,6 +1495,7 @@ pub async fn handle_official_outbounds_hub(
 • 🌐 نودهای وب‌گردی (Web Browsing): <b>{} نود</b>
 • 📥 نودهای دانلود پرسرعت (Download): <b>{} نود</b>
 • 🔒 نودهای آی‌پی ثابت مسکونی (Static IP): <b>{} نود</b>
+• ⚡️ اکانت Cloudflare WARP سرور: <b>{}</b>
 
 <i>نکته: نودهای رسمی ادمین بر خلاف نودهای اهدایی کاربران، هرگز منقضی نشده و در تولید کانفیگ کلاینت‌ها بالاترین اولویت را دارند.</i>
 
@@ -1496,6 +1503,7 @@ pub async fn handle_official_outbounds_hub(
         web_nodes.len(),
         dl_nodes.len(),
         static_nodes.len(),
+        warp_status,
     );
 
     bot.send_message(chat_id, text)
@@ -1522,6 +1530,12 @@ pub async fn handle_official_outbounds_hub_callback(
     let web_nodes = Repository::get_official_outbounds_by_category(pool, "web_browsing").await.unwrap_or_default();
     let dl_nodes = Repository::get_official_outbounds_by_category(pool, "download").await.unwrap_or_default();
     let static_nodes = Repository::get_official_outbounds_by_category(pool, "static_ip").await.unwrap_or_default();
+    let warp_account = Repository::get_active_warp_account(pool).await.unwrap_or(None);
+    let warp_status = if let Some(ref w) = warp_account {
+        format!("فعال ⚡️ ({})", if w.account_type == "plus" { "WARP+ 🌟" } else { "رایگان" })
+    } else {
+        "تنظیم‌نشده (خاموش)".to_string()
+    };
 
     let text = format!(
         r#"🌐 <b>مرکز مدیریت اوتباندهای رسمی و اختصاصی سنترا (Official Outbounds Hub)</b>
@@ -1532,6 +1546,7 @@ pub async fn handle_official_outbounds_hub_callback(
 • 🌐 نودهای وب‌گردی (Web Browsing): <b>{} نود</b>
 • 📥 نودهای دانلود پرسرعت (Download): <b>{} نود</b>
 • 🔒 نودهای آی‌پی ثابت مسکونی (Static IP): <b>{} نود</b>
+• ⚡️ اکانت Cloudflare WARP سرور: <b>{}</b>
 
 <i>نکته: نودهای رسمی ادمین بر خلاف نودهای اهدایی کاربران، هرگز منقضی نشده و در تولید کانفیگ کلاینت‌ها بالاترین اولویت را دارند.</i>
 
@@ -1539,6 +1554,7 @@ pub async fn handle_official_outbounds_hub_callback(
         web_nodes.len(),
         dl_nodes.len(),
         static_nodes.len(),
+        warp_status,
     );
 
     if let Some(msg) = &q.message {
@@ -2199,6 +2215,77 @@ pub async fn handle_resync_subscription_callback(
             let err_text = format!("❌ خطا در همگام‌سازی مجدد سابسکریپشن:\n{}", e);
             if let Some(msg) = &q.message {
                 let _ = bot.send_message(msg.chat().id, err_text).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Generate or refresh Cloudflare WARP WireGuard account for server dual-chain routing
+pub async fn handle_generate_warp_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+    admin_chat_id: i64,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone()).text("⛔ دسترسی غیرمجاز!").show_alert(true).await?;
+        return Ok(());
+    }
+
+    bot.answer_callback_query(q.id.clone()).text("⏳ در حال ثبت کلیدهای WireGuard در سرورهای کلادفلر...").await?;
+
+    match crate::warp_gen::register_warp_account(None).await {
+        Ok(account_data) => {
+            let _ = Repository::save_warp_account(
+                pool,
+                &account_data.private_key,
+                &account_data.public_key,
+                &account_data.address_v4,
+                &account_data.address_v6,
+                &account_data.reserved_json(),
+                account_data.account_id.as_deref(),
+                account_data.token.as_deref(),
+                account_data.license_key.as_deref(),
+                &account_data.account_type,
+            )
+            .await;
+
+            let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
+
+            let text = format!(
+                r#"⚡️ <b>اکانت Cloudflare WARP با موفقیت ایجاد و شارژ شد!</b>
+
+🔑 <b>مشخصات اکانت WireGuard کلادفلر:</b>
+• نوع اکانت: <b>{}</b>
+• کلید عمومی: <code>{}</code>
+• آدرس IPv4: <code>{}/32</code>
+• آدرس IPv6: <code>{}/128</code>
+• بایت‌های Reserved: <code>{:?}</code>
+
+🔄 <b>وضعیت پل سرور:</b>
+زنجیره خروجی دوگانه (Dual-Chain) در Sing-box به صورت آنی فعال گردید. کاربرانی که گزینه WARP را در کلاینت روشن کنند، ترافیکشان به صورت خودکار از داخل تونل کلادفلر عبور داده می‌شود."#,
+                if account_data.account_type == "plus" { "WARP+ اختصاصی 🌟" } else { "WARP رایگان ⚡️" },
+                account_data.public_key,
+                account_data.address_v4,
+                account_data.address_v6,
+                account_data.reserved,
+            );
+
+            if let Some(msg) = &q.message {
+                bot.send_message(msg.chat().id, text)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(admin_official_outbounds_hub_keyboard())
+                    .await?;
+            }
+        }
+        Err(e) => {
+            if let Some(msg) = &q.message {
+                bot.send_message(msg.chat().id, format!("❌ خطا در ثبت اکانت WARP: {}", e))
+                    .reply_markup(admin_official_outbounds_hub_keyboard())
+                    .await?;
             }
         }
     }

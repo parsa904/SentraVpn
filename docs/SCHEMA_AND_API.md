@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS device_sessions (
     os                      TEXT NOT NULL,       -- windows, android, darwin, linux
     client_version          TEXT NOT NULL,       -- نگارش کلاینت سنترا (مثلا: "1.0.0")
     ip_address              TEXT NOT NULL,       -- آخرین IP کلاینت
+    use_warp                INTEGER NOT NULL DEFAULT 0, -- آیا کاربر تونل اختیاری Cloudflare WARP را فعال کرده است؟
     is_active               INTEGER NOT NULL DEFAULT 1,
     last_seen_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -234,6 +235,26 @@ CREATE TABLE IF NOT EXISTS ip_registrations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ip_registrations_lookup ON ip_registrations(ip, created_at);
+
+-- ============================================================================
+-- 4.4. جدول اکانت‌های فعال Cloudflare WARP (WARP_ACCOUNTS)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS warp_accounts (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id              TEXT NOT NULL,
+    private_key             TEXT NOT NULL,
+    public_key              TEXT NOT NULL,
+    ipv4_address            TEXT NOT NULL,
+    ipv6_address            TEXT NOT NULL,
+    reserved                TEXT NOT NULL,       -- آرایه بایت رزرو شده در قالب [x,y,z]
+    license_key             TEXT,
+    is_active               INTEGER NOT NULL DEFAULT 1,
+    created_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_warp_accounts_active ON warp_accounts(is_active);
+
 
 -- ============================================================================
 -- 5. جدول لاگ‌های تجمیعی مصرف ترافیک (TRAFFIC_LOGS)
@@ -538,7 +559,7 @@ END;
 ```
 
 ### ۲.۴. دریافت کانفیگ چندپروتکلی کلاینت (`POST /api/v1/client/config`)
-کلاینت سنترا برای برقراری اتصال امن، این اندپوینت را فراخوانی می‌کند. هیچ‌گونه آدرس یا جزییات V2Ray/sing-box به کاربر ارسال نشده و ارتباط از طریق یکی از ۴ پروتکل امن (`openvpn_udp`، `openvpn_tcp`، `stealth`، `ikev2`) برقرار می‌گردد. پارامتر اختیاری `location_code` امکان انتخاب موقعیت جغرافیایی خروجی را برای حالات وب‌گردی و دانلود فراهم می‌سازد.
+کلاینت سنترا برای برقراری اتصال امن، این اندپوینت را فراخوانی می‌کند. هیچ‌گونه آدرس یا جزییات V2Ray/sing-box به کاربر ارسال نشده و ارتباط از طریق یکی از ۴ پروتکل امن (`openvpn_udp`، `openvpn_tcp`، `stealth`، `ikev2`) برقرار می‌گردد. پارامتر اختیاری `location_code` امکان انتخاب موقعیت جغرافیایی خروجی و پارامتر اختیاری `use_warp` امکان فعال‌سازی تونل زنجیره‌ای Cloudflare WARP را برای حالات وب‌گردی و دانلود فراهم می‌سازد (در حالت آی‌پی ثابت مسکونی، WARP اجباراً غیرفعال است).
 
 - **مسیر:** `/api/v1/client/config`
 - **روش:** `POST`
@@ -550,7 +571,8 @@ END;
   "os": "windows",
   "mode": "web_browsing",
   "protocol": "openvpn_udp",
-  "location_code": "DE"
+  "location_code": "DE",
+  "use_warp": true
 }
 ```
 
@@ -568,7 +590,9 @@ END;
   "auth_password": "token_lite_sandbox_001",
   "ovpn_config": "# Sentra Platform - OpenVPN Client Profile\nclient\ndev tun\nproto udp\nremote 127.0.0.1 1194\n...",
   "stunnel": null,
-  "ikev2": null
+  "ikev2": null,
+  "use_warp": true,
+  "warp_subnet": "10.8.10.0/24"
 }
 ```
 

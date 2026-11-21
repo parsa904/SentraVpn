@@ -132,6 +132,9 @@ pub fn admin_official_outbounds_hub_keyboard() -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("➕ افزودن اوتباند جدید (رسمی)", "adm_ob_add_start"),
         ],
         vec![
+            InlineKeyboardButton::callback("⚡️ تولید و شارژ خودکار اکانت WARP", "adm_warp_generate"),
+        ],
+        vec![
             InlineKeyboardButton::callback("🌐 لیست نودهای وب‌گردی", "adm_ob_list_web_browsing"),
             InlineKeyboardButton::callback("📥 لیست نودهای دانلود", "adm_ob_list_download"),
         ],

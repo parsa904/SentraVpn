@@ -1,4 +1,5 @@
 use crate::error::CoreError;
+use sqlx::Row;
 use crate::models::{
     AppRelease, ConnectionModeInfo, DonatedOutbound, Donation, Outbound, Subscription, User,
     UserDevice,
@@ -393,6 +394,30 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
         );
         "#
     ).execute(pool).await;
+
+    // Cloudflare WARP Accounts table
+    let _ = sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS warp_accounts (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            private_key         TEXT NOT NULL,
+            public_key          TEXT NOT NULL,
+            address_v4          TEXT NOT NULL,
+            address_v6          TEXT NOT NULL,
+            reserved            TEXT NOT NULL,
+            account_id          TEXT,
+            token               TEXT,
+            license_key         TEXT,
+            account_type        TEXT NOT NULL DEFAULT 'free',
+            is_active           INTEGER NOT NULL DEFAULT 1,
+            created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_warp_accounts_is_active ON warp_accounts(is_active);
+        "#
+    ).execute(pool).await;
+
+    // Add use_warp column to device_sessions
+    let _ = sqlx::query("ALTER TABLE device_sessions ADD COLUMN use_warp INTEGER NOT NULL DEFAULT 0").execute(pool).await;
 
     // Check if existing donated_outbounds table includes static_ip in CHECK constraint
     let table_sql: Option<String> = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='donated_outbounds'")
@@ -3168,6 +3193,78 @@ impl Repository {
         .fetch_optional(pool)
         .await?;
         Ok(row)
+    }
+
+    /// Save or replace active Cloudflare WARP account
+    pub async fn save_warp_account(
+        pool: &DbPool,
+        private_key: &str,
+        public_key: &str,
+        address_v4: &str,
+        address_v6: &str,
+        reserved: &str,
+        account_id: Option<&str>,
+        token: Option<&str>,
+        license_key: Option<&str>,
+        account_type: &str,
+    ) -> Result<i64, CoreError> {
+        // Deactivate previous WARP accounts to keep a single active master
+        let _ = sqlx::query("UPDATE warp_accounts SET is_active = 0").execute(pool).await;
+
+        let row = sqlx::query(
+            r#"
+            INSERT INTO warp_accounts (
+                private_key, public_key, address_v4, address_v6, reserved,
+                account_id, token, license_key, account_type, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            RETURNING id
+            "#
+        )
+        .bind(private_key)
+        .bind(public_key)
+        .bind(address_v4)
+        .bind(address_v6)
+        .bind(reserved)
+        .bind(account_id)
+        .bind(token)
+        .bind(license_key)
+        .bind(account_type)
+        .fetch_one(pool)
+        .await?;
+
+        let id: i64 = row.try_get("id").unwrap_or(1);
+        Ok(id)
+    }
+
+    /// Get current active Cloudflare WARP account
+    pub async fn get_active_warp_account(
+        pool: &DbPool,
+    ) -> Result<Option<crate::models::WarpAccount>, CoreError> {
+        let row = sqlx::query_as::<_, crate::models::WarpAccount>(
+            "SELECT * FROM warp_accounts WHERE is_active = 1 ORDER BY id DESC LIMIT 1"
+        )
+        .fetch_optional(pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Update user session WARP preference
+    pub async fn update_device_use_warp(
+        pool: &DbPool,
+        subscription_id: i64,
+        device_identifier: &str,
+        use_warp: bool,
+    ) -> Result<(), CoreError> {
+        let warp_val = if use_warp { 1 } else { 0 };
+        let _ = sqlx::query(
+            "UPDATE device_sessions SET use_warp = ? WHERE subscription_id = ? AND device_identifier = ?"
+        )
+        .bind(warp_val)
+        .bind(subscription_id)
+        .bind(device_identifier)
+        .execute(pool)
+        .await;
+        Ok(())
     }
 }
 

@@ -197,6 +197,7 @@ impl VpnManager {
         anti_dpi: &crate::state::AntiDpiSettings,
         selected_location: Option<&str>,
         dns_config: &crate::state::DnsConfig,
+        use_warp: bool,
     ) -> Result<Value, String> {
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
@@ -219,7 +220,8 @@ impl VpnManager {
             "device_name": dev_name,
             "os": if cfg!(target_os = "android") { "android" } else { "windows" },
             "mode": selected_mode,
-            "protocol": selected_protocol
+            "protocol": selected_protocol,
+            "use_warp": if selected_mode == "static_ip" { false } else { use_warp }
         });
         if let Some(loc) = selected_location {
             if !loc.is_empty() && loc != "auto" {
@@ -635,7 +637,7 @@ impl VpnManager {
 
         self.is_running.store(true, Ordering::SeqCst);
 
-        let (token, mode, protocol, split, sandbox, anti_dpi, location, dns_cfg) = {
+        let (token, mode, protocol, split, sandbox, anti_dpi, location, dns_cfg, use_warp) = {
             let s = app_state.lock().await;
             (
                 s.subscription_token.clone().unwrap_or_else(|| "token_lite_sandbox_001".to_string()),
@@ -646,6 +648,7 @@ impl VpnManager {
                 s.anti_dpi.clone(),
                 s.selected_location.clone(),
                 s.dns_config.clone(),
+                s.use_warp,
             )
         };
 
@@ -663,14 +666,14 @@ impl VpnManager {
         {
             let mut state = app_state.lock().await;
             state.status = ConnectionStatus::Connecting;
-            state.logs.push(format!("[INFO] [Core] Initiating connection in mode [{}] with protocol [{}]...", mode, protocol));
+            state.logs.push(format!("[INFO] [Core] Initiating connection in mode [{}] with protocol [{}] (WARP: {})...", mode, protocol, if use_warp && mode != "static_ip" { "ON" } else { "OFF" }));
         }
 
         TelemetryService::emit_status_change(&app_handle, "Connecting", &mode, None);
         TelemetryService::emit_log(
             &app_handle,
             "INFO",
-            &format!("[Core] Requesting secure profile for mode [{}] and protocol [{}]...", mode, protocol),
+            &format!("[Core] Requesting secure profile for mode [{}] and protocol [{}] (WARP: {})...", mode, protocol, if use_warp && mode != "static_ip" { "ON" } else { "OFF" }),
         );
 
         // Fetch / compile config
@@ -682,6 +685,7 @@ impl VpnManager {
             &anti_dpi,
             Some(&location),
             &dns_cfg,
+            use_warp,
         ).await {
             Ok(cfg) => cfg,
             Err(e) => {
