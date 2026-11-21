@@ -367,15 +367,15 @@ pub async fn set_routing_mode(
 
 #[tauri::command]
 pub async fn test_api_connection(state: State<'_, AppState>) -> Result<String, String> {
-    info!("Testing connectivity to Sentra Core API on http://127.0.0.1:8080/health...");
+    info!("Testing connectivity to Sentra Core API on https://head.cyberservice.sbs:8443/health...");
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(4))
         .build()
         .map_err(|e| e.to_string())?;
 
     let start = std::time::Instant::now();
     let resp = client
-        .get("http://127.0.0.1:8080/health")
+        .get("https://head.cyberservice.sbs:8443/health")
         .send()
         .await;
 
@@ -384,8 +384,8 @@ pub async fn test_api_connection(state: State<'_, AppState>) -> Result<String, S
     let mut app_state = state.lock().await;
     match resp {
         Ok(r) if r.status().is_success() => {
-            let log_entry = format!("[INFO] [API] Sentra Core online at 127.0.0.1:8080 (Latency: {}ms)", duration_ms);
-            app_state.logs.push(log_entry.clone());
+            let log_entry = format!("[INFO] [API] Sentra Core online at head.cyberservice.sbs:8443 (Latency: {}ms)", duration_ms);
+            app_state.logs.push(log_entry);
             Ok(format!("اتصال به API مرکزی برقرار است (تاخیر: {} میلی‌ثانیه)", duration_ms))
         }
         Ok(r) => {
@@ -394,9 +394,9 @@ pub async fn test_api_connection(state: State<'_, AppState>) -> Result<String, S
             Err(format!("پاسخ سرور با کد خطا مواجه شد: HTTP {}", r.status()))
         }
         Err(e) => {
-            let log_entry = format!("[ERROR] [API] Failed to connect to 127.0.0.1:8080: {}", e);
+            let log_entry = format!("[ERROR] [API] Failed to connect to head.cyberservice.sbs:8443: {}", e);
             app_state.logs.push(log_entry);
-            Err("سرور مرکزی (sentra-core) روی پورت ۸۰۸۰ در دسترس نیست.".to_string())
+            Err("سرور مرکزی (head.cyberservice.sbs:8443) در دسترس نیست.".to_string())
         }
     }
 }
@@ -672,11 +672,11 @@ pub async fn get_available_locations(
     token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(4))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let mut req = client.get("http://127.0.0.1:8080/api/v1/client/locations");
+    let mut req = client.get("https://head.cyberservice.sbs:8443/api/v1/client/locations");
     if let Some(t) = token {
         req = req.header("X-Subscription-Token", t);
     }

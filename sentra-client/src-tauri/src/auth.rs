@@ -5,9 +5,7 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 
 pub const BACKEND_FALLBACK_URLS: &[&str] = &[
-    "http://127.0.0.1:8080",
-    "https://api1.sentravpn.org",
-    "https://api2.sentravpn.org",
+    "https://head.cyberservice.sbs:8443",
 ];
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
