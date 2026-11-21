@@ -55,6 +55,15 @@ pub struct DonatedOutbound {
     pub last_checked_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub allow_web: i64,
+    pub allow_download: i64,
+    pub allow_static_ip: i64,
+    pub gemini_ok: i64,
+    pub trading_safe: i64,
+    pub speed_score: i64,
+    pub jitter_ms: i64,
+    pub last_online_at: Option<DateTime<Utc>>,
+    pub allocation_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

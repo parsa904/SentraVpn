@@ -147,17 +147,20 @@ pub fn admin_official_outbounds_hub_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
-/// Inline keyboard for selecting target category for new official outbound
+/// Inline keyboard for selecting target allocation for new official outbound
 pub fn admin_select_outbound_target_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("🌐 ۱. وب‌گردی (Web Browsing)", "adm_ob_target_web_browsing"),
+            InlineKeyboardButton::callback("🌐 فقط بخش رایگان (وب‌گردی / دانلود)", "adm_ob_alloc_free_only"),
         ],
         vec![
-            InlineKeyboardButton::callback("📥 ۲. دانلود (Download)", "adm_ob_target_download"),
+            InlineKeyboardButton::callback("💎 فقط بخش آی‌پی ثابت (ترید و جمنای)", "adm_ob_alloc_static_only"),
         ],
         vec![
-            InlineKeyboardButton::callback("🔒 ۳. آی‌پی ثابت (Static IP - ترید و جمنای)", "adm_ob_target_static_ip"),
+            InlineKeyboardButton::callback("⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)", "adm_ob_alloc_both"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("🤖 تشخیص هوشمند خودکار (بر اساس تست جمنای و سرعت)", "adm_ob_alloc_auto"),
         ],
         vec![
             InlineKeyboardButton::callback("🔙 انصراف و بازگشت", "adm_action_official_outbounds"),
@@ -170,12 +173,37 @@ pub fn admin_official_outbound_actions_keyboard(outbound_id: i64, is_active: boo
     let toggle_label = if is_active { "⏸ غیرفعال‌سازی" } else { "▶️ فعال‌سازی" };
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("🔄 تست مجدد پینگ", format!("adm_ob_ping_{}", outbound_id)),
+            InlineKeyboardButton::callback("🔄 تست کیفیت و پینگ", format!("adm_ob_ping_{}", outbound_id)),
             InlineKeyboardButton::callback(toggle_label, format!("adm_ob_toggle_{}", outbound_id)),
+        ],
+        vec![
+            InlineKeyboardButton::callback("🔀 تغییر تخصیص دسترسی", format!("adm_ob_realloc_{}", outbound_id)),
+            InlineKeyboardButton::callback("🧪 تست جمنای و ترید", format!("adm_ob_gemini_{}", outbound_id)),
         ],
         vec![
             InlineKeyboardButton::callback("🗑 حذف نود", format!("adm_ob_del_{}", outbound_id)),
             InlineKeyboardButton::callback("🔙 بازگشت به لیست", format!("adm_ob_list_{}", category)),
+        ],
+    ])
+}
+
+/// Keyboard for switching node allocation
+pub fn admin_outbound_reallocation_keyboard(outbound_id: i64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("🌐 فقط بخش رایگان (وب / دانلود)", format!("adm_set_alloc_{}_free_only", outbound_id)),
+        ],
+        vec![
+            InlineKeyboardButton::callback("💎 فقط بخش آی‌پی ثابت (ترید و جمنای)", format!("adm_set_alloc_{}_static_only", outbound_id)),
+        ],
+        vec![
+            InlineKeyboardButton::callback("⚡️ هر دو بخش (رایگان + آی‌پی ثابت)", format!("adm_set_alloc_{}_both", outbound_id)),
+        ],
+        vec![
+            InlineKeyboardButton::callback("🤖 تشخیص هوشمند خودکار", format!("adm_set_alloc_{}_auto", outbound_id)),
+        ],
+        vec![
+            InlineKeyboardButton::callback("🔙 انصراف", "adm_action_official_outbounds"),
         ],
     ])
 }

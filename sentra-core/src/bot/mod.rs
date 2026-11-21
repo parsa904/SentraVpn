@@ -371,6 +371,33 @@ pub async fn run_telegram_bot(
                                 if let Err(e) = admin_handlers::handle_target_category_chosen(&bot, &q, admin_chat_id, cat).await {
                                     error!("Error in adm_ob_target: {:?}", e);
                                 }
+                            } else if let Some(alloc) = data.strip_prefix("adm_ob_alloc_") {
+                                if let Err(e) = admin_handlers::handle_target_category_chosen(&bot, &q, admin_chat_id, alloc).await {
+                                    error!("Error in adm_ob_alloc: {:?}", e);
+                                }
+                            } else if let Some(id_str) = data.strip_prefix("adm_ob_realloc_") {
+                                if let Ok(ob_id) = id_str.parse::<i64>() {
+                                    if let Err(e) = admin_handlers::handle_realloc_official_outbound_menu_callback(&bot, &q, admin_chat_id, ob_id).await {
+                                        error!("Error in adm_ob_realloc: {:?}", e);
+                                    }
+                                }
+                            } else if let Some(rest) = data.strip_prefix("adm_set_alloc_") {
+                                // format: {outbound_id}_{mode}
+                                if let Some(idx) = rest.find('_') {
+                                    let id_part = &rest[..idx];
+                                    let mode_part = &rest[idx + 1..];
+                                    if let Ok(ob_id) = id_part.parse::<i64>() {
+                                        if let Err(e) = admin_handlers::handle_set_outbound_allocation_callback(&bot, &q, &pool, admin_chat_id, ob_id, mode_part).await {
+                                            error!("Error in adm_set_alloc: {:?}", e);
+                                        }
+                                    }
+                                }
+                            } else if let Some(id_str) = data.strip_prefix("adm_ob_gemini_") {
+                                if let Ok(ob_id) = id_str.parse::<i64>() {
+                                    if let Err(e) = admin_handlers::handle_test_gemini_outbound_callback(&bot, &q, &pool, admin_chat_id, ob_id).await {
+                                        error!("Error in adm_ob_gemini: {:?}", e);
+                                    }
+                                }
                             } else if let Some(cat) = data.strip_prefix("adm_ob_list_") {
                                 if let Err(e) = admin_handlers::handle_list_official_outbounds(&bot, &q, &pool, admin_chat_id, cat).await {
                                     error!("Error in adm_ob_list: {:?}", e);

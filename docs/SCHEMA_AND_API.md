@@ -175,6 +175,15 @@ CREATE TABLE IF NOT EXISTS donated_outbounds (
     label                   TEXT,                -- برچسب سفارشی نود رسمی (مانند US-Static-01 یا DE-Download-01)
     country_code            TEXT NOT NULL DEFAULT 'XX', -- کد کشور (مانند DE, NL, FI, US)
     country_name            TEXT NOT NULL DEFAULT 'جهانی 🌍', -- نام و پرچم کشور
+    allow_web               INTEGER NOT NULL DEFAULT 1,  -- مجوز سرویس‌دهی در استخر وب‌گردی
+    allow_download          INTEGER NOT NULL DEFAULT 1,  -- مجوز سرویس‌دهی در استخر دانلود پرسرعت
+    allow_static_ip         INTEGER NOT NULL DEFAULT 0,  -- مجوز سرویس‌دهی در استخر آی‌پی ثابت مسکونی (ترید و جمنای)
+    gemini_ok               INTEGER NOT NULL DEFAULT 0,  -- تایید دسترسی بدون خطای منطقه‌ای به Google Gemini
+    trading_safe            INTEGER NOT NULL DEFAULT 0,  -- تایید اتصال پایدار برای پلتفرم‌های ترید (Jitter < 30ms)
+    speed_score             INTEGER NOT NULL DEFAULT 50, -- امتیاز رتبه‌بندی کیفیت و سرعت (۰ تا ۱۰۰)
+    jitter_ms               INTEGER NOT NULL DEFAULT 0,  -- نوسان تاخیر پینگ شبکه
+    last_online_at          DATETIME,                    -- آخرین زمان موفقیت‌آمیز پاسخگویی (جهت پاکسازی ۴۸ ساعته نودهای مرده)
+    allocation_mode         TEXT NOT NULL DEFAULT 'auto', -- نحوه تخصیص (free_only, static_only, both, auto)
     last_checked_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -186,6 +195,10 @@ CREATE INDEX IF NOT EXISTS idx_donated_assigned_tier ON donated_outbounds(assign
 CREATE INDEX IF NOT EXISTS idx_donated_server ON donated_outbounds(server_address, server_port);
 CREATE INDEX IF NOT EXISTS idx_donated_is_official ON donated_outbounds(is_official);
 CREATE INDEX IF NOT EXISTS idx_donated_country_code ON donated_outbounds(country_code);
+CREATE INDEX IF NOT EXISTS idx_donated_speed_score ON donated_outbounds(speed_score);
+CREATE INDEX IF NOT EXISTS idx_donated_allow_static ON donated_outbounds(allow_static_ip);
+CREATE INDEX IF NOT EXISTS idx_donated_allow_web ON donated_outbounds(allow_web);
+CREATE INDEX IF NOT EXISTS idx_donated_allow_dl ON donated_outbounds(allow_download);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_donated_fingerprint ON donated_outbounds(fingerprint_sha256);
 
 -- ============================================================================

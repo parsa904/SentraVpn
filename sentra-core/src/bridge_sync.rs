@@ -30,7 +30,7 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
     let mut singbox_outbounds: Vec<Value> = Vec::new();
     let mut web_outbound_tags: Vec<String> = Vec::new();
     let mut dl_outbound_tags: Vec<String> = Vec::new();
-    let mut static_target_tag = "direct-out".to_string();
+    let mut static_outbound_tags: Vec<String> = Vec::new();
 
     // Default direct outbound fallback
     singbox_outbounds.push(json!({
@@ -38,7 +38,7 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
         "tag": "direct-out"
     }));
 
-    // Register all active web outbounds with country tags
+    // Register all active web outbounds with country tags (sorted by speed_score DESC, latency_ms ASC)
     for dob in &web_outbounds {
         if let Ok(mut parsed) = serde_json::from_str::<Value>(&dob.config_json) {
             let tag = format!("out-web-{}-{}", dob.country_code.to_lowercase(), dob.id);
@@ -50,7 +50,7 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
         }
     }
 
-    // Register all active download outbounds with country tags
+    // Register all active download outbounds with country tags (sorted by speed_score DESC, latency_ms ASC)
     for dob in &dl_outbounds {
         if let Ok(mut parsed) = serde_json::from_str::<Value>(&dob.config_json) {
             let tag = format!("out-dl-{}-{}", dob.country_code.to_lowercase(), dob.id);
@@ -62,17 +62,35 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
         }
     }
 
-    // Register static_ip outbound
-    if let Some(dob) = static_outbounds.first() {
+    // Register static_ip outbounds (sorted by speed_score DESC, latency_ms ASC)
+    for dob in &static_outbounds {
         if let Ok(mut parsed) = serde_json::from_str::<Value>(&dob.config_json) {
-            let tag = format!("out-static-{}", dob.id);
+            let tag = format!("out-static-{}-{}", dob.country_code.to_lowercase(), dob.id);
             if let Some(obj) = parsed.as_object_mut() {
                 obj.insert("tag".to_string(), json!(tag));
             }
             singbox_outbounds.push(parsed);
-            static_target_tag = tag;
+            static_outbound_tags.push(tag);
         }
     }
+
+    let static_target_tag = if !static_outbound_tags.is_empty() {
+        if static_outbound_tags.len() > 1 {
+            singbox_outbounds.push(json!({
+                "type": "urltest",
+                "tag": "out-static-auto",
+                "outbounds": static_outbound_tags,
+                "url": "https://api.binance.com/api/v3/ping",
+                "interval": "5m",
+                "tolerance": 30
+            }));
+            "out-static-auto".to_string()
+        } else {
+            static_outbound_tags[0].clone()
+        }
+    } else {
+        "direct-out".to_string()
+    };
 
     // Create urltest Auto groups for web and download
     let web_target_tag = if !web_outbound_tags.is_empty() {
@@ -233,7 +251,13 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
     });
 
     let bridge_path_str = env::var("SINGBOX_BRIDGE_PATH")
-        .unwrap_or_else(|_| "/etc/sing-box/bridge-config.json".to_string());
+        .unwrap_or_else(|_| {
+            if Path::new("/etc/sing-box/config.json").exists() || Path::new("/etc/sing-box").exists() {
+                "/etc/sing-box/config.json".to_string()
+            } else {
+                "/etc/sing-box/bridge-config.json".to_string()
+            }
+        });
     let bridge_path = Path::new(&bridge_path_str);
 
     if let Some(parent) = bridge_path.parent() {
@@ -243,12 +267,16 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
     let formatted_json = serde_json::to_string_pretty(&config)
         .map_err(|e| CoreError::Internal(format!("Failed to serialize bridge config: {}", e)))?;
 
-    match fs::write(bridge_path, formatted_json) {
+    match fs::write(bridge_path, &formatted_json) {
         Ok(_) => {
             info!(
                 "[BridgeSync] Successfully written bridge config to {:?}. Reloading sing-box...",
                 bridge_path
             );
+            // Also write mirror copy to /etc/sing-box/bridge-config.json if target was config.json
+            if bridge_path_str.ends_with("config.json") {
+                let _ = fs::write("/etc/sing-box/bridge-config.json", &formatted_json);
+            }
             reload_singbox_service();
         }
         Err(e) => {

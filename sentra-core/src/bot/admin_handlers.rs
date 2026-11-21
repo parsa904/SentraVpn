@@ -1,11 +1,12 @@
 use crate::bot::keyboards::{
     admin_app_release_inline_keyboard, admin_dashboard_inline_keyboard,
     admin_official_outbound_actions_keyboard, admin_official_outbounds_hub_keyboard,
-    admin_outbounds_inline_keyboard, admin_select_outbound_target_keyboard,
-    admin_user_card_inline_keyboard, user_main_keyboard,
+    admin_outbound_reallocation_keyboard, admin_outbounds_inline_keyboard,
+    admin_select_outbound_target_keyboard, admin_user_card_inline_keyboard, user_main_keyboard,
 };
 use crate::db::{DbPool, Repository};
 use crate::outbound_analyzer::OutboundAnalyzer;
+use crate::quality_engine::QualityEngine;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -1617,9 +1618,11 @@ pub async fn handle_target_category_chosen(
     .await;
 
     let cat_fa = match category {
-        "web_browsing" => "🌐 وب‌گردی (Web Browsing)",
+        "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
+        "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
+        "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
+        "auto" => "🤖 تشخیص هوشمند خودکار (بر اساس تست جمنای و سرعت)",
         "download" => "📥 دانلود (Download)",
-        "static_ip" => "🔒 آی‌پی ثابت مسکونی (Static IP)",
         _ => category,
     };
 
@@ -1856,9 +1859,11 @@ pub async fn handle_admin_outbound_text_input(
     clear_admin_outbound_state(telegram_user_id).await;
 
     let cat_fa = match category {
-        "web_browsing" => "🌐 وب‌گردی (Web Browsing)",
+        "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
+        "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
+        "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
+        "auto" => "🤖 تشخیص هوشمند خودکار (بر اساس تست جمنای و سرعت)",
         "download" => "📥 دانلود (Download)",
-        "static_ip" => "🔒 آی‌پی ثابت مسکونی (Static IP)",
         _ => category,
     };
     let status_badge = if is_online {
@@ -1908,9 +1913,11 @@ pub async fn handle_list_official_outbounds(
     }
 
     let cat_fa = match category {
-        "web_browsing" => "🌐 وب‌گردی (Web Browsing)",
+        "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
+        "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
+        "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
+        "auto" => "🤖 تشخیص هوشمند خودکار (بر اساس تست جمنای و سرعت)",
         "download" => "📥 دانلود (Download)",
-        "static_ip" => "🔒 آی‌پی ثابت مسکونی (Static IP)",
         _ => category,
     };
 
@@ -1949,21 +1956,46 @@ pub async fn handle_list_official_outbounds(
 
         for ob in &nodes {
             let status_icon = if ob.status == "active" { "🟢 فعال / آنلاین" } else { "🔴 غیرفعال / آفلاین" };
+            let alloc_desc = if ob.allow_static_ip == 1 && ob.allow_web == 1 {
+                "⚡️ هر دو بخش (رایگان + آی‌پی ثابت)"
+            } else if ob.allow_static_ip == 1 {
+                "💎 فقط آی‌پی ثابت (ترید و جمنای)"
+            } else {
+                "🌐 فقط بخش رایگان (وب / دانلود)"
+            };
+            let gemini_badge = if ob.gemini_ok == 1 { "✅ سازگار و آماده" } else { "❌ ناموفق / تست‌نشده" };
+            let trading_badge = if ob.trading_safe == 1 { "✅ پایدار (Jitter < 30ms)" } else { "⚠️ نامناسب" };
+            let last_seen = ob.last_online_at
+                .map(|t| t.with_timezone(&chrono_tz::Asia::Tehran).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "ثبت‌نشده".to_string());
+
             let card = format!(
                 r#"🔹 <b>{}</b> ({})
-• شناسه: <code>#{}</code> | پروتکل: <code>{}</code>
+• شناسه: <code>#{}</code> | پروتکل: <code>{}</code> | کشور: <code>{}</code>
 • آدرس سرور: <code>{}:{}</code>
-• آخرین پینگ: <b>{} ms</b> | سلامت: <b>{}%</b>
-• ترافیک مصرفی: <b>{}</b>"#,
+• تخصیص دسترسی: <b>{}</b> (حالت: <code>{}</code>)
+• امتیاز کیفیت سرعت: <b>{}/100</b> | پینگ: <b>{} ms</b> (نوسان: <b>{} ms</b>)
+• پهنای باند تخمینی: <b>{:.1} Mbps</b> | ترافیک مصرفی: <b>{}</b>
+• تست Google Gemini: <b>{}</b>
+• تست پایداری ترید (Trading): <b>{}</b>
+• آخرین اتصال موفق: <code>{}</code>"#,
                 ob.label.as_deref().unwrap_or(&ob.tag),
                 status_icon,
                 ob.id,
                 ob.protocol,
+                ob.country_code,
                 ob.server_address,
                 ob.server_port,
+                alloc_desc,
+                ob.allocation_mode,
+                ob.speed_score,
                 ob.latency_ms,
-                ob.health_score,
-                format_traffic(ob.bytes_served)
+                ob.jitter_ms,
+                ob.speed_mbps,
+                format_traffic(ob.bytes_served),
+                gemini_badge,
+                trading_badge,
+                last_seen
             );
 
             bot.send_message(msg.chat().id, card)
@@ -1977,7 +2009,7 @@ pub async fn handle_list_official_outbounds(
     Ok(())
 }
 
-/// Re-test latency of an official outbound
+/// Re-test latency, jitter, speed score and gemini readiness of an official outbound
 pub async fn handle_ping_official_outbound_callback(
     bot: &Bot,
     q: &CallbackQuery,
@@ -1999,7 +2031,7 @@ pub async fn handle_ping_official_outbound_callback(
         }
     };
 
-    bot.answer_callback_query(q.id.clone()).text("⏳ در حال تست اتصال و سنجش پینگ...").await?;
+    bot.answer_callback_query(q.id.clone()).text("⏳ در حال تست اتصال، نوسان (Jitter) و امتیاز سرعت...").await?;
 
     let ip = match OutboundAnalyzer::check_anti_ssrf(&ob.server_address).await {
         Ok(ip) => ip,
@@ -2009,34 +2041,80 @@ pub async fn handle_ping_official_outbound_callback(
         }
     };
 
-    let (latency_ms, speed_mbps, is_online, _err) = OutboundAnalyzer::benchmark_proxy(ip, ob.server_port as u16).await;
-    Repository::update_official_outbound_benchmark(pool, outbound_id, latency_ms, speed_mbps, is_online).await?;
+    let (latency_ms, jitter_ms, speed_mbps, speed_score, is_online) =
+        QualityEngine::test_outbound_network_quality(ip, ob.server_port as u16).await;
+
+    let parsed_config: serde_json::Value = serde_json::from_str(&ob.config_json).unwrap_or_default();
+    let (gemini_ok, trading_safe) =
+        QualityEngine::test_gemini_and_trading_readiness(ip, ob.server_port as u16, &parsed_config, &ob.country_code, jitter_ms).await;
+
+    Repository::update_outbound_quality_metrics(
+        pool,
+        outbound_id,
+        latency_ms,
+        jitter_ms,
+        speed_mbps,
+        speed_score,
+        gemini_ok,
+        trading_safe,
+        is_online,
+    )
+    .await?;
+
+    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
 
     let alert_msg = if is_online {
-        format!("✅ پینگ جدید: {} ms | سرعت: {:.1} Mbps", latency_ms, speed_mbps)
+        format!(
+            "✅ نتایج تست کیفیت:\n• پینگ: {} ms | نوسان: {} ms\n• امتیاز سرعت: {}/100\n• تست جمنای: {}\n• تست ترید: {}",
+            latency_ms,
+            jitter_ms,
+            speed_score,
+            if gemini_ok { "✅ تایید" } else { "❌ ناموفق" },
+            if trading_safe { "✅ پایدار" } else { "⚠️ ناپایدار" }
+        )
     } else {
-        "🔴 خطا: تایم‌اوت اتصال به سرور".to_string()
+        "🔴 خطا: عدم پاسخ به تست پینگ در ۳ تلاش متوالی".to_string()
     };
 
     // Update message card if available
     if let Some(msg) = &q.message {
         let status_icon = if is_online { "🟢 فعال / آنلاین" } else { "🔴 غیرفعال / آفلاین" };
+        let alloc_desc = if ob.allow_static_ip == 1 && ob.allow_web == 1 {
+            "⚡️ هر دو بخش (رایگان + آی‌پی ثابت)"
+        } else if ob.allow_static_ip == 1 {
+            "💎 فقط آی‌پی ثابت (ترید و جمنای)"
+        } else {
+            "🌐 فقط بخش رایگان (وب / دانلود)"
+        };
+        let gemini_badge = if gemini_ok { "✅ سازگار و آماده" } else { "❌ ناموفق" };
+        let trading_badge = if trading_safe { "✅ پایدار (Jitter < 30ms)" } else { "⚠️ نامناسب" };
+
         let card = format!(
             r#"🔹 <b>{}</b> ({})
-• شناسه: <code>#{}</code> | پروتکل: <code>{}</code>
+• شناسه: <code>#{}</code> | پروتکل: <code>{}</code> | کشور: <code>{}</code>
 • آدرس سرور: <code>{}:{}</code>
-• آخرین پینگ: <b>{} ms</b> | سلامت: <b>{}%</b>
-• ترافیک مصرفی: <b>{}</b>
-<i>(بروزرسانی‌شده در همین لحظه)</i>"#,
+• تخصیص دسترسی: <b>{}</b> (حالت: <code>{}</code>)
+• امتیاز کیفیت سرعت: <b>{}/100</b> | پینگ: <b>{} ms</b> (نوسان: <b>{} ms</b>)
+• پهنای باند تخمینی: <b>{:.1} Mbps</b> | ترافیک مصرفی: <b>{}</b>
+• تست Google Gemini: <b>{}</b>
+• تست پایداری ترید (Trading): <b>{}</b>
+<i>(بروزرسانی‌شده در همین لحظه توسط موتور کیفیت)</i>"#,
             ob.label.as_deref().unwrap_or(&ob.tag),
             status_icon,
             ob.id,
             ob.protocol,
+            ob.country_code,
             ob.server_address,
             ob.server_port,
+            alloc_desc,
+            ob.allocation_mode,
+            speed_score,
             latency_ms,
-            if is_online { 100 } else { 0 },
-            format_traffic(ob.bytes_served)
+            jitter_ms,
+            speed_mbps,
+            format_traffic(ob.bytes_served),
+            gemini_badge,
+            trading_badge
         );
 
         let _ = bot.edit_message_text(msg.chat().id, msg.id(), card)
@@ -2046,6 +2124,168 @@ pub async fn handle_ping_official_outbound_callback(
     }
 
     let _ = bot.send_message(q.from.id, alert_msg).await;
+    Ok(())
+}
+
+/// Open reallocation menu for an outbound
+pub async fn handle_realloc_official_outbound_menu_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    admin_chat_id: i64,
+    outbound_id: i64,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone()).text("⛔ دسترسی غیرمجاز!").show_alert(true).await?;
+        return Ok(());
+    }
+
+    let prompt = format!(
+        r#"🔀 <b>تغییر تخصیص دسترسی نود #{}</b>
+
+لطفاً بخش مجاز برای سرویس‌دهی این نود را انتخاب نمایید:"#,
+        outbound_id
+    );
+
+    if let Some(msg) = &q.message {
+        bot.edit_message_text(msg.chat().id, msg.id(), prompt)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(admin_outbound_reallocation_keyboard(outbound_id))
+            .await?;
+    }
+    bot.answer_callback_query(q.id.clone()).await?;
+    Ok(())
+}
+
+/// Set outbound allocation mode (free_only, static_only, both, auto)
+pub async fn handle_set_outbound_allocation_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+    admin_chat_id: i64,
+    outbound_id: i64,
+    alloc_mode: &str,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone()).text("⛔ دسترسی غیرمجاز!").show_alert(true).await?;
+        return Ok(());
+    }
+
+    let (allow_web, allow_download, allow_static_ip) = match alloc_mode {
+        "free_only" => (true, true, false),
+        "static_only" => (false, false, true),
+        "both" => (true, true, true),
+        _ => (true, true, false), // auto initially starts with free, updated by engine
+    };
+
+    Repository::update_outbound_allocation(
+        pool,
+        outbound_id,
+        allow_web,
+        allow_download,
+        allow_static_ip,
+        alloc_mode,
+    )
+    .await?;
+
+    // Auto-sync server bridge
+    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
+
+    let desc = match alloc_mode {
+        "free_only" => "🌐 فقط بخش رایگان (وب / دانلود)",
+        "static_only" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
+        "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت)",
+        _ => "🤖 تشخیص هوشمند خودکار",
+    };
+
+    bot.answer_callback_query(q.id.clone())
+        .text(format!("✅ تخصیص نود به [{}] تغییر یافت.", desc))
+        .show_alert(true)
+        .await?;
+
+    if let Some(msg) = &q.message {
+        let _ = bot.edit_message_text(
+            msg.chat().id,
+            msg.id(),
+            format!("✅ <b>تخصیص دسترسی نود #{} با موفقیت روی [{}] تنظیم و در پل سرور همگام شد.</b>", outbound_id, desc),
+        )
+        .parse_mode(ParseMode::Html)
+        .reply_markup(admin_official_outbounds_hub_keyboard())
+        .await;
+    }
+
+    Ok(())
+}
+
+/// Run instant Gemini & Trading test for a single outbound
+pub async fn handle_test_gemini_outbound_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+    admin_chat_id: i64,
+    outbound_id: i64,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone()).text("⛔ دسترسی غیرمجاز!").show_alert(true).await?;
+        return Ok(());
+    }
+
+    let ob = match Repository::get_official_outbound_by_id(pool, outbound_id).await? {
+        Some(o) => o,
+        None => {
+            bot.answer_callback_query(q.id.clone()).text("نود یافت نشد.").show_alert(true).await?;
+            return Ok(());
+        }
+    };
+
+    bot.answer_callback_query(q.id.clone()).text("🧪 در حال اجرای تست تخصصی Google Gemini و Trading...").await?;
+
+    let ip = match OutboundAnalyzer::check_anti_ssrf(&ob.server_address).await {
+        Ok(ip) => ip,
+        Err(_) => {
+            bot.send_message(q.from.id, "❌ خطای DNS سرور").await?;
+            return Ok(());
+        }
+    };
+
+    let (_lat, jitter_ms, _spd, _score, _up) =
+        QualityEngine::test_outbound_network_quality(ip, ob.server_port as u16).await;
+
+    let parsed_config: serde_json::Value = serde_json::from_str(&ob.config_json).unwrap_or_default();
+    let (gemini_ok, trading_safe) =
+        QualityEngine::test_gemini_and_trading_readiness(ip, ob.server_port as u16, &parsed_config, &ob.country_code, jitter_ms).await;
+
+    Repository::update_outbound_quality_metrics(
+        pool,
+        outbound_id,
+        ob.latency_ms,
+        jitter_ms,
+        ob.speed_mbps,
+        ob.speed_score,
+        gemini_ok,
+        trading_safe,
+        true,
+    )
+    .await?;
+
+    let report_msg = format!(
+        r#"🧪 <b>نتایج تست سازگاری نود #{}:</b>
+
+• 🤖 <b>Google Gemini:</b> {}
+• 📈 <b>پایداری ترید (Trading Jitter &lt; 30ms):</b> {} (نوسان فعلی: <code>{} ms</code>)
+• 🔒 <b>شرایط ورود به استخر آی‌پی ثابت:</b> {}
+
+⚡️ وضعیت در دیتابیس ثبت و در پل سرور همگام گردید."#,
+        outbound_id,
+        if gemini_ok { "✅ سازگار و بدون فیلتر منطقه‌ای" } else { "❌ مسدود یا نیازمند احراز هویت" },
+        if trading_safe { "✅ فوق‌العاده پایدار" } else { "⚠️ ناپایدار برای ترید لحظه‌ای" },
+        jitter_ms,
+        if gemini_ok && trading_safe { "✅ واجد شرایط (تایید شده)" } else { "❌ فاقد شرایط آی‌پی ثابت" }
+    );
+
+    let _ = bot.send_message(q.from.id, report_msg).parse_mode(ParseMode::Html).await;
     Ok(())
 }
 
