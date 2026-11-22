@@ -42,9 +42,13 @@
 CREATE TABLE IF NOT EXISTS users (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     user_uuid               TEXT NOT NULL UNIQUE, -- شناسه جهانی یکتا برای اتصال در تمامی کلاینت‌ها
-    telegram_id             BIGINT UNIQUE,        -- شناسه تلگرام (اختیاری جهت پشتیبانی از ثبت‌نام مستقیم در اپ)
-    username                TEXT UNIQUE,          -- نام کاربری جهت ورود مستقیم با پسورد
+    email                   TEXT UNIQUE,          -- ایمیل یکتا جهت احراز هویت
     password_hash           TEXT,                 -- هش ایمن پسورد با الگوریتم صنعتی Argon2id
+    telegram_id             BIGINT UNIQUE,        -- شناسه عددی تلگرام (اختیاری)
+    telegram_verified       INTEGER NOT NULL DEFAULT 0, -- تایید حساب در ربات تلگرام (شرط دسترسی به حالت دانلود)
+    verify_code             TEXT,                 -- کد موقت ۶ رقمی تایید تلگرام (انقضای ۱۵ دقیقه)
+    verify_code_expires_at  DATETIME,             -- تاریخ انقضای کد تایید
+    username                TEXT UNIQUE,          -- نام کاربری
     first_name              TEXT NOT NULL,
     last_name               TEXT,
     role                    TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('user', 'admin', 'reseller')),
@@ -59,10 +63,10 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_uuid ON users(user_uuid);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);
-CREATE INDEX IF NOT EXISTS idx_users_auth_code ON users(auth_code);
-CREATE INDEX IF NOT EXISTS idx_users_link_code ON users(link_code);
+CREATE INDEX IF NOT EXISTS idx_users_verify_code ON users(verify_code);
 
 -- ============================================================================
 -- 2. جدول اشتراک‌ها (SUBSCRIPTIONS)
@@ -309,22 +313,18 @@ CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON support_tickets(user_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON support_tickets(status);
 
 -- ============================================================================
--- 8. جدول نسخه‌های رسمی اپلیکیشن کلاینت (APP_RELEASES)
+-- 8. جدول متمرکز نسخه‌های رسمی اپلیکیشن کلاینت (APP_RELEASES)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS app_releases (
-    platform            TEXT PRIMARY KEY CHECK(platform IN ('windows', 'android')),
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     version             TEXT NOT NULL,
-    telegram_file_id    TEXT NOT NULL,
-    file_name           TEXT NOT NULL,
-    file_size_mb        REAL NOT NULL DEFAULT 0.0,
     changelog           TEXT NOT NULL DEFAULT '',
+    windows_file_id     TEXT,
+    windows_github_url  TEXT,
+    android_file_id     TEXT,
+    android_github_url  TEXT,
     updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE TRIGGER IF NOT EXISTS trg_app_releases_updated_at AFTER UPDATE ON app_releases
-FOR EACH ROW BEGIN
-    UPDATE app_releases SET updated_at = CURRENT_TIMESTAMP WHERE platform = OLD.platform;
-END;
 ```
 
 ---
@@ -335,8 +335,9 @@ END;
 
 ---
 
-### ۲.۰.۱. ثبت‌نام مستقیم کاربر جدید (`POST /api/v1/auth/register`)
-ثبت‌نام مستقیم و آنی در اپلیکیشن کلاینت ویندوز یا اندروید بدون وابستگی به تلگرام با فعال‌سازی خودکار اشتراک رایگان Sentra Lite و ثبت دستگاه جاری.
+### ۲.۰.۱. ثبت‌نام کاربر با ایمیل و رمز عبور (`POST /api/v1/auth/register`)
+ثبت‌نام مستقیم و آنی در اپلیکیشن کلاینت با ایمیل و رمز عبور (هش‌شده با الگوریتم امن Argon2id).
+* **سطح دسترسی پیش‌فرض:** کاربر بلافاصله به بخش **وب‌گردی (web_browsing)** دسترسی دارد اما بخش **دانلود (download)** تا زمان تایید حساب در ربات تلگرام قفل است (`telegram_verified = false`).
 
 - **مسیر:** `/api/v1/auth/register`
 - **روش:** `POST`
@@ -344,7 +345,7 @@ END;
 - **بدنه درخواست (JSON):**
 ```json
 {
-  "username": "sentra_fan",
+  "email": "user@example.com",
   "password": "StrongPassword123",
   "device_identifier": "sentra-pc-4f81c9a0",
   "device_name": "Windows PC",
@@ -358,12 +359,15 @@ END;
   "success": true,
   "access_token": "jwt_sentra_token_uuid",
   "token_type": "Bearer",
+  "telegram_verified": false,
   "user": {
     "id": 12,
     "user_uuid": "550e8400-e29b-41d4-a716-446655440000",
+    "email": "user@example.com",
     "telegram_id": null,
-    "username": "sentra_fan",
-    "first_name": "sentra_fan",
+    "telegram_verified": false,
+    "username": "user@example.com",
+    "first_name": "user@example.com",
     "role": "user"
   },
   "subscription": {
@@ -379,18 +383,66 @@ END;
 
 ---
 
-### ۲.۰.۲. ورود با نام کاربری و رمز عبور (`POST /api/v1/auth/login`)
-ورود دائمی کاربر ثبت‌نام‌شده با اعتبارسنجی هش `bcrypt` و ثبت نشست دستگاه جدید (با رعایت سقف ۳ دستگاه).
+### ۲.۰.۲. ورود با ایمیل و رمز عبور (`POST /api/v1/auth/login`)
+ورود دائمی کاربر با اعتبارسنجی هش `Argon2id` و دریافت وضعیت تایید تلگرام جهت کنترل قفل بخش دانلود.
 
 - **مسیر:** `/api/v1/auth/login`
 - **روش:** `POST`
 - **بدنه درخواست (JSON):**
 ```json
 {
-  "username": "sentra_fan",
+  "email": "user@example.com",
   "password": "StrongPassword123",
   "device_identifier": "sentra-pc-4f81c9a0",
   "os": "windows"
+}
+```
+- **پاسخ موفق (200 OK):**
+```json
+{
+  "success": true,
+  "access_token": "jwt_sentra_token_uuid",
+  "token_type": "Bearer",
+  "telegram_verified": false,
+  "user": { ... },
+  "subscription": { ... }
+}
+```
+
+---
+
+### ۲.۰.۳. درخواست تایید تلگرام و دریافت لینک اختصاصی (`POST /api/v1/auth/request-telegram-verify`)
+تولید کد موقت ۶ رقمی یکتا با انقضای ۱۵ دقیقه‌ای به همراه لینک مستقیم تلگرام جهت تایید آنی با لمس لینک در ربات (`https://t.me/<BOT_USERNAME>?start=verify_<CODE>`). با تایید این لینک، بخش دانلود برای کاربر باز می‌شود.
+
+- **مسیر:** `/api/v1/auth/request-telegram-verify`
+- **روش:** `POST`
+- **هدرها:** `Authorization: Bearer <access_token>`
+- **پاسخ موفق (200 OK):**
+```json
+{
+  "success": true,
+  "verify_code": "849201",
+  "bot_username": "SentraVpnBot",
+  "verify_url": "https://t.me/SentraVpnBot?start=verify_849201",
+  "expires_in_seconds": 900
+}
+```
+
+---
+
+### ۲.۰.۴. استعلام وضعیت تایید تلگرام (`GET /api/v1/auth/verify-status`)
+بررسی آنی اینکه آیا کاربر حساب تلگرام خود را تایید کرده و بخش دانلود فعال شده است یا خیر.
+
+- **مسیر:** `/api/v1/auth/verify-status`
+- **روش:** `GET`
+- **هدرها:** `Authorization: Bearer <access_token>`
+- **پاسخ موفق (200 OK):**
+```json
+{
+  "success": true,
+  "telegram_verified": true,
+  "telegram_id": 123456789,
+  "email": "user@example.com"
 }
 ```
 

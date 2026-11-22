@@ -89,6 +89,8 @@ pub struct ClientState {
     pub username: String,
     pub remaining_bytes: i64,
     pub expires_at: Option<String>,
+    pub telegram_verified: bool,
+    pub email: Option<String>,
     pub status: ConnectionStatus,
     pub selected_mode: String,
     pub selected_protocol: String,
@@ -118,6 +120,8 @@ impl Default for ClientState {
             username: "مهمان".to_string(),
             remaining_bytes: 10_737_418_240, // 10 GB default
             expires_at: None,
+            telegram_verified: false,
+            email: None,
             status: ConnectionStatus::Disconnected,
             selected_mode: "web_browsing".to_string(),
             selected_protocol: "openvpn_udp".to_string(),

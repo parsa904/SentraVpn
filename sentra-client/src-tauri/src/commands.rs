@@ -20,6 +20,8 @@ pub async fn login_with_code(
     app_state.username = session.username.clone();
     app_state.remaining_bytes = session.remaining_bytes;
     app_state.expires_at = session.expires_at.clone();
+    app_state.telegram_verified = session.telegram_verified;
+    app_state.email = session.email.clone();
 
     let log_msg = format!(
         "[INFO] [Auth] Authenticated as {} (Tier: {})",
@@ -46,6 +48,8 @@ pub async fn register_with_credentials(
     app_state.username = session.username.clone();
     app_state.remaining_bytes = session.remaining_bytes;
     app_state.expires_at = session.expires_at.clone();
+    app_state.telegram_verified = session.telegram_verified;
+    app_state.email = session.email.clone();
 
     let log_msg = format!(
         "[INFO] [Auth] Registered and logged in as {} (Tier: {})",
@@ -72,6 +76,8 @@ pub async fn login_with_credentials(
     app_state.username = session.username.clone();
     app_state.remaining_bytes = session.remaining_bytes;
     app_state.expires_at = session.expires_at.clone();
+    app_state.telegram_verified = session.telegram_verified;
+    app_state.email = session.email.clone();
 
     let log_msg = format!(
         "[INFO] [Auth] Logged in as {} (Tier: {})",
@@ -79,6 +85,33 @@ pub async fn login_with_credentials(
     );
     app_state.logs.push(log_msg);
 
+    Ok(app_state.clone())
+}
+
+#[tauri::command]
+pub async fn request_telegram_verify(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let auth_token = {
+        let app_state = state.lock().await;
+        app_state.auth_token.clone()
+    };
+    let token = auth_token.ok_or("ابتدا وارد حساب کاربری خود شوید.".to_string())?;
+    AuthManager::request_telegram_verify(&token).await
+}
+
+#[tauri::command]
+pub async fn check_telegram_verify_status(state: State<'_, AppState>) -> Result<ClientState, String> {
+    let auth_token = {
+        let app_state = state.lock().await;
+        app_state.auth_token.clone()
+    };
+    let token = auth_token.ok_or("ابتدا وارد حساب کاربری خود شوید.".to_string())?;
+    let is_verified = AuthManager::check_telegram_verify_status(&token).await?;
+
+    let mut app_state = state.lock().await;
+    app_state.telegram_verified = is_verified;
+    if is_verified {
+        app_state.logs.push("[INFO] [Telegram] حساب تلگرام تایید گردید. بخش دانلود فعال شد.".to_string());
+    }
     Ok(app_state.clone())
 }
 

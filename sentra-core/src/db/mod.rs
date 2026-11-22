@@ -1,3 +1,5 @@
+mod extensions;
+
 use crate::error::CoreError;
 use sqlx::Row;
 use crate::models::{
@@ -164,7 +166,7 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
             user_id                 INTEGER NOT NULL,
             tier                    TEXT NOT NULL CHECK(tier IN ('Sentra Lite', 'Sentra Pro', 'Sentra Flow+')),
             token                   TEXT NOT NULL UNIQUE,
-            status                  TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'expired', 'depleted', 'disabled')),
+            status                  TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'expired', 'depleted', 'disabled', 'suspended')),
             upload_bytes            BIGINT NOT NULL DEFAULT 0,
             download_bytes          BIGINT NOT NULL DEFAULT 0,
             traffic_limit_bytes     BIGINT NOT NULL,
@@ -570,24 +572,24 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
         "#
     ).execute(pool).await;
 
-    // 10. APP RELEASES table (Client App Binaries & Telegram file_id)
+    // 10. APP RELEASES table (Unified Client App Releases)
     let _ = sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS app_releases (
-            platform            TEXT PRIMARY KEY CHECK(platform IN ('windows', 'android')),
-            version             TEXT NOT NULL,
-            telegram_file_id    TEXT NOT NULL,
-            file_name           TEXT NOT NULL,
-            file_size_mb        REAL NOT NULL DEFAULT 0.0,
+            id                  INTEGER PRIMARY KEY CHECK(id = 1),
+            version             TEXT NOT NULL DEFAULT '1.0.0',
             changelog           TEXT NOT NULL DEFAULT '',
+            windows_file_id     TEXT,
+            windows_github_url  TEXT,
+            android_file_id     TEXT,
+            android_github_url  TEXT,
             updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE TRIGGER IF NOT EXISTS trg_app_releases_updated_at AFTER UPDATE ON app_releases
-        FOR EACH ROW BEGIN
-            UPDATE app_releases SET updated_at = CURRENT_TIMESTAMP WHERE platform = OLD.platform;
-        END;
         "#
     ).execute(pool).await;
+
+    // Run extended migrations (users alter, unified app_releases migration, password_resets)
+    extensions::run_extended_migrations(pool).await?;
 
     // Seed/Update 4 Connection Modes outbounds (web_browsing, download, static_ip, gaming)
     sqlx::query(
@@ -862,7 +864,7 @@ impl Repository {
     }
 
     /// Builds dynamic 4-mode information for a specific user
-    pub fn build_modes_info(sub: &Subscription) -> Vec<ConnectionModeInfo> {
+    pub fn build_modes_info(sub: &Subscription, telegram_verified: bool) -> Vec<ConnectionModeInfo> {
         let is_free = sub.tier == "Sentra Lite";
 
         let (wb_status, wb_rem) = if is_free {
@@ -873,12 +875,24 @@ impl Repository {
             ("active".to_string(), 999_999)
         };
 
-        let (dl_status, dl_rem) = if is_free {
-            let rem = (3072 - sub.download_used_mb).max(0);
-            let status = if rem == 0 { "depleted" } else { "active" };
-            (status.to_string(), rem)
+        let (dl_status, dl_rem, dl_badge) = if is_free {
+            if !telegram_verified {
+                (
+                    "locked".to_string(),
+                    0i64,
+                    Some("قفل • نیاز به تایید حساب در ربات تلگرام".to_string()),
+                )
+            } else {
+                let rem = (3072 - sub.download_used_mb).max(0);
+                let status = if rem == 0 { "depleted" } else { "active" };
+                (
+                    status.to_string(),
+                    rem,
+                    Some("رایگان • ۳ گیگابایت روزانه".to_string()),
+                )
+            }
         } else {
-            ("active".to_string(), 999_999)
+            ("active".to_string(), 999_999, Some("نامحدود".to_string()))
         };
 
         let (static_status, static_badge, static_limit, static_used, static_rem) = if is_free {
@@ -914,7 +928,7 @@ impl Repository {
                 name: "دانلود".to_string(),
                 icon: "📥".to_string(),
                 status: dl_status,
-                badge: if is_free { Some("رایگان • ۳ گیگابایت روزانه".to_string()) } else { Some("نامحدود".to_string()) },
+                badge: dl_badge,
                 daily_limit_mb: if is_free { 3072 } else { 0 },
                 used_today_mb: sub.download_used_mb,
                 remaining_today_mb: dl_rem,
@@ -1546,8 +1560,9 @@ impl Repository {
         }
 
         let user = sqlx::query_as::<_, User>(
-            "SELECT * FROM users WHERE LOWER(username) = LOWER(?) LIMIT 1"
+            "SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?) LIMIT 1"
         )
+        .bind(clean)
         .bind(clean)
         .fetch_optional(pool)
         .await?;
@@ -2751,33 +2766,47 @@ impl Repository {
         platform: &str,
         version: &str,
         telegram_file_id: &str,
-        file_name: &str,
-        file_size_mb: f64,
+        _file_name: &str,
+        _file_size_mb: f64,
         changelog: &str,
     ) -> Result<AppRelease, CoreError> {
         sqlx::query(
-            r#"
-            INSERT INTO app_releases (platform, version, telegram_file_id, file_name, file_size_mb, changelog, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(platform) DO UPDATE SET
-                version = excluded.version,
-                telegram_file_id = excluded.telegram_file_id,
-                file_name = excluded.file_name,
-                file_size_mb = excluded.file_size_mb,
-                changelog = excluded.changelog,
-                updated_at = CURRENT_TIMESTAMP
-            "#,
+            "INSERT OR IGNORE INTO app_releases (id, version, changelog) VALUES (1, ?, ?)",
         )
-        .bind(platform)
         .bind(version)
-        .bind(telegram_file_id)
-        .bind(file_name)
-        .bind(file_size_mb)
         .bind(changelog)
         .execute(pool)
         .await?;
 
-        Self::get_app_release_by_platform(pool, platform)
+        if platform == "windows" {
+            sqlx::query(
+                r#"
+                UPDATE app_releases
+                SET version = ?, changelog = ?, windows_file_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+                "#,
+            )
+            .bind(version)
+            .bind(changelog)
+            .bind(telegram_file_id)
+            .execute(pool)
+            .await?;
+        } else if platform == "android" {
+            sqlx::query(
+                r#"
+                UPDATE app_releases
+                SET version = ?, changelog = ?, android_file_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+                "#,
+            )
+            .bind(version)
+            .bind(changelog)
+            .bind(telegram_file_id)
+            .execute(pool)
+            .await?;
+        }
+
+        Self::get_latest_app_release(pool)
             .await?
             .ok_or_else(|| CoreError::Database(sqlx::Error::RowNotFound))
     }
@@ -2785,20 +2814,9 @@ impl Repository {
     /// Get an app release by platform ('windows' or 'android')
     pub async fn get_app_release_by_platform(
         pool: &DbPool,
-        platform: &str,
+        _platform: &str,
     ) -> Result<Option<AppRelease>, CoreError> {
-        let release = sqlx::query_as::<_, AppRelease>(
-            r#"
-            SELECT platform, version, telegram_file_id, file_name, file_size_mb, changelog, updated_at
-            FROM app_releases
-            WHERE platform = ?
-            "#,
-        )
-        .bind(platform)
-        .fetch_optional(pool)
-        .await?;
-
-        Ok(release)
+        Self::get_latest_app_release(pool).await
     }
 
     /// Get all app releases
@@ -2808,9 +2826,9 @@ impl Repository {
     ) -> Result<Vec<AppRelease>, CoreError> {
         let releases = sqlx::query_as::<_, AppRelease>(
             r#"
-            SELECT platform, version, telegram_file_id, file_name, file_size_mb, changelog, updated_at
+            SELECT id, version, changelog, windows_file_id, windows_github_url, android_file_id, android_github_url, updated_at
             FROM app_releases
-            ORDER BY platform ASC
+            ORDER BY id DESC
             "#,
         )
         .fetch_all(pool)

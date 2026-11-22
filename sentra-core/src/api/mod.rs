@@ -1,3 +1,5 @@
+mod password_reset;
+
 use crate::compiler;
 use crate::db::{DbPool, Repository};
 use crate::error::CoreError;
@@ -96,7 +98,7 @@ impl LoginRateLimiter {
     }
 }
 
-fn extract_client_ip(headers: &HeaderMap) -> String {
+pub(super) fn extract_client_ip(headers: &HeaderMap) -> String {
     if let Some(xff) = headers.get("x-forwarded-for") {
         if let Ok(s) = xff.to_str() {
             if let Some(first) = s.split(',').next() {
@@ -138,9 +140,9 @@ pub struct CodeLoginRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct RegisterRequest {
-    pub username: String,
+    pub email: Option<String>,
+    pub username: Option<String>,
     pub password: String,
     pub device_identifier: Option<String>,
     pub device_name: Option<String>,
@@ -149,9 +151,9 @@ pub struct RegisterRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct LoginRequest {
-    pub username: String,
+    pub email: Option<String>,
+    pub username: Option<String>,
     pub password: String,
     pub device_identifier: Option<String>,
     pub device_name: Option<String>,
@@ -252,6 +254,12 @@ pub fn create_router(
         // 1. Auth endpoints
         .route("/api/v1/auth/register", post(auth_register))
         .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/auth/password-reset/request", post(password_reset::auth_password_reset_request))
+        .route("/api/v1/auth/forgot-password", post(password_reset::auth_password_reset_request))
+        .route("/api/v1/auth/password-reset/confirm", post(password_reset::auth_password_reset_confirm))
+        .route("/api/v1/auth/reset-password", post(password_reset::auth_password_reset_confirm))
+        .route("/api/v1/auth/request-telegram-verify", post(auth_request_telegram_verify))
+        .route("/api/v1/auth/verify-status", get(auth_verify_status))
         .route("/api/v1/auth/code-login", post(auth_code_login))
         .route("/api/v1/auth/exchange-code", post(auth_code_login))
         .route("/api/v1/auth/link-token", post(auth_link_token))
@@ -288,8 +296,24 @@ pub fn create_router(
         .with_state(state)
 }
 
+/// Helper function to extract auth / subscription token from headers
+fn extract_auth_token(headers: &HeaderMap) -> Result<String, CoreError> {
+    headers
+        .get("X-Subscription-Token")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .map(|s| s.strip_prefix("jwt_sentra_").unwrap_or(s).to_string())
+        })
+        .ok_or(CoreError::AuthFailed("توکن یا شناسه نشست نامعتبر است.".to_string()))
+}
+
 /// POST /api/v1/auth/register
-/// Registers a new account directly with username and password, provisions Lite subscription, and registers device
+/// Registers a new account directly with email & password (or username), provisions Lite subscription, and registers device
 async fn auth_register(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -298,23 +322,7 @@ async fn auth_register(
     let client_ip = extract_client_ip(&headers);
     state.rate_limiter.check_ip(&client_ip).await?;
 
-    let username = payload.username.trim().to_lowercase();
     let password = payload.password.trim();
-
-    if username.len() < 3 || username.len() > 32 || !username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        state.rate_limiter.record_failure(&client_ip).await;
-        return Err(CoreError::BadRequest(
-            "نام کاربری باید بین ۳ تا ۳۲ کاراکتر و فقط شامل حروف انگلیسی، اعداد و زیرخط باشد.".to_string(),
-        ));
-    }
-
-    if Repository::RESERVED_USERNAMES.contains(&username.as_str()) {
-        state.rate_limiter.record_failure(&client_ip).await;
-        return Err(CoreError::BadRequest(
-            "این نام کاربری رزرو شده و قابل انتخاب نیست.".to_string(),
-        ));
-    }
-
     if password.len() < 8 {
         state.rate_limiter.record_failure(&client_ip).await;
         return Err(CoreError::BadRequest(
@@ -325,15 +333,46 @@ async fn auth_register(
     // Rate limit: Max 2 registrations per 24 hours per IP
     Repository::check_and_record_ip_registration(&state.pool, &client_ip).await?;
 
-    let (user, sub) = match Repository::register_user_with_credentials(&state.pool, &username, password, None).await {
-        Ok(res) => {
-            state.rate_limiter.record_success(&client_ip).await;
-            res
+    let (user, sub) = if let Some(ref em) = payload.email {
+        let clean_email = em.trim().to_lowercase();
+        match Repository::register_user_with_email_and_password(&state.pool, &clean_email, password, None).await {
+            Ok(res) => {
+                state.rate_limiter.record_success(&client_ip).await;
+                res
+            }
+            Err(e) => {
+                state.rate_limiter.record_failure(&client_ip).await;
+                return Err(e);
+            }
         }
-        Err(e) => {
-            state.rate_limiter.record_failure(&client_ip).await;
-            return Err(e);
+    } else if let Some(ref un) = payload.username {
+        let clean_un = un.trim().to_lowercase();
+        if clean_un.contains('@') {
+            match Repository::register_user_with_email_and_password(&state.pool, &clean_un, password, None).await {
+                Ok(res) => {
+                    state.rate_limiter.record_success(&client_ip).await;
+                    res
+                }
+                Err(e) => {
+                    state.rate_limiter.record_failure(&client_ip).await;
+                    return Err(e);
+                }
+            }
+        } else {
+            match Repository::register_user_with_credentials(&state.pool, &clean_un, password, None).await {
+                Ok(res) => {
+                    state.rate_limiter.record_success(&client_ip).await;
+                    res
+                }
+                Err(e) => {
+                    state.rate_limiter.record_failure(&client_ip).await;
+                    return Err(e);
+                }
+            }
         }
+    } else {
+        state.rate_limiter.record_failure(&client_ip).await;
+        return Err(CoreError::BadRequest("لطفاً ایمیل و رمز عبور را وارد فرمایید.".to_string()));
     };
 
     let device_id = payload.device_identifier.as_deref().unwrap_or("desktop-client-001");
@@ -364,10 +403,13 @@ async fn auth_register(
             "success": true,
             "access_token": format!("jwt_sentra_{}", sub.token),
             "token_type": "Bearer",
+            "telegram_verified": false,
             "user": {
                 "id": user.id,
                 "user_uuid": user.user_uuid,
+                "email": user.email,
                 "telegram_id": user.telegram_id,
+                "telegram_verified": false,
                 "username": user.username,
                 "first_name": user.first_name,
                 "role": user.role
@@ -386,7 +428,7 @@ async fn auth_register(
 }
 
 /// POST /api/v1/auth/login
-/// Validates username & password credentials, verifies device slot (Max 3 Devices), and returns session JWT
+/// Validates email/username & password credentials, verifies device slot (Max 3 Devices), and returns session JWT + telegram_verified status
 async fn auth_login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -395,10 +437,15 @@ async fn auth_login(
     let client_ip = extract_client_ip(&headers);
     state.rate_limiter.check_ip(&client_ip).await?;
 
-    let username = payload.username.trim().to_lowercase();
+    let identifier = payload.email.as_deref()
+        .or(payload.username.as_deref())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CoreError::BadRequest("لطفاً ایمیل و رمز عبور را وارد فرمایید.".to_string()))?;
+
     let password = payload.password.trim();
 
-    let (user, sub) = match Repository::login_user_with_credentials(&state.pool, &username, password).await {
+    let (user, sub) = match Repository::login_user_with_email_and_password(&state.pool, identifier, password).await {
         Ok(res) => {
             state.rate_limiter.record_success(&client_ip).await;
             res
@@ -430,6 +477,7 @@ async fn auth_login(
     .await?;
 
     let remaining_bytes = (sub.traffic_limit_bytes - (sub.upload_bytes + sub.download_bytes)).max(0);
+    let is_verified = user.telegram_verified != 0;
 
     Ok((
         StatusCode::OK,
@@ -437,10 +485,13 @@ async fn auth_login(
             "success": true,
             "access_token": format!("jwt_sentra_{}", sub.token),
             "token_type": "Bearer",
+            "telegram_verified": is_verified,
             "user": {
                 "id": user.id,
                 "user_uuid": user.user_uuid,
+                "email": user.email,
                 "telegram_id": user.telegram_id,
+                "telegram_verified": is_verified,
                 "username": user.username,
                 "first_name": user.first_name,
                 "role": user.role
@@ -453,6 +504,61 @@ async fn auth_login(
                 "max_concurrent_devices": sub.max_concurrent_devices,
                 "expires_at": sub.expires_at.to_rfc3339()
             }
+        })),
+    )
+        .into_response())
+}
+
+/// POST /api/v1/auth/request-telegram-verify
+/// Generates temporary 6-digit verification code with 15-minute expiration and direct Telegram bot link
+async fn auth_request_telegram_verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, CoreError> {
+    let token = extract_auth_token(&headers)?;
+    let sub = Repository::get_subscription_by_token(&state.pool, &token).await?;
+    let user = Repository::get_user_by_id(&state.pool, sub.user_id)
+        .await?
+        .ok_or(CoreError::UserNotFound)?;
+
+    let code = Repository::request_telegram_verify(&state.pool, user.id).await?;
+    let bot_username = std::env::var("TELOXIDE_BOT_USERNAME").unwrap_or_else(|_| "SentraVpnBot".to_string());
+    let verify_url = format!("https://t.me/{}?start=verify_{}", bot_username, code);
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "verify_code": code,
+            "bot_username": bot_username,
+            "verify_url": verify_url,
+            "expires_in_seconds": 900
+        })),
+    )
+        .into_response())
+}
+
+/// GET /api/v1/auth/verify-status
+/// Returns current Telegram verification state for the authenticated user
+async fn auth_verify_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, CoreError> {
+    let token = extract_auth_token(&headers)?;
+    let sub = Repository::get_subscription_by_token(&state.pool, &token).await?;
+    let user = Repository::get_user_by_id(&state.pool, sub.user_id)
+        .await?
+        .ok_or(CoreError::UserNotFound)?;
+
+    let is_verified = user.telegram_verified != 0;
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "telegram_verified": is_verified,
+            "telegram_id": user.telegram_id,
+            "email": user.email,
         })),
     )
         .into_response())
@@ -582,16 +688,21 @@ async fn get_client_modes(
                 .map(|s| s.replace("jwt_sentra_", ""))
         });
 
-    let modes = if let Some(t) = token {
+    let (modes, is_verified) = if let Some(t) = token {
         match Repository::get_subscription_by_token(&state.pool, &t).await {
             Ok(mut sub) => {
                 let _ = Repository::check_and_reset_daily_quota(&state.pool, &mut sub).await;
-                Repository::build_modes_info(&sub)
+                let verified = if let Ok(Some(u)) = Repository::get_user_by_id(&state.pool, sub.user_id).await {
+                    u.telegram_verified != 0
+                } else {
+                    false
+                };
+                (Repository::build_modes_info(&sub, verified), verified)
             }
-            Err(_) => Repository::build_default_modes_info(),
+            Err(_) => (Repository::build_default_modes_info(), false),
         }
     } else {
-        Repository::build_default_modes_info()
+        (Repository::build_default_modes_info(), false)
     };
 
     Ok((
@@ -599,6 +710,7 @@ async fn get_client_modes(
         [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
         Json(json!({
             "success": true,
+            "telegram_verified": is_verified,
             "modes": modes
         })),
     )
@@ -650,7 +762,7 @@ async fn client_config(
 
     // 1. Check if user account is suspended or banned (Anomaly Protection)
     let user_opt = Repository::get_user_by_id(&state.pool, sub.user_id).await?;
-    if let Some(user) = user_opt {
+    if let Some(ref user) = user_opt {
         if user.status == "suspended" || sub.status == "suspended" {
             return Err(CoreError::AccountSuspended(
                 "حساب شما به دلیل الگوی مصرف ترافیک غیرعادی موقتاً متوقف شده است. لطفاً با پشتیبانی در ارتباط باشید.".to_string(),
@@ -695,6 +807,17 @@ async fn client_config(
         return Err(CoreError::ModeComingSoon {
             mode: "گیمینگ (Gaming)".to_string(),
         });
+    }
+
+    // A2. Download mode lock check: Requires telegram verification for Free/Lite users
+    if requested_mode == "download" && sub.tier == "Sentra Lite" {
+        if let Some(ref u) = user_opt {
+            if u.telegram_verified == 0 {
+                return Err(CoreError::ModeLocked {
+                    mode: "دانلود (Download) - نیاز به تایید حساب در ربات تلگرام".to_string(),
+                });
+            }
+        }
     }
 
     // B. Static IP quota & tier check (30 GB limit for Pro / Flow+)
@@ -1056,30 +1179,39 @@ async fn client_version(
     Query(query): Query<ClientVersionQuery>,
 ) -> Result<Response, CoreError> {
     let target_platform = query.platform.as_deref().unwrap_or("windows");
-    let release_opt = Repository::get_app_release_by_platform(&state.pool, target_platform).await?;
+    let release_opt = Repository::get_latest_app_release(&state.pool).await?;
 
-    let (latest_version, release_notes, release_date, file_name, file_size_mb) = match release_opt {
-        Some(rel) => (
-            rel.version,
-            if rel.changelog.is_empty() {
-                format!("بروزرسانی نسخه {} کلاینت هوشمند Sentra Connect", rel.platform)
+    let (latest_version, release_notes, release_date, file_name, file_size_mb, download_url) = match release_opt {
+        Some(rel) => {
+            let dl_url = if target_platform == "android" {
+                rel.android_github_url.unwrap_or_else(|| "https://t.me/SentraVpnBot".to_string())
             } else {
-                rel.changelog
-            },
-            rel.updated_at.format("%Y-%m-%d").to_string(),
-            rel.file_name,
-            rel.file_size_mb,
-        ),
+                rel.windows_github_url.unwrap_or_else(|| "https://t.me/SentraVpnBot".to_string())
+            };
+            (
+                rel.version,
+                if rel.changelog.is_empty() {
+                    format!("بروزرسانی نسخه رسمی کلاینت هوشمند Sentra Connect برای {}", target_platform)
+                } else {
+                    rel.changelog
+                },
+                rel.updated_at.format("%Y-%m-%d").to_string(),
+                if target_platform == "android" { "Sentra-v1.0.0-Android.apk".to_string() } else { "Sentra-v1.0.0-Windows-Setup.exe".to_string() },
+                if target_platform == "android" { 35.0 } else { 45.0 },
+                dl_url,
+            )
+        }
         None => (
-            "1.1.0".to_string(),
-            "نسخه ۱.۱.۰: ضربان قلب و همگام‌سازی لحظه‌ای حجم، ایزولاسیون کامل آی‌پی در حالت آی‌پی ثابت، محافظت نشت DNS، بازیابی خودکار اتصال شبکه در اندروید.".to_string(),
-            "2026-11-20".to_string(),
+            "1.0.0".to_string(),
+            "نسخه ۱.۰.۰: ضربان قلب و همگام‌سازی لحظه‌ای حجم، ایزولاسیون کامل آی‌پی در حالت آی‌پی ثابت، محافظت نشت DNS، بازیابی خودکار اتصال شبکه در اندروید.".to_string(),
+            "2026-11-22".to_string(),
             if target_platform == "windows" {
-                "SentraConnect-Setup.exe".to_string()
+                "Sentra-v1.0.0-Windows-Setup.exe".to_string()
             } else {
-                "SentraConnect.apk".to_string()
+                "Sentra-v1.0.0-Android.apk".to_string()
             },
-            25.0,
+            40.0,
+            "https://t.me/SentraVpnBot".to_string(),
         ),
     };
 
@@ -1092,7 +1224,7 @@ async fn client_version(
             "platform": target_platform,
             "file_name": file_name,
             "file_size_mb": file_size_mb,
-            "download_url": "https://t.me/SentraVpnBot",
+            "download_url": download_url,
             "release_notes": release_notes,
             "release_date": release_date,
             "mandatory": false

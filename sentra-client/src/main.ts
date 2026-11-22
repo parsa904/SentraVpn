@@ -20,6 +20,8 @@ interface ClientState {
   username: string;
   remaining_bytes: number;
   expires_at?: string | null;
+  telegram_verified?: boolean;
+  email?: string | null;
   status: 'Disconnected' | 'Connecting' | 'Connected' | { Error: string };
   selected_mode: string;
   selected_protocol?: string;
@@ -752,6 +754,31 @@ function updateModesUI() {
       dlBar.style.width = '100%';
       dlBar.className = 'bg-[#3B82F6] h-full rounded-full transition-all duration-300';
     }
+  }
+
+  // Download Mode Lock based on Telegram Verification for Free users
+  const dlLockOverlay = document.getElementById('dl-lock-overlay');
+  const dlQuotaContainer = document.getElementById('dl-quota-container');
+  const dlBadge = document.getElementById('dl-badge');
+  const dlIcon = document.getElementById('dl-icon');
+
+  const isDlLocked = isFreeTier && !currentState.telegram_verified;
+  if (isDlLocked) {
+    if (dlLockOverlay) dlLockOverlay.classList.remove('hidden');
+    if (dlQuotaContainer) dlQuotaContainer.classList.add('opacity-40');
+    if (dlBadge) {
+      dlBadge.textContent = '🔒 قفل (تایید تلگرام)';
+      dlBadge.className = 'text-[9px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 font-medium border border-amber-500/30';
+    }
+    if (dlIcon) dlIcon.textContent = '🔒';
+  } else {
+    if (dlLockOverlay) dlLockOverlay.classList.add('hidden');
+    if (dlQuotaContainer) dlQuotaContainer.classList.remove('opacity-40');
+    if (dlBadge) {
+      dlBadge.textContent = 'Hysteria 2';
+      dlBadge.className = 'text-[9px] px-1.5 py-0.5 rounded bg-[#3B82F6]/15 text-[#3B82F6] font-medium border border-[#3B82F6]/20';
+    }
+    if (dlIcon) dlIcon.textContent = '⚡';
   }
 
   // Static IP locked/unlocked state & 30GB quota meter
@@ -1704,10 +1731,58 @@ function initEventListeners() {
         return;
       }
 
+      if (mode === 'download' && currentState.tier === 'Sentra Lite' && !currentState.telegram_verified) {
+        alert('🔒 بخش دانلود برای کاربران رایگان تا زمان تایید حساب در ربات تلگرام قفل است. لطفاً از دکمه «تایید در تلگرام» استفاده فرمایید.');
+        return;
+      }
+
       currentState = await invokeTauri<ClientState>('set_connection_mode', { mode });
       renderState();
       updateModesUI();
     });
+  });
+
+  // Telegram Verification Buttons for Download Mode
+  const btnOpenTelegramVerify = document.getElementById('btn-open-telegram-verify');
+  const btnRecheckTelegramVerify = document.getElementById('btn-recheck-telegram-verify');
+  const dlVerifyCodeBadge = document.getElementById('dl-verify-code-badge');
+
+  btnOpenTelegramVerify?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    try {
+      if (btnOpenTelegramVerify) btnOpenTelegramVerify.textContent = 'در حال دریافت...';
+      const res = await invokeTauri<any>('request_telegram_verify');
+      if (res && res.verify_url) {
+        if (dlVerifyCodeBadge && res.verify_code) {
+          dlVerifyCodeBadge.textContent = `کد: ${res.verify_code}`;
+        }
+        window.open(res.verify_url, '_blank');
+      }
+    } catch (err: any) {
+      alert(`خطا در درخواست تایید تلگرام: ${err?.toString() || err}`);
+    } finally {
+      if (btnOpenTelegramVerify) btnOpenTelegramVerify.textContent = '🔗 تایید در تلگرام';
+    }
+  });
+
+  btnRecheckTelegramVerify?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    try {
+      if (btnRecheckTelegramVerify) btnRecheckTelegramVerify.textContent = 'در حال بررسی...';
+      const updated = await invokeTauri<ClientState>('check_telegram_verify_status');
+      currentState = updated;
+      renderState();
+      updateModesUI();
+      if (updated.telegram_verified) {
+        alert('✅ حساب کاربری تلگرام شما با موفقیت تایید شد! بخش دانلود فعال گردید.');
+      } else {
+        alert('⚠️ حساب تلگرام هنوز تایید نشده است. لطفاً در ربات تلگرام روی لینک باز شده کلیک کنید.');
+      }
+    } catch (err: any) {
+      alert(`خطا در بررسی وضعیت: ${err?.toString() || err}`);
+    } finally {
+      if (btnRecheckTelegramVerify) btnRecheckTelegramVerify.textContent = '🔄 بررسی مجدد';
+    }
   });
 
   // 6. Protocol Selection Buttons

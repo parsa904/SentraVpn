@@ -53,6 +53,7 @@ pub enum AdminUploadState {
         version: String,
         changelog: String,
     },
+    AwaitingGithubRelease,
 }
 
 static ADMIN_UPLOAD_STATES: OnceLock<RwLock<HashMap<i64, AdminUploadState>>> = OnceLock::new();
@@ -74,6 +75,39 @@ pub async fn get_admin_upload_state(admin_id: i64) -> Option<AdminUploadState> {
 pub async fn clear_admin_upload_state(admin_id: i64) {
     let mut map = upload_states_map().write().await;
     map.remove(&admin_id);
+}
+
+#[derive(Debug, Clone)]
+pub enum AdminActionState {
+    AwaitingUserSearch,
+    AwaitingBroadcast,
+}
+
+static ADMIN_ACTION_STATES: OnceLock<RwLock<HashMap<i64, AdminActionState>>> = OnceLock::new();
+
+fn action_states_map() -> &'static RwLock<HashMap<i64, AdminActionState>> {
+    ADMIN_ACTION_STATES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub async fn set_admin_action_state(admin_id: i64, state: AdminActionState) {
+    let mut map = action_states_map().write().await;
+    map.insert(admin_id, state);
+}
+
+pub async fn get_admin_action_state(admin_id: i64) -> Option<AdminActionState> {
+    let map = action_states_map().read().await;
+    map.get(&admin_id).cloned()
+}
+
+pub async fn clear_admin_action_state(admin_id: i64) {
+    let mut map = action_states_map().write().await;
+    map.remove(&admin_id);
+}
+
+pub async fn clear_all_admin_states(admin_id: i64) {
+    clear_admin_outbound_state(admin_id).await;
+    clear_admin_upload_state(admin_id).await;
+    clear_admin_action_state(admin_id).await;
 }
 
 pub fn is_authorized_admin(telegram_id: i64, admin_chat_id: i64) -> bool {
@@ -1166,7 +1200,7 @@ pub async fn handle_six_layer_health_test(
 
 pub async fn handle_return_to_user_menu(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
     bot.send_message(msg.chat.id, "👤 به منوی اصلی کاربری سنترا بازگشتید.")
-        .reply_markup(user_main_keyboard())
+        .reply_markup(crate::bot::keyboards::user_main_keyboard_with_admin(true))
         .await?;
     Ok(())
 }
@@ -1175,6 +1209,7 @@ pub async fn handle_return_to_user_menu(bot: &Bot, msg: &Message) -> anyhow::Res
 pub async fn handle_app_upload_menu_callback(
     bot: &Bot,
     q: &CallbackQuery,
+    pool: &DbPool,
     admin_chat_id: i64,
 ) -> anyhow::Result<()> {
     let telegram_user_id = q.from.id.0 as i64;
@@ -1186,13 +1221,20 @@ pub async fn handle_app_upload_menu_callback(
         return Ok(());
     }
 
-    let text = r#"📤 <b>مدیریت و انتشار نسخه جدید اپلیکیشن Sentra Connect</b>
+    let release_opt = Repository::get_latest_app_release(pool).await.unwrap_or(None);
+    let cur_ver = release_opt.as_ref().map(|r| r.version.as_str()).unwrap_or("ثبت نشده");
 
-لطفاً سیستم‌عامل مورد نظر برای بارگذاری نسخه جدید را انتخاب فرمایید:
-• <b>ویندوز:</b> فایل با پسوند <code>.exe</code> یا <code>.msi</code>
-• <b>اندروید:</b> فایل با پسوند <code>.apk</code>
+    let text = format!(
+        r#"📦 <b>مدیریت و انتشار نسخه جدید Sentra Connect</b>
 
-پس از انتخاب پلتفرم، شماره نسخه و سپس فایل نصبی از شما دریافت خواهد شد."#;
+🔹 <b>نسخه فعلی فعال:</b> <code>{}</code>
+
+لطفاً یکی از گزینه‌های زیر را انتخاب فرمایید:
+• <b>🖥 ثبت فایل نصب ویندوز:</b> دریافت فایل <code>.exe</code>
+• <b>📱 ثبت فایل نصب اندروید:</b> دریافت فایل <code>.apk</code>
+• <b>🔗 ثبت لینک GitHub Release:</b> تنظیم آدرس‌های گیت‌هاب و نسخه"#,
+        cur_ver
+    );
 
     if let Some(msg) = &q.message {
         bot.edit_message_text(msg.chat().id, msg.id(), text)
@@ -1208,6 +1250,7 @@ pub async fn handle_app_upload_menu_callback(
 pub async fn handle_app_upload_menu_msg(
     bot: &Bot,
     msg: &Message,
+    pool: &DbPool,
     admin_chat_id: i64,
 ) -> anyhow::Result<()> {
     let telegram_user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
@@ -1216,13 +1259,20 @@ pub async fn handle_app_upload_menu_msg(
         return Ok(());
     }
 
-    let text = r#"📤 <b>مدیریت و انتشار نسخه جدید اپلیکیشن Sentra Connect</b>
+    let release_opt = Repository::get_latest_app_release(pool).await.unwrap_or(None);
+    let cur_ver = release_opt.as_ref().map(|r| r.version.as_str()).unwrap_or("ثبت نشده");
 
-لطفاً سیستم‌عامل مورد نظر برای بارگذاری نسخه جدید را انتخاب فرمایید:
-• <b>ویندوز:</b> فایل با پسوند <code>.exe</code> یا <code>.msi</code>
-• <b>اندروید:</b> فایل با پسوند <code>.apk</code>
+    let text = format!(
+        r#"📦 <b>مدیریت و انتشار نسخه جدید Sentra Connect</b>
 
-پس از انتخاب پلتفرم، شماره نسخه و سپس فایل نصبی از شما دریافت خواهد شد."#;
+🔹 <b>نسخه فعلی فعال:</b> <code>{}</code>
+
+لطفاً یکی از گزینه‌های زیر را انتخاب فرمایید:
+• <b>🖥 ثبت فایل نصب ویندوز:</b> دریافت فایل <code>.exe</code>
+• <b>📱 ثبت فایل نصب اندروید:</b> دریافت فایل <code>.apk</code>
+• <b>🔗 ثبت لینک GitHub Release:</b> تنظیم آدرس‌های گیت‌هاب و نسخه"#,
+        cur_ver
+    );
 
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
@@ -1256,9 +1306,9 @@ pub async fn handle_admin_start_upload(
     .await;
 
     let platform_fa = if platform == "windows" {
-        "ویندوز (Windows)"
+        "ویندوز (Windows .exe)"
     } else {
-        "اندروید (Android)"
+        "اندروید (Android .apk)"
     };
 
     let text = format!(
@@ -1267,18 +1317,151 @@ pub async fn handle_admin_start_upload(
 لطفاً <b>شماره نسخه</b> و <b>توضیح کوتاه تغییرات</b> را در یک پیام بفرستید.
 
 <i>فرمت نمونه:</i>
-<code>0.1.0 - نسخه اولیه با پشتیبانی از حالت رایگان</code>
-
-یا جهت لغو عملیات ارسال نمایید: /cancel"#,
+<code>1.0.0 - نسخه رسمی با پشتیبانی از پروتکل‌های امن و سوییچ هوشمند</code>"#,
         platform_fa
     );
 
     if let Some(msg) = &q.message {
         bot.send_message(msg.chat().id, text)
             .parse_mode(ParseMode::Html)
+            .reply_markup(crate::bot::keyboards::cancel_inline_keyboard())
             .await?;
     }
     bot.answer_callback_query(q.id.clone()).await?;
+    Ok(())
+}
+
+/// Admin initiates GitHub release setting
+pub async fn handle_admin_start_github_release(
+    bot: &Bot,
+    q: &CallbackQuery,
+    admin_chat_id: i64,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone())
+            .text("⛔ دسترسی غیرمجاز!")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+
+    set_admin_upload_state(telegram_user_id, AdminUploadState::AwaitingGithubRelease).await;
+
+    let text = r#"🔗 <b>ثبت لینک دانلود GitHub Release</b>
+
+لطفاً اطلاعات نسخه و آدرس‌های انتشار گیت‌هاب را با خط عمودی (|) در یک پیام ارسال فرمایید:
+<code>نسخه|لینک ویندوز (.exe)|لینک اندروید (.apk)|توضیحات</code>
+
+<i>نمونه آماده:</i>
+<code>1.0.0|https://github.com/sentravpn/client/releases/download/v1.0.0/Sentra-v1.0.0-Windows-Setup.exe|https://github.com/sentravpn/client/releases/download/v1.0.0/Sentra-v1.0.0-Android.apk|نسخه رسمی کلاینت هوشمند Sentra Connect</code>"#;
+
+    if let Some(msg) = &q.message {
+        bot.send_message(msg.chat().id, text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(crate::bot::keyboards::cancel_inline_keyboard())
+            .await?;
+    }
+    bot.answer_callback_query(q.id.clone()).await?;
+    Ok(())
+}
+
+/// View current release details
+pub async fn handle_admin_view_current_release(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+    admin_chat_id: i64,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone()).text("⛔ عدم دسترسی").await?;
+        return Ok(());
+    }
+
+    let release_opt = Repository::get_latest_app_release(pool).await?;
+
+    let text = match release_opt {
+        Some(r) => format!(
+            r#"📦 <b>اطلاعات آخرین نسخه ثبت‌شده:</b>
+
+🔹 <b>نسخه:</b> <code>{}</code>
+🖥 <b>فایل ویندوز تلگرام:</b> {}
+🌐 <b>لینک ویندوز گیت‌هاب:</b> <code>{}</code>
+📱 <b>فایل اندروید تلگرام:</b> {}
+🌐 <b>لینک اندروید گیت‌هاب:</b> <code>{}</code>
+📝 <b>تغییرات:</b> <i>{}</i>
+📅 <b>تاریخ بروزرسانی:</b> <code>{}</code>"#,
+            r.version,
+            if r.windows_file_id.is_some() { "✅ ثبت‌شده" } else { "❌ ثبت‌نشده" },
+            r.windows_github_url.as_deref().unwrap_or("تنظیم نشده"),
+            if r.android_file_id.is_some() { "✅ ثبت‌شده" } else { "❌ ثبت‌نشده" },
+            r.android_github_url.as_deref().unwrap_or("تنظیم نشده"),
+            r.changelog,
+            r.updated_at.format("%Y-%m-%d %H:%M UTC")
+        ),
+        None => "⏳ هیچ نسخه‌ای تاکنون در دیتابیس ثبت نشده است.".to_string(),
+    };
+
+    if let Some(msg) = &q.message {
+        bot.send_message(msg.chat().id, text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(admin_app_release_inline_keyboard())
+            .await?;
+    }
+    bot.answer_callback_query(q.id.clone()).await?;
+    Ok(())
+}
+
+/// Prompt admin for User Management (search by email, username, id)
+pub async fn handle_admin_user_management_prompt(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: i64,
+    admin_chat_id: i64,
+) -> anyhow::Result<()> {
+    if !is_authorized_admin(user_id, admin_chat_id) {
+        bot.send_message(chat_id, "⛔ دسترسی غیرمجاز!").await?;
+        return Ok(());
+    }
+
+    set_admin_action_state(user_id, AdminActionState::AwaitingUserSearch).await;
+
+    let text = r#"👥 <b>مدیریت کاربران Sentra</b>
+
+لطفاً <b>ایمیل</b>، <b>نام کاربری</b> یا <b>شناسه عددی (ID)</b> کاربر مورد نظر را ارسال فرمایید تا کارت مدیریت کاربر برای شما نمایش داده شود:"#;
+
+    bot.send_message(chat_id, text)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(crate::bot::keyboards::cancel_inline_keyboard())
+        .await?;
+
+    Ok(())
+}
+
+/// Prompt admin for Broadcast
+pub async fn handle_admin_broadcast_prompt(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: i64,
+    admin_chat_id: i64,
+) -> anyhow::Result<()> {
+    if !is_authorized_admin(user_id, admin_chat_id) {
+        bot.send_message(chat_id, "⛔ دسترسی غیرمجاز!").await?;
+        return Ok(());
+    }
+
+    set_admin_action_state(user_id, AdminActionState::AwaitingBroadcast).await;
+
+    let text = r#"📢 <b>ارسال پیام همگانی به کلیه کاربران</b>
+
+لطفاً متن پیام یا تصویر همراه با کپشن را برای ارسال همگانی به تمامی کاربران فعال بفرستید:"#;
+
+    bot.send_message(chat_id, text)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(crate::bot::keyboards::cancel_inline_keyboard())
+        .await?;
+
     Ok(())
 }
 

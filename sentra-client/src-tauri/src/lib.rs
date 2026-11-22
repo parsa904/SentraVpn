@@ -41,6 +41,8 @@ pub fn run() {
         initial_state.tier = session.tier;
         initial_state.username = session.username;
         initial_state.remaining_bytes = session.remaining_bytes;
+        initial_state.telegram_verified = session.telegram_verified;
+        initial_state.email = session.email.clone();
         initial_state.logs.push("[INFO] [Auth] Restored active session from local storage.".to_string());
     }
 
@@ -58,6 +60,8 @@ pub fn run() {
             commands::login_with_code,
             commands::register_with_credentials,
             commands::login_with_credentials,
+            commands::request_telegram_verify,
+            commands::check_telegram_verify_status,
             commands::get_telegram_link_code,
             commands::get_client_state,
             commands::connect_vpn,

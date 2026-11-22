@@ -7,6 +7,7 @@ pub struct User {
     pub id: i64,
     pub user_uuid: String,
     pub telegram_id: Option<i64>,
+    pub email: Option<String>,
     pub username: Option<String>,
     pub password_hash: Option<String>,
     pub first_name: String,
@@ -18,9 +19,18 @@ pub struct User {
     pub auth_code_expires_at: Option<DateTime<Utc>>,
     pub link_code: Option<String>,
     pub link_code_expires_at: Option<DateTime<Utc>>,
+    pub telegram_verified: i64,
+    pub verify_code: Option<String>,
+    pub verify_code_expires_at: Option<DateTime<Utc>>,
     pub outbound_reward_banned: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl User {
+    pub fn is_telegram_verified(&self) -> bool {
+        self.telegram_verified != 0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -195,12 +205,13 @@ pub struct UserDevice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct AppRelease {
-    pub platform: String,
+    pub id: i64,
     pub version: String,
-    pub telegram_file_id: String,
-    pub file_name: String,
-    pub file_size_mb: f64,
     pub changelog: String,
+    pub windows_file_id: Option<String>,
+    pub windows_github_url: Option<String>,
+    pub android_file_id: Option<String>,
+    pub android_github_url: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 

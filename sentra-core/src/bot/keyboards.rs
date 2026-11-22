@@ -1,34 +1,27 @@
-use crate::models::{Outbound, UserDevice};
+use crate::models::{AppRelease, Outbound, UserDevice};
 use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup,
 };
 
-/// Main persistent reply keyboard for users (with optional Admin panel button)
+/// Main persistent reply keyboard for users (100% button-driven UI)
 pub fn user_main_keyboard_with_admin(is_admin: bool) -> KeyboardMarkup {
     let mut rows = vec![
         vec![
-            KeyboardButton::new("🎁 دریافت اشتراک رایگان (Sentra Lite)"),
-            KeyboardButton::new("⚡ ارتقا به پلن ویژه (Sentra Pro / Flow+)"),
+            KeyboardButton::new("📥 دانلود اپلیکیشن (ویندوز / اندروید)"),
+            KeyboardButton::new("👤 حساب کاربری و وضعیت اشتراک"),
         ],
         vec![
-            KeyboardButton::new("📥 دانلود اپلیکیشن Sentra Connect"),
+            KeyboardButton::new("🔗 تایید حساب و باز کردن بخش دانلود"),
+            KeyboardButton::new("🎁 اهدای کانفیگ (کمک به شبکه)"),
         ],
         vec![
-            KeyboardButton::new("🔑 دریافت کانفیگ و کد اتصال"),
-            KeyboardButton::new("🍏 دریافت اشتراک iOS (OpenVPN)"),
-        ],
-        vec![
-            KeyboardButton::new("🤝 اهدای اوتباند (حمایت از Sentra)"),
-            KeyboardButton::new("🔗 اتصال حساب اپلیکیشن"),
-        ],
-        vec![
-            KeyboardButton::new("💖 حمایت مالی از توسعه Sentra"),
-            KeyboardButton::new("📊 وضعیت اشتراک و تیکت پشتیبانی"),
+            KeyboardButton::new("💬 پشتیبانی و راهنما"),
+            KeyboardButton::new("🔑 بازیابی رمز عبور"),
         ],
     ];
 
     if is_admin {
-        rows.push(vec![KeyboardButton::new("🛠 پنل مدیریت")]);
+        rows.push(vec![KeyboardButton::new("🛠 پنل مدیریت (ادمین)")]);
     }
 
     KeyboardMarkup::new(rows).resize_keyboard()
@@ -37,6 +30,32 @@ pub fn user_main_keyboard_with_admin(is_admin: bool) -> KeyboardMarkup {
 /// Main persistent reply keyboard for normal users
 pub fn user_main_keyboard() -> KeyboardMarkup {
     user_main_keyboard_with_admin(false)
+}
+
+/// Admin Panel persistent reply keyboard (100% button-driven UI)
+pub fn admin_main_keyboard() -> KeyboardMarkup {
+    KeyboardMarkup::new(vec![
+        vec![
+            KeyboardButton::new("📊 آمار لحظه‌ای سرور و کاربران"),
+            KeyboardButton::new("🌐 مدیریت اوتباندها و نودها"),
+        ],
+        vec![
+            KeyboardButton::new("👥 مدیریت کاربران"),
+            KeyboardButton::new("📦 انتشار نسخه جدید (ویندوز و اندروید)"),
+        ],
+        vec![
+            KeyboardButton::new("📢 ارسال پیام همگانی"),
+            KeyboardButton::new("🔙 بازگشت به منوی کاربر"),
+        ],
+    ])
+    .resize_keyboard()
+}
+
+/// General cancellation inline keyboard (shown on all awaiting states)
+pub fn cancel_inline_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback("❌ انصراف", "cancel_state")],
+    ])
 }
 
 /// Inline keyboard for iOS OpenVPN Connection Mode selection
@@ -129,20 +148,18 @@ pub fn admin_dashboard_inline_keyboard() -> InlineKeyboardMarkup {
 pub fn admin_official_outbounds_hub_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("➕ افزودن اوتباند جدید (رسمی)", "adm_ob_add_start"),
+            InlineKeyboardButton::callback("➕ افزودن لینک تکی", "adm_ob_add_single"),
+            InlineKeyboardButton::callback("📥 افزودن سابلینک", "adm_ob_add_sublink"),
         ],
         vec![
-            InlineKeyboardButton::callback("⚡️ تولید و شارژ خودکار اکانت WARP", "adm_warp_generate"),
+            InlineKeyboardButton::callback("⚡ ساخت خودکار WARP", "adm_warp_generate"),
+            InlineKeyboardButton::callback("📋 لیست و حذف نودها", "adm_ob_list_all"),
         ],
         vec![
-            InlineKeyboardButton::callback("🌐 لیست نودهای وب‌گردی", "adm_ob_list_web_browsing"),
-            InlineKeyboardButton::callback("📥 لیست نودهای دانلود", "adm_ob_list_download"),
+            InlineKeyboardButton::callback("⚙️ تنظیم دسترسی رایگان یا آی‌پی ثابت", "adm_ob_alloc_settings"),
         ],
         vec![
-            InlineKeyboardButton::callback("🔒 لیست نودهای آی‌پی ثابت", "adm_ob_list_static_ip"),
-        ],
-        vec![
-            InlineKeyboardButton::callback("🔙 بازگشت به داشبورد ادمین", "adm_back_main"),
+            InlineKeyboardButton::callback("🔙 بازگشت به پنل مدیریت", "adm_back_main"),
         ],
     ])
 }
@@ -208,36 +225,48 @@ pub fn admin_outbound_reallocation_keyboard(outbound_id: i64) -> InlineKeyboardM
     ])
 }
 
-/// Inline keyboard for selecting target platform for new app release in Admin panel
+/// Inline keyboard for selecting target action for new app release in Admin panel
 pub fn admin_app_release_inline_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("🪟 آپلود نسخه ویندوز (.exe)", "adm_upload_windows"),
+            InlineKeyboardButton::callback("🖥 ثبت فایل نصب ویندوز (.exe)", "adm_rel_upload_win"),
+            InlineKeyboardButton::callback("📱 ثبت فایل نصب اندروید (.apk)", "adm_rel_upload_apk"),
         ],
         vec![
-            InlineKeyboardButton::callback("🤖 آپلود نسخه اندروید (.apk)", "adm_upload_android"),
+            InlineKeyboardButton::callback("🔗 ثبت لینک GitHub Release", "adm_rel_set_github"),
+            InlineKeyboardButton::callback("📋 مشاهده وضعیت آخرین نسخه", "adm_rel_view_current"),
         ],
         vec![
-            InlineKeyboardButton::callback("🔙 بازگشت به داشبورد", "adm_back_main"),
+            InlineKeyboardButton::callback("🔙 بازگشت به پنل مدیریت", "adm_back_main"),
         ],
     ])
 }
 
 /// Inline keyboard for downloading the Sentra Connect client apps
-pub fn download_app_inline_keyboard() -> InlineKeyboardMarkup {
+pub fn download_app_inline_keyboard(release: Option<&AppRelease>) -> InlineKeyboardMarkup {
+    let github_url = release
+        .and_then(|r| {
+            if let Some(ref w) = r.windows_github_url {
+                Some(w.as_str())
+            } else if let Some(ref a) = r.android_github_url {
+                Some(a.as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or("https://github.com/sentravpn/client/releases/latest");
+
+    let valid_url = url::Url::parse(github_url)
+        .unwrap_or_else(|_| url::Url::parse("https://github.com").unwrap());
+
     InlineKeyboardMarkup::new(vec![
-        vec![InlineKeyboardButton::callback(
-            "🪟 دانلود نسخه ویندوز (Windows 10/11)",
-            "dl_app_windows",
-        )],
-        vec![InlineKeyboardButton::callback(
-            "🤖 دانلود نسخه اندروید (Android)",
-            "dl_app_android",
-        )],
-        vec![InlineKeyboardButton::callback(
-            "🍏 راهنمای اتصال آیفون (iOS - OpenVPN)",
-            "dl_app_ios",
-        )],
+        vec![
+            InlineKeyboardButton::callback("🖥 دانلود نسخه ویندوز (.exe)", "dl_app_windows"),
+            InlineKeyboardButton::callback("📱 دانلود نسخه اندروید (.apk)", "dl_app_android"),
+        ],
+        vec![
+            InlineKeyboardButton::url("🔗 صفحه انتشار گیتهاب", valid_url),
+        ],
     ])
 }
 
@@ -300,26 +329,6 @@ pub fn donation_review_inline_keyboard(donation_id: i64, qualifies_for_pro: bool
             InlineKeyboardButton::callback("❌ [رد رسید حمایت مالی]", format!("donate_reject_{}", donation_id)),
         ],
     ])
-}
-
-/// Hidden Admin Menu persistent reply keyboard
-#[allow(dead_code)]
-pub fn admin_main_keyboard() -> KeyboardMarkup {
-    KeyboardMarkup::new(vec![
-        vec![
-            KeyboardButton::new("📊 آمار و تفکیک کاربران"),
-            KeyboardButton::new("🌐 مدیریت اوتباندها و نودها"),
-        ],
-        vec![
-            KeyboardButton::new("📤 آپلود / بروزرسانی اپلیکیشن"),
-            KeyboardButton::new("🔄 وضعیت نودهای خروجی شبکه"),
-        ],
-        vec![
-            KeyboardButton::new("🩺 تست سلامت ۶ لایه سیستم"),
-            KeyboardButton::new("👤 بازگشت به منوی کاربری"),
-        ],
-    ])
-    .resize_keyboard()
 }
 
 /// Inline keyboard for toggling outbounds in Admin panel
@@ -397,5 +406,33 @@ pub fn subscription_status_inline_keyboard(devices_count: usize) -> InlineKeyboa
             InlineKeyboardButton::callback("⚡ تیکت پشتیبانی", "ticket_general"),
             InlineKeyboardButton::callback("💳 ارتقا اشتراک", "sim_pay_success"),
         ],
+    ])
+}
+
+/// Inline keyboard for password reset menu
+pub fn password_reset_inline_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "🔢 دریافت کد بازیابی ۶ رقمی (برای اپلیکیشن)",
+            "pwd_reset_get_code",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "🔐 تنظیم مستقیم رمز عبور جدید در ربات",
+            "pwd_reset_set_direct",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "🚫 لغو کدهای بازیابی فعال",
+            "pwd_reset_cancel",
+        )],
+    ])
+}
+
+/// Alert inline keyboard sent with password reset code
+pub fn password_reset_alert_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "🚫 من درخواست ندادهام (ابطال فوری کد)",
+            "pwd_reset_cancel",
+        )],
     ])
 }
