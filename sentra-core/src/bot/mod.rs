@@ -1,6 +1,5 @@
 pub mod admin_handlers;
 pub mod keyboards;
-pub mod password_reset;
 pub mod rate_limiter;
 pub mod user_handlers;
 
@@ -62,7 +61,7 @@ pub async fn run_telegram_bot(
                 let rate_limiter = Arc::clone(&rate_limiter);
                 move |bot: Bot, msg: Message| {
                     let pool = Arc::clone(&pool);
-                    let _base_url = Arc::clone(&base_url);
+                    let base_url = Arc::clone(&base_url);
                     let rate_limiter = Arc::clone(&rate_limiter);
                     async move {
                         // Anti-spam / Flood Protection (> 5 reqs in < 10s -> 5m Cooldown)
@@ -87,10 +86,31 @@ pub async fn run_telegram_bot(
                         // 1. Check if user sent a Photo (e.g. manual payment receipt or broadcast with photo)
                         if let Some(photos) = msg.photo() {
                             if !photos.is_empty() {
-                                // If admin sending a photo with caption starting with /broadcast
+                                // If admin sending a photo with caption starting with /broadcast or while in AwaitingBroadcast state
                                 if admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id) {
+                                    let admin_panel_state = admin_handlers::get_admin_panel_state(telegram_user_id).await;
+                                    if matches!(admin_panel_state, Some(admin_handlers::AdminPanelState::AwaitingBroadcast)) {
+                                        admin_handlers::clear_admin_panel_state(telegram_user_id).await;
+                                        let broadcast_text = msg.caption().unwrap_or("").trim();
+                                        let best_photo = &photos[photos.len() - 1];
+                                        if let Err(e) = admin_handlers::handle_admin_broadcast(
+                                            &bot,
+                                            &msg,
+                                            &pool,
+                                            admin_chat_id,
+                                            broadcast_text,
+                                            Some(best_photo.file.id.clone()),
+                                        )
+                                        .await
+                                        {
+                                            error!("Error in stateful broadcast with photo: {:?}", e);
+                                        }
+                                        return respond(());
+                                    }
+
                                     if let Some(caption) = msg.caption() {
                                         if let Some(stripped) = caption.strip_prefix("/broadcast ") {
+                                            admin_handlers::clear_all_admin_states(telegram_user_id).await;
                                             let broadcast_text = stripped.trim();
                                             let best_photo = &photos[photos.len() - 1];
                                             if let Err(e) = admin_handlers::handle_admin_broadcast(
@@ -111,6 +131,7 @@ pub async fn run_telegram_bot(
                                 }
 
                                 // Regular user or payment / donation receipt submission
+                                user_handlers::clear_user_state(telegram_user_id).await;
                                 if let Err(e) = admin_handlers::handle_receipt_submission(&bot, &msg, &pool, admin_chat_id, pro_subscription_price).await {
                                     error!("Error in handle_receipt_submission: {:?}", e);
                                 }
@@ -143,15 +164,10 @@ pub async fn run_telegram_bot(
                                         admin_handlers::AdminUploadState::AwaitingVersionAndChangelog { .. } => {
                                             let _ = bot.send_message(
                                                 msg.chat.id,
-                                                "⚠️ لطفاً ابتدا شماره نسخه و توضیح کوتاه تغییرات را به صورت متن بفرستید، سپس فایل را ارسال نمایید.",
-                                            ).await;
-                                            return respond(());
-                                        }
-                                        admin_handlers::AdminUploadState::AwaitingGithubRelease => {
-                                            let _ = bot.send_message(
-                                                msg.chat.id,
-                                                "⚠️ این بخش منتظر ارسال لینک Release در گیت‌هاب به صورت متنی است، نه فایل نصبی.",
-                                            ).await;
+                                                "⚠️ لطفاً ابتدا شماره نسخه و توضیح کوتاه تغییرات را به صورت متن بفرستید، سپس فایل را ارسال نمایید (یا روی «🔙 بازگشت» بزنید).",
+                                            )
+                                            .reply_markup(keyboards::cancel_and_back_inline_keyboard("adm_action_upload_app"))
+                                            .await;
                                             return respond(());
                                         }
                                     }
@@ -163,202 +179,182 @@ pub async fn run_telegram_bot(
                         if let Some(text) = msg.text() {
                             let text = text.trim();
 
-                            // Cancel command check in text
-                            if text == "/cancel" || text == "انصراف" || text == "❌ انصراف" {
-                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
+                            // Global immediate escape commands: /cancel, /start, or Back button text
+                            if text == "/cancel" || text == "🔙 بازگشت" || text == "🔙 بازگشت به منوی اصلی" {
                                 user_handlers::clear_user_state(telegram_user_id).await;
-                                let _ = bot.send_message(msg.chat.id, "❌ عملیات لغو شد. به منوی اصلی بازگشتید.")
-                                    .reply_markup(keyboards::user_main_keyboard_with_admin(admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id)))
-                                    .await;
+                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
+                                let is_admin = admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id);
+                                let _ = bot.send_message(
+                                    msg.chat.id,
+                                    "🔙 عملیات جاری لغو شد و به منوی اصلی بازگشتید.",
+                                )
+                                .reply_markup(keyboards::user_main_keyboard_with_admin(is_admin))
+                                .await;
                                 return respond(());
                             }
 
-                            // A. Check active admin state for app release input
-                            if admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id) {
-                                if let Some(upload_state) = admin_handlers::get_admin_upload_state(telegram_user_id).await {
-                                    match upload_state {
-                                        admin_handlers::AdminUploadState::AwaitingVersionAndChangelog { platform } => {
-                                            if let Err(e) = admin_handlers::handle_admin_version_text(&bot, &msg, admin_chat_id, &platform, text).await {
-                                                error!("Error in handle_admin_version_text: {:?}", e);
-                                            }
-                                            return respond(());
-                                        }
-                                        admin_handlers::AdminUploadState::AwaitingGithubRelease => {
-                                            let parts: Vec<&str> = text.split('|').map(|s| s.trim()).collect();
-                                            if parts.len() >= 3 {
-                                                let version = parts[0];
-                                                let win_url = parts[1];
-                                                let apk_url = parts[2];
-                                                let changelog = if parts.len() > 3 { parts[3] } else { "" };
-                                                if let Err(e) = crate::db::Repository::set_github_app_release(&pool, version, win_url, apk_url, changelog).await {
-                                                    let _ = bot.send_message(msg.chat.id, format!("❌ خطا در ثبت اطلاعات گیت‌هاب: {}", e)).await;
-                                                } else {
-                                                    admin_handlers::clear_admin_upload_state(telegram_user_id).await;
-                                                    let _ = bot.send_message(
-                                                        msg.chat.id,
-                                                        format!("✅ اطلاعات نسخه <code>{}</code> و لینک‌های دانلود گیت‌هاب با موفقیت ثبت گردید.", version),
-                                                    )
-                                                    .parse_mode(ParseMode::Html)
-                                                    .reply_markup(keyboards::admin_app_release_inline_keyboard())
-                                                    .await;
+                            // Top-level menu buttons & /start always clear any pending input state first
+                            let is_top_level_navigation = matches!(
+                                text,
+                                "/start"
+                                    | "/admin"
+                                    | "/health"
+                                    | "📥 دانلود اپلیکیشن Sentra Connect"
+                                    | "📤 آپلود / بروزرسانی اپلیکیشن"
+                                    | "🌐 مدیریت اوتباندها و نودها"
+                                    | "🎁 دریافت اشتراک رایگان (Sentra Lite)"
+                                    | "⚡ ارتقا به پلن ویژه (Sentra Pro / Flow+)"
+                                    | "🔑 دریافت کانفیگ و کد اتصال"
+                                    | "🍏 دریافت اشتراک iOS (OpenVPN)"
+                                    | "🤝 اهدای اوتباند (حمایت از Sentra)"
+                                    | "💖 حمایت مالی از توسعه Sentra"
+                                    | "🔗 اتصال حساب اپلیکیشن"
+                                    | "📊 وضعیت اشتراک و تیکت پشتیبانی"
+                                    | "🛠 پنل مدیریت"
+                                    | "🛡 مدیریت سنترا (پنل ادمین)"
+                                    | "🔄 وضعیت نودهای خروجی شبکه"
+                                    | "🩺 تست سلامت ۶ لایه سیستم"
+                                    | "👤 بازگشت به منوی کاربری"
+                            );
+
+                            if is_top_level_navigation {
+                                user_handlers::clear_user_state(telegram_user_id).await;
+                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
+                            } else {
+                                // Check active admin input states (Upload / Outbound / Search / Broadcast)
+                                if admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id) {
+                                    if let Some(upload_state) = admin_handlers::get_admin_upload_state(telegram_user_id).await {
+                                        match upload_state {
+                                            admin_handlers::AdminUploadState::AwaitingVersionAndChangelog { platform } => {
+                                                if let Err(e) = admin_handlers::handle_admin_version_text(&bot, &msg, admin_chat_id, &platform, text).await {
+                                                    error!("Error in handle_admin_version_text: {:?}", e);
                                                 }
-                                            } else {
+                                                return respond(());
+                                            }
+                                            admin_handlers::AdminUploadState::AwaitingFile { .. } => {
                                                 let _ = bot.send_message(
                                                     msg.chat.id,
-                                                    "⚠️ فرمت ارسالی نامعتبر است.\nلطفاً به صورت زیر ارسال فرمایید:\n<code>نسخه|لینک ویندوز|لینک اندروید|توضیحات</code>",
+                                                    "⚠️ لطفاً فایل نصبی را به صورت Document در چت بفرستید (یا جهت انصراف روی «🔙 بازگشت» بزنید).",
                                                 )
-                                                .parse_mode(ParseMode::Html)
-                                                .reply_markup(keyboards::cancel_inline_keyboard())
+                                                .reply_markup(keyboards::cancel_and_back_inline_keyboard("adm_action_upload_app"))
                                                 .await;
+                                                return respond(());
                                             }
-                                            return respond(());
                                         }
-                                        admin_handlers::AdminUploadState::AwaitingFile { .. } => {
-                                            let _ = bot.send_message(
-                                                msg.chat.id,
-                                                "⚠️ لطفاً فایل نصبی را به صورت Document در چت ارسال فرمایید (یا از دکمه انصراف استفاده نمایید).",
-                                            )
-                                            .reply_markup(keyboards::cancel_inline_keyboard())
-                                            .await;
-                                            return respond(());
+                                    }
+
+                                    // Check active admin state for official outbound input (label + link/json)
+                                    if let Some(outbound_state) = admin_handlers::get_admin_outbound_state(telegram_user_id).await {
+                                        match outbound_state {
+                                            admin_handlers::AdminOutboundState::AwaitingOutboundInput { category } => {
+                                                if let Err(e) = admin_handlers::handle_admin_outbound_text_input(
+                                                    &bot,
+                                                    &msg,
+                                                    &pool,
+                                                    admin_chat_id,
+                                                    &category,
+                                                    text,
+                                                )
+                                                .await
+                                                {
+                                                    error!("Error handling admin outbound text input: {:?}", e);
+                                                }
+                                                return respond(());
+                                            }
+                                        }
+                                    }
+
+                                    // Check active admin panel state (direct user search or broadcast text)
+                                    if let Some(panel_state) = admin_handlers::get_admin_panel_state(telegram_user_id).await {
+                                        if !text.starts_with('/') {
+                                            admin_handlers::clear_admin_panel_state(telegram_user_id).await;
+                                            match panel_state {
+                                                admin_handlers::AdminPanelState::AwaitingUserSearch => {
+                                                    if let Err(e) = admin_handlers::handle_admin_search_user(&bot, &msg, &pool, admin_chat_id, text).await {
+                                                        error!("Error in stateful admin search: {:?}", e);
+                                                    }
+                                                    return respond(());
+                                                }
+                                                admin_handlers::AdminPanelState::AwaitingBroadcast => {
+                                                    if let Err(e) = admin_handlers::handle_admin_broadcast(&bot, &msg, &pool, admin_chat_id, text, None).await {
+                                                        error!("Error in stateful admin broadcast: {:?}", e);
+                                                    }
+                                                    return respond(());
+                                                }
+                                            }
                                         }
                                     }
                                 }
 
-                                // B. Check active admin action state (user search, broadcast)
-                                if let Some(action_state) = admin_handlers::get_admin_action_state(telegram_user_id).await {
-                                    match action_state {
-                                        admin_handlers::AdminActionState::AwaitingUserSearch => {
-                                            admin_handlers::clear_admin_action_state(telegram_user_id).await;
-                                            if let Err(e) = admin_handlers::handle_admin_search_user(&bot, &msg, &pool, admin_chat_id, text).await {
-                                                error!("Error in handle_admin_search_user: {:?}", e);
-                                            }
-                                            return respond(());
-                                        }
-                                        admin_handlers::AdminActionState::AwaitingBroadcast => {
-                                            admin_handlers::clear_admin_action_state(telegram_user_id).await;
-                                            if let Err(e) = admin_handlers::handle_admin_broadcast(&bot, &msg, &pool, admin_chat_id, text, None).await {
-                                                error!("Error in handle_admin_broadcast: {:?}", e);
-                                            }
-                                            return respond(());
-                                        }
-                                    }
-                                }
-
-                                // C. Check active admin state for official outbound input (label + link/json)
-                                if let Some(outbound_state) = admin_handlers::get_admin_outbound_state(telegram_user_id).await {
-                                    match outbound_state {
-                                        admin_handlers::AdminOutboundState::AwaitingOutboundInput { category } => {
-                                            admin_handlers::clear_admin_outbound_state(telegram_user_id).await;
-                                            if let Err(e) = admin_handlers::handle_admin_outbound_text_input(
-                                                &bot,
-                                                &msg,
-                                                &pool,
-                                                admin_chat_id,
-                                                &category,
-                                                text,
-                                            )
-                                            .await
-                                            {
-                                                error!("Error handling admin outbound text input: {:?}", e);
-                                            }
-                                            return respond(());
-                                        }
-                                    }
-                                }
-                            }
-
-                            // D. Check active user state (telegram verification code, donation)
-                            if let Some(user_state) = user_handlers::get_user_state(telegram_user_id).await {
-                                match user_state {
-                                    user_handlers::UserState::AwaitingVerifyCode => {
-                                        user_handlers::clear_user_state(telegram_user_id).await;
-                                        if let Err(e) = user_handlers::handle_verify_code_input(&bot, &msg, &pool, admin_chat_id, text).await {
-                                            error!("Error in handle_verify_code_input: {:?}", e);
-                                        }
-                                        return respond(());
-                                    }
-                                    user_handlers::UserState::AwaitingDonationConfig => {
-                                        user_handlers::clear_user_state(telegram_user_id).await;
-                                        if let Err(e) = user_handlers::handle_donation_submission(&bot, &msg, &pool, text).await {
-                                            error!("Error in handle_donation_submission: {:?}", e);
-                                        }
-                                        return respond(());
-                                    }
-                                    user_handlers::UserState::AwaitingNewPasswordReset => {
-                                        if let Err(e) = password_reset::handle_new_password_reset_input(&bot, &msg, &pool, admin_chat_id, text).await {
-                                            error!("Error in handle_new_password_reset_input: {:?}", e);
+                                // Check active user state (e.g. direct 6-digit link code without /link prefix)
+                                if let Some(user_state) = user_handlers::get_user_state(telegram_user_id).await {
+                                    if user_state == user_handlers::UserState::AwaitingLinkCode
+                                        && text.len() == 6
+                                        && text.chars().all(|c| c.is_ascii_digit())
+                                    {
+                                        if let Err(e) = user_handlers::handle_link_command(&bot, &msg, &pool, text).await {
+                                            error!("Error in stateful handle_link_command: {:?}", e);
                                         }
                                         return respond(());
                                     }
                                 }
                             }
 
-                            // E. Standard Reply Button and Command Handlers (100% button-driven)
-                            if text == "/start" || text.starts_with("/start ") {
-                                let payload = text.strip_prefix("/start ").map(|s| s.trim());
-                                if let Err(e) = user_handlers::handle_start(&bot, &msg, &pool, admin_chat_id, payload).await {
+                            if text == "/start" {
+                                if let Err(e) = user_handlers::handle_start(&bot, &msg, &pool, admin_chat_id).await {
                                     error!("Error in /start: {:?}", e);
                                 }
-                            } else if text == "📥 دانلود اپلیکیشن (ویندوز / اندروید)" || text == "📥 دانلود اپلیکیشن Sentra Connect" {
-                                if let Err(e) = user_handlers::handle_download_app_menu(&bot, &msg, &pool).await {
+                            } else if text == "📥 دانلود اپلیکیشن Sentra Connect" {
+                                if let Err(e) = user_handlers::handle_download_app_menu(&bot, &msg).await {
                                     error!("Error in handle_download_app_menu: {:?}", e);
                                 }
-                            } else if text == "👤 حساب کاربری و وضعیت اشتراک" || text == "📊 وضعیت اشتراک و تیکت پشتیبانی" {
-                                if let Err(e) = user_handlers::handle_subscription_status(&bot, &msg, &pool).await {
-                                    error!("Error in handle_subscription_status: {:?}", e);
-                                }
-                            } else if text == "🔗 تایید حساب و باز کردن بخش دانلود" {
-                                user_handlers::set_user_state(telegram_user_id, user_handlers::UserState::AwaitingVerifyCode).await;
-                                if let Err(e) = user_handlers::handle_request_verify_code_prompt(&bot, &msg).await {
-                                    error!("Error in handle_request_verify_code_prompt: {:?}", e);
-                                }
-                            } else if text == "🎁 اهدای کانفیگ (کمک به شبکه)" || text == "🤝 اهدای اوتباند (حمایت از Sentra)" {
-                                user_handlers::set_user_state(telegram_user_id, user_handlers::UserState::AwaitingDonationConfig).await;
-                                if let Err(e) = user_handlers::handle_donation_prompt(&bot, &msg).await {
-                                    error!("Error in handle_donation_prompt: {:?}", e);
-                                }
-                            } else if text == "💬 پشتیبانی و راهنما" {
-                                if let Err(e) = user_handlers::handle_support_guide(&bot, &msg).await {
-                                    error!("Error in handle_support_guide: {:?}", e);
-                                }
-                            } else if text == "🔑 بازیابی رمز عبور" || text == "/resetpassword" {
-                                if let Err(e) = password_reset::handle_password_reset_menu(&bot, &msg, &pool, admin_chat_id).await {
-                                    error!("Error in handle_password_reset_menu: {:?}", e);
-                                }
-                            } else if text == "🛠 پنل مدیریت (ادمین)" || text == "🛠 پنل مدیریت" || text == "/admin" {
-                                if let Err(e) = admin_handlers::handle_admin_panel(&bot, &msg, &pool, admin_chat_id).await {
-                                    error!("Error in /admin: {:?}", e);
-                                }
-                            }
-                            // Admin Submenu Reply Buttons
-                            else if text == "📊 آمار لحظه‌ای سرور و کاربران" {
-                                if let Err(e) = admin_handlers::handle_admin_panel(&bot, &msg, &pool, admin_chat_id).await {
-                                    error!("Error in admin stats: {:?}", e);
+                            } else if text == "📤 آپلود / بروزرسانی اپلیکیشن" {
+                                if let Err(e) = admin_handlers::handle_app_upload_menu_msg(&bot, &msg, admin_chat_id).await {
+                                    error!("Error in handle_app_upload_menu_msg: {:?}", e);
                                 }
                             } else if text == "🌐 مدیریت اوتباندها و نودها" {
                                 if let Err(e) = admin_handlers::handle_official_outbounds_hub(&bot, msg.chat.id, &pool, admin_chat_id, telegram_user_id).await {
                                     error!("Error in handle_official_outbounds_hub: {:?}", e);
                                 }
-                            } else if text == "👥 مدیریت کاربران" {
-                                if let Err(e) = admin_handlers::handle_admin_user_management_prompt(&bot, msg.chat.id, telegram_user_id, admin_chat_id).await {
-                                    error!("Error in handle_admin_user_management_prompt: {:?}", e);
+                            } else if text == "🎁 دریافت اشتراک رایگان (Sentra Lite)" {
+                                if let Err(e) = user_handlers::handle_free_account(&bot, &msg, &pool).await {
+                                    error!("Error in handle_free_account: {:?}", e);
                                 }
-                            } else if text == "📦 انتشار نسخه جدید (ویندوز و اندروید)" || text == "📤 آپلود / بروزرسانی اپلیکیشن" {
-                                if let Err(e) = admin_handlers::handle_app_upload_menu_msg(&bot, &msg, &pool, admin_chat_id).await {
-                                    error!("Error in handle_app_upload_menu_msg: {:?}", e);
+                            } else if text == "⚡ ارتقا به پلن ویژه (Sentra Pro / Flow+)" {
+                                if let Err(e) = user_handlers::handle_upgrade_prompt(&bot, &msg).await {
+                                    error!("Error in handle_upgrade_prompt: {:?}", e);
                                 }
-                            } else if text == "📢 ارسال پیام همگانی" {
-                                if let Err(e) = admin_handlers::handle_admin_broadcast_prompt(&bot, msg.chat.id, telegram_user_id, admin_chat_id).await {
-                                    error!("Error in handle_admin_broadcast_prompt: {:?}", e);
+                            } else if text == "🔑 دریافت کانفیگ و کد اتصال" {
+                                if let Err(e) = user_handlers::handle_get_config_and_links(&bot, &msg, &pool, &base_url).await {
+                                    error!("Error in handle_get_config_and_links: {:?}", e);
                                 }
-                            } else if text == "🔙 بازگشت به منوی کاربر" || text == "👤 بازگشت به منوی کاربری" {
-                                if let Err(e) = admin_handlers::handle_return_to_user_menu(&bot, &msg).await {
-                                    error!("Error in handle_return_to_user_menu: {:?}", e);
+                            } else if text == "🍏 دریافت اشتراک iOS (OpenVPN)" {
+                                if let Err(e) = user_handlers::handle_ios_subscription_prompt(&bot, &msg, &pool).await {
+                                    error!("Error in handle_ios_subscription_prompt: {:?}", e);
                                 }
-                            }
-                            // Legacy config link submissions
-                            else if text.starts_with("vless://")
+                            } else if text == "🤝 اهدای اوتباند (حمایت از Sentra)" {
+                                if let Err(e) = user_handlers::handle_donation_prompt(&bot, &msg).await {
+                                    error!("Error in handle_donation_prompt: {:?}", e);
+                                }
+                            } else if text == "💖 حمایت مالی از توسعه Sentra" {
+                                if let Err(e) = user_handlers::handle_financial_donation_prompt(&bot, &msg, pro_subscription_price).await {
+                                    error!("Error in handle_financial_donation_prompt: {:?}", e);
+                                }
+                            } else if text == "🔗 اتصال حساب اپلیکیشن" {
+                                if let Err(e) = user_handlers::handle_link_account_prompt(&bot, &msg, &pool).await {
+                                    error!("Error in handle_link_account_prompt: {:?}", e);
+                                }
+                            } else if text == "/link" || text.starts_with("/link ") {
+                                let args = if text.len() > 5 { &text[5..] } else { "" };
+                                if let Err(e) = user_handlers::handle_link_command(&bot, &msg, &pool, args).await {
+                                    error!("Error in handle_link_command: {:?}", e);
+                                }
+                            } else if let Some(stripped) = text.strip_prefix("/setpassword ") {
+                                let args = stripped.trim();
+                                if let Err(e) = user_handlers::handle_setpassword_command(&bot, &msg, &pool, args).await {
+                                    error!("Error in handle_setpassword_command: {:?}", e);
+                                }
+                            } else if text.starts_with("vless://")
                                 || text.starts_with("vmess://")
                                 || text.starts_with("trojan://")
                                 || text.starts_with("hy2://")
@@ -370,10 +366,44 @@ pub async fn run_telegram_bot(
                                 if let Err(e) = user_handlers::handle_donation_submission(&bot, &msg, &pool, text).await {
                                     error!("Error in handle_donation_submission: {:?}", e);
                                 }
+                            } else if text == "📊 وضعیت اشتراک و تیکت پشتیبانی" {
+                                if let Err(e) = user_handlers::handle_subscription_status(&bot, &msg, &pool).await {
+                                    error!("Error in handle_subscription_status: {:?}", e);
+                                }
+                            } else if text == "/admin" || text == "🛠 پنل مدیریت" || text == "🛡 مدیریت سنترا (پنل ادمین)" {
+                                if let Err(e) = admin_handlers::handle_admin_panel(&bot, &msg, &pool, admin_chat_id).await {
+                                    error!("Error in /admin: {:?}", e);
+                                }
+                            } else if text.starts_with("/user ") || text.starts_with("/search ") {
+                                let query = if let Some(stripped) = text.strip_prefix("/user ") {
+                                    stripped.trim()
+                                } else {
+                                    text.strip_prefix("/search ").unwrap_or_default().trim()
+                                };
+                                if let Err(e) = admin_handlers::handle_admin_search_user(&bot, &msg, &pool, admin_chat_id, query).await {
+                                    error!("Error in handle_admin_search_user: {:?}", e);
+                                }
+                            } else if let Some(stripped) = text.strip_prefix("/broadcast ") {
+                                let broadcast_text = stripped.trim();
+                                if let Err(e) = admin_handlers::handle_admin_broadcast(&bot, &msg, &pool, admin_chat_id, broadcast_text, None).await {
+                                    error!("Error in handle_admin_broadcast: {:?}", e);
+                                }
+                            } else if text == "🔄 وضعیت نودهای خروجی شبکه" {
+                                if let Err(e) = admin_handlers::handle_outbounds_menu(&bot, msg.chat.id, &pool, admin_chat_id, telegram_user_id).await {
+                                    error!("Error in handle_outbounds_menu: {:?}", e);
+                                }
+                            } else if text == "🩺 تست سلامت ۶ لایه سیستم" || text == "/health" {
+                                if let Err(e) = admin_handlers::handle_six_layer_health_test(&bot, msg.chat.id, &pool, admin_chat_id, telegram_user_id).await {
+                                    error!("Error in handle_six_layer_health_test: {:?}", e);
+                                }
+                            } else if text == "👤 بازگشت به منوی کاربری" {
+                                if let Err(e) = admin_handlers::handle_return_to_user_menu(&bot, &msg).await {
+                                    error!("Error in handle_return_to_user_menu: {:?}", e);
+                                }
                             } else {
                                 let _ = bot.send_message(
                                     msg.chat.id,
-                                    "💡 لطفاً یکی از گزینه‌های منوی زیر را لمس نمایید یا /start را ارسال فرمایید.",
+                                    "💡 لطفاً یکی از گزینه‌های منوی زیر را لمس نمایید یا /start را بفرستید.",
                                 )
                                 .reply_markup(keyboards::user_main_keyboard_with_admin(admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id)))
                                 .await;
@@ -412,20 +442,14 @@ pub async fn run_telegram_bot(
                         }
 
                         if let Some(ref data) = q.data {
-                            if data == "cancel_state" {
-                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
-                                user_handlers::clear_user_state(telegram_user_id).await;
-                                if let Some(msg) = &q.message {
-                                    let is_admin = admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id);
-                                    let _ = bot.send_message(msg.chat().id, "❌ عملیات جاری لغو گردید.")
-                                        .reply_markup(keyboards::user_main_keyboard_with_admin(is_admin))
-                                        .await;
+                            // Global User Back to Main Menu (clears any pending UserState & Admin*State)
+                            if data == "user_back_main" {
+                                if let Err(e) = user_handlers::handle_user_back_to_main_callback(&bot, &q, admin_chat_id).await {
+                                    error!("Error in user_back_main: {:?}", e);
                                 }
-                                let _ = bot.answer_callback_query(q.id.clone()).text("عملیات لغو شد.").await;
-                                return respond(());
                             }
                             // User Device Management Callbacks
-                            if data == "manage_devices" || data == "back_to_status" {
+                            else if data == "manage_devices" || data == "back_to_status" {
                                 if let Err(e) = user_handlers::handle_manage_devices_callback(&bot, &q, &pool).await {
                                     error!("Error in handle_manage_devices_callback: {:?}", e);
                                 }
@@ -436,20 +460,18 @@ pub async fn run_telegram_bot(
                             }
                             // Admin Dashboard Actions
                             else if data == "adm_action_stats" {
+                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
                                 if let Err(e) = admin_handlers::handle_realtime_stats_callback(&bot, &q, &pool, admin_chat_id).await {
                                     error!("Error in adm_action_stats: {:?}", e);
                                 }
                             } else if data == "adm_action_official_outbounds" {
+                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
                                 if let Err(e) = admin_handlers::handle_official_outbounds_hub_callback(&bot, &q, &pool, admin_chat_id).await {
                                     error!("Error in adm_action_official_outbounds: {:?}", e);
                                 }
-                            } else if data == "adm_ob_add_start" || data == "adm_ob_add_single" || data == "adm_ob_add_sublink" {
+                            } else if data == "adm_ob_add_start" {
                                 if let Err(e) = admin_handlers::handle_start_add_official_outbound(&bot, &q, admin_chat_id).await {
-                                    error!("Error in adm_ob_add: {:?}", e);
-                                }
-                            } else if data == "adm_ob_list_all" || data == "adm_ob_alloc_settings" {
-                                if let Err(e) = admin_handlers::handle_list_official_outbounds(&bot, &q, &pool, admin_chat_id, "all").await {
-                                    error!("Error in adm_ob_list_all: {:?}", e);
+                                    error!("Error in adm_ob_add_start: {:?}", e);
                                 }
                             } else if let Some(cat) = data.strip_prefix("adm_ob_target_") {
                                 if let Err(e) = admin_handlers::handle_target_category_chosen(&bot, &q, admin_chat_id, cat).await {
@@ -515,24 +537,17 @@ pub async fn run_telegram_bot(
                                     error!("Error in adm_warp_generate: {:?}", e);
                                 }
                             } else if data == "adm_action_upload_app" {
-                                if let Err(e) = admin_handlers::handle_app_upload_menu_callback(&bot, &q, &pool, admin_chat_id).await {
+                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
+                                if let Err(e) = admin_handlers::handle_app_upload_menu_callback(&bot, &q, admin_chat_id).await {
                                     error!("Error in adm_action_upload_app: {:?}", e);
                                 }
-                            } else if data == "adm_upload_windows" || data == "adm_rel_upload_win" {
+                            } else if data == "adm_upload_windows" {
                                 if let Err(e) = admin_handlers::handle_admin_start_upload(&bot, &q, admin_chat_id, "windows").await {
                                     error!("Error in adm_upload_windows: {:?}", e);
                                 }
-                            } else if data == "adm_upload_android" || data == "adm_rel_upload_apk" {
+                            } else if data == "adm_upload_android" {
                                 if let Err(e) = admin_handlers::handle_admin_start_upload(&bot, &q, admin_chat_id, "android").await {
                                     error!("Error in adm_upload_android: {:?}", e);
-                                }
-                            } else if data == "adm_rel_set_github" {
-                                if let Err(e) = admin_handlers::handle_admin_start_github_release(&bot, &q, admin_chat_id).await {
-                                    error!("Error in adm_rel_set_github: {:?}", e);
-                                }
-                            } else if data == "adm_rel_view_current" {
-                                if let Err(e) = admin_handlers::handle_admin_view_current_release(&bot, &q, &pool, admin_chat_id).await {
-                                    error!("Error in adm_rel_view_current: {:?}", e);
                                 }
                             } else if data == "dl_app_windows" {
                                 if let Err(e) = user_handlers::handle_download_platform_callback(&bot, &q, &pool, "windows").await {
@@ -547,30 +562,58 @@ pub async fn run_telegram_bot(
                                     error!("Error in dl_app_ios: {:?}", e);
                                 }
                             } else if data == "adm_action_search" {
+                                if !admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id) {
+                                    let _ = bot.answer_callback_query(q.id.clone()).text("⛔ دسترسی غیرمجاز!").show_alert(true).await;
+                                    return respond(());
+                                }
+                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
+                                admin_handlers::set_admin_panel_state(
+                                    telegram_user_id,
+                                    admin_handlers::AdminPanelState::AwaitingUserSearch,
+                                )
+                                .await;
+                                let prompt = "🔍 <b>جستجو و مدیریت کاربر:</b>\n\nلطفاً شناسه عددی تلگرام، شناسه دیتابیس یا یوزرنیم کاربر را مستقیماً بفرستید (یا از دستور <code>/user &lt;آیدی یا یوزرنیم&gt;</code> استفاده کنید).\n\n<i>مثال:</i>\n<code>12345678</code> یا <code>@username</code>";
                                 if let Some(msg) = &q.message {
-                                    if let Err(e) = admin_handlers::handle_admin_user_management_prompt(&bot, msg.chat().id, telegram_user_id, admin_chat_id).await {
-                                        error!("Error in adm_action_search: {:?}", e);
-                                    }
+                                    let _ = bot.send_message(msg.chat().id, prompt)
+                                        .parse_mode(ParseMode::Html)
+                                        .reply_markup(keyboards::back_to_admin_inline_keyboard())
+                                        .await;
                                 }
                                 let _ = bot.answer_callback_query(q.id.clone()).await;
                             } else if data == "adm_action_broadcast" {
+                                if !admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id) {
+                                    let _ = bot.answer_callback_query(q.id.clone()).text("⛔ دسترسی غیرمجاز!").show_alert(true).await;
+                                    return respond(());
+                                }
+                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
+                                admin_handlers::set_admin_panel_state(
+                                    telegram_user_id,
+                                    admin_handlers::AdminPanelState::AwaitingBroadcast,
+                                )
+                                .await;
+                                let prompt = "📢 <b>ارسال پیام همگانی (Broadcast):</b>\n\nمتن پیام همگانی (یا تصویر همراه با کپشن) را مستقیماً در همین چت ارسال کنید تا برای کلیه کاربران ارسال شود.\n\n<i>همچنین می‌توانید از دستور <code>/broadcast &lt;متن پیام&gt;</code> استفاده نمایید.</i>";
                                 if let Some(msg) = &q.message {
-                                    if let Err(e) = admin_handlers::handle_admin_broadcast_prompt(&bot, msg.chat().id, telegram_user_id, admin_chat_id).await {
-                                        error!("Error in adm_action_broadcast: {:?}", e);
-                                    }
+                                    let _ = bot.send_message(msg.chat().id, prompt)
+                                        .parse_mode(ParseMode::Html)
+                                        .reply_markup(keyboards::back_to_admin_inline_keyboard())
+                                        .await;
                                 }
                                 let _ = bot.answer_callback_query(q.id.clone()).await;
                             } else if data == "adm_action_outbounds" {
+                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
                                 if let Some(msg) = &q.message {
                                     let _ = admin_handlers::handle_outbounds_menu(&bot, msg.chat().id, &pool, admin_chat_id, telegram_user_id).await;
                                 }
                                 let _ = bot.answer_callback_query(q.id.clone()).await;
                             } else if data == "adm_action_health" {
+                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
                                 if let Some(msg) = &q.message {
                                     let _ = admin_handlers::handle_six_layer_health_test(&bot, msg.chat().id, &pool, admin_chat_id, telegram_user_id).await;
                                 }
                                 let _ = bot.answer_callback_query(q.id.clone()).await;
                             } else if data == "adm_action_return" {
+                                user_handlers::clear_user_state(telegram_user_id).await;
+                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
                                 if let Some(msg) = &q.message {
                                     let _ = bot.send_message(msg.chat().id, "👤 به منوی اصلی کاربری سنترا بازگشتید.")
                                         .reply_markup(keyboards::user_main_keyboard_with_admin(true))
@@ -578,6 +621,12 @@ pub async fn run_telegram_bot(
                                 }
                                 let _ = bot.answer_callback_query(q.id.clone()).await;
                             } else if data == "adm_back_main" {
+                                if !admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id) {
+                                    let _ = bot.answer_callback_query(q.id.clone()).text("⛔ دسترسی غیرمجاز!").show_alert(true).await;
+                                    return respond(());
+                                }
+                                user_handlers::clear_user_state(telegram_user_id).await;
+                                admin_handlers::clear_all_admin_states(telegram_user_id).await;
                                 if let Some(msg) = &q.message {
                                     let stats = match crate::db::Repository::get_admin_realtime_stats(&pool).await {
                                         Ok(s) => s,
@@ -598,10 +647,17 @@ pub async fn run_telegram_bot(
                                         stats.suspended_users,
                                         stats.active_sessions
                                     );
-                                    let _ = bot.edit_message_text(msg.chat().id, msg.id(), text)
+                                    if bot.edit_message_text(msg.chat().id, msg.id(), text.clone())
                                         .parse_mode(ParseMode::Html)
                                         .reply_markup(keyboards::admin_dashboard_inline_keyboard())
-                                        .await;
+                                        .await
+                                        .is_err()
+                                    {
+                                        let _ = bot.send_message(msg.chat().id, text)
+                                            .parse_mode(ParseMode::Html)
+                                            .reply_markup(keyboards::admin_dashboard_inline_keyboard())
+                                            .await;
+                                    }
                                 }
                                 let _ = bot.answer_callback_query(q.id.clone()).await;
                             }
@@ -722,18 +778,6 @@ pub async fn run_telegram_bot(
                                     .text("پلن Sentra Flow+: دارای IP مسکونی ثابت آمریکا تضمین‌شده برای Google Flow و Gemini")
                                     .show_alert(true)
                                     .await;
-                            } else if data == "pwd_reset_get_code" {
-                                if let Err(e) = password_reset::handle_password_reset_get_code_callback(&bot, &q, &pool).await {
-                                    error!("Error in pwd_reset_get_code: {:?}", e);
-                                }
-                            } else if data == "pwd_reset_set_direct" {
-                                if let Err(e) = password_reset::handle_password_reset_set_direct_callback(&bot, &q, &pool).await {
-                                    error!("Error in pwd_reset_set_direct: {:?}", e);
-                                }
-                            } else if data == "pwd_reset_cancel" {
-                                if let Err(e) = password_reset::handle_password_reset_cancel_callback(&bot, &q, &pool).await {
-                                    error!("Error in pwd_reset_cancel: {:?}", e);
-                                }
                             }
                         }
                         respond(())

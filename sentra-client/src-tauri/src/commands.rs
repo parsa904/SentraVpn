@@ -20,8 +20,6 @@ pub async fn login_with_code(
     app_state.username = session.username.clone();
     app_state.remaining_bytes = session.remaining_bytes;
     app_state.expires_at = session.expires_at.clone();
-    app_state.telegram_verified = session.telegram_verified;
-    app_state.email = session.email.clone();
 
     let log_msg = format!(
         "[INFO] [Auth] Authenticated as {} (Tier: {})",
@@ -48,8 +46,6 @@ pub async fn register_with_credentials(
     app_state.username = session.username.clone();
     app_state.remaining_bytes = session.remaining_bytes;
     app_state.expires_at = session.expires_at.clone();
-    app_state.telegram_verified = session.telegram_verified;
-    app_state.email = session.email.clone();
 
     let log_msg = format!(
         "[INFO] [Auth] Registered and logged in as {} (Tier: {})",
@@ -76,8 +72,6 @@ pub async fn login_with_credentials(
     app_state.username = session.username.clone();
     app_state.remaining_bytes = session.remaining_bytes;
     app_state.expires_at = session.expires_at.clone();
-    app_state.telegram_verified = session.telegram_verified;
-    app_state.email = session.email.clone();
 
     let log_msg = format!(
         "[INFO] [Auth] Logged in as {} (Tier: {})",
@@ -85,47 +79,6 @@ pub async fn login_with_credentials(
     );
     app_state.logs.push(log_msg);
 
-    Ok(app_state.clone())
-}
-
-#[tauri::command]
-pub async fn request_password_reset(email: String) -> Result<serde_json::Value, String> {
-    AuthManager::request_password_reset(&email).await
-}
-
-#[tauri::command]
-pub async fn confirm_password_reset(
-    email: String,
-    code: String,
-    new_password: String,
-) -> Result<serde_json::Value, String> {
-    AuthManager::confirm_password_reset(&email, &code, &new_password).await
-}
-
-#[tauri::command]
-pub async fn request_telegram_verify(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let auth_token = {
-        let app_state = state.lock().await;
-        app_state.auth_token.clone()
-    };
-    let token = auth_token.ok_or("ابتدا وارد حساب کاربری خود شوید.".to_string())?;
-    AuthManager::request_telegram_verify(&token).await
-}
-
-#[tauri::command]
-pub async fn check_telegram_verify_status(state: State<'_, AppState>) -> Result<ClientState, String> {
-    let auth_token = {
-        let app_state = state.lock().await;
-        app_state.auth_token.clone()
-    };
-    let token = auth_token.ok_or("ابتدا وارد حساب کاربری خود شوید.".to_string())?;
-    let is_verified = AuthManager::check_telegram_verify_status(&token).await?;
-
-    let mut app_state = state.lock().await;
-    app_state.telegram_verified = is_verified;
-    if is_verified {
-        app_state.logs.push("[INFO] [Telegram] حساب تلگرام تایید گردید. بخش دانلود فعال شد.".to_string());
-    }
     Ok(app_state.clone())
 }
 
@@ -259,82 +212,73 @@ pub async fn get_connection_modes(
     token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|e| e.to_string())?;
 
-    for base_url in crate::auth::BACKEND_FALLBACK_URLS {
+    for base_url in crate::auth::get_backend_urls() {
         let mut req = client.get(format!("{}/api/v1/client/modes", base_url));
         if let Some(ref t) = token {
             req = req.query(&[("token", t.as_str())]);
         }
         if let Ok(resp) = req.send().await {
             if resp.status().is_success() {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Ok(mut json) = resp.json::<serde_json::Value>().await {
+                    // Temporarily hide gaming mode from UI while keeping backend intact
+                    if let Some(modes) = json.get_mut("modes").and_then(|m| m.as_array_mut()) {
+                        modes.retain(|item| item.get("id").and_then(|v| v.as_str()) != Some("gaming"));
+                    }
                     return Ok(json);
                 }
             }
         }
     }
 
-    // High-fidelity fallback conforming to the 4 Modes specification
-            Ok(serde_json::json!({
-                "success": true,
-                "modes": [
-                    {
-                        "id": "web_browsing",
-                        "title": "وب‌گردی",
-                        "description": "مرور روزمره وب و شبکه‌های اجتماعی (۲ گیگابایت روزانه)",
-                        "protocol": "WS + Fragment",
-                        "speed": "متوسط",
-                        "security": "کم",
-                        "is_locked": false,
-                        "is_coming_soon": false,
-                        "daily_quota_mb": 2048,
-                        "daily_used_mb": 0,
-                        "allowed_tiers": ["Sentra Lite", "Sentra Pro", "Sentra Flow+"]
-                    },
-                    {
-                        "id": "download",
-                        "title": "دانلود",
-                        "description": "انتقال فایل پرسرعت بر بستر Hysteria 2 (۳ گیگابایت روزانه)",
-                        "protocol": "Hysteria 2",
-                        "speed": "حداکثر",
-                        "security": "متوسط",
-                        "is_locked": false,
-                        "is_coming_soon": false,
-                        "daily_quota_mb": 3072,
-                        "daily_used_mb": 0,
-                        "allowed_tiers": ["Sentra Lite", "Sentra Pro", "Sentra Flow+"]
-                    },
-                    {
-                        "id": "gaming",
-                        "title": "گیمینگ",
-                        "description": "کاهش پینگ و تثبیت جیتر (به‌زودی اضافه می‌شود)",
-                        "protocol": "UDP Optimized",
-                        "speed": "تاخیر فوق‌کم",
-                        "security": "بالا",
-                        "is_locked": false,
-                        "is_coming_soon": true,
-                        "daily_quota_mb": 0,
-                        "daily_used_mb": 0,
-                        "allowed_tiers": ["Sentra Lite", "Sentra Pro", "Sentra Flow+"]
-                    },
-                    {
-                        "id": "static_ip",
-                        "title": "آی‌پی ثابت",
-                        "description": "مسیریابی مسکونی تمیز آمریکا برای صرافی‌های ترید و جمنای (Google Gemini)",
-                        "protocol": "Residential VLESS Reality",
-                        "speed": "بالا",
-                        "security": "حداکثر",
-                        "is_locked": true,
-                        "is_coming_soon": false,
-                        "daily_quota_mb": 0,
-                        "daily_used_mb": 0,
-                        "allowed_tiers": ["Sentra Pro", "Sentra Flow+"]
-                    }
-                ]
-            }))
+    // High-fidelity fallback (Gaming mode temporarily hidden)
+    Ok(serde_json::json!({
+        "success": true,
+        "modes": [
+            {
+                "id": "web_browsing",
+                "title": "وب‌گردی",
+                "description": "مرور روزمره وب و شبکه‌های اجتماعی (۲ گیگابایت روزانه)",
+                "protocol": "WS + Fragment",
+                "speed": "متوسط",
+                "security": "کم",
+                "is_locked": false,
+                "is_coming_soon": false,
+                "daily_quota_mb": 2048,
+                "daily_used_mb": 0,
+                "allowed_tiers": ["Sentra Lite", "Sentra Pro", "Sentra Flow+"]
+            },
+            {
+                "id": "download",
+                "title": "دانلود",
+                "description": "انتقال فایل پرسرعت بر بستر Hysteria 2 (۳ گیگابایت روزانه)",
+                "protocol": "Hysteria 2",
+                "speed": "حداکثر",
+                "security": "متوسط",
+                "is_locked": false,
+                "is_coming_soon": false,
+                "daily_quota_mb": 3072,
+                "daily_used_mb": 0,
+                "allowed_tiers": ["Sentra Lite", "Sentra Pro", "Sentra Flow+"]
+            },
+            {
+                "id": "static_ip",
+                "title": "آی‌پی ثابت",
+                "description": "مسیریابی مسکونی تمیز آمریکا برای صرافی‌های ترید و جمنای (Google Gemini)",
+                "protocol": "Residential VLESS Reality",
+                "speed": "بالا",
+                "security": "حداکثر",
+                "is_locked": true,
+                "is_coming_soon": false,
+                "daily_quota_mb": 0,
+                "daily_used_mb": 0,
+                "allowed_tiers": ["Sentra Pro", "Sentra Flow+"]
+            }
+        ]
+    }))
 }
 
 #[tauri::command]
@@ -342,16 +286,15 @@ pub async fn set_connection_mode(
     mode: String,
     state: State<'_, AppState>,
 ) -> Result<ClientState, String> {
+    if mode == "gaming" {
+        return Err("حالت گیمینگ موقتاً غیرفعال است.".to_string());
+    }
     let mut app_state = state.lock().await;
     app_state.selected_mode = mode.clone();
     if mode == "static_ip" {
         app_state.routing_mode = "tunnel".to_string();
         app_state.kill_switch = true;
         app_state.logs.push("[SECURITY] در حالت آی‌پی ثابت، برای امنیت حساب‌های مالی فقط حالت Tunnel (همراه با Kill-Switch) فعال است.".to_string());
-    } else if mode == "gaming" {
-        app_state.routing_mode = "tunnel".to_string();
-        app_state.tun_mode = true;
-        app_state.logs.push("[GAMING] حالت گیمینگ انتخاب شد (هدایت کامل ترافیک UDP با استک سیستم و پینگ بهینه).".to_string());
     }
     let msg = format!("[CONFIG] Connection mode switched to [{}]", mode);
     app_state.logs.push(msg);
@@ -371,22 +314,6 @@ pub async fn set_connection_protocol(
     app_state.selected_protocol = protocol.clone();
     let msg = format!("[CONFIG] Connection protocol switched to [{}]", protocol);
     app_state.logs.push(msg);
-    Ok(app_state.clone())
-}
-
-#[tauri::command]
-pub async fn set_gaming_submode(
-    submode: String,
-    state: State<'_, AppState>,
-) -> Result<ClientState, String> {
-    let mut app_state = state.lock().await;
-    let sm = match submode.as_str() {
-        "anti_sanction" => "anti_sanction".to_string(),
-        _ => "full_udp".to_string(),
-    };
-    app_state.gaming_submode = sm.clone();
-    let label = if sm == "anti_sanction" { "ضدتحریم پینگ صفر" } else { "تونل کامل گیمینگ" };
-    app_state.logs.push(format!("[GAMING] حالت فرعی گیمینگ به [{}] تنظیم شد.", label));
     Ok(app_state.clone())
 }
 
@@ -434,38 +361,37 @@ pub async fn set_routing_mode(
 
 #[tauri::command]
 pub async fn test_api_connection(state: State<'_, AppState>) -> Result<String, String> {
-    info!("Testing connectivity to Sentra Core API on https://head.cyberservice.sbs:8443/health...");
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(6))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let start = std::time::Instant::now();
-    let resp = client
-        .get("https://head.cyberservice.sbs:8443/health")
-        .send()
-        .await;
-
-    let duration_ms = start.elapsed().as_millis();
-
-    let mut app_state = state.lock().await;
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            let log_entry = format!("[INFO] [API] Sentra Core online at head.cyberservice.sbs:8443 (Latency: {}ms)", duration_ms);
-            app_state.logs.push(log_entry);
-            Ok(format!("اتصال به API مرکزی برقرار است (تاخیر: {} میلی‌ثانیه)", duration_ms))
-        }
-        Ok(r) => {
-            let log_entry = format!("[WARN] [API] Sentra Core responded with HTTP {}", r.status());
-            app_state.logs.push(log_entry);
-            Err(format!("پاسخ سرور با کد خطا مواجه شد: HTTP {}", r.status()))
-        }
-        Err(e) => {
-            let log_entry = format!("[ERROR] [API] Failed to connect to head.cyberservice.sbs:8443: {}", e);
-            app_state.logs.push(log_entry);
-            Err("سرور مرکزی (head.cyberservice.sbs:8443) در دسترس نیست.".to_string())
+    let mut last_error = String::new();
+    for base_url in crate::auth::get_backend_urls() {
+        let health_url = format!("{}/health", base_url);
+        info!("Testing connectivity to Sentra Core API on {}...", health_url);
+        let start = std::time::Instant::now();
+        match client.get(&health_url).send().await {
+            Ok(r) if r.status().is_success() => {
+                let duration_ms = start.elapsed().as_millis();
+                let mut app_state = state.lock().await;
+                let log_entry = format!("[INFO] [API] Sentra Core online at {} (Latency: {}ms)", base_url, duration_ms);
+                app_state.logs.push(log_entry);
+                return Ok(format!("اتصال به سرور مرکزی برقرار است (تاخیر: {} میلی‌ثانیه)", duration_ms));
+            }
+            Ok(r) => {
+                last_error = format!("HTTP {} از {}", r.status(), base_url);
+            }
+            Err(e) => {
+                last_error = format!("{} ({})", base_url, e);
+            }
         }
     }
+
+    let mut app_state = state.lock().await;
+    let log_entry = format!("[ERROR] [API] Failed to connect to Sentra Core: {}", last_error);
+    app_state.logs.push(log_entry);
+    Err(format!("سرور مرکزی سنترا در دسترس نیست ({}).", last_error))
 }
 
 #[tauri::command]
@@ -523,11 +449,11 @@ pub async fn get_user_devices(
     };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|e| e.to_string())?;
 
-    for base_url in crate::auth::BACKEND_FALLBACK_URLS {
+    for base_url in crate::auth::get_backend_urls() {
         let url = format!("{}/api/v1/client/devices?token={}", base_url, token);
         if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
@@ -587,11 +513,11 @@ pub async fn remove_user_device(
     };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|e| e.to_string())?;
 
-    for base_url in crate::auth::BACKEND_FALLBACK_URLS {
+    for base_url in crate::auth::get_backend_urls() {
         let url = format!("{}/api/v1/client/devices/remove?token={}", base_url, token);
         if let Ok(resp) = client.post(&url).json(&serde_json::json!({ "device_id": device_id })).send().await {
             if resp.status().is_success() {
@@ -616,11 +542,11 @@ pub async fn remove_user_device(
 #[tauri::command]
 pub async fn check_client_version() -> Result<serde_json::Value, String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(6))
         .build()
         .map_err(|e| e.to_string())?;
 
-    for base_url in crate::auth::BACKEND_FALLBACK_URLS {
+    for base_url in crate::auth::get_backend_urls() {
         let url = format!("{}/api/v1/client/version", base_url);
         if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
@@ -739,22 +665,26 @@ pub async fn get_available_locations(
     token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let mut req = client.get("https://head.cyberservice.sbs:8443/api/v1/client/locations");
-    if let Some(t) = token {
-        req = req.header("X-Subscription-Token", t);
+    for base_url in crate::auth::get_backend_urls() {
+        let mut req = client.get(format!("{}/api/v1/client/locations", base_url));
+        if let Some(ref t) = token {
+            req = req.header("X-Subscription-Token", t);
+        }
+        if let Ok(resp) = req.send().await {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    return Ok(json);
+                }
+            }
+        }
     }
 
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            Ok(json)
-        }
-        _ => {
-            // Local dev fallback
+    {
+        // Local dev fallback
             Ok(serde_json::json!({
                 "success": true,
                 "default": "auto",
@@ -795,9 +725,8 @@ pub async fn get_available_locations(
                         "active_nodes": 1,
                         "is_auto": false
                     }
-                ]
-            }))
-        }
+        ]
+    }))
     }
 }
 

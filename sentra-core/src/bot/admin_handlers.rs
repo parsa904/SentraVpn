@@ -2,7 +2,8 @@ use crate::bot::keyboards::{
     admin_app_release_inline_keyboard, admin_dashboard_inline_keyboard,
     admin_official_outbound_actions_keyboard, admin_official_outbounds_hub_keyboard,
     admin_outbound_reallocation_keyboard, admin_outbounds_inline_keyboard,
-    admin_select_outbound_target_keyboard, admin_user_card_inline_keyboard, user_main_keyboard,
+    admin_select_outbound_target_keyboard, admin_user_card_inline_keyboard,
+    cancel_and_back_inline_keyboard, user_main_keyboard_with_admin,
 };
 use crate::db::{DbPool, Repository};
 use crate::outbound_analyzer::OutboundAnalyzer;
@@ -53,7 +54,6 @@ pub enum AdminUploadState {
         version: String,
         changelog: String,
     },
-    AwaitingGithubRelease,
 }
 
 static ADMIN_UPLOAD_STATES: OnceLock<RwLock<HashMap<i64, AdminUploadState>>> = OnceLock::new();
@@ -77,37 +77,38 @@ pub async fn clear_admin_upload_state(admin_id: i64) {
     map.remove(&admin_id);
 }
 
-#[derive(Debug, Clone)]
-pub enum AdminActionState {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminPanelState {
     AwaitingUserSearch,
     AwaitingBroadcast,
 }
 
-static ADMIN_ACTION_STATES: OnceLock<RwLock<HashMap<i64, AdminActionState>>> = OnceLock::new();
+static ADMIN_PANEL_STATES: OnceLock<RwLock<HashMap<i64, AdminPanelState>>> = OnceLock::new();
 
-fn action_states_map() -> &'static RwLock<HashMap<i64, AdminActionState>> {
-    ADMIN_ACTION_STATES.get_or_init(|| RwLock::new(HashMap::new()))
+fn panel_states_map() -> &'static RwLock<HashMap<i64, AdminPanelState>> {
+    ADMIN_PANEL_STATES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub async fn set_admin_action_state(admin_id: i64, state: AdminActionState) {
-    let mut map = action_states_map().write().await;
+pub async fn set_admin_panel_state(admin_id: i64, state: AdminPanelState) {
+    let mut map = panel_states_map().write().await;
     map.insert(admin_id, state);
 }
 
-pub async fn get_admin_action_state(admin_id: i64) -> Option<AdminActionState> {
-    let map = action_states_map().read().await;
+pub async fn get_admin_panel_state(admin_id: i64) -> Option<AdminPanelState> {
+    let map = panel_states_map().read().await;
     map.get(&admin_id).cloned()
 }
 
-pub async fn clear_admin_action_state(admin_id: i64) {
-    let mut map = action_states_map().write().await;
+pub async fn clear_admin_panel_state(admin_id: i64) {
+    let mut map = panel_states_map().write().await;
     map.remove(&admin_id);
 }
 
+/// Immediately clears all pending admin conversation/input states
 pub async fn clear_all_admin_states(admin_id: i64) {
     clear_admin_outbound_state(admin_id).await;
     clear_admin_upload_state(admin_id).await;
-    clear_admin_action_state(admin_id).await;
+    clear_admin_panel_state(admin_id).await;
 }
 
 pub fn is_authorized_admin(telegram_id: i64, admin_chat_id: i64) -> bool {
@@ -1199,8 +1200,13 @@ pub async fn handle_six_layer_health_test(
 }
 
 pub async fn handle_return_to_user_menu(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
+    if let Some(u) = msg.from.as_ref() {
+        let tid = u.id.0 as i64;
+        clear_all_admin_states(tid).await;
+        crate::bot::user_handlers::clear_user_state(tid).await;
+    }
     bot.send_message(msg.chat.id, "👤 به منوی اصلی کاربری سنترا بازگشتید.")
-        .reply_markup(crate::bot::keyboards::user_main_keyboard_with_admin(true))
+        .reply_markup(user_main_keyboard_with_admin(true))
         .await?;
     Ok(())
 }
@@ -1209,7 +1215,6 @@ pub async fn handle_return_to_user_menu(bot: &Bot, msg: &Message) -> anyhow::Res
 pub async fn handle_app_upload_menu_callback(
     bot: &Bot,
     q: &CallbackQuery,
-    pool: &DbPool,
     admin_chat_id: i64,
 ) -> anyhow::Result<()> {
     let telegram_user_id = q.from.id.0 as i64;
@@ -1221,26 +1226,28 @@ pub async fn handle_app_upload_menu_callback(
         return Ok(());
     }
 
-    let release_opt = Repository::get_latest_app_release(pool).await.unwrap_or(None);
-    let cur_ver = release_opt.as_ref().map(|r| r.version.as_str()).unwrap_or("ثبت نشده");
+    let text = r#"📤 <b>مدیریت و انتشار نسخه جدید اپلیکیشن Sentra Connect</b>
 
-    let text = format!(
-        r#"📦 <b>مدیریت و انتشار نسخه جدید Sentra Connect</b>
+لطفاً سیستم‌عامل مورد نظر برای بارگذاری نسخه جدید را انتخاب فرمایید:
+• <b>ویندوز:</b> فایل با پسوند <code>.exe</code> یا <code>.msi</code>
+• <b>اندروید:</b> فایل با پسوند <code>.apk</code>
 
-🔹 <b>نسخه فعلی فعال:</b> <code>{}</code>
-
-لطفاً یکی از گزینه‌های زیر را انتخاب فرمایید:
-• <b>🖥 ثبت فایل نصب ویندوز:</b> دریافت فایل <code>.exe</code>
-• <b>📱 ثبت فایل نصب اندروید:</b> دریافت فایل <code>.apk</code>
-• <b>🔗 ثبت لینک GitHub Release:</b> تنظیم آدرس‌های گیت‌هاب و نسخه"#,
-        cur_ver
-    );
+پس از انتخاب پلتفرم، شماره نسخه و سپس فایل نصبی از شما دریافت خواهد شد."#;
 
     if let Some(msg) = &q.message {
-        bot.edit_message_text(msg.chat().id, msg.id(), text)
+        if bot
+            .edit_message_text(msg.chat().id, msg.id(), text)
             .parse_mode(ParseMode::Html)
             .reply_markup(admin_app_release_inline_keyboard())
-            .await?;
+            .await
+            .is_err()
+        {
+            let _ = bot
+                .send_message(msg.chat().id, text)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(admin_app_release_inline_keyboard())
+                .await;
+        }
     }
     bot.answer_callback_query(q.id.clone()).await?;
     Ok(())
@@ -1250,7 +1257,6 @@ pub async fn handle_app_upload_menu_callback(
 pub async fn handle_app_upload_menu_msg(
     bot: &Bot,
     msg: &Message,
-    pool: &DbPool,
     admin_chat_id: i64,
 ) -> anyhow::Result<()> {
     let telegram_user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
@@ -1259,20 +1265,13 @@ pub async fn handle_app_upload_menu_msg(
         return Ok(());
     }
 
-    let release_opt = Repository::get_latest_app_release(pool).await.unwrap_or(None);
-    let cur_ver = release_opt.as_ref().map(|r| r.version.as_str()).unwrap_or("ثبت نشده");
+    let text = r#"📤 <b>مدیریت و انتشار نسخه جدید اپلیکیشن Sentra Connect</b>
 
-    let text = format!(
-        r#"📦 <b>مدیریت و انتشار نسخه جدید Sentra Connect</b>
+لطفاً سیستم‌عامل مورد نظر برای بارگذاری نسخه جدید را انتخاب فرمایید:
+• <b>ویندوز:</b> فایل با پسوند <code>.exe</code> یا <code>.msi</code>
+• <b>اندروید:</b> فایل با پسوند <code>.apk</code>
 
-🔹 <b>نسخه فعلی فعال:</b> <code>{}</code>
-
-لطفاً یکی از گزینه‌های زیر را انتخاب فرمایید:
-• <b>🖥 ثبت فایل نصب ویندوز:</b> دریافت فایل <code>.exe</code>
-• <b>📱 ثبت فایل نصب اندروید:</b> دریافت فایل <code>.apk</code>
-• <b>🔗 ثبت لینک GitHub Release:</b> تنظیم آدرس‌های گیت‌هاب و نسخه"#,
-        cur_ver
-    );
+پس از انتخاب پلتفرم، شماره نسخه و سپس فایل نصبی از شما دریافت خواهد شد."#;
 
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
@@ -1306,9 +1305,9 @@ pub async fn handle_admin_start_upload(
     .await;
 
     let platform_fa = if platform == "windows" {
-        "ویندوز (Windows .exe)"
+        "ویندوز (Windows)"
     } else {
-        "اندروید (Android .apk)"
+        "اندروید (Android)"
     };
 
     let text = format!(
@@ -1317,151 +1316,19 @@ pub async fn handle_admin_start_upload(
 لطفاً <b>شماره نسخه</b> و <b>توضیح کوتاه تغییرات</b> را در یک پیام بفرستید.
 
 <i>فرمت نمونه:</i>
-<code>1.0.0 - نسخه رسمی با پشتیبانی از پروتکل‌های امن و سوییچ هوشمند</code>"#,
+<code>0.1.0 - نسخه اولیه با پشتیبانی از حالت رایگان</code>
+
+یا جهت لغو عملیات ارسال نمایید: /cancel"#,
         platform_fa
     );
 
     if let Some(msg) = &q.message {
         bot.send_message(msg.chat().id, text)
             .parse_mode(ParseMode::Html)
-            .reply_markup(crate::bot::keyboards::cancel_inline_keyboard())
+            .reply_markup(cancel_and_back_inline_keyboard("adm_action_upload_app"))
             .await?;
     }
     bot.answer_callback_query(q.id.clone()).await?;
-    Ok(())
-}
-
-/// Admin initiates GitHub release setting
-pub async fn handle_admin_start_github_release(
-    bot: &Bot,
-    q: &CallbackQuery,
-    admin_chat_id: i64,
-) -> anyhow::Result<()> {
-    let telegram_user_id = q.from.id.0 as i64;
-    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
-        bot.answer_callback_query(q.id.clone())
-            .text("⛔ دسترسی غیرمجاز!")
-            .show_alert(true)
-            .await?;
-        return Ok(());
-    }
-
-    set_admin_upload_state(telegram_user_id, AdminUploadState::AwaitingGithubRelease).await;
-
-    let text = r#"🔗 <b>ثبت لینک دانلود GitHub Release</b>
-
-لطفاً اطلاعات نسخه و آدرس‌های انتشار گیت‌هاب را با خط عمودی (|) در یک پیام ارسال فرمایید:
-<code>نسخه|لینک ویندوز (.exe)|لینک اندروید (.apk)|توضیحات</code>
-
-<i>نمونه آماده:</i>
-<code>1.0.0|https://github.com/sentravpn/client/releases/download/v1.0.0/Sentra-v1.0.0-Windows-Setup.exe|https://github.com/sentravpn/client/releases/download/v1.0.0/Sentra-v1.0.0-Android.apk|نسخه رسمی کلاینت هوشمند Sentra Connect</code>"#;
-
-    if let Some(msg) = &q.message {
-        bot.send_message(msg.chat().id, text)
-            .parse_mode(ParseMode::Html)
-            .reply_markup(crate::bot::keyboards::cancel_inline_keyboard())
-            .await?;
-    }
-    bot.answer_callback_query(q.id.clone()).await?;
-    Ok(())
-}
-
-/// View current release details
-pub async fn handle_admin_view_current_release(
-    bot: &Bot,
-    q: &CallbackQuery,
-    pool: &DbPool,
-    admin_chat_id: i64,
-) -> anyhow::Result<()> {
-    let telegram_user_id = q.from.id.0 as i64;
-    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
-        bot.answer_callback_query(q.id.clone()).text("⛔ عدم دسترسی").await?;
-        return Ok(());
-    }
-
-    let release_opt = Repository::get_latest_app_release(pool).await?;
-
-    let text = match release_opt {
-        Some(r) => format!(
-            r#"📦 <b>اطلاعات آخرین نسخه ثبت‌شده:</b>
-
-🔹 <b>نسخه:</b> <code>{}</code>
-🖥 <b>فایل ویندوز تلگرام:</b> {}
-🌐 <b>لینک ویندوز گیت‌هاب:</b> <code>{}</code>
-📱 <b>فایل اندروید تلگرام:</b> {}
-🌐 <b>لینک اندروید گیت‌هاب:</b> <code>{}</code>
-📝 <b>تغییرات:</b> <i>{}</i>
-📅 <b>تاریخ بروزرسانی:</b> <code>{}</code>"#,
-            r.version,
-            if r.windows_file_id.is_some() { "✅ ثبت‌شده" } else { "❌ ثبت‌نشده" },
-            r.windows_github_url.as_deref().unwrap_or("تنظیم نشده"),
-            if r.android_file_id.is_some() { "✅ ثبت‌شده" } else { "❌ ثبت‌نشده" },
-            r.android_github_url.as_deref().unwrap_or("تنظیم نشده"),
-            r.changelog,
-            r.updated_at.format("%Y-%m-%d %H:%M UTC")
-        ),
-        None => "⏳ هیچ نسخه‌ای تاکنون در دیتابیس ثبت نشده است.".to_string(),
-    };
-
-    if let Some(msg) = &q.message {
-        bot.send_message(msg.chat().id, text)
-            .parse_mode(ParseMode::Html)
-            .reply_markup(admin_app_release_inline_keyboard())
-            .await?;
-    }
-    bot.answer_callback_query(q.id.clone()).await?;
-    Ok(())
-}
-
-/// Prompt admin for User Management (search by email, username, id)
-pub async fn handle_admin_user_management_prompt(
-    bot: &Bot,
-    chat_id: ChatId,
-    user_id: i64,
-    admin_chat_id: i64,
-) -> anyhow::Result<()> {
-    if !is_authorized_admin(user_id, admin_chat_id) {
-        bot.send_message(chat_id, "⛔ دسترسی غیرمجاز!").await?;
-        return Ok(());
-    }
-
-    set_admin_action_state(user_id, AdminActionState::AwaitingUserSearch).await;
-
-    let text = r#"👥 <b>مدیریت کاربران Sentra</b>
-
-لطفاً <b>ایمیل</b>، <b>نام کاربری</b> یا <b>شناسه عددی (ID)</b> کاربر مورد نظر را ارسال فرمایید تا کارت مدیریت کاربر برای شما نمایش داده شود:"#;
-
-    bot.send_message(chat_id, text)
-        .parse_mode(ParseMode::Html)
-        .reply_markup(crate::bot::keyboards::cancel_inline_keyboard())
-        .await?;
-
-    Ok(())
-}
-
-/// Prompt admin for Broadcast
-pub async fn handle_admin_broadcast_prompt(
-    bot: &Bot,
-    chat_id: ChatId,
-    user_id: i64,
-    admin_chat_id: i64,
-) -> anyhow::Result<()> {
-    if !is_authorized_admin(user_id, admin_chat_id) {
-        bot.send_message(chat_id, "⛔ دسترسی غیرمجاز!").await?;
-        return Ok(());
-    }
-
-    set_admin_action_state(user_id, AdminActionState::AwaitingBroadcast).await;
-
-    let text = r#"📢 <b>ارسال پیام همگانی به کلیه کاربران</b>
-
-لطفاً متن پیام یا تصویر همراه با کپشن را برای ارسال همگانی به تمامی کاربران فعال بفرستید:"#;
-
-    bot.send_message(chat_id, text)
-        .parse_mode(ParseMode::Html)
-        .reply_markup(crate::bot::keyboards::cancel_inline_keyboard())
-        .await?;
-
     Ok(())
 }
 
@@ -1539,6 +1406,7 @@ pub async fn handle_admin_version_text(
 
     bot.send_message(msg.chat.id, reply)
         .parse_mode(ParseMode::Html)
+        .reply_markup(cancel_and_back_inline_keyboard("adm_action_upload_app"))
         .await?;
 
     Ok(())
@@ -1591,6 +1459,7 @@ pub async fn handle_admin_file_upload(
         );
         bot.send_message(msg.chat.id, err_msg)
             .parse_mode(ParseMode::Html)
+            .reply_markup(cancel_and_back_inline_keyboard("adm_action_upload_app"))
             .await?;
         return Ok(());
     }
@@ -1664,7 +1533,6 @@ pub async fn handle_official_outbounds_hub(
     let web_nodes = Repository::get_official_outbounds_by_category(pool, "web_browsing").await.unwrap_or_default();
     let dl_nodes = Repository::get_official_outbounds_by_category(pool, "download").await.unwrap_or_default();
     let static_nodes = Repository::get_official_outbounds_by_category(pool, "static_ip").await.unwrap_or_default();
-    let gaming_nodes = Repository::get_official_outbounds_by_category(pool, "gaming").await.unwrap_or_default();
     let warp_account = Repository::get_active_warp_account(pool).await.unwrap_or(None);
     let warp_status = if let Some(ref w) = warp_account {
         format!("فعال ⚡️ ({})", if w.account_type == "plus" { "WARP+ 🌟" } else { "رایگان" })
@@ -1675,13 +1543,12 @@ pub async fn handle_official_outbounds_hub(
     let text = format!(
         r#"🌐 <b>مرکز مدیریت اوتباندهای رسمی و اختصاصی سنترا (Official Outbounds Hub)</b>
 
-در این بخش می‌توانید سرورهای اصلی هر ۴ حالت فعال شبکه را اضافه، پایش و مدیریت فرمایید:
+در این بخش می‌توانید سرورهای اصلی هر ۳ حالت فعال شبکه را اضافه، پایش و مدیریت فرمایید:
 
 📊 <b>آمار نودهای اختصاصی فعال:</b>
 • 🌐 نودهای وب‌گردی (Web Browsing): <b>{} نود</b>
 • 📥 نودهای دانلود پرسرعت (Download): <b>{} نود</b>
 • 🔒 نودهای آی‌پی ثابت مسکونی (Static IP): <b>{} نود</b>
-• 🎮 نودهای گیمینگ و ضدتحریم (Gaming): <b>{} نود</b>
 • ⚡️ اکانت Cloudflare WARP سرور: <b>{}</b>
 
 <i>نکته: نودهای رسمی ادمین بر خلاف نودهای اهدایی کاربران، هرگز منقضی نشده و در تولید کانفیگ کلاینت‌ها بالاترین اولویت را دارند.</i>
@@ -1690,7 +1557,6 @@ pub async fn handle_official_outbounds_hub(
         web_nodes.len(),
         dl_nodes.len(),
         static_nodes.len(),
-        gaming_nodes.len(),
         warp_status,
     );
 
@@ -1718,7 +1584,6 @@ pub async fn handle_official_outbounds_hub_callback(
     let web_nodes = Repository::get_official_outbounds_by_category(pool, "web_browsing").await.unwrap_or_default();
     let dl_nodes = Repository::get_official_outbounds_by_category(pool, "download").await.unwrap_or_default();
     let static_nodes = Repository::get_official_outbounds_by_category(pool, "static_ip").await.unwrap_or_default();
-    let gaming_nodes = Repository::get_official_outbounds_by_category(pool, "gaming").await.unwrap_or_default();
     let warp_account = Repository::get_active_warp_account(pool).await.unwrap_or(None);
     let warp_status = if let Some(ref w) = warp_account {
         format!("فعال ⚡️ ({})", if w.account_type == "plus" { "WARP+ 🌟" } else { "رایگان" })
@@ -1729,13 +1594,12 @@ pub async fn handle_official_outbounds_hub_callback(
     let text = format!(
         r#"🌐 <b>مرکز مدیریت اوتباندهای رسمی و اختصاصی سنترا (Official Outbounds Hub)</b>
 
-در این بخش می‌توانید سرورهای اصلی هر ۴ حالت فعال شبکه را اضافه، پایش و مدیریت فرمایید:
+در این بخش می‌توانید سرورهای اصلی هر ۳ حالت فعال شبکه را اضافه، پایش و مدیریت فرمایید:
 
 📊 <b>آمار نودهای اختصاصی فعال:</b>
 • 🌐 نودهای وب‌گردی (Web Browsing): <b>{} نود</b>
 • 📥 نودهای دانلود پرسرعت (Download): <b>{} نود</b>
 • 🔒 نودهای آی‌پی ثابت مسکونی (Static IP): <b>{} نود</b>
-• 🎮 نودهای گیمینگ و ضدتحریم (Gaming): <b>{} نود</b>
 • ⚡️ اکانت Cloudflare WARP سرور: <b>{}</b>
 
 <i>نکته: نودهای رسمی ادمین بر خلاف نودهای اهدایی کاربران، هرگز منقضی نشده و در تولید کانفیگ کلاینت‌ها بالاترین اولویت را دارند.</i>
@@ -1744,7 +1608,6 @@ pub async fn handle_official_outbounds_hub_callback(
         web_nodes.len(),
         dl_nodes.len(),
         static_nodes.len(),
-        gaming_nodes.len(),
         warp_status,
     );
 
@@ -1807,7 +1670,6 @@ pub async fn handle_target_category_chosen(
     .await;
 
     let cat_fa = match category {
-        "gaming" => "🎮 بخش گیمینگ و ضدتحریم (WireGuard / TUIC / Hysteria 2)",
         "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
         "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
         "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
@@ -1841,6 +1703,7 @@ pub async fn handle_target_category_chosen(
     if let Some(msg) = &q.message {
         bot.send_message(msg.chat().id, text)
             .parse_mode(ParseMode::Html)
+            .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
             .await?;
     }
     bot.answer_callback_query(q.id.clone()).await?;
@@ -1938,9 +1801,10 @@ pub async fn handle_admin_outbound_text_input(
                 return Ok(());
             }
             Err(e) => {
-                let err_msg = format!("❌ <b>خطا در پردازش سابسکریپشن:</b>\n{}\n\nلطفاً لینک را بررسی فرمایید یا /cancel را بفرستید.", e);
+                let err_msg = format!("❌ <b>خطا در پردازش سابسکریپشن:</b>\n{}\n\nلطفاً لینک را بررسی فرمایید یا روی «🔙 بازگشت» بزنید.", e);
                 bot.send_message(msg.chat.id, err_msg)
                     .parse_mode(ParseMode::Html)
+                    .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
                     .await?;
                 return Ok(());
             }
@@ -1956,8 +1820,6 @@ pub async fn handle_admin_outbound_text_input(
             || rest.starts_with("hy2://")
             || rest.starts_with("hysteria2://")
             || rest.starts_with("tuic://")
-            || rest.starts_with("wireguard://")
-            || rest.starts_with("wg://")
             || rest.starts_with("ss://")
             || (rest.starts_with('{') && rest.contains("\"server\"")))
             && !first_word.starts_with("vless://")
@@ -1966,8 +1828,6 @@ pub async fn handle_admin_outbound_text_input(
             && !first_word.starts_with("hy2://")
             && !first_word.starts_with("hysteria2://")
             && !first_word.starts_with("tuic://")
-            && !first_word.starts_with("wireguard://")
-            && !first_word.starts_with("wg://")
             && !first_word.starts_with("ss://")
             && !first_word.starts_with('{')
         {
@@ -1983,9 +1843,10 @@ pub async fn handle_admin_outbound_text_input(
     let parsed = match OutboundAnalyzer::parse_input(link_or_json) {
         Ok(p) => p,
         Err(e) => {
-            let err_msg = format!("❌ <b>خطا در تحلیل لینک یا کانفیگ:</b>\n{}\n\nلطفاً لینک یا JSON صحیح ارسال فرمایید یا /cancel را بفرستید.", e);
+            let err_msg = format!("❌ <b>خطا در تحلیل لینک یا کانفیگ:</b>\n{}\n\nلطفاً لینک یا JSON صحیح ارسال فرمایید یا روی «🔙 بازگشت» بزنید.", e);
             bot.send_message(msg.chat.id, err_msg)
                 .parse_mode(ParseMode::Html)
+                .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
                 .await?;
             return Ok(());
         }
@@ -2005,9 +1866,10 @@ pub async fn handle_admin_outbound_text_input(
     let ip = match OutboundAnalyzer::check_anti_ssrf(&parsed.server_address).await {
         Ok(ip) => ip,
         Err(e) => {
-            let err_msg = format!("❌ <b>خطای امنیتی آدرس سرور (SSRF Protection):</b>\n{}\n\nلطفاً آدرس معتبر وارد کنید یا /cancel را بفرستید.", e);
+            let err_msg = format!("❌ <b>خطای امنیتی آدرس سرور (SSRF Protection):</b>\n{}\n\nلطفاً آدرس معتبر وارد کنید یا روی «🔙 بازگشت» بزنید.", e);
             bot.send_message(msg.chat.id, err_msg)
                 .parse_mode(ParseMode::Html)
+                .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
                 .await?;
             return Ok(());
         }
@@ -2053,7 +1915,6 @@ pub async fn handle_admin_outbound_text_input(
     clear_admin_outbound_state(telegram_user_id).await;
 
     let cat_fa = match category {
-        "gaming" => "🎮 بخش گیمینگ و ضدتحریم (WireGuard / TUIC / Hysteria 2)",
         "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
         "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
         "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
@@ -2108,7 +1969,6 @@ pub async fn handle_list_official_outbounds(
     }
 
     let cat_fa = match category {
-        "gaming" => "🎮 بخش گیمینگ و ضدتحریم (WireGuard / TUIC / Hysteria 2)",
         "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
         "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
         "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
@@ -2232,7 +2092,9 @@ pub async fn handle_ping_official_outbound_callback(
     let ip = match OutboundAnalyzer::check_anti_ssrf(&ob.server_address).await {
         Ok(ip) => ip,
         Err(_) => {
-            bot.send_message(q.from.id, "❌ خطای DNS / آدرس سرور نامعتبر است.").await?;
+            bot.send_message(q.from.id, "❌ خطای DNS / آدرس سرور نامعتبر است.")
+                .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
+                .await?;
             return Ok(());
         }
     };
@@ -2251,7 +2113,6 @@ pub async fn handle_ping_official_outbound_callback(
         jitter_ms,
         speed_mbps,
         speed_score,
-        ob.quality_score,
         gemini_ok,
         trading_safe,
         is_online,
@@ -2320,7 +2181,10 @@ pub async fn handle_ping_official_outbound_callback(
             .await;
     }
 
-    let _ = bot.send_message(q.from.id, alert_msg).await;
+    let _ = bot
+        .send_message(q.from.id, alert_msg)
+        .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
+        .await;
     Ok(())
 }
 
@@ -2370,7 +2234,6 @@ pub async fn handle_set_outbound_allocation_callback(
     }
 
     let (allow_web, allow_download, allow_static_ip) = match alloc_mode {
-        "gaming" => (false, false, false),
         "free_only" => (true, true, false),
         "static_only" => (false, false, true),
         "both" => (true, true, true),
@@ -2391,7 +2254,6 @@ pub async fn handle_set_outbound_allocation_callback(
     let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
 
     let desc = match alloc_mode {
-        "gaming" => "🎮 بخش گیمینگ و ضدتحریم",
         "free_only" => "🌐 فقط بخش رایگان (وب / دانلود)",
         "static_only" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
         "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت)",
@@ -2463,7 +2325,6 @@ pub async fn handle_test_gemini_outbound_callback(
         jitter_ms,
         ob.speed_mbps,
         ob.speed_score,
-        ob.quality_score,
         gemini_ok,
         trading_safe,
         true,
@@ -2485,7 +2346,11 @@ pub async fn handle_test_gemini_outbound_callback(
         if gemini_ok && trading_safe { "✅ واجد شرایط (تایید شده)" } else { "❌ فاقد شرایط آی‌پی ثابت" }
     );
 
-    let _ = bot.send_message(q.from.id, report_msg).parse_mode(ParseMode::Html).await;
+    let _ = bot
+        .send_message(q.from.id, report_msg)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
+        .await;
     Ok(())
 }
 
@@ -2565,8 +2430,14 @@ pub async fn handle_delete_official_outbound_callback(
         let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
         bot.answer_callback_query(q.id.clone()).text("🗑 نود با موفقیت حذف شد.").show_alert(true).await?;
         if let Some(msg) = &q.message {
-            let _ = bot.edit_message_text(msg.chat().id, msg.id(), format!("🗑 <b>نود #{} از سیستم حذف گردید.</b>", outbound_id))
+            let _ = bot
+                .edit_message_text(
+                    msg.chat().id,
+                    msg.id(),
+                    format!("🗑 <b>نود #{} از سیستم حذف گردید.</b>", outbound_id),
+                )
                 .parse_mode(ParseMode::Html)
+                .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
                 .await;
         }
     } else {
@@ -2655,7 +2526,10 @@ pub async fn handle_resync_subscription_callback(
         Err(e) => {
             let err_text = format!("❌ خطا در همگام‌سازی مجدد سابسکریپشن:\n{}", e);
             if let Some(msg) = &q.message {
-                let _ = bot.send_message(msg.chat().id, err_text).await;
+                let _ = bot
+                    .send_message(msg.chat().id, err_text)
+                    .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
+                    .await;
             }
         }
     }

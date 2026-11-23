@@ -1,5 +1,3 @@
-mod extensions;
-
 use crate::error::CoreError;
 use sqlx::Row;
 use crate::models::{
@@ -166,7 +164,7 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
             user_id                 INTEGER NOT NULL,
             tier                    TEXT NOT NULL CHECK(tier IN ('Sentra Lite', 'Sentra Pro', 'Sentra Flow+')),
             token                   TEXT NOT NULL UNIQUE,
-            status                  TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'expired', 'depleted', 'disabled', 'suspended')),
+            status                  TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'expired', 'depleted', 'disabled')),
             upload_bytes            BIGINT NOT NULL DEFAULT 0,
             download_bytes          BIGINT NOT NULL DEFAULT 0,
             traffic_limit_bytes     BIGINT NOT NULL,
@@ -175,7 +173,6 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
             web_browsing_used_mb    BIGINT NOT NULL DEFAULT 0,
             download_used_mb        BIGINT NOT NULL DEFAULT 0,
             static_ip_used_mb       BIGINT NOT NULL DEFAULT 0,
-            gaming_used_mb          INTEGER NOT NULL DEFAULT 0,
             last_quota_reset        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             starts_at               DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             expires_at              DATETIME NOT NULL,
@@ -199,9 +196,6 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
         .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE subscriptions ADD COLUMN static_ip_used_mb BIGINT NOT NULL DEFAULT 0")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE subscriptions ADD COLUMN gaming_used_mb INTEGER NOT NULL DEFAULT 0")
         .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE subscriptions ADD COLUMN last_quota_reset DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP")
@@ -337,9 +331,9 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
             config_json             TEXT NOT NULL,
             latency_ms              INTEGER NOT NULL DEFAULT 9999,
             speed_mbps              REAL NOT NULL DEFAULT 0.0,
-            assigned_tier           TEXT NOT NULL CHECK(assigned_tier IN ('web_browsing', 'download', 'static_ip', 'gaming', 'rejected')),
+            assigned_tier           TEXT NOT NULL CHECK(assigned_tier IN ('web_browsing', 'download', 'static_ip', 'rejected')),
             health_score            INTEGER NOT NULL DEFAULT 100,
-            status                  TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('pending', 'active', 'inactive', 'rejected', 'degraded')),
+            status                  TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('pending', 'active', 'inactive', 'rejected')),
             fail_count              INTEGER NOT NULL DEFAULT 0,
             reward_granted          INTEGER NOT NULL DEFAULT 0,
             raw_link                TEXT,
@@ -415,15 +409,6 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_country_code ON donated_outbounds(country_code)").execute(pool).await;
     let _ = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_donated_fingerprint ON donated_outbounds(fingerprint_sha256)").execute(pool).await;
 
-    // Outbound quality score migrations for dynamic quality ranking
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN quality_score INTEGER NOT NULL DEFAULT 50").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE outbounds ADD COLUMN quality_score INTEGER NOT NULL DEFAULT 50").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE outbounds ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 9999").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE outbounds ADD COLUMN is_healthy INTEGER NOT NULL DEFAULT 1").execute(pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_quality_score ON donated_outbounds(quality_score)").execute(pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_outbounds_quality_score ON outbounds(quality_score)").execute(pool).await;
-    let _ = sqlx::query("UPDATE donated_outbounds SET quality_score = speed_score WHERE quality_score = 50 AND speed_score > 0").execute(pool).await;
-
     // Subscription sources table (Admin Sub URLs with periodic re-sync)
     let _ = sqlx::query(
         r#"
@@ -485,9 +470,9 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
                     config_json             TEXT NOT NULL,
                     latency_ms              INTEGER NOT NULL DEFAULT 9999,
                     speed_mbps              REAL NOT NULL DEFAULT 0.0,
-                    assigned_tier           TEXT NOT NULL CHECK(assigned_tier IN ('web_browsing', 'download', 'static_ip', 'gaming', 'rejected')),
+                    assigned_tier           TEXT NOT NULL CHECK(assigned_tier IN ('web_browsing', 'download', 'static_ip', 'rejected')),
                     health_score            INTEGER NOT NULL DEFAULT 100,
-                    status                  TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('pending', 'active', 'inactive', 'rejected', 'degraded')),
+                    status                  TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('pending', 'active', 'inactive', 'rejected')),
                     fail_count              INTEGER NOT NULL DEFAULT 0,
                     reward_granted          INTEGER NOT NULL DEFAULT 0,
                     raw_link                TEXT,
@@ -585,24 +570,24 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
         "#
     ).execute(pool).await;
 
-    // 10. APP RELEASES table (Unified Client App Releases)
+    // 10. APP RELEASES table (Client App Binaries & Telegram file_id)
     let _ = sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS app_releases (
-            id                  INTEGER PRIMARY KEY CHECK(id = 1),
-            version             TEXT NOT NULL DEFAULT '1.0.0',
+            platform            TEXT PRIMARY KEY CHECK(platform IN ('windows', 'android')),
+            version             TEXT NOT NULL,
+            telegram_file_id    TEXT NOT NULL,
+            file_name           TEXT NOT NULL,
+            file_size_mb        REAL NOT NULL DEFAULT 0.0,
             changelog           TEXT NOT NULL DEFAULT '',
-            windows_file_id     TEXT,
-            windows_github_url  TEXT,
-            android_file_id     TEXT,
-            android_github_url  TEXT,
             updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TRIGGER IF NOT EXISTS trg_app_releases_updated_at AFTER UPDATE ON app_releases
+        FOR EACH ROW BEGIN
+            UPDATE app_releases SET updated_at = CURRENT_TIMESTAMP WHERE platform = OLD.platform;
+        END;
         "#
     ).execute(pool).await;
-
-    // Run extended migrations (users alter, unified app_releases migration, password_resets)
-    extensions::run_extended_migrations(pool).await?;
 
     // Seed/Update 4 Connection Modes outbounds (web_browsing, download, static_ip, gaming)
     sqlx::query(
@@ -612,7 +597,7 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
         (1, 'Sentra Web Browsing', 'http', '127.0.0.1', 10801, 'httpupgrade', 0, 'Sentra Lite', 'web_browsing', 'DE', 1),
         (2, 'Sentra Download', 'socks', '127.0.0.1', 10804, 'tcp', 0, 'Sentra Lite', 'download', 'FI', 1),
         (3, 'Sentra Static IP US', 'vless', '127.0.0.1', 10802, 'tcp', 1, 'Sentra Pro', 'static_ip', 'US', 1),
-        (4, 'Sentra Gaming Node', 'socks', '127.0.0.1', 10803, 'quic', 0, 'Sentra Flow+', 'gaming', 'TR', 1)
+        (4, 'Sentra Gaming Node', 'socks', '127.0.0.1', 10803, 'quic', 0, 'Sentra Flow+', 'gaming', 'TR', 0)
         "#,
     )
     .execute(pool)
@@ -830,11 +815,10 @@ impl Repository {
         if tehran_now.date_naive() > tehran_last_reset.date_naive() {
             sub.web_browsing_used_mb = 0;
             sub.download_used_mb = 0;
-            sub.gaming_used_mb = 0;
             sub.last_quota_reset = now;
 
             sqlx::query(
-                "UPDATE subscriptions SET web_browsing_used_mb = 0, download_used_mb = 0, gaming_used_mb = 0, last_quota_reset = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE subscriptions SET web_browsing_used_mb = 0, download_used_mb = 0, last_quota_reset = CURRENT_TIMESTAMP WHERE id = ?",
             )
             .bind(sub.id)
             .execute(pool)
@@ -872,20 +856,13 @@ impl Repository {
                     .execute(pool)
                     .await?;
             }
-            "gaming" => {
-                sqlx::query("UPDATE subscriptions SET gaming_used_mb = gaming_used_mb + ? WHERE id = ?")
-                    .bind(delta_mb)
-                    .bind(sub_id)
-                    .execute(pool)
-                    .await?;
-            }
             _ => {}
         }
         Ok(())
     }
 
     /// Builds dynamic 4-mode information for a specific user
-    pub fn build_modes_info(sub: &Subscription, telegram_verified: bool) -> Vec<ConnectionModeInfo> {
+    pub fn build_modes_info(sub: &Subscription) -> Vec<ConnectionModeInfo> {
         let is_free = sub.tier == "Sentra Lite";
 
         let (wb_status, wb_rem) = if is_free {
@@ -896,32 +873,12 @@ impl Repository {
             ("active".to_string(), 999_999)
         };
 
-        let (dl_status, dl_rem, dl_badge) = if is_free {
-            if !telegram_verified {
-                (
-                    "locked".to_string(),
-                    0i64,
-                    Some("قفل • نیاز به تایید حساب در ربات تلگرام".to_string()),
-                )
-            } else {
-                let rem = (3072 - sub.download_used_mb).max(0);
-                let status = if rem == 0 { "depleted" } else { "active" };
-                (
-                    status.to_string(),
-                    rem,
-                    Some("رایگان • ۳ گیگابایت روزانه".to_string()),
-                )
-            }
-        } else {
-            ("active".to_string(), 999_999, Some("نامحدود".to_string()))
-        };
-
-        let (gaming_status, gaming_badge, gaming_rem) = if is_free {
-            let rem = (3072 - sub.gaming_used_mb).max(0);
+        let (dl_status, dl_rem) = if is_free {
+            let rem = (3072 - sub.download_used_mb).max(0);
             let status = if rem == 0 { "depleted" } else { "active" };
-            (status.to_string(), Some("رایگان • ۳ گیگابایت روزانه".to_string()), rem)
+            (status.to_string(), rem)
         } else {
-            ("active".to_string(), Some("نامحدود • کمترین تاخیر".to_string()), 999_999)
+            ("active".to_string(), 999_999)
         };
 
         let (static_status, static_badge, static_limit, static_used, static_rem) = if is_free {
@@ -957,7 +914,7 @@ impl Repository {
                 name: "دانلود".to_string(),
                 icon: "📥".to_string(),
                 status: dl_status,
-                badge: dl_badge,
+                badge: if is_free { Some("رایگان • ۳ گیگابایت روزانه".to_string()) } else { Some("نامحدود".to_string()) },
                 daily_limit_mb: if is_free { 3072 } else { 0 },
                 used_today_mb: sub.download_used_mb,
                 remaining_today_mb: dl_rem,
@@ -969,14 +926,14 @@ impl Repository {
                 id: "gaming".to_string(),
                 name: "گیمینگ".to_string(),
                 icon: "🎮".to_string(),
-                status: gaming_status,
-                badge: gaming_badge,
-                daily_limit_mb: if is_free { 3072 } else { 0 },
-                used_today_mb: sub.gaming_used_mb,
-                remaining_today_mb: gaming_rem,
-                speed_desc: "پینگ فوق‌العاده کم (Low Latency)".to_string(),
-                security_desc: "پایداری بالا و UDP بهینه".to_string(),
-                description: "بهینه‌شده برای بازی‌های آنلاین رقابتی، ترافیک بدون لگ و کاهش نوسان پینگ (WireGuard / TUIC / Hysteria 2)".to_string(),
+                status: "coming_soon".to_string(),
+                badge: Some("به‌زودی اضافه می‌شود".to_string()),
+                daily_limit_mb: 0,
+                used_today_mb: 0,
+                remaining_today_mb: 0,
+                speed_desc: "پینگ فوق‌العاده کم".to_string(),
+                security_desc: "پایداری بالا".to_string(),
+                description: "کاهش چشمگیر پینگ و جیتر ویژه بازی‌های آنلاین رقابتی".to_string(),
             },
             ConnectionModeInfo {
                 id: "static_ip".to_string(),
@@ -1027,14 +984,14 @@ impl Repository {
                 id: "gaming".to_string(),
                 name: "گیمینگ".to_string(),
                 icon: "🎮".to_string(),
-                status: "active".to_string(),
-                badge: Some("پینگ فوق‌العاده کم • UDP بهینه".to_string()),
-                daily_limit_mb: 3072,
+                status: "coming_soon".to_string(),
+                badge: Some("به‌زودی اضافه می‌شود".to_string()),
+                daily_limit_mb: 0,
                 used_today_mb: 0,
-                remaining_today_mb: 3072,
-                speed_desc: "پینگ فوق‌العاده کم (Low Latency)".to_string(),
-                security_desc: "پایداری بالا و UDP بهینه".to_string(),
-                description: "کاهش چشمگیر پینگ و جیتر ویژه بازی‌های آنلاین رقابتی (WireGuard / TUIC / Hysteria 2)".to_string(),
+                remaining_today_mb: 0,
+                speed_desc: "پینگ فوق‌العاده کم".to_string(),
+                security_desc: "پایداری بالا".to_string(),
+                description: "کاهش چشمگیر پینگ و جیتر ویژه بازی‌های آنلاین رقابتی".to_string(),
             },
             ConnectionModeInfo {
                 id: "static_ip".to_string(),
@@ -1052,7 +1009,6 @@ impl Repository {
         ]
     }
 
-    #[allow(dead_code)]
     pub async fn generate_auth_code(
         pool: &DbPool,
         user_id: i64,
@@ -1177,21 +1133,21 @@ impl Repository {
         let outbounds = match tier {
             "Sentra Flow+" => {
                 sqlx::query_as::<_, Outbound>(
-                    "SELECT * FROM outbounds WHERE is_active = 1 ORDER BY quality_score DESC, latency_ms ASC, weight DESC, id ASC",
+                    "SELECT * FROM outbounds WHERE is_active = 1 ORDER BY weight DESC, id ASC",
                 )
                 .fetch_all(pool)
                 .await?
             }
             "Sentra Pro" => {
                 sqlx::query_as::<_, Outbound>(
-                    "SELECT * FROM outbounds WHERE is_active = 1 AND min_tier IN ('Sentra Lite', 'Sentra Pro') ORDER BY quality_score DESC, latency_ms ASC, weight DESC, id ASC",
+                    "SELECT * FROM outbounds WHERE is_active = 1 AND min_tier IN ('Sentra Lite', 'Sentra Pro') ORDER BY weight DESC, id ASC",
                 )
                 .fetch_all(pool)
                 .await?
             }
             _ => {
                 sqlx::query_as::<_, Outbound>(
-                    "SELECT * FROM outbounds WHERE is_active = 1 AND min_tier = 'Sentra Lite' ORDER BY quality_score DESC, latency_ms ASC, weight DESC, id ASC",
+                    "SELECT * FROM outbounds WHERE is_active = 1 AND min_tier = 'Sentra Lite' ORDER BY weight DESC, id ASC",
                 )
                 .fetch_all(pool)
                 .await?
@@ -1590,9 +1546,8 @@ impl Repository {
         }
 
         let user = sqlx::query_as::<_, User>(
-            "SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?) LIMIT 1"
+            "SELECT * FROM users WHERE LOWER(username) = LOWER(?) LIMIT 1"
         )
-        .bind(clean)
         .bind(clean)
         .fetch_optional(pool)
         .await?;
@@ -1840,7 +1795,6 @@ impl Repository {
         let delta_wb = if mode == "web_browsing" { delta_mb } else { 0 };
         let delta_dl = if mode == "download" { delta_mb } else { 0 };
         let delta_static = if mode == "static_ip" { delta_mb } else { 0 };
-        let delta_gaming = if mode == "gaming" { delta_mb } else { 0 };
 
         if delta_total > 0 {
             sqlx::query(
@@ -1851,7 +1805,6 @@ impl Repository {
                     web_browsing_used_mb = web_browsing_used_mb + ?,
                     download_used_mb = download_used_mb + ?,
                     static_ip_used_mb = static_ip_used_mb + ?,
-                    gaming_used_mb = gaming_used_mb + ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 "#,
@@ -1861,7 +1814,6 @@ impl Repository {
             .bind(delta_wb)
             .bind(delta_dl)
             .bind(delta_static)
-            .bind(delta_gaming)
             .bind(sub.id)
             .execute(pool)
             .await?;
@@ -1871,7 +1823,6 @@ impl Repository {
             sub.web_browsing_used_mb += delta_wb;
             sub.download_used_mb += delta_dl;
             sub.static_ip_used_mb += delta_static;
-            sub.gaming_used_mb += delta_gaming;
 
             // Log into traffic_logs
             let _ = sqlx::query(
@@ -1921,12 +1872,6 @@ impl Repository {
                     message: "سقف حجم روزانه ۳ گیگابایت دانلود به پایان رسید. ریست روزانه ساعت ۰۰:۰۰ به وقت ایران انجام می‌شود.".to_string(),
                 });
             }
-            if mode == "gaming" && sub.gaming_used_mb >= 3072 {
-                return Ok(HeartbeatVerdict::Disconnect {
-                    code: "QUOTA_EXCEEDED".to_string(),
-                    message: "سقف حجم روزانه ۳ گیگابایت گیمینگ به پایان رسید. ریست روزانه ساعت ۰۰:۰۰ به وقت ایران انجام می‌شود.".to_string(),
-                });
-            }
         }
 
         // Check overall total package bytes (only for Lite since Pro/Flow+ web & download are unlimited)
@@ -1956,7 +1901,6 @@ impl Repository {
             download_used_mb: sub.download_used_mb,
             static_ip_used_mb: sub.static_ip_used_mb,
             static_ip_remaining_mb: static_rem,
-            gaming_used_mb: sub.gaming_used_mb,
         })
     }
 
@@ -2067,7 +2011,6 @@ impl Repository {
     }
 
     /// Authenticate standalone user with username and password
-    #[allow(dead_code)]
     pub async fn login_user_with_credentials(
         pool: &DbPool,
         username: &str,
@@ -2128,7 +2071,6 @@ impl Repository {
 
     /// Link Telegram account to app account using 6-digit link code
     /// Hardened: checks neither account is suspended, takes MAX of quotas (no quota summing), enforces MAX 3 devices
-    #[allow(dead_code)]
     pub async fn link_telegram_account_by_code(
         pool: &DbPool,
         telegram_id: i64,
@@ -2303,7 +2245,6 @@ impl Repository {
     }
 
     /// Set or update username and password for a user
-    #[allow(dead_code)]
     pub async fn set_credentials_for_user(
         pool: &DbPool,
         user_id: i64,
@@ -2810,58 +2751,54 @@ impl Repository {
         platform: &str,
         version: &str,
         telegram_file_id: &str,
-        _file_name: &str,
-        _file_size_mb: f64,
+        file_name: &str,
+        file_size_mb: f64,
         changelog: &str,
     ) -> Result<AppRelease, CoreError> {
         sqlx::query(
-            "INSERT OR IGNORE INTO app_releases (id, version, changelog) VALUES (1, ?, ?)",
+            r#"
+            INSERT INTO app_releases (platform, version, telegram_file_id, file_name, file_size_mb, changelog, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(platform) DO UPDATE SET
+                version = excluded.version,
+                telegram_file_id = excluded.telegram_file_id,
+                file_name = excluded.file_name,
+                file_size_mb = excluded.file_size_mb,
+                changelog = excluded.changelog,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
         )
+        .bind(platform)
         .bind(version)
+        .bind(telegram_file_id)
+        .bind(file_name)
+        .bind(file_size_mb)
         .bind(changelog)
         .execute(pool)
         .await?;
 
-        if platform == "windows" {
-            sqlx::query(
-                r#"
-                UPDATE app_releases
-                SET version = ?, changelog = ?, windows_file_id = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-                "#,
-            )
-            .bind(version)
-            .bind(changelog)
-            .bind(telegram_file_id)
-            .execute(pool)
-            .await?;
-        } else if platform == "android" {
-            sqlx::query(
-                r#"
-                UPDATE app_releases
-                SET version = ?, changelog = ?, android_file_id = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-                "#,
-            )
-            .bind(version)
-            .bind(changelog)
-            .bind(telegram_file_id)
-            .execute(pool)
-            .await?;
-        }
-
-        Self::get_latest_app_release(pool)
+        Self::get_app_release_by_platform(pool, platform)
             .await?
             .ok_or_else(|| CoreError::Database(sqlx::Error::RowNotFound))
     }
 
     /// Get an app release by platform ('windows' or 'android')
-    #[allow(dead_code)]
     pub async fn get_app_release_by_platform(
         pool: &DbPool,
-        _platform: &str,
+        platform: &str,
     ) -> Result<Option<AppRelease>, CoreError> {
-        Self::get_latest_app_release(pool).await
+        let release = sqlx::query_as::<_, AppRelease>(
+            r#"
+            SELECT platform, version, telegram_file_id, file_name, file_size_mb, changelog, updated_at
+            FROM app_releases
+            WHERE platform = ?
+            "#,
+        )
+        .bind(platform)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(release)
     }
 
     /// Get all app releases
@@ -2871,9 +2808,9 @@ impl Repository {
     ) -> Result<Vec<AppRelease>, CoreError> {
         let releases = sqlx::query_as::<_, AppRelease>(
             r#"
-            SELECT id, version, changelog, windows_file_id, windows_github_url, android_file_id, android_github_url, updated_at
+            SELECT platform, version, telegram_file_id, file_name, file_size_mb, changelog, updated_at
             FROM app_releases
-            ORDER BY id DESC
+            ORDER BY platform ASC
             "#,
         )
         .fetch_all(pool)
@@ -2903,7 +2840,6 @@ impl Repository {
         country_name: &str,
     ) -> Result<DonatedOutbound, CoreError> {
         let (allow_web, allow_download, allow_static_ip, alloc_mode, assigned_tier) = match category {
-            "gaming" => (0, 0, 0, "gaming", "gaming"),
             "free_only" => (1, 1, 0, "free_only", "web_browsing"),
             "static_only" | "static_ip" => (0, 0, 1, "static_only", "static_ip"),
             "both" => (1, 1, 1, "both", "static_ip"),
@@ -3003,9 +2939,7 @@ impl Repository {
         allow_static_ip: bool,
         allocation_mode: &str,
     ) -> Result<(), CoreError> {
-        let assigned_tier = if allocation_mode == "gaming" {
-            "gaming"
-        } else if allow_static_ip {
+        let assigned_tier = if allow_static_ip {
             "static_ip"
         } else if allow_download && !allow_web {
             "download"
@@ -3037,7 +2971,7 @@ impl Repository {
         Ok(())
     }
 
-    /// Update full quality metrics from quality engine benchmark with EMA smoothing and 3-strike degraded status
+    /// Update full quality metrics from quality engine benchmark
     #[allow(clippy::too_many_arguments)]
     pub async fn update_outbound_quality_metrics(
         pool: &DbPool,
@@ -3046,29 +2980,12 @@ impl Repository {
         jitter_ms: i64,
         speed_mbps: f64,
         speed_score: i64,
-        old_quality_score: i64,
         gemini_ok: bool,
         trading_safe: bool,
         is_up: bool,
-    ) -> Result<i64, CoreError> {
+    ) -> Result<(), CoreError> {
         let g_val = if gemini_ok { 1 } else { 0 };
         let t_val = if trading_safe { 1 } else { 0 };
-
-        let quality_score = if is_up {
-            // Smart EMA formula: new_score = 0.7 * old_score + 0.3 * current_sample_score
-            let ema_base = if old_quality_score > 0 {
-                (0.7 * (old_quality_score as f64) + 0.3 * (speed_score as f64)).round() as i64
-            } else {
-                speed_score
-            };
-            let mut final_score = ema_base.clamp(1, 100);
-            if gemini_ok && trading_safe {
-                final_score = (final_score + 5).min(100);
-            }
-            final_score
-        } else {
-            0
-        };
 
         if is_up {
             sqlx::query(
@@ -3078,7 +2995,6 @@ impl Repository {
                     jitter_ms = ?,
                     speed_mbps = ?,
                     speed_score = ?,
-                    quality_score = ?,
                     gemini_ok = ?,
                     trading_safe = ?,
                     fail_count = 0,
@@ -3103,7 +3019,6 @@ impl Repository {
             .bind(jitter_ms)
             .bind(speed_mbps)
             .bind(speed_score)
-            .bind(quality_score)
             .bind(g_val)
             .bind(t_val)
             .bind(g_val)
@@ -3116,15 +3031,13 @@ impl Repository {
             .execute(pool)
             .await?;
         } else {
-            // If failed in 3 consecutive tests, immediately mark as 'degraded' (pulling out of active pool)
             sqlx::query(
                 r#"
                 UPDATE donated_outbounds
                 SET fail_count = fail_count + 1,
                     health_score = MAX(0, health_score - 20),
-                    quality_score = 0,
                     offline_since = COALESCE(offline_since, CURRENT_TIMESTAMP),
-                    status = CASE WHEN (fail_count + 1) >= 3 THEN 'degraded' ELSE status END,
+                    status = CASE WHEN fail_count >= 2 THEN 'inactive' ELSE status END,
                     last_checked_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 "#
@@ -3134,7 +3047,7 @@ impl Repository {
             .await?;
         }
 
-        Ok(quality_score)
+        Ok(())
     }
 
     /// Automatically clean up dead outbounds older than 48 hours without successful response
@@ -3143,7 +3056,7 @@ impl Repository {
             r#"
             SELECT * FROM donated_outbounds
             WHERE (last_online_at IS NOT NULL AND last_online_at < datetime('now', '-48 hours'))
-               OR (last_online_at IS NULL AND created_at < datetime('now', '-48 hours') AND status IN ('inactive', 'degraded'))
+               OR (last_online_at IS NULL AND created_at < datetime('now', '-48 hours') AND status = 'inactive')
             "#
         )
         .fetch_all(pool)
@@ -3159,35 +3072,6 @@ impl Repository {
         }
 
         Ok(dead_nodes)
-    }
-
-    /// Periodically cleans up expired/used password reset codes, auth codes, and telegram link codes
-    pub async fn cleanup_expired_codes(pool: &DbPool) -> Result<(u64, u64, u64), CoreError> {
-        // 1. Delete expired or used password reset codes older than 1 hour past expiration or 24 hours after use
-        let pr_res = sqlx::query(
-            "DELETE FROM password_resets WHERE expires_at < datetime('now', '-1 hour') OR (used = 1 AND created_at < datetime('now', '-24 hours'))"
-        )
-        .execute(pool)
-        .await
-        .map_err(CoreError::Database)?;
-
-        // 2. Clear expired auth codes
-        let ac_res = sqlx::query(
-            "UPDATE users SET auth_code = NULL, auth_code_expires_at = NULL WHERE auth_code_expires_at IS NOT NULL AND auth_code_expires_at < datetime('now')"
-        )
-        .execute(pool)
-        .await
-        .map_err(CoreError::Database)?;
-
-        // 3. Clear expired link codes (Telegram verification)
-        let lc_res = sqlx::query(
-            "UPDATE users SET link_code = NULL, link_code_expires_at = NULL WHERE link_code_expires_at IS NOT NULL AND link_code_expires_at < datetime('now')"
-        )
-        .execute(pool)
-        .await
-        .map_err(CoreError::Database)?;
-
-        Ok((pr_res.rows_affected(), ac_res.rows_affected(), lc_res.rows_affected()))
     }
 
     /// Retrieve any donated or official outbound by ID
@@ -3211,7 +3095,6 @@ impl Repository {
         category: &str,
     ) -> Result<Vec<DonatedOutbound>, CoreError> {
         let filter_col = match category {
-            "gaming" => "assigned_tier = 'gaming'",
             "static_ip" | "static_only" => "allow_static_ip = 1",
             "download" => "allow_download = 1",
             _ => "allow_web = 1",
@@ -3372,8 +3255,8 @@ impl Repository {
         let query = format!(
             r#"
             SELECT * FROM donated_outbounds 
-            WHERE status = 'active' AND latency_ms < 2500 AND {}
-            ORDER BY quality_score DESC, latency_ms ASC, is_official DESC, speed_score DESC, health_score DESC
+            WHERE status = 'active' AND {}
+            ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC
             LIMIT 15
             "#,
             filter_col
@@ -3402,8 +3285,8 @@ impl Repository {
             let query = format!(
                 r#"
                 SELECT * FROM donated_outbounds 
-                WHERE status = 'active' AND latency_ms < 2500 AND {} AND UPPER(country_code) = UPPER(?)
-                ORDER BY quality_score DESC, latency_ms ASC, is_official DESC, speed_score DESC, health_score DESC
+                WHERE status = 'active' AND {} AND UPPER(country_code) = UPPER(?)
+                ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC
                 LIMIT 15
                 "#,
                 filter_col
@@ -3661,7 +3544,6 @@ pub enum HeartbeatVerdict {
         download_used_mb: i64,
         static_ip_used_mb: i64,
         static_ip_remaining_mb: i64,
-        gaming_used_mb: i64,
     },
     Disconnect {
         code: String,

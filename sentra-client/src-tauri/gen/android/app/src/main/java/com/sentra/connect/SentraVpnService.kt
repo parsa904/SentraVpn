@@ -239,7 +239,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
 
             // 5. Start telemetry metrics ticker
             startTelemetryTicker()
-            SentraVpnPlugin.broadcastStatus("Connected", true)
+            SentraVpnPlugin.broadcastStatus("Connected", mode)
             writeLog("[Core] Sentra Connect Android VpnService online (mode: $mode)")
 
         } catch (e: Exception) {
@@ -302,7 +302,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
             Log.w(TAG, "Error closing TUN interface: ${e.message}")
         }
 
-        SentraVpnPlugin.broadcastStatus("Disconnected", false)
+        SentraVpnPlugin.broadcastStatus("Disconnected", "None")
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
 

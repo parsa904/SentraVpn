@@ -41,8 +41,6 @@ pub fn run() {
         initial_state.tier = session.tier;
         initial_state.username = session.username;
         initial_state.remaining_bytes = session.remaining_bytes;
-        initial_state.telegram_verified = session.telegram_verified;
-        initial_state.email = session.email.clone();
         initial_state.logs.push("[INFO] [Auth] Restored active session from local storage.".to_string());
     }
 
@@ -60,10 +58,6 @@ pub fn run() {
             commands::login_with_code,
             commands::register_with_credentials,
             commands::login_with_credentials,
-            commands::request_password_reset,
-            commands::confirm_password_reset,
-            commands::request_telegram_verify,
-            commands::check_telegram_verify_status,
             commands::get_telegram_link_code,
             commands::get_client_state,
             commands::connect_vpn,
@@ -74,7 +68,6 @@ pub fn run() {
             commands::toggle_kill_switch,
             commands::get_connection_modes,
             commands::set_connection_mode,
-            commands::set_gaming_submode,
             commands::set_connection_protocol,
             commands::test_api_connection,
             commands::get_logs,
@@ -111,9 +104,5 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Sentra Connect tauri application");
 
-    app.run(|_app_handle, event| {
-        if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
-            let _ = sysproxy::disable_system_proxy();
-        }
-    });
+    app.run(|_app_handle, _event| {});
 }

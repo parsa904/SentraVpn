@@ -80,10 +80,6 @@ impl Default for DnsConfig {
     }
 }
 
-fn default_gaming_submode() -> String {
-    "full_udp".to_string()
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientState {
     pub is_authenticated: bool,
@@ -93,8 +89,6 @@ pub struct ClientState {
     pub username: String,
     pub remaining_bytes: i64,
     pub expires_at: Option<String>,
-    pub telegram_verified: bool,
-    pub email: Option<String>,
     pub status: ConnectionStatus,
     pub selected_mode: String,
     pub selected_protocol: String,
@@ -107,8 +101,6 @@ pub struct ClientState {
     pub split_tunneling: bool,
     pub tun_mode: bool,
     pub kill_switch: bool,
-    #[serde(default = "default_gaming_submode")]
-    pub gaming_submode: String,
     pub anti_dpi: AntiDpiSettings,
     pub dns_config: DnsConfig,
     pub connected_since: Option<DateTime<Utc>>,
@@ -126,8 +118,6 @@ impl Default for ClientState {
             username: "مهمان".to_string(),
             remaining_bytes: 10_737_418_240, // 10 GB default
             expires_at: None,
-            telegram_verified: false,
-            email: None,
             status: ConnectionStatus::Disconnected,
             selected_mode: "web_browsing".to_string(),
             selected_protocol: "openvpn_udp".to_string(),
@@ -140,7 +130,6 @@ impl Default for ClientState {
             split_tunneling: true,
             tun_mode: false, // Default to System Proxy mode (Windows safe unprivileged execution)
             kill_switch: false,
-            gaming_submode: "full_udp".to_string(),
             anti_dpi: AntiDpiSettings::default(),
             dns_config: DnsConfig::default(),
             connected_since: None,

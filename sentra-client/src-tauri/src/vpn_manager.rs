@@ -87,7 +87,7 @@ impl VpnManager {
                         Err(_) => return,
                     };
 
-                    for base_url in crate::auth::AuthManager::get_backend_urls() {
+                    for base_url in crate::auth::get_backend_urls() {
                         let url = format!("{}/api/v1/client/heartbeat", base_url);
                         let res = client
                             .post(&url)
@@ -215,7 +215,6 @@ impl VpnManager {
         selected_location: Option<&str>,
         dns_config: &crate::state::DnsConfig,
         use_warp: bool,
-        gaming_submode: Option<&str>,
     ) -> Result<Value, String> {
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
@@ -246,22 +245,22 @@ impl VpnManager {
                 request_body["location_code"] = json!(loc);
             }
         }
-        if selected_mode == "gaming" {
-            if let Some(gsm) = gaming_submode {
-                request_body["gaming_submode"] = json!(gsm);
-            }
-        }
 
         let mut config_resp = None;
         let mut last_status = None;
         let mut last_err_body = None;
 
-        for base_url in crate::auth::AuthManager::get_backend_urls() {
+        for base_url in crate::auth::get_backend_urls() {
             let url = format!("{}/api/v1/client/config", base_url);
             match client.post(&url).json(&request_body).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     config_resp = Some(resp);
                     break;
+                }
+                Ok(resp) if resp.status().is_server_error() => {
+                    last_status = Some(resp.status());
+                    last_err_body = resp.text().await.ok();
+                    warn!("Config endpoint {} returned 5xx; trying next fallback...", base_url);
                 }
                 Ok(resp) => {
                     last_status = Some(resp.status());
@@ -660,7 +659,7 @@ impl VpnManager {
 
         self.is_running.store(true, Ordering::SeqCst);
 
-        let (token, mode, protocol, split, sandbox, anti_dpi, location, dns_cfg, use_warp, routing_mode, gaming_submode) = {
+        let (token, mode, protocol, split, sandbox, anti_dpi, location, dns_cfg, use_warp, routing_mode) = {
             let s = app_state.lock().await;
             (
                 s.subscription_token.clone().unwrap_or_else(|| "token_lite_sandbox_001".to_string()),
@@ -673,7 +672,6 @@ impl VpnManager {
                 s.dns_config.clone(),
                 s.use_warp,
                 s.routing_mode.clone(),
-                s.gaming_submode.clone(),
             )
         };
 
@@ -683,11 +681,6 @@ impl VpnManager {
             s.kill_switch = true;
             s.routing_mode = "tunnel".to_string();
             s.logs.push("[SECURITY] Strict Leak Protection engaged for Static IP (Kill-Switch enforced, Tunnel mode locked, IPv6 blocked).".to_string());
-        } else if mode == "gaming" {
-            let mut s = app_state.lock().await;
-            s.routing_mode = "tunnel".to_string();
-            s.tun_mode = true;
-            s.logs.push(format!("[GAMING] Gaming TUN mode active (submode: {}, MTU: 1420, System stack, Anti-Lag: No Mux/Fragment).", gaming_submode));
         }
 
         // Perform crash-safe synchronization of any pending traffic from previous abnormal exit
@@ -717,7 +710,6 @@ impl VpnManager {
             Some(&location),
             &dns_cfg,
             use_warp,
-            Some(&gaming_submode),
         ).await {
             Ok(cfg) => cfg,
             Err(e) => {
@@ -1015,7 +1007,7 @@ impl VpnManager {
 
                 // 3. Send Heartbeat to backend with fallback
                 let mut hb_success = false;
-                for base_url in crate::auth::AuthManager::get_backend_urls() {
+                for base_url in crate::auth::get_backend_urls() {
                     let url = format!("{}/api/v1/client/heartbeat", base_url);
                     let res = client
                         .post(&url)
@@ -1118,16 +1110,6 @@ impl VpnManager {
 
             // Always revert Windows System Proxy
             let _ = sysproxy::disable_system_proxy();
-
-            // On Windows, cleanly flush DNS to prevent DNS cache / routing lock
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                let _ = std::process::Command::new("ipconfig")
-                    .arg("/flushdns")
-                    .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                    .output();
-            }
         }
 
         // Clean up shared state

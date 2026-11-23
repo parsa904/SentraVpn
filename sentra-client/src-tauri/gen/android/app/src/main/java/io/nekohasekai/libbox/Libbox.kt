@@ -6,7 +6,6 @@ package io.nekohasekai.libbox
 interface BoxService {
     fun start()
     fun close()
-    fun resetNetwork()
 }
 
 /**
@@ -21,10 +20,6 @@ object Libbox {
 
             override fun close() {
                 platformInterface.writeLog("[libbox] BoxService closed.")
-            }
-
-            override fun resetNetwork() {
-                platformInterface.writeLog("[libbox] Network reset requested.")
             }
         }
     }

@@ -7,7 +7,6 @@ pub struct User {
     pub id: i64,
     pub user_uuid: String,
     pub telegram_id: Option<i64>,
-    pub email: Option<String>,
     pub username: Option<String>,
     pub password_hash: Option<String>,
     pub first_name: String,
@@ -19,45 +18,9 @@ pub struct User {
     pub auth_code_expires_at: Option<DateTime<Utc>>,
     pub link_code: Option<String>,
     pub link_code_expires_at: Option<DateTime<Utc>>,
-    pub telegram_verified: i64,
-    pub verify_code: Option<String>,
-    pub verify_code_expires_at: Option<DateTime<Utc>>,
     pub outbound_reward_banned: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-impl User {
-    #[allow(dead_code)]
-    pub fn is_telegram_verified(&self) -> bool {
-        self.telegram_verified != 0
-    }
-
-    pub fn fallback_user(user_id: i64) -> Self {
-        Self {
-            id: user_id,
-            user_uuid: format!("usr-fallback-{:08x}", user_id),
-            telegram_id: None,
-            email: None,
-            username: Some(format!("user_{}", user_id)),
-            password_hash: None,
-            first_name: "Sentra User".to_string(),
-            last_name: None,
-            photo_url: None,
-            role: "user".to_string(),
-            status: "active".to_string(),
-            auth_code: None,
-            auth_code_expires_at: None,
-            link_code: None,
-            link_code_expires_at: None,
-            telegram_verified: 1,
-            verify_code: None,
-            verify_code_expires_at: None,
-            outbound_reward_banned: 0,
-            created_at: Utc::now() - chrono::Duration::days(10),
-            updated_at: Utc::now(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -101,9 +64,6 @@ pub struct DonatedOutbound {
     pub jitter_ms: i64,
     pub last_online_at: Option<DateTime<Utc>>,
     pub allocation_mode: String,
-    #[serde(default)]
-    #[sqlx(default)]
-    pub quality_score: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -134,9 +94,6 @@ pub struct Subscription {
     pub web_browsing_used_mb: i64,
     pub download_used_mb: i64,
     pub static_ip_used_mb: i64,
-    #[serde(default)]
-    #[sqlx(default)]
-    pub gaming_used_mb: i64,
     pub last_quota_reset: DateTime<Utc>,
     pub starts_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -165,18 +122,6 @@ pub struct Outbound {
     pub weight: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    #[serde(default)]
-    #[sqlx(default)]
-    pub country_name: Option<String>,
-    #[serde(default)]
-    #[sqlx(default)]
-    pub quality_score: i64,
-    #[serde(default)]
-    #[sqlx(default)]
-    pub latency_ms: i64,
-    #[serde(default)]
-    #[sqlx(default)]
-    pub is_healthy: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -250,13 +195,12 @@ pub struct UserDevice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct AppRelease {
-    pub id: i64,
+    pub platform: String,
     pub version: String,
+    pub telegram_file_id: String,
+    pub file_name: String,
+    pub file_size_mb: f64,
     pub changelog: String,
-    pub windows_file_id: Option<String>,
-    pub windows_github_url: Option<String>,
-    pub android_file_id: Option<String>,
-    pub android_github_url: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 

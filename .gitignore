@@ -1,87 +1,11 @@
-# ------------------------------------------------------------------------------
-# Build Targets & Outputs
-# ------------------------------------------------------------------------------
 target/
-**/target/
-build/
-**/build/
-dist/
-**/dist/
-.vite/
-release-dist/
-releases/
-
-# ------------------------------------------------------------------------------
-# Dependencies & Package Managers
-# ------------------------------------------------------------------------------
 node_modules/
-**/node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# ------------------------------------------------------------------------------
-# Environment, Credentials & Secrets
-# ------------------------------------------------------------------------------
-.env
-.env.*
-!.env.example
-*.env
-*.pem
-*.key
-*.cert
-*.crt
-
-# ------------------------------------------------------------------------------
-# Android Keystores & Signing Keys
-# ------------------------------------------------------------------------------
-*.keystore
-*.jks
-release-keystore.jks
-**/sentra-release.keystore
-.gradle/
-**/.gradle/
-**/local.properties
-**/captures/
-.externalNativeBuild/
-.cxx/
-
-# ------------------------------------------------------------------------------
-# Database Files & Journals
-# ------------------------------------------------------------------------------
-*.db
-*.db*
-*.db-wal
-*.db-shm
-*.db-journal
-*.sqlite
-*.sqlite3
-*.sqlite-wal
-*.sqlite-shm
-sentra-core/*.db*
-sentra_local.db*
-
-# ------------------------------------------------------------------------------
-# Large Binary Releases & Build Executables
-# ------------------------------------------------------------------------------
-*.exe
-*.apk
-*.aab
-*.msi
 **/binaries/*.exe
 **/binaries/*.aar
-**/binaries/sing-box-*
 **/sing-box*
 !**/sing-box*.json
 !**/sing-box*.template.json
-
-# ------------------------------------------------------------------------------
-# Backups, Caches & OS Artifacts
-# ------------------------------------------------------------------------------
-*.bak
-**/*.bak
-.sentra/
-**/.sentra/
-.DS_Store
-Thumbs.db
-*.log
+*.db
+*.db*
+*.sqlite
+.env

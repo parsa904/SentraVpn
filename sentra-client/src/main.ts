@@ -20,13 +20,10 @@ interface ClientState {
   username: string;
   remaining_bytes: number;
   expires_at?: string | null;
-  telegram_verified?: boolean;
-  email?: string | null;
   status: 'Disconnected' | 'Connecting' | 'Connected' | { Error: string };
   selected_mode: string;
   selected_protocol?: string;
   selected_location: string;
-  gaming_submode?: string;
   routing_mode?: string;
   local_socks5_port?: number;
   local_http_port?: number;
@@ -132,7 +129,6 @@ let currentState: ClientState = {
   selected_mode: "web_browsing",
   selected_protocol: "openvpn_udp",
   selected_location: "auto",
-  gaming_submode: "full_udp",
   routing_mode: "tunnel",
   local_socks5_port: 10808,
   local_http_port: 10809,
@@ -157,6 +153,133 @@ let currentState: ClientState = {
 
 let connectionTimerInterval: number | null = null;
 let uptimeSeconds: number = 0;
+let lastRenderedScreen: 'auth' | 'main' | null = null;
+let toastHideTimeout: number | null = null;
+
+// ------------------------------------------------------------------------------
+// UI Feedback Helpers (Toast, Button Spinner, Error Extraction, Click Ripple)
+// ------------------------------------------------------------------------------
+function extractErrorMessage(err: unknown, fallback: string): string {
+  if (!err) return fallback;
+  let raw = typeof err === 'string' ? err : (err as Error)?.message || String(err);
+  raw = raw.replace(/^Error:\s*/i, '').trim();
+  return raw || fallback;
+}
+
+function showToast(message: string, kind: 'info' | 'success' | 'error' = 'info') {
+  const el = document.getElementById('sentra-toast');
+  if (!el) return;
+  el.textContent = message;
+  el.classList.remove(
+    'toast-hidden',
+    'toast-visible',
+    'bg-emerald-600/95',
+    'border-emerald-400/50',
+    'text-white',
+    'bg-red-600/95',
+    'border-red-400/50',
+    'bg-slate-900/92',
+    'border-slate-700'
+  );
+  if (kind === 'success') {
+    el.classList.add('bg-emerald-600/95', 'border-emerald-400/50', 'text-white');
+  } else if (kind === 'error') {
+    el.classList.add('bg-red-600/95', 'border-red-400/50', 'text-white');
+  } else {
+    el.classList.add('bg-slate-900/92', 'border-slate-700', 'text-white');
+  }
+  // Force reflow for smooth transition
+  void el.offsetWidth;
+  el.classList.add('toast-visible');
+  if (toastHideTimeout) window.clearTimeout(toastHideTimeout);
+  toastHideTimeout = window.setTimeout(() => {
+    el.classList.remove('toast-visible');
+    el.classList.add('toast-hidden');
+  }, 3600);
+}
+
+function setButtonLoading(
+  btn: HTMLElement | null,
+  loading: boolean,
+  loadingLabel: string,
+  idleLabel: string
+) {
+  if (!btn) return;
+  const buttonEl = btn as HTMLButtonElement;
+  buttonEl.disabled = loading;
+  if (loading) {
+    buttonEl.innerHTML = `
+      <span class="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin inline-block"></span>
+      <span>${loadingLabel}</span>
+    `;
+  } else {
+    buttonEl.innerHTML = `<span>${idleLabel}</span>`;
+  }
+}
+
+function showAuthError(message: string) {
+  const authErr = document.getElementById('auth-error-msg');
+  if (!authErr) return;
+  authErr.textContent = message;
+  authErr.classList.remove('hidden', 'animate-error-shake');
+  void authErr.offsetWidth;
+  authErr.classList.add('animate-error-shake');
+}
+
+function clearAuthError() {
+  const authErr = document.getElementById('auth-error-msg');
+  if (!authErr) return;
+  authErr.textContent = '';
+  authErr.classList.add('hidden');
+  authErr.classList.remove('animate-error-shake');
+}
+
+function replayAnimation(el: HTMLElement | null, className: string) {
+  if (!el) return;
+  el.classList.remove(className);
+  void el.offsetWidth;
+  el.classList.add(className);
+}
+
+function initRippleEffects() {
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    return;
+  }
+  document.addEventListener('pointerdown', (e: PointerEvent) => {
+    const target = (e.target as HTMLElement | null)?.closest(
+      'button, .mode-item, .sentra-interactive'
+    ) as HTMLElement | null;
+    if (!target) return;
+    if ((target as HTMLButtonElement).disabled || target.classList.contains('cursor-not-allowed')) {
+      return;
+    }
+    const rect = target.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const size = Math.max(rect.width, rect.height);
+    const ripple = document.createElement('span');
+    const isSolidCta =
+      target.classList.contains('text-white') &&
+      !target.classList.contains('bg-[#1E293B]') &&
+      !target.classList.contains('bg-[#0F172A]');
+    ripple.className = isSolidCta ? 'sentra-ripple sentra-ripple-light' : 'sentra-ripple';
+    ripple.style.width = `${size}px`;
+    ripple.style.height = `${size}px`;
+    ripple.style.left = `${e.clientX - rect.left - size / 2}px`;
+    ripple.style.top = `${e.clientY - rect.top - size / 2}px`;
+    target.appendChild(ripple);
+    window.setTimeout(() => ripple.remove(), 560);
+  });
+}
+
+function openExternalLinkSafe(url: string) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
 
 // ------------------------------------------------------------------------------
 // Tauri IPC Wrapper
@@ -164,26 +287,7 @@ let uptimeSeconds: number = 0;
 async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Promise<T> {
   const tauri = (window as any).__TAURI__;
   if (tauri && tauri.core && typeof tauri.core.invoke === 'function') {
-    try {
-      return await tauri.core.invoke(cmd, args);
-    } catch (err: any) {
-      const errMsg = String(err?.message || err || '');
-      if (
-        errMsg.includes('401') ||
-        errMsg.toLowerCase().includes('unauthorized') ||
-        errMsg.includes('TOKEN_EXPIRED') ||
-        errMsg.includes('INVALID_TOKEN') ||
-        errMsg.includes('SESSION_EXPIRED')
-      ) {
-        console.warn('[Auth] Received 401 Unauthorized. Redirecting to login screen...', errMsg);
-        currentState.is_authenticated = false;
-        currentState.auth_token = null;
-        currentState.subscription_token = null;
-        currentState.status = 'Disconnected';
-        renderUI();
-      }
-      throw err;
-    }
+    return await tauri.core.invoke(cmd, args);
   }
 
   // --- Browser Dev Mock Fallback ---
@@ -229,10 +333,6 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
     updateTelemetryDisplay(currentState.metrics);
     return { ...currentState } as unknown as T;
   }
-  if (cmd === 'set_gaming_submode') {
-    currentState.gaming_submode = (args?.submode as string) || 'full_udp';
-    return { ...currentState } as unknown as T;
-  }
   if (cmd === 'test_api_connection') {
     return "اتصال آزمایشی به API برقرار است (حالت پیش‌نمایش مرورگر)" as unknown as T;
   }
@@ -275,46 +375,6 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
     currentState.status = 'Disconnected';
     stopTimer();
     return { ...currentState } as unknown as T;
-  }
-  if (cmd === 'request_password_reset') {
-    const email = (args.email || '').trim();
-    if (!email) throw new Error("لطفاً ایمیل یا نام کاربری خود را وارد فرمایید.");
-    const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || 'https://head.cyberservice.sbs:8443';
-    try {
-      const resp = await fetch(`${baseUrl}/api/v1/auth/password-reset/request`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email })
-      });
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok) throw new Error(data.message || data.error || "خطا در ارسال درخواست بازیابی رمز عبور.");
-      return data as unknown as T;
-    } catch (e: any) {
-      if (e.message && !e.message.includes('fetch')) throw e;
-      return { success: true, delivery: "telegram", expires_in_seconds: 600 } as unknown as T;
-    }
-  }
-  if (cmd === 'confirm_password_reset') {
-    const email = (args.email || '').trim();
-    const code = (args.code || '').trim();
-    const new_password = (args.new_password || '').trim();
-    if (!email) throw new Error("لطفاً ایمیل یا نام کاربری را وارد نمایید.");
-    if (code.length !== 6 || !/^\d{6}$/.test(code)) throw new Error("کد تایید باید ۶ رقم باشد.");
-    if (new_password.length < 8) throw new Error("رمز عبور جدید باید حداقل ۸ کاراکتر باشد.");
-    const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || 'https://head.cyberservice.sbs:8443';
-    try {
-      const resp = await fetch(`${baseUrl}/api/v1/auth/password-reset/confirm`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, code, new_password })
-      });
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok) throw new Error(data.message || data.error || "خطا در بازنشانی رمز عبور.");
-      return data as unknown as T;
-    } catch (e: any) {
-      if (e.message && !e.message.includes('fetch')) throw e;
-      return { success: true, message: "رمز عبور با موفقیت تغییر یافت." } as unknown as T;
-    }
   }
   if (cmd === 'get_available_locations') {
     return [
@@ -370,6 +430,157 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
     return { ...currentState } as unknown as T;
   }
 
+  if (cmd === 'login_with_credentials') {
+    const username = (args.username || '').trim();
+    const password = args.password || '';
+    await new Promise(resolve => setTimeout(resolve, 350));
+    if (!username || !password) throw new Error("لطفاً نام کاربری و رمز عبور را وارد کنید.");
+    currentState.is_authenticated = true;
+    currentState.username = username;
+    currentState.tier = username.toLowerCase().includes('flow')
+      ? "Sentra Flow+"
+      : username.toLowerCase().includes('pro')
+      ? "Sentra Pro"
+      : "Sentra Lite";
+    currentState.expires_at = currentState.tier === "Sentra Lite" ? null : "2026-12-31T23:59:59Z";
+    currentState.logs.push(`[INFO] [Auth] Logged in as ${username} (${currentState.tier})`);
+    return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'register_with_credentials') {
+    const username = (args.username || '').trim();
+    const password = args.password || '';
+    await new Promise(resolve => setTimeout(resolve, 400));
+    if (username.length < 3) throw new Error("نام کاربری باید حداقل ۳ کاراکتر باشد.");
+    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+      throw new Error("نام کاربری فقط باید شامل حروف انگلیسی، اعداد و زیرخط (_) باشد.");
+    }
+    if (password.length < 8) throw new Error("رمز عبور باید حداقل ۸ کاراکتر باشد.");
+    currentState.is_authenticated = true;
+    currentState.username = username;
+    currentState.tier = "Sentra Lite";
+    currentState.expires_at = null;
+    currentState.remaining_bytes = 10_737_418_240;
+    currentState.logs.push(`[INFO] [Auth] Registered free account: ${username}`);
+    return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'set_connection_mode') {
+    const mode = args.mode || 'web_browsing';
+    if (mode === 'gaming') {
+      throw new Error("حالت گیمینگ موقتاً غیرفعال است.");
+    }
+    currentState.selected_mode = mode;
+    if (mode === 'static_ip') {
+      currentState.routing_mode = 'tunnel';
+      currentState.use_warp = false;
+    }
+    currentState.logs.push(`[INFO] [Mode] Connection mode switched to: ${mode}`);
+    return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'set_connection_protocol') {
+    const protocol = args.protocol || 'openvpn_udp';
+    currentState.selected_protocol = protocol;
+    currentState.logs.push(`[INFO] [Protocol] Protocol switched to: ${protocol}`);
+    return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'get_connection_modes') {
+    return {
+      success: true,
+      modes: [
+        {
+          id: 'web_browsing',
+          title: 'وب‌گردی روزمره',
+          description: 'مرور سریع و پایدار وب',
+          protocol: 'VLESS Reality',
+          speed: 'High',
+          security: 'TLS 1.3',
+          is_locked: false,
+          is_coming_soon: false,
+          daily_quota_mb: 2048,
+          daily_used_mb: 340,
+          allowed_tiers: ['Sentra Lite', 'Sentra Pro', 'Sentra Flow+'],
+        },
+        {
+          id: 'download',
+          title: 'دانلود پرسرعت',
+          description: 'پهنای باند بالا روی Hysteria 2',
+          protocol: 'Hysteria 2',
+          speed: 'Ultra',
+          security: 'QUIC',
+          is_locked: false,
+          is_coming_soon: false,
+          daily_quota_mb: 3072,
+          daily_used_mb: 512,
+          allowed_tiers: ['Sentra Lite', 'Sentra Pro', 'Sentra Flow+'],
+        },
+        {
+          id: 'static_ip',
+          title: 'آی‌پی ثابت مسکونی',
+          description: 'مناسب ترید و حساب‌های مالی',
+          protocol: 'Dedicated Tunnel',
+          speed: 'Stable',
+          security: 'Zero-Leak',
+          is_locked: currentState.tier === 'Sentra Lite',
+          is_coming_soon: false,
+          daily_quota_mb: 30720,
+          daily_used_mb: 1280,
+          allowed_tiers: ['Sentra Pro', 'Sentra Flow+'],
+        },
+      ],
+    } as unknown as T;
+  }
+  if (cmd === 'toggle_split_tunneling') {
+    currentState.split_tunneling = !!args.enabled;
+    currentState.logs.push(`[CONFIG] Split tunneling: ${currentState.split_tunneling ? 'ON' : 'OFF'}`);
+    return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'toggle_tun_mode') {
+    currentState.tun_mode = !!args.enabled;
+    currentState.logs.push(`[CONFIG] TUN mode: ${currentState.tun_mode ? 'ON' : 'OFF'}`);
+    return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'toggle_kill_switch') {
+    currentState.kill_switch = !!args.enabled;
+    currentState.logs.push(`[CONFIG] Kill-switch: ${currentState.kill_switch ? 'ON' : 'OFF'}`);
+    return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'toggle_sandbox_mode') {
+    currentState.sandbox_loopback = !!args.enabled;
+    currentState.logs.push(`[CONFIG] Sandbox loopback mode: ${currentState.sandbox_loopback ? 'ON' : 'OFF'}`);
+    return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'remove_user_device') {
+    currentState.logs.push(`[INFO] [Device] Removed device ${args.device_id}`);
+    return { success: true } as unknown as T;
+  }
+  if (cmd === 'get_telegram_link_code') {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    return code as unknown as T;
+  }
+  if (cmd === 'save_anti_dpi_settings') {
+    currentState.logs.push(`[Anti-DPI] Settings saved (${args.settings?.preset || 'custom'})`);
+    return { success: true } as unknown as T;
+  }
+  if (cmd === 'test_anti_dpi_settings') {
+    return {
+      success: true,
+      ping_ms: 42,
+      status_text: '✅ اتصال ضد DPI سالم است — پینگ میانگین: 42ms (بدون اختلال)',
+      is_blocked: false,
+    } as unknown as T;
+  }
+  if (cmd === 'clear_logs') {
+    currentState.logs = [];
+    return { success: true } as unknown as T;
+  }
+  if (cmd === 'check_client_version') {
+    return {
+      latest_version: '1.0.0',
+      min_supported_version: '1.0.0',
+      download_url: '',
+      release_notes: '',
+    } as unknown as T;
+  }
+
   return { ...currentState } as unknown as T;
 }
 
@@ -407,7 +618,7 @@ async function setupTauriEventListeners() {
       if (event.payload.message) {
         const msg = event.payload.message;
         if (!handleCoreError(msg)) {
-          alert('قطع اتصال تانل: ' + msg);
+          showToast('قطع اتصال تانل: ' + msg, 'error');
         }
       }
     }
@@ -439,8 +650,7 @@ function formatDuration(totalSeconds: number): string {
 function formatModeBadge(modeId: string): string {
   switch (modeId) {
     case 'download': return '⚡ ۲. دانلود پرسرعت';
-    case 'gaming': return '🎮 ۳. گیمینگ (کاهش پینگ)';
-    case 'static_ip': return '🔒 ۴. آی‌پی ثابت مسکونی';
+    case 'static_ip': return '🔒 ۳. آی‌پی ثابت مسکونی';
     case 'web_browsing':
     default: return '🌐 ۱. وب‌گردی روزمره';
   }
@@ -453,14 +663,27 @@ function renderState() {
   const authScreen = document.getElementById('auth-screen');
   const mainScreen = document.getElementById('main-screen');
 
+  // Auto-fallback if legacy saved state had gaming mode selected
+  if (currentState.selected_mode === 'gaming') {
+    currentState.selected_mode = 'web_browsing';
+  }
+
   if (!currentState.is_authenticated) {
     authScreen?.classList.remove('hidden');
     mainScreen?.classList.add('hidden');
+    if (lastRenderedScreen !== 'auth') {
+      replayAnimation(authScreen, 'animate-screen-enter');
+      lastRenderedScreen = 'auth';
+    }
     return;
   }
 
   authScreen?.classList.add('hidden');
   mainScreen?.classList.remove('hidden');
+  if (lastRenderedScreen !== 'main') {
+    replayAnimation(mainScreen, 'animate-screen-enter');
+    lastRenderedScreen = 'main';
+  }
 
   // Top Bar: Subscription Badge
   const tierBadge = document.getElementById('tier-badge');
@@ -691,48 +914,35 @@ function renderRoutingMode() {
 
 function renderPowerButton() {
   const masterBtn = document.getElementById('master-power-btn');
+  const orbWrap = document.getElementById('power-orb-wrap');
   const powerIcon = document.getElementById('power-icon');
   const statusText = document.getElementById('status-text');
 
   if (!masterBtn || !powerIcon || !statusText) return;
 
   masterBtn.classList.remove('btn-connecting', 'btn-connected');
+  orbWrap?.classList.remove('state-idle', 'state-connecting', 'state-connected');
 
   if (currentState.status === 'Connected') {
     masterBtn.classList.add('btn-connected');
+    orbWrap?.classList.add('state-connected');
     masterBtn.style.borderColor = '#10B981';
-    powerIcon.className = 'w-10 h-10 text-[#10B981] transition-colors duration-300';
+    powerIcon.className = 'w-11 h-11 text-[#059669] transition-colors duration-300';
     statusText.textContent = 'اتصال ایمن برقرار است';
-    statusText.className = 'text-xs font-semibold text-[#10B981]';
+    statusText.className = 'text-sm font-bold text-[#059669] transition-colors';
   } else if (currentState.status === 'Connecting') {
     masterBtn.classList.add('btn-connecting');
+    orbWrap?.classList.add('state-connecting');
     masterBtn.style.borderColor = '#F59E0B';
-    powerIcon.className = 'w-10 h-10 text-[#F59E0B] transition-colors duration-300 animate-pulse';
+    powerIcon.className = 'w-11 h-11 text-[#D97706] transition-colors duration-300 animate-pulse';
     statusText.textContent = 'در حال برقراری تانل...';
-    statusText.className = 'text-xs font-semibold text-[#F59E0B]';
+    statusText.className = 'text-sm font-bold text-[#D97706] transition-colors';
   } else {
-    masterBtn.style.borderColor = 'rgba(255, 255, 255, 0.15)';
-    powerIcon.className = 'w-10 h-10 text-[#64748B] transition-colors duration-300';
+    orbWrap?.classList.add('state-idle');
+    masterBtn.style.borderColor = '';
+    powerIcon.className = 'w-11 h-11 text-[#64748B] transition-colors duration-300';
     statusText.textContent = 'قطع ارتباط';
-    statusText.className = 'text-xs font-semibold text-[#94A3B8]';
-  }
-}
-
-let recentPings: number[] = [];
-let currentJitterMs = 0;
-
-function updateGamingJitter(newPing: number) {
-  if (newPing <= 0) return;
-  recentPings.push(newPing);
-  if (recentPings.length > 6) recentPings.shift();
-  if (recentPings.length >= 2) {
-    let diffSum = 0;
-    for (let i = 1; i < recentPings.length; i++) {
-      diffSum += Math.abs(recentPings[i] - recentPings[i - 1]);
-    }
-    currentJitterMs = Math.round(diffSum / (recentPings.length - 1));
-  } else {
-    currentJitterMs = 1;
+    statusText.className = 'text-sm font-bold text-[#94A3B8] transition-colors';
   }
 }
 
@@ -746,23 +956,6 @@ function updateTelemetryDisplay(metrics: TelemetryMetrics) {
   if (upEl) upEl.textContent = formatSpeed(metrics.upload_speed_bps);
   if (pingEl) pingEl.textContent = metrics.ping_ms > 0 ? `${metrics.ping_ms} ms` : '- ms';
   if (timerEl) timerEl.textContent = formatDuration(metrics.uptime_seconds);
-
-  // Live Gaming Telemetry Display
-  const gamingBar = document.getElementById('gaming-telemetry-bar');
-  if (gamingBar) {
-    if (currentState.selected_mode === 'gaming' && currentState.status === 'Connected') {
-      gamingBar.classList.remove('hidden');
-      const gPing = document.getElementById('gaming-ping-val');
-      const gJitter = document.getElementById('gaming-jitter-val');
-      if (gPing) gPing.textContent = metrics.ping_ms > 0 ? `${metrics.ping_ms} ms` : '- ms';
-      if (gJitter) {
-        updateGamingJitter(metrics.ping_ms);
-        gJitter.textContent = `±${currentJitterMs} ms`;
-      }
-    } else {
-      gamingBar.classList.add('hidden');
-    }
-  }
 }
 
 function startTimer() {
@@ -856,31 +1049,6 @@ function updateModesUI() {
     }
   }
 
-  // Download Mode Lock based on Telegram Verification for Free users
-  const dlLockOverlay = document.getElementById('dl-lock-overlay');
-  const dlQuotaContainer = document.getElementById('dl-quota-container');
-  const dlBadge = document.getElementById('dl-badge');
-  const dlIcon = document.getElementById('dl-icon');
-
-  const isDlLocked = isFreeTier && !currentState.telegram_verified;
-  if (isDlLocked) {
-    if (dlLockOverlay) dlLockOverlay.classList.remove('hidden');
-    if (dlQuotaContainer) dlQuotaContainer.classList.add('opacity-40');
-    if (dlBadge) {
-      dlBadge.textContent = '🔒 قفل (تایید تلگرام)';
-      dlBadge.className = 'text-[9px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 font-medium border border-amber-500/30';
-    }
-    if (dlIcon) dlIcon.textContent = '🔒';
-  } else {
-    if (dlLockOverlay) dlLockOverlay.classList.add('hidden');
-    if (dlQuotaContainer) dlQuotaContainer.classList.remove('opacity-40');
-    if (dlBadge) {
-      dlBadge.textContent = 'Hysteria 2';
-      dlBadge.className = 'text-[9px] px-1.5 py-0.5 rounded bg-[#3B82F6]/15 text-[#3B82F6] font-medium border border-[#3B82F6]/20';
-    }
-    if (dlIcon) dlIcon.textContent = '⚡';
-  }
-
   // Static IP locked/unlocked state & 30GB quota meter
   const staticIcon = document.getElementById('static-ip-icon');
   const staticBadge = document.getElementById('static-ip-badge');
@@ -913,64 +1081,14 @@ function updateModesUI() {
     }
   }
 
-  // 3. Gaming Mode Box & Quota Display
-  const gamingSubmodeBox = document.getElementById('gaming-submode-box');
-  const gamingQuotaText = document.getElementById('gaming-quota-text');
-  const gamingBadge = document.getElementById('gaming-badge');
-  const gm = connectionModes.find(m => m.id === 'gaming');
-
-  if (currentState.selected_mode === 'gaming') {
-    if (gamingSubmodeBox) gamingSubmodeBox.classList.remove('hidden');
-    const submode = currentState.gaming_submode || 'full_udp';
-    const btnFull = document.getElementById('submode-full-udp');
-    const btnAnti = document.getElementById('submode-anti-sanction');
-    if (btnFull && btnAnti) {
-      if (submode === 'full_udp') {
-        btnFull.className = 'gaming-submode-btn p-1.5 rounded-lg bg-[#0F172A] border border-[#F59E0B] text-right transition flex flex-col cursor-pointer';
-        btnAnti.className = 'gaming-submode-btn p-1.5 rounded-lg bg-[#0F172A] border border-white/10 hover:border-white/20 text-right transition flex flex-col cursor-pointer';
-      } else {
-        btnFull.className = 'gaming-submode-btn p-1.5 rounded-lg bg-[#0F172A] border border-white/10 hover:border-white/20 text-right transition flex flex-col cursor-pointer';
-        btnAnti.className = 'gaming-submode-btn p-1.5 rounded-lg bg-[#0F172A] border border-[#F59E0B] text-right transition flex flex-col cursor-pointer';
-      }
-    }
-
-    const smBadge = document.getElementById('gaming-submode-badge');
-    if (smBadge) {
-      smBadge.textContent = submode === 'anti_sanction' ? 'ضدتحریم پینگ صفر' : 'Full UDP';
-    }
-  } else {
-    if (gamingSubmodeBox) gamingSubmodeBox.classList.add('hidden');
-  }
-
-  if (isFreeTier) {
-    const gmUsed = gm ? gm.daily_used_mb || 0 : 0;
-    const gmRem = Math.max(0, 3072 - gmUsed);
-    if (gamingQuotaText) gamingQuotaText.textContent = `سهمیه امروز: ${(gmRem / 1024).toFixed(1)} GB باقیمانده`;
-    if (gamingBadge) {
-      if (gmRem === 0) {
-        gamingBadge.textContent = 'سقف ۳ گیگ امروز پر شد';
-        gamingBadge.className = 'text-[9px] px-1.5 py-0.5 rounded bg-[#EF4444]/15 text-[#EF4444] font-medium border border-[#EF4444]/20';
-      } else {
-        gamingBadge.textContent = '۳ گیگابایت روزانه رایگان';
-        gamingBadge.className = 'text-[9px] px-1.5 py-0.5 rounded bg-[#F59E0B]/15 text-[#F59E0B] font-medium border border-[#F59E0B]/20';
-      }
-    }
-  } else {
-    if (gamingQuotaText) gamingQuotaText.textContent = 'سهمیه گیمینگ: نامحدود (VIP)';
-    if (gamingBadge) {
-      gamingBadge.textContent = 'ترافیک نامحدود گیمینگ';
-      gamingBadge.className = 'text-[9px] px-1.5 py-0.5 rounded bg-[#10B981]/15 text-[#10B981] font-medium border border-[#10B981]/20';
-    }
-  }
-
-  // Highlight active mode card
-  ['web_browsing', 'download', 'gaming', 'static_ip'].forEach(id => {
+  // Highlight active mode card (Gaming mode temporarily hidden)
+  ['web_browsing', 'download', 'static_ip'].forEach(id => {
     const el = document.getElementById(`card-mode-${id}`);
     if (el) {
       if (id === currentState.selected_mode) {
-        el.classList.add('border-[#10B981]', 'ring-1', 'ring-[#10B981]');
+        el.classList.add('mode-active');
       } else {
-        el.classList.remove('border-[#10B981]', 'ring-1', 'ring-[#10B981]');
+        el.classList.remove('mode-active');
       }
     }
   });
@@ -982,7 +1100,7 @@ async function refreshConnectionModes() {
       token: currentState.subscription_token,
     });
     if (res && res.modes) {
-      connectionModes = res.modes;
+      connectionModes = res.modes.filter(m => m.id !== 'gaming');
       updateModesUI();
     }
   } catch (err) {
@@ -1086,7 +1204,7 @@ async function loadUserDevices() {
 
           document.getElementById('devices-modal')?.classList.add('hidden');
         } catch (err: any) {
-          alert('خطا در جایگزینی دستگاه: ' + (err?.toString() || ''));
+          showToast('خطا در جایگزینی دستگاه: ' + extractErrorMessage(err, 'عملیات ناموفق بود'), 'error');
         }
       });
     });
@@ -1094,15 +1212,19 @@ async function loadUserDevices() {
     // Handle individual removal
     container.querySelectorAll('.remove-dev-btn').forEach(btn => {
       btn.addEventListener('click', async (e) => {
-        const devId = (e.currentTarget as HTMLElement).getAttribute('data-dev-id');
+        const targetBtn = e.currentTarget as HTMLButtonElement;
+        const devId = targetBtn.getAttribute('data-dev-id');
         if (!devId) return;
-        if (confirm('آیا از حذف این دستگاه اطمینان دارید؟ دسترسی اتصال آن متوقف خواهد شد.')) {
-          try {
-            await invokeTauri('remove_user_device', { device_id: devId });
-            await loadUserDevices();
-          } catch (err: any) {
-            alert('خطا در حذف دستگاه: ' + (err?.toString() || ''));
-          }
+        try {
+          targetBtn.disabled = true;
+          targetBtn.textContent = 'در حال حذف...';
+          await invokeTauri('remove_user_device', { device_id: devId });
+          showToast('دستگاه با موفقیت حذف گردید.', 'success');
+          await loadUserDevices();
+        } catch (err: any) {
+          targetBtn.disabled = false;
+          targetBtn.textContent = 'حذف';
+          showToast('خطا در حذف دستگاه: ' + extractErrorMessage(err, 'عملیات ناموفق بود'), 'error');
         }
       });
     });
@@ -1156,94 +1278,34 @@ function handleCoreError(errStr: string): boolean {
   return true;
 }
 
-// ------------------------------------------------------------------------------
-// Password Reset API Calls (Two-Step Verification)
-// ------------------------------------------------------------------------------
-async function apiPasswordResetRequest(email: string): Promise<any> {
-  const tauri = (window as any).__TAURI__;
-  if (tauri && tauri.core && typeof tauri.core.invoke === 'function') {
-    return await invokeTauri('request_password_reset', { email });
-  }
-
-  const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || 'https://head.cyberservice.sbs:8443';
-  const endpoints = [baseUrl, 'https://head.cyberservice.sbs:8443', 'http://127.0.0.1:8080'];
-  let lastErr = 'عدم برقراری ارتباط با سرور.';
-
-  for (const base of endpoints) {
-    try {
-      const res = await fetch(`${base}/api/v1/auth/password-reset/request`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email })
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) {
-        return data;
-      }
-      throw new Error(data.message || data.error || 'خطا در ارسال درخواست بازیابی رمز عبور.');
-    } catch (e: any) {
-      if (e.message && !e.message.includes('fetch')) throw e;
-      lastErr = e.message || lastErr;
+function handleAuthError(err: unknown, fallback: string) {
+  const errStr = extractErrorMessage(err, fallback);
+  if (errStr.includes('ACCOUNT_SUSPENDED')) {
+    const suspendedModal = document.getElementById('suspended-modal');
+    const suspendedText = document.getElementById('suspended-msg-text');
+    if (suspendedText) {
+      suspendedText.textContent = errStr.replace(/^ACCOUNT_SUSPENDED:\s*/i, '').trim() || suspendedText.textContent;
     }
+    suspendedModal?.classList.remove('hidden');
+    showAuthError(errStr.replace(/^ACCOUNT_SUSPENDED:\s*/i, '').trim());
+    return;
   }
-  throw new Error(lastErr);
-}
-
-async function apiPasswordResetConfirm(email: string, code: string, newPassword: string): Promise<any> {
-  const tauri = (window as any).__TAURI__;
-  if (tauri && tauri.core && typeof tauri.core.invoke === 'function') {
-    return await invokeTauri('confirm_password_reset', { email, code, new_password: newPassword });
+  if (errStr.includes('MAX_DEVICES_REACHED')) {
+    const cleanMsg = errStr.replace(/^MAX_DEVICES_REACHED:\s*/i, '').trim();
+    showAuthError(cleanMsg);
+    const devicesModal = document.getElementById('devices-modal');
+    devicesModal?.classList.remove('hidden');
+    loadUserDevices();
+    return;
   }
-
-  const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || 'https://head.cyberservice.sbs:8443';
-  const endpoints = [baseUrl, 'https://head.cyberservice.sbs:8443', 'http://127.0.0.1:8080'];
-  let lastErr = 'عدم برقراری ارتباط با سرور.';
-
-  for (const base of endpoints) {
-    try {
-      const res = await fetch(`${base}/api/v1/auth/password-reset/confirm`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, code, new_password: newPassword })
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) {
-        return data;
-      }
-      throw new Error(data.message || data.error || 'خطا در تغییر رمز عبور.');
-    } catch (e: any) {
-      if (e.message && !e.message.includes('fetch')) throw e;
-      lastErr = e.message || lastErr;
-    }
-  }
-  throw new Error(lastErr);
+  showAuthError(errStr);
 }
 
 // ------------------------------------------------------------------------------
 // Event Listeners Initialization
 // ------------------------------------------------------------------------------
 function initEventListeners() {
-  const authErr = document.getElementById('auth-error-msg');
-  const authSuccess = document.getElementById('auth-success-msg');
-  const authTabs = document.getElementById('auth-tabs');
-
-  // Forgot Password DOM Elements
-  const formForgot = document.getElementById('auth-form-forgot');
-  const forgotLink = document.getElementById('forgot-password-link');
-  const forgotBackBtn = document.getElementById('forgot-back-btn');
-  const forgotStep1 = document.getElementById('forgot-step-1');
-  const forgotStep2 = document.getElementById('forgot-step-2');
-  const forgotIdentifierInput = document.getElementById('forgot-identifier-input') as HTMLInputElement;
-  const forgotRequestBtn = document.getElementById('forgot-request-btn');
-  const forgotCodeInput = document.getElementById('forgot-code-input') as HTMLInputElement;
-  const forgotPassInput = document.getElementById('forgot-password-input') as HTMLInputElement;
-  const forgotConfirmBtn = document.getElementById('forgot-confirm-btn');
-  const forgotStep2ChangeEmail = document.getElementById('forgot-step2-change-email');
-  const forgotStep2Info = document.getElementById('forgot-step2-info');
-  const forgotErr = document.getElementById('forgot-error-msg');
-  const forgotSuccess = document.getElementById('forgot-success-msg');
-
-  // 1a. Auth Tabs Switcher
+  // 1a. Auth Tabs Switcher (with Smooth Fade + Slide Transition)
   const tabLogin = document.getElementById('auth-tab-login');
   const tabRegister = document.getElementById('auth-tab-register');
   const tabOtp = document.getElementById('auth-tab-otp');
@@ -1252,11 +1314,7 @@ function initEventListeners() {
   const formOtp = document.getElementById('auth-form-otp');
 
   const selectAuthTab = (activeTab: 'login' | 'register' | 'otp') => {
-    if (authErr) authErr.classList.add('hidden');
-    if (authSuccess) authSuccess.classList.add('hidden');
-    formForgot?.classList.add('hidden');
-    authTabs?.classList.remove('hidden');
-
+    clearAuthError();
     const tabs = [
       { id: 'login', tab: tabLogin, form: formLogin },
       { id: 'register', tab: tabRegister, form: formRegister },
@@ -1264,11 +1322,12 @@ function initEventListeners() {
     ];
     tabs.forEach(t => {
       if (t.id === activeTab) {
-        t.tab?.classList.add('text-white', 'bg-[#0F172A]', 'shadow-sm');
+        t.tab?.classList.add('active', 'font-semibold');
         t.tab?.classList.remove('text-[#94A3B8]');
         t.form?.classList.remove('hidden');
+        replayAnimation(t.form, 'animate-tab-enter');
       } else {
-        t.tab?.classList.remove('text-white', 'bg-[#0F172A]', 'shadow-sm');
+        t.tab?.classList.remove('active', 'font-semibold');
         t.tab?.classList.add('text-[#94A3B8]');
         t.form?.classList.add('hidden');
       }
@@ -1288,216 +1347,31 @@ function initEventListeners() {
     const username = loginUserInput?.value?.trim() || '';
     const password = loginPassInput?.value || '';
     if (!username || !password) {
-      if (authErr) {
-        authErr.textContent = 'لطفاً نام کاربری و رمز عبور را وارد فرمایید.';
-        authErr.classList.remove('hidden');
-      }
+      showAuthError('لطفاً نام کاربری و رمز عبور خود را وارد فرمایید.');
       return;
     }
-    if (authErr) authErr.classList.add('hidden');
+    clearAuthError();
+    setButtonLoading(loginSubmitBtn, true, 'در حال اتصال به سرور...', 'ورود به حساب');
     try {
-      if (loginSubmitBtn) {
-        loginSubmitBtn.textContent = 'در حال ورود...';
-        (loginSubmitBtn as HTMLButtonElement).disabled = true;
-      }
       const updated = await invokeTauri<ClientState>('login_with_credentials', { username, password });
       currentState = updated;
+      showToast(`خوش آمدید، ${currentState.username}!`, 'success');
       renderState();
       await loadUserDevices();
       await refreshConnectionModes();
-    } catch (e: any) {
-      const errStr = e?.toString() || 'نام کاربری یا رمز عبور اشتباه است.';
-      if (!handleCoreError(errStr)) {
-        if (authErr) {
-          authErr.textContent = errStr;
-          authErr.classList.remove('hidden');
-        }
-      }
+    } catch (e: unknown) {
+      handleAuthError(e, 'نام کاربری یا رمز عبور اشتباه است یا ارتباط با سرور برقرار نشد.');
     } finally {
-      if (loginSubmitBtn) {
-        loginSubmitBtn.textContent = 'ورود به حساب';
-        (loginSubmitBtn as HTMLButtonElement).disabled = false;
-      }
+      setButtonLoading(loginSubmitBtn, false, 'در حال اتصال به سرور...', 'ورود به حساب');
     }
   };
 
   loginSubmitBtn?.addEventListener('click', handleCredentialsLogin);
-  loginPassInput?.addEventListener('keypress', (e) => {
+  loginUserInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') loginPassInput?.focus();
+  });
+  loginPassInput?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') handleCredentialsLogin();
-  });
-
-  // 1e. Forgot Password Two-Step Flow
-  const returnToLogin = (prefillIdentifier?: string) => {
-    if (forgotErr) forgotErr.classList.add('hidden');
-    if (forgotSuccess) forgotSuccess.classList.add('hidden');
-    formForgot?.classList.add('hidden');
-    authTabs?.classList.remove('hidden');
-    selectAuthTab('login');
-    if (prefillIdentifier && loginUserInput) {
-      loginUserInput.value = prefillIdentifier;
-    }
-  };
-
-  forgotLink?.addEventListener('click', () => {
-    if (authErr) authErr.classList.add('hidden');
-    if (authSuccess) authSuccess.classList.add('hidden');
-    if (forgotErr) forgotErr.classList.add('hidden');
-    if (forgotSuccess) forgotSuccess.classList.add('hidden');
-
-    formLogin?.classList.add('hidden');
-    formRegister?.classList.add('hidden');
-    formOtp?.classList.add('hidden');
-    authTabs?.classList.add('hidden');
-
-    formForgot?.classList.remove('hidden');
-    forgotStep1?.classList.remove('hidden');
-    forgotStep2?.classList.add('hidden');
-
-    const currentEntered = loginUserInput?.value?.trim() || '';
-    if (currentEntered && forgotIdentifierInput) {
-      forgotIdentifierInput.value = currentEntered;
-    }
-    forgotIdentifierInput?.focus();
-  });
-
-  forgotBackBtn?.addEventListener('click', () => returnToLogin());
-
-  forgotStep2ChangeEmail?.addEventListener('click', () => {
-    if (forgotErr) forgotErr.classList.add('hidden');
-    if (forgotSuccess) forgotSuccess.classList.add('hidden');
-    forgotStep2?.classList.add('hidden');
-    forgotStep1?.classList.remove('hidden');
-    forgotIdentifierInput?.focus();
-  });
-
-  // Step 1: Request OTP Code to Telegram
-  const handleForgotRequest = async () => {
-    const identifier = forgotIdentifierInput?.value?.trim() || '';
-    if (!identifier) {
-      if (forgotErr) {
-        forgotErr.textContent = 'لطفاً ایمیل یا نام کاربری خود را وارد فرمایید.';
-        forgotErr.classList.remove('hidden');
-      }
-      if (forgotSuccess) forgotSuccess.classList.add('hidden');
-      return;
-    }
-    if (forgotErr) forgotErr.classList.add('hidden');
-    if (forgotSuccess) forgotSuccess.classList.add('hidden');
-
-    try {
-      if (forgotRequestBtn) {
-        forgotRequestBtn.textContent = 'در حال ارسال کد به تلگرام...';
-        (forgotRequestBtn as HTMLButtonElement).disabled = true;
-      }
-      await apiPasswordResetRequest(identifier);
-
-      forgotStep1?.classList.add('hidden');
-      forgotStep2?.classList.remove('hidden');
-      if (forgotStep2Info) {
-        forgotStep2Info.textContent = `کد ۶ رقمی به تلگرام مرتبط با «${identifier}» ارسال شد.`;
-      }
-      if (forgotSuccess) {
-        forgotSuccess.textContent = 'کد تایید ۶ رقمی به ربات تلگرام ارسال گردید.';
-        forgotSuccess.classList.remove('hidden');
-      }
-      if (forgotCodeInput) {
-        forgotCodeInput.value = '';
-        forgotCodeInput.focus();
-      }
-      if (forgotPassInput) {
-        forgotPassInput.value = '';
-      }
-    } catch (e: any) {
-      const errStr = e?.message || e?.toString() || 'خطا در ارسال درخواست بازیابی رمز عبور.';
-      if (forgotErr) {
-        forgotErr.textContent = errStr;
-        forgotErr.classList.remove('hidden');
-      }
-    } finally {
-      if (forgotRequestBtn) {
-        forgotRequestBtn.textContent = 'ارسال کد تایید به تلگرام';
-        (forgotRequestBtn as HTMLButtonElement).disabled = false;
-      }
-    }
-  };
-
-  forgotRequestBtn?.addEventListener('click', handleForgotRequest);
-  forgotIdentifierInput?.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') handleForgotRequest();
-  });
-
-  // Step 2: Confirm OTP & Set New Password
-  const handleForgotConfirm = async () => {
-    const identifier = forgotIdentifierInput?.value?.trim() || '';
-    const code = forgotCodeInput?.value?.trim() || '';
-    const newPassword = forgotPassInput?.value || '';
-
-    if (!identifier) {
-      if (forgotErr) {
-        forgotErr.textContent = 'لطفاً ایمیل یا نام کاربری را در مرحله اول وارد نمایید.';
-        forgotErr.classList.remove('hidden');
-      }
-      return;
-    }
-    if (!code || code.length !== 6 || !/^\d{6}$/.test(code)) {
-      if (forgotErr) {
-        forgotErr.textContent = 'کد تایید باید یک عدد ۶ رقمی باشد.';
-        forgotErr.classList.remove('hidden');
-      }
-      if (forgotSuccess) forgotSuccess.classList.add('hidden');
-      return;
-    }
-    if (!newPassword || newPassword.length < 8) {
-      if (forgotErr) {
-        forgotErr.textContent = 'رمز عبور جدید باید حداقل ۸ کاراکتر باشد.';
-        forgotErr.classList.remove('hidden');
-      }
-      if (forgotSuccess) forgotSuccess.classList.add('hidden');
-      return;
-    }
-
-    if (forgotErr) forgotErr.classList.add('hidden');
-    if (forgotSuccess) forgotSuccess.classList.add('hidden');
-
-    try {
-      if (forgotConfirmBtn) {
-        forgotConfirmBtn.textContent = 'در حال تغییر رمز عبور...';
-        (forgotConfirmBtn as HTMLButtonElement).disabled = true;
-      }
-      await apiPasswordResetConfirm(identifier, code, newPassword);
-
-      // Return user to login form and show success message
-      returnToLogin(identifier);
-      if (authSuccess) {
-        authSuccess.textContent = '✅ رمز عبور با موفقیت تغییر یافت. اکنون می‌توانید با رمز جدید وارد شوید.';
-        authSuccess.classList.remove('hidden');
-      }
-      if (loginPassInput) {
-        loginPassInput.value = '';
-        loginPassInput.focus();
-      }
-    } catch (e: any) {
-      const errStr = e?.message || e?.toString() || 'خطا در بازنشانی رمز عبور.';
-      if (forgotErr) {
-        forgotErr.textContent = errStr;
-        forgotErr.classList.remove('hidden');
-      }
-    } finally {
-      if (forgotConfirmBtn) {
-        forgotConfirmBtn.textContent = 'تغییر رمز عبور و ورود';
-        (forgotConfirmBtn as HTMLButtonElement).disabled = false;
-      }
-    }
-  };
-
-  forgotConfirmBtn?.addEventListener('click', handleForgotConfirm);
-  forgotCodeInput?.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') {
-      if (forgotPassInput) forgotPassInput.focus();
-    }
-  });
-  forgotPassInput?.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') handleForgotConfirm();
   });
 
   // 1c. Register Free Account
@@ -1509,55 +1383,42 @@ function initEventListeners() {
     const username = regUserInput?.value?.trim() || '';
     const password = regPassInput?.value || '';
     if (!username || !password) {
-      if (authErr) {
-        authErr.textContent = 'لطفاً نام کاربری و رمز عبور را وارد فرمایید.';
-        authErr.classList.remove('hidden');
-      }
+      showAuthError('لطفاً نام کاربری و رمز عبور دلخواه خود را وارد فرمایید.');
       return;
     }
-    if (username.length < 3) {
-      if (authErr) {
-        authErr.textContent = 'نام کاربری باید حداقل ۳ کاراکتر باشد.';
-        authErr.classList.remove('hidden');
-      }
+    if (username.length < 3 || username.length > 32) {
+      showAuthError('نام کاربری باید بین ۳ تا ۳۲ کاراکتر باشد.');
+      return;
+    }
+    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+      showAuthError('نام کاربری فقط باید شامل حروف انگلیسی، اعداد و زیرخط (_) باشد.');
       return;
     }
     if (password.length < 8) {
-      if (authErr) {
-        authErr.textContent = 'رمز عبور باید حداقل ۸ کاراکتر باشد.';
-        authErr.classList.remove('hidden');
-      }
+      showAuthError('رمز عبور باید حداقل ۸ کاراکتر باشد.');
       return;
     }
-    if (authErr) authErr.classList.add('hidden');
+    clearAuthError();
+    setButtonLoading(registerSubmitBtn, true, 'در حال ایجاد حساب رایگان...', 'ساخت حساب کاربری رایگان');
     try {
-      if (registerSubmitBtn) {
-        registerSubmitBtn.textContent = 'در حال ثبت‌نام...';
-        (registerSubmitBtn as HTMLButtonElement).disabled = true;
-      }
       const updated = await invokeTauri<ClientState>('register_with_credentials', { username, password });
       currentState = updated;
+      showToast('حساب کاربری رایگان شما با موفقیت ساخته شد!', 'success');
       renderState();
       await loadUserDevices();
       await refreshConnectionModes();
-    } catch (e: any) {
-      const errStr = e?.toString() || 'خطا در ثبت‌نام حساب جدید.';
-      if (!handleCoreError(errStr)) {
-        if (authErr) {
-          authErr.textContent = errStr;
-          authErr.classList.remove('hidden');
-        }
-      }
+    } catch (e: unknown) {
+      handleAuthError(e, 'خطا در ثبت‌نام حساب جدید. ممکن است این نام کاربری قبلاً ثبت شده باشد.');
     } finally {
-      if (registerSubmitBtn) {
-        registerSubmitBtn.textContent = 'ساخت حساب کاربری رایگان';
-        (registerSubmitBtn as HTMLButtonElement).disabled = false;
-      }
+      setButtonLoading(registerSubmitBtn, false, 'در حال ایجاد حساب رایگان...', 'ساخت حساب کاربری رایگان');
     }
   };
 
   registerSubmitBtn?.addEventListener('click', handleRegister);
-  regPassInput?.addEventListener('keypress', (e) => {
+  regUserInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') regPassInput?.focus();
+  });
+  regPassInput?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') handleRegister();
   });
 
@@ -1566,43 +1427,29 @@ function initEventListeners() {
   const authInput = document.getElementById('auth-code-input') as HTMLInputElement;
 
   const handleLogin = async (code: string) => {
-    if (!code || code.length !== 8) {
-      if (authErr) {
-        authErr.textContent = 'کد ورود باید دقیقاً ۸ رقم عددی باشد.';
-        authErr.classList.remove('hidden');
-      }
+    const cleanCode = code.trim();
+    if (!cleanCode || cleanCode.length !== 8 || !/^\d{8}$/.test(cleanCode)) {
+      showAuthError('کد ورود باید دقیقاً ۸ رقم عددی باشد.');
       return;
     }
-    if (authErr) authErr.classList.add('hidden');
-
+    clearAuthError();
+    setButtonLoading(authBtn, true, 'در حال بررسی کد...', 'ورود با کد تلگرام');
     try {
-      if (authBtn) {
-        authBtn.textContent = 'در حال بررسی...';
-        (authBtn as HTMLButtonElement).disabled = true;
-      }
-      const updated = await invokeTauri<ClientState>('login_with_code', { code });
+      const updated = await invokeTauri<ClientState>('login_with_code', { code: cleanCode });
       currentState = updated;
+      showToast('ورود با کد تلگرام با موفقیت انجام شد!', 'success');
       renderState();
       await loadUserDevices();
       await refreshConnectionModes();
-    } catch (e: any) {
-      const errStr = e?.toString() || 'خطا در ورود';
-      if (!handleCoreError(errStr)) {
-        if (authErr) {
-          authErr.textContent = errStr;
-          authErr.classList.remove('hidden');
-        }
-      }
+    } catch (e: unknown) {
+      handleAuthError(e, 'کد ورود نامعتبر است یا منقضی شده است.');
     } finally {
-      if (authBtn) {
-        authBtn.textContent = 'ورود با کد تلگرام';
-        (authBtn as HTMLButtonElement).disabled = false;
-      }
+      setButtonLoading(authBtn, false, 'در حال بررسی کد...', 'ورود با کد تلگرام');
     }
   };
 
   authBtn?.addEventListener('click', () => handleLogin(authInput?.value || ''));
-  authInput?.addEventListener('keypress', (e) => {
+  authInput?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') handleLogin(authInput?.value || '');
   });
 
@@ -1727,6 +1574,7 @@ function initEventListeners() {
     allTabContents.forEach(content => content?.classList.add('hidden'));
     activeBtn?.classList.add('active');
     activeContent?.classList.remove('hidden');
+    replayAnimation(activeContent, 'animate-tab-enter');
     if (activeBtn === tabBtnLogs) {
       renderLogs();
     }
@@ -1927,8 +1775,8 @@ function initEventListeners() {
     try {
       currentState = await invokeTauri<ClientState>('toggle_tun_mode', { enabled: val });
     } catch (err: any) {
-      const errStr = err?.toString() || 'خطا در فعال‌سازی حالت TUN';
-      alert(errStr);
+      const errStr = extractErrorMessage(err, 'خطا در فعال‌سازی حالت TUN');
+      showToast(errStr, 'error');
       tunToggle.checked = false;
       currentState.tun_mode = false;
     }
@@ -1976,14 +1824,14 @@ function initEventListeners() {
     const btn = document.getElementById(`routing-btn-${m}`);
     btn?.addEventListener('click', async () => {
       if (currentState.selected_mode === 'static_ip' && m !== 'tunnel') {
-        alert('در حالت آی‌پی ثابت، برای امنیت حساب‌های مالی فقط حالت Tunnel فعال است.');
+        showToast('در حالت آی‌پی ثابت، برای امنیت حساب‌های مالی فقط حالت Tunnel فعال است.', 'error');
         return;
       }
       try {
         currentState = await invokeTauri<ClientState>('set_routing_mode', { routing_mode: m });
         renderState();
       } catch (err: any) {
-        alert(err?.toString() || 'خطا در تغییر حالت مسیریابی');
+        showToast(extractErrorMessage(err, 'خطا در تغییر حالت مسیریابی'), 'error');
       }
     });
   });
@@ -2050,7 +1898,7 @@ function initEventListeners() {
         }
       }, 1000);
     } catch (err: any) {
-      alert(err?.toString() || 'خطا در دریافت کد اتصال تلگرام');
+      showToast(extractErrorMessage(err, 'خطا در دریافت کد اتصال تلگرام'), 'error');
     }
   });
 
@@ -2121,87 +1969,28 @@ function initEventListeners() {
   });
 
   upgradeViaBotBtn?.addEventListener('click', () => {
-    window.open('https://t.me/SentraConnectBot', '_blank');
+    openExternalLinkSafe('https://t.me/SentraConnectBot');
     upgradeModal?.classList.add('hidden');
   });
 
   document.querySelectorAll('.mode-item').forEach(item => {
     item.addEventListener('click', async (e) => {
       const mode = (e.currentTarget as HTMLElement).getAttribute('data-mode');
-      if (!mode) return;
+      if (!mode || mode === 'gaming') return;
 
       if (mode === 'static_ip' && currentState.tier === 'Sentra Lite') {
         upgradeModal?.classList.remove('hidden');
         return;
       }
 
-      if (mode === 'download' && currentState.tier === 'Sentra Lite' && !currentState.telegram_verified) {
-        alert('🔒 بخش دانلود برای کاربران رایگان تا زمان تایید حساب در ربات تلگرام قفل است. لطفاً از دکمه «تایید در تلگرام» استفاده فرمایید.');
-        return;
-      }
-
-      currentState = await invokeTauri<ClientState>('set_connection_mode', { mode });
-      renderState();
-      updateModesUI();
-    });
-  });
-
-  // Gaming Submode Buttons
-  document.querySelectorAll('.gaming-submode-btn').forEach(btn => {
-    btn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const submode = (e.currentTarget as HTMLElement).getAttribute('data-submode');
-      if (!submode) return;
       try {
-        currentState = await invokeTauri<ClientState>('set_gaming_submode', { submode });
+        currentState = await invokeTauri<ClientState>('set_connection_mode', { mode });
+        renderState();
         updateModesUI();
-      } catch (err: any) {
-        console.warn('Failed to set gaming submode:', err);
+      } catch (err: unknown) {
+        showToast(extractErrorMessage(err, 'خطا در تغییر حالت اتصال'), 'error');
       }
     });
-  });
-
-  // Telegram Verification Buttons for Download Mode
-  const btnOpenTelegramVerify = document.getElementById('btn-open-telegram-verify');
-  const btnRecheckTelegramVerify = document.getElementById('btn-recheck-telegram-verify');
-  const dlVerifyCodeBadge = document.getElementById('dl-verify-code-badge');
-
-  btnOpenTelegramVerify?.addEventListener('click', async (e) => {
-    e.stopPropagation();
-    try {
-      if (btnOpenTelegramVerify) btnOpenTelegramVerify.textContent = 'در حال دریافت...';
-      const res = await invokeTauri<any>('request_telegram_verify');
-      if (res && res.verify_url) {
-        if (dlVerifyCodeBadge && res.verify_code) {
-          dlVerifyCodeBadge.textContent = `کد: ${res.verify_code}`;
-        }
-        window.open(res.verify_url, '_blank');
-      }
-    } catch (err: any) {
-      alert(`خطا در درخواست تایید تلگرام: ${err?.toString() || err}`);
-    } finally {
-      if (btnOpenTelegramVerify) btnOpenTelegramVerify.textContent = '🔗 تایید در تلگرام';
-    }
-  });
-
-  btnRecheckTelegramVerify?.addEventListener('click', async (e) => {
-    e.stopPropagation();
-    try {
-      if (btnRecheckTelegramVerify) btnRecheckTelegramVerify.textContent = 'در حال بررسی...';
-      const updated = await invokeTauri<ClientState>('check_telegram_verify_status');
-      currentState = updated;
-      renderState();
-      updateModesUI();
-      if (updated.telegram_verified) {
-        alert('✅ حساب کاربری تلگرام شما با موفقیت تایید شد! بخش دانلود فعال گردید.');
-      } else {
-        alert('⚠️ حساب تلگرام هنوز تایید نشده است. لطفاً در ربات تلگرام روی لینک باز شده کلیک کنید.');
-      }
-    } catch (err: any) {
-      alert(`خطا در بررسی وضعیت: ${err?.toString() || err}`);
-    } finally {
-      if (btnRecheckTelegramVerify) btnRecheckTelegramVerify.textContent = '🔄 بررسی مجدد';
-    }
   });
 
   // 6. Protocol Selection Buttons
@@ -2229,7 +2018,7 @@ function initEventListeners() {
   });
 
   suspendedSupportBtn?.addEventListener('click', () => {
-    window.open('https://t.me/SentraConnectBot', '_blank');
+    openExternalLinkSafe('https://t.me/SentraConnectBot');
     suspendedModal?.classList.add('hidden');
   });
 }
@@ -2605,7 +2394,7 @@ function renderDnsServersList() {
     card.querySelector('.select-dns-btn')?.addEventListener('click', (e) => {
       e.stopPropagation();
       if (isStaticIp && dns.is_iranian) {
-        alert('در حالت آی‌پی ثابت مسکونی، جهت حفظ امنیت و عدم نشت هویت، DNSهای داخلی ایران غیرفعال هستند.');
+        showToast('در حالت آی‌پی ثابت مسکونی، جهت حفظ امنیت و عدم نشت هویت، DNSهای داخلی ایران غیرفعال هستند.', 'error');
         return;
       }
       selectDns(dns.id, dns.address);
@@ -2679,9 +2468,9 @@ async function selectAutoFastestDns() {
   if (valid.length > 0) {
     const fastest = valid[0];
     await selectDns(fastest.id, fastest.address);
-    alert(`✨ سریع‌ترین DNS انتخاب شد:\n${fastest.name} (${fastest.address}) با زمان پاسخ ${fastest.ping_ms}ms اعمال گردید.`);
+    showToast(`✨ سریع‌ترین DNS انتخاب شد: ${fastest.name} (${fastest.ping_ms}ms)`, 'success');
   } else {
-    alert('هیچ DNS فعالی برای انتخاب خودکار یافت نشد.');
+    showToast('هیچ DNS فعالی برای انتخاب خودکار یافت نشد.', 'error');
   }
 }
 
@@ -2693,7 +2482,7 @@ async function addCustomDns() {
   const address = addrInput?.value.trim();
 
   if (!name || !address) {
-    alert('لطفاً نام و آدرس DNS سفارشی را وارد کنید.');
+    showToast('لطفاً نام و آدرس DNS سفارشی را وارد کنید.', 'error');
     return;
   }
 
@@ -2742,6 +2531,7 @@ async function deleteCustomDns(id: string) {
 window.addEventListener('DOMContentLoaded', async () => {
   initSplashScreen();
   initTheme();
+  initRippleEffects();
   initEventListeners();
   await setupTauriEventListeners();
 

@@ -1,0 +1,15 @@
+{
+  "name": "sentra-platform",
+  "version": "1.0.0",
+  "description": "Sentra Connect - Anti-Censorship Network Platform",
+  "private": true,
+  "workspaces": [
+    "sentra-client"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=sentra-connect",
+    "build": "npm run build --workspace=sentra-connect",
+    "lint": "npm run lint --workspace=sentra-connect",
+    "preview": "npm run preview --workspace=sentra-connect"
+  }
+}

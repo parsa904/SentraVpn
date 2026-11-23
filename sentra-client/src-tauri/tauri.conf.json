@@ -13,9 +13,12 @@
     "windows": [
       {
         "title": "Sentra Connect",
-        "width": 380,
-        "height": 640,
-        "resizable": false,
+        "width": 440,
+        "height": 700,
+        "minWidth": 380,
+        "minHeight": 600,
+        "resizable": true,
+        "maximizable": true,
         "fullscreen": false,
         "center": true,
         "decorations": true,
@@ -24,7 +27,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: https:; font-src 'self' https: data:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; connect-src 'self' https://head.cyberservice.sbs:8443 ipc: http://ipc.localhost;"
+      "csp": "default-src 'self'; img-src 'self' data: blob: https: http:; font-src 'self' https: data:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; connect-src 'self' http://116.203.188.124:8080 http://116.203.188.124:* https://116.203.188.124:* https://head.cyberservice.sbs:8443 ipc: http://ipc.localhost tauri://localhost http://tauri.localhost https://tauri.localhost;"
     }
   },
   "bundle": {
@@ -48,7 +51,8 @@
     "windows": {
       "nsis": {
         "installMode": "perMachine",
-        "displayLanguageSelector": false
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico"
       }
     }
   }

@@ -1,7 +1,7 @@
 use crate::bot::keyboards::{
-    download_app_inline_keyboard, ios_modes_inline_keyboard, ios_protocol_choice_keyboard,
-    subscription_status_inline_keyboard, upgrade_plans_inline_keyboard,
-    user_devices_inline_keyboard, user_main_keyboard, user_main_keyboard_with_admin,
+    back_to_main_inline_keyboard, cancel_and_back_inline_keyboard, download_app_inline_keyboard,
+    ios_modes_inline_keyboard, ios_protocol_choice_keyboard, subscription_status_inline_keyboard,
+    upgrade_plans_inline_keyboard, user_devices_inline_keyboard, user_main_keyboard_with_admin,
 };
 use crate::compiler;
 use crate::db::{DbPool, Repository};
@@ -11,11 +11,11 @@ use teloxide::prelude::*;
 use teloxide::types::{InputFile, ParseMode};
 use tokio::sync::RwLock;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserState {
-    AwaitingVerifyCode,
-    AwaitingDonationConfig,
-    AwaitingNewPasswordReset,
+    AwaitingDonationLink,
+    AwaitingReceiptPhoto,
+    AwaitingLinkCode,
 }
 
 static USER_STATES: OnceLock<RwLock<HashMap<i64, UserState>>> = OnceLock::new();
@@ -24,19 +24,50 @@ fn user_states_map() -> &'static RwLock<HashMap<i64, UserState>> {
     USER_STATES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub async fn set_user_state(user_id: i64, state: UserState) {
+pub async fn set_user_state(telegram_id: i64, state: UserState) {
     let mut map = user_states_map().write().await;
-    map.insert(user_id, state);
+    map.insert(telegram_id, state);
 }
 
-pub async fn get_user_state(user_id: i64) -> Option<UserState> {
+pub async fn get_user_state(telegram_id: i64) -> Option<UserState> {
     let map = user_states_map().read().await;
-    map.get(&user_id).cloned()
+    map.get(&telegram_id).cloned()
 }
 
-pub async fn clear_user_state(user_id: i64) {
+pub async fn clear_user_state(telegram_id: i64) {
     let mut map = user_states_map().write().await;
-    map.remove(&user_id);
+    map.remove(&telegram_id);
+}
+
+/// Global Back handler: clears any pending UserState or Admin*State and returns to main menu
+pub async fn handle_user_back_to_main_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    admin_chat_id: i64,
+) -> anyhow::Result<()> {
+    let tid = q.from.id.0 as i64;
+    clear_user_state(tid).await;
+    crate::bot::admin_handlers::clear_all_admin_states(tid).await;
+
+    let is_admin = admin_chat_id != 0 && tid == admin_chat_id;
+
+    let _ = bot
+        .answer_callback_query(q.id.clone())
+        .text("🔙 بازگشت به منوی اصلی")
+        .await;
+
+    if let Some(msg) = &q.message {
+        let _ = bot
+            .send_message(
+                msg.chat().id,
+                "🏠 <b>منوی اصلی ربات سنترا (Sentra)</b>\n\nعملیات قبلی بسته شد. لطفاً یکی از گزینه‌های زیر را انتخاب نمایید:",
+            )
+            .parse_mode(ParseMode::Html)
+            .reply_markup(user_main_keyboard_with_admin(is_admin))
+            .await;
+    }
+
+    Ok(())
 }
 
 pub async fn handle_start(
@@ -44,7 +75,6 @@ pub async fn handle_start(
     msg: &Message,
     pool: &DbPool,
     admin_chat_id: i64,
-    start_payload: Option<&str>,
 ) -> anyhow::Result<()> {
     let telegram_user = match msg.from.as_ref() {
         Some(u) => u,
@@ -63,38 +93,21 @@ pub async fn handle_start(
     let sub = Repository::create_or_ensure_lite_subscription(pool, user.id).await?;
     let is_admin_user = admin_chat_id != 0 && (telegram_user.id.0 as i64 == admin_chat_id);
 
-    // Deep link handler for verification: /start verify_<CODE> or /start reset_password
-    if let Some(payload) = start_payload {
-        if let Some(code) = payload.strip_prefix("verify_") {
-            return handle_verify_code_input(bot, msg, pool, admin_chat_id, code).await;
-        }
-        if payload == "reset_password" {
-            return crate::bot::password_reset::handle_password_reset_menu(bot, msg, pool, admin_chat_id).await;
-        }
-    }
-
-    let is_verified = user.telegram_verified != 0;
-    let verify_status_str = if is_verified {
-        "🟢 تایید شده (بخش دانلود باز است)"
-    } else {
-        "🔒 تایید نشده (بخش دانلود قفل است)"
-    };
-
     let mut text = format!(
-        r#"👋 درود <b>{}</b> گرامی، به ربات هوشمند <b>سنترا (Sentra)</b> خوش آمدید!
+        r#"👋 درود <b>{}</b> گرامی، به پلتفرم هوشمند ضدسانسور <b>سنترا (Sentra)</b> خوش آمدید!
 
-🛡 <b>مشخصات حساب کاربری شما:</b>
-• وضعیت تایید تلگرام: <b>{}</b>
+🛡 <b>مشخصات سرویس فعال شما:</b>
 • سطح اشتراک: <code>{}</code>
-• پروتکل پیش‌فرض: <code>Sing-box v1.10+ (TUN / SysProxy)</code>
+• سقف حجم ماهیانه: <code>10 گیگابایت</code>
+• پروتکل پیش‌فرض: <code>Sing-box v1.10+ (TUN Mode)</code>
 • وضعیت شبکه: <b>🟢 پایدار و فعال</b>
 
-👇 <i>از منوی دکمه‌ای زیر می‌توانید تمامی بخش‌ها را مدیریت فرمایید:</i>"#,
-        user.first_name, verify_status_str, sub.tier
+⚡ برای اتصال، دکمه <b>«🔑 دریافت کانفیگ و کد اتصال»</b> را بزنید یا جهت استفاده تخصصی از <b>Google Flow و Gemini</b> پلن خود را ارتقا دهید."#,
+        user.first_name, sub.tier
     );
 
     if is_admin_user {
-        text.push_str("\n\n👑 <i>دسترسی مدیر کل سیستم فعال است. از دکمه «🛠 پنل مدیریت (ادمین)» استفاده فرمایید.</i>");
+        text.push_str("\n\n👑 <i>دسترسی مدیر کل فعال است. برای ورود به پنل ادمین دستور /admin را ارسال کنید.</i>");
     }
 
     bot.send_message(msg.chat.id, text)
@@ -105,101 +118,6 @@ pub async fn handle_start(
     Ok(())
 }
 
-/// Prompt user to send 6-digit Telegram verification code from app
-pub async fn handle_request_verify_code_prompt(
-    bot: &Bot,
-    msg: &Message,
-) -> anyhow::Result<()> {
-    let text = r#"🔗 <b>تایید حساب و باز کردن بخش دانلود</b>
-
-برای تایید حساب، لطفاً کد ۶ رقمی تولیدشده در اپلیکیشن <b>Sentra Connect</b> را در پاسخ به این پیام ارسال نمایید.
-
-💡 <i>راهنما: در صفحه داشبورد نرم‌افزار، روی کارت «دانلود» کلیک کرده و دکمه «🔗 تایید حساب در تلگرام» را بزنید.</i>"#;
-
-    bot.send_message(msg.chat.id, text)
-        .parse_mode(ParseMode::Html)
-        .reply_markup(crate::bot::keyboards::cancel_inline_keyboard())
-        .await?;
-
-    Ok(())
-}
-
-/// Process verification code received from user
-pub async fn handle_verify_code_input(
-    bot: &Bot,
-    msg: &Message,
-    pool: &DbPool,
-    admin_chat_id: i64,
-    code: &str,
-) -> anyhow::Result<()> {
-    let telegram_user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-    let is_admin_user = admin_chat_id != 0 && (telegram_user_id == admin_chat_id);
-
-    let verify_result = Repository::verify_telegram_code(pool, telegram_user_id, code.trim()).await?;
-
-    match verify_result {
-        Some(user) => {
-            let user_email = user.email.unwrap_or_else(|| "حساب کاربری".to_string());
-            let success_text = format!(
-                r#"🎉 <b>تبریک! حساب کاربری شما با موفقیت تایید شد.</b>
-
-👤 <b>ایمیل حساب:</b> <code>{}</code>
-🔗 <b>شناسه تلگرام متصل‌شده:</b> <code>{}</code>
-
-✅ <b>بخش دانلود پرسرعت (Download) هم‌اکنون برای شما باز و فعال شد!</b>
-می‌توانید به نرم‌افزار Sentra Connect بازگشته، دکمه «بررسی مجدد وضعیت» را بزنید و از حالت دانلود پرسرعت بدون محدودیت استفاده فرمایید."#,
-                user_email, telegram_user_id
-            );
-
-            bot.send_message(msg.chat.id, success_text)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(user_main_keyboard_with_admin(is_admin_user))
-                .await?;
-        }
-        None => {
-            let error_text = r#"❌ <b>کد تایید وارد شده نامعتبر است یا منقضی شده است.</b>
-
-⏳ مهلت اعتبار هر کد تایید <b>۱۵ دقیقه</b> می‌باشد.
-لطفاً در اپلیکیشن Sentra Connect مجدداً روی کارت دانلود کلیک کرده و کد جدید دریافت نمایید."#;
-
-            bot.send_message(msg.chat.id, error_text)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(user_main_keyboard_with_admin(is_admin_user))
-                .await?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Show comprehensive support guide
-pub async fn handle_support_guide(
-    bot: &Bot,
-    msg: &Message,
-) -> anyhow::Result<()> {
-    let text = r#"💬 <b>پشتیبانی و راهنمای جامع Sentra Connect</b>
-
-🔹 <b>نحوه اتصال و استفاده:</b>
-۱. ابتدا کلاینت را از دکمه «📥 دانلود اپلیکیشن» دانلود و نصب فرمایید.
-۲. با ایمیل و رمز عبور خود در اپلیکیشن ثبت‌نام کنید.
-۳. برای استفاده از بخش دانلود، حساب تلگرام خود را با دکمه «🔗 تایید حساب» متصل کنید.
-
-🔹 <b>رفع خطاهای رایج:</b>
-• <b>کندی سرعت:</b> از بخش تنظیمات اپلیکیشن پروتکل یا لوکیشن را تغییر دهید.
-• <b>خطای قطع اتصال:</b> مطمئن شوید حالت TUN با دسترسی Administrator اجرا می‌شود یا حالت System Proxy را انتخاب کنید.
-• <b>ترید و صرافی‌ها:</b> از حالت «آی‌پی ثابت (Static IP)» استفاده نمایید.
-
-📩 جهت ارتباط با کارشناسان فنی یا ثبت تیکت، می‌توانید از دکمه‌های زیر استفاده فرمایید:"#;
-
-    bot.send_message(msg.chat.id, text)
-        .parse_mode(ParseMode::Html)
-        .reply_markup(crate::bot::keyboards::support_ticket_inline_keyboard())
-        .await?;
-
-    Ok(())
-}
-
-#[allow(dead_code)]
 pub async fn handle_free_account(bot: &Bot, msg: &Message, pool: &DbPool) -> anyhow::Result<()> {
     let telegram_user = match msg.from.as_ref() {
         Some(u) => u,
@@ -241,13 +159,12 @@ pub async fn handle_free_account(bot: &Bot, msg: &Message, pool: &DbPool) -> any
 
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
-        .reply_markup(user_main_keyboard())
+        .reply_markup(back_to_main_inline_keyboard())
         .await?;
 
     Ok(())
 }
 
-#[allow(dead_code)]
 pub async fn handle_upgrade_prompt(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
     let text = r#"⚡ <b>تعرفه‌ها و پلن‌های ضدسانسور سنترا:</b>
 
@@ -314,14 +231,13 @@ pub async fn handle_payment_simulation(
     if let Some(msg) = &q.message {
         bot.send_message(msg.chat().id, confirmation_text)
             .parse_mode(ParseMode::Html)
-            .reply_markup(user_main_keyboard())
+            .reply_markup(back_to_main_inline_keyboard())
             .await?;
     }
 
     Ok(())
 }
 
-#[allow(dead_code)]
 pub async fn handle_get_config_and_links(
     bot: &Bot,
     msg: &Message,
@@ -365,7 +281,7 @@ pub async fn handle_get_config_and_links(
 
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
-        .reply_markup(user_main_keyboard())
+        .reply_markup(back_to_main_inline_keyboard())
         .await?;
 
     // Output 3: Generate and send the actual test .ovpn file as document
@@ -375,6 +291,7 @@ pub async fn handle_get_config_and_links(
 
     bot.send_document(msg.chat.id, ovpn_file)
         .caption("🛡 پروفایل OpenVPN سنترا (رمزنگاری AES-256-GCM و tls-crypt)")
+        .reply_markup(back_to_main_inline_keyboard())
         .await?;
 
     Ok(())
@@ -502,7 +419,7 @@ pub async fn handle_ticket_callback(
     if let Some(msg) = &q.message {
         bot.send_message(msg.chat().id, reply)
             .parse_mode(ParseMode::Html)
-            .reply_markup(user_main_keyboard())
+            .reply_markup(back_to_main_inline_keyboard())
             .await?;
     }
 
@@ -510,7 +427,6 @@ pub async fn handle_ticket_callback(
 }
 
 /// Prompt iOS user to pick one of the 4 connection modes for OpenVPN
-#[allow(dead_code)]
 pub async fn handle_ios_subscription_prompt(
     bot: &Bot,
     msg: &Message,
@@ -544,8 +460,7 @@ pub async fn handle_ios_subscription_prompt(
 
 🌐 <b>۱. وب‌گردی (Web Browsing):</b> ۲ گیگابایت سهمیه روزانه رایگان، مناسب گشت‌وگذار روزمره
 ⚡ <b>۲. دانلود (Download):</b> ۳ گیگابایت سهمیه روزانه رایگان، بهینه‌سازی سرعت بالا
-🎮 <b>۳. گیمینگ (Gaming):</b> کاهش پینگ و جیتر (به‌زودی اضافه می‌شود)
-🔒 <b>۴. آی‌پی ثابت ترید/جمنای (Static IP):</b> آی‌پی ثابت تمیز مسکونی آمریکا (ویژه کاربران Pro و Flow+)
+🔒 <b>۳. آی‌پی ثابت ترید/جمنای (Static IP):</b> آی‌پی ثابت تمیز مسکونی آمریکا (ویژه کاربران Pro و Flow+)
 
 👇 <b>لطفاً حالت اتصال مورد نظر خود را انتخاب نمایید:</b>"#,
         sub.tier
@@ -733,6 +648,7 @@ pub async fn handle_ios_send_ikev2(
         bot.send_document(msg.chat().id, config_file)
             .caption(caption)
             .parse_mode(ParseMode::Html)
+            .reply_markup(cancel_and_back_inline_keyboard("ios_sub_back_to_modes"))
             .await?;
     }
 
@@ -819,13 +735,14 @@ pub async fn handle_ios_send_openvpn(
         bot.send_document(msg.chat().id, ovpn_file)
             .caption(caption)
             .parse_mode(ParseMode::Html)
+            .reply_markup(cancel_and_back_inline_keyboard("ios_sub_back_to_modes"))
             .await?;
     }
 
     Ok(())
 }
 
-/// Returns iOS user back to the 4 connection modes selection
+/// Returns iOS user back to the active connection modes selection
 pub async fn handle_ios_back_to_modes(
     bot: &Bot,
     q: &CallbackQuery,
@@ -850,15 +767,24 @@ pub async fn handle_ios_back_to_modes(
 
 به دلیل محدودیت‌های سیستم‌عامل iOS در نصب هسته‌های جانبی، اتصال در آیفون از طریق <b>IKEv2 بومی</b> یا <b>OpenVPN</b> برقرار می‌شود.
 
-📌 لطفاً یکی از ۴ حالت اتصال زیر را متناسب با نیاز خود انتخاب فرمایید:"#;
+📌 لطفاً یکی از حالت‌های اتصال زیر را متناسب با نیاز خود انتخاب فرمایید:"#;
 
     bot.answer_callback_query(q.id.clone()).await?;
 
     if let Some(msg) = &q.message {
-        let _ = bot.edit_message_text(msg.chat().id, msg.id(), prompt)
+        if bot
+            .edit_message_text(msg.chat().id, msg.id(), prompt)
             .parse_mode(ParseMode::Html)
             .reply_markup(ios_modes_inline_keyboard(&sub.tier))
-            .await;
+            .await
+            .is_err()
+        {
+            let _ = bot
+                .send_message(msg.chat().id, prompt)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(ios_modes_inline_keyboard(&sub.tier))
+                .await;
+        }
     }
 
     Ok(())
@@ -959,6 +885,10 @@ pub async fn handle_delete_device_callback(
 
 /// Prompt explaining Community Outbound Donation
 pub async fn handle_donation_prompt(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
+    if let Some(u) = msg.from.as_ref() {
+        set_user_state(u.id.0 as i64, UserState::AwaitingDonationLink).await;
+    }
+
     let text = r#"🤝 <b>سامانه اهدای اوتباند و مشارکت در شبکه ضدسانسور Sentra:</b>
 
 سنترا یک اکوسیستم غیرمتمرکز است که به جامعه کاربران خود متکی است. اگر یک سرور شخصی، کانفیگ اختصاصی یا پروتکل ضدفیلتر پایدار دارید، می‌توانید آن را به شبکه اهدا کنید تا در استخر عمومی جهت وب‌گردی و دور زدن سانسور استفاده شود.
@@ -976,17 +906,21 @@ pub async fn handle_donation_prompt(bot: &Bot, msg: &Message) -> anyhow::Result<
 
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
+        .reply_markup(back_to_main_inline_keyboard())
         .await?;
     Ok(())
 }
 
 /// Prompt explaining Financial Support / Donation
-#[allow(dead_code)]
 pub async fn handle_financial_donation_prompt(
     bot: &Bot,
     msg: &Message,
     pro_price: i64,
 ) -> anyhow::Result<()> {
+    if let Some(u) = msg.from.as_ref() {
+        set_user_state(u.id.0 as i64, UserState::AwaitingReceiptPhoto).await;
+    }
+
     let double_price = pro_price * 2;
     let text = format!(
         r#"💖 <b>حمایت مالی از توسعه و پایداری شبکه سنترا (Sentra):</b>
@@ -1015,6 +949,7 @@ pub async fn handle_financial_donation_prompt(
 
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
+        .reply_markup(back_to_main_inline_keyboard())
         .await?;
 
     Ok(())
@@ -1032,6 +967,8 @@ pub async fn handle_donation_submission(
         None => return Ok(()),
     };
 
+    clear_user_state(telegram_user.id.0 as i64).await;
+
     let user = Repository::get_or_create_user(
         pool,
         telegram_user.id.0 as i64,
@@ -1048,6 +985,7 @@ pub async fn handle_donation_submission(
 
     bot.send_message(msg.chat.id, queue_msg)
         .parse_mode(ParseMode::Html)
+        .reply_markup(back_to_main_inline_keyboard())
         .await?;
 
     let pool_clone = pool.clone();
@@ -1071,7 +1009,6 @@ pub async fn handle_donation_submission(
 }
 
 /// Prompt explaining Account Linking
-#[allow(dead_code)]
 pub async fn handle_link_account_prompt(
     bot: &Bot,
     msg: &Message,
@@ -1091,6 +1028,8 @@ pub async fn handle_link_account_prompt(
     )
     .await?;
 
+    set_user_state(telegram_user.id.0 as i64, UserState::AwaitingLinkCode).await;
+
     let code = Repository::generate_link_code(pool, user.id).await?;
 
     let text = format!(
@@ -1099,7 +1038,7 @@ pub async fn handle_link_account_prompt(
 با اتصال حساب، اشتراک و سهمیه‌های شما در ربات تلگرام، اپلیکیشن ویندوز و کلاینت اندروید همگام می‌شوند.
 
 🔹 <b>روش اول: اگر در اپلیکیشن ویندوز/اندروید ثبت‌نام کرده‌اید:</b>
-کد ۶ رقمی اتصال را از اپلیکیشن دریافت کرده و با دستور زیر ارسال کنید:
+کد ۶ رقمی اتصال را از اپلیکیشن دریافت کرده و مستقیماً همینجا ارسال کنید یا از دستور زیر استفاده کنید:
 <code>/link 123456</code> (کد ۶ رقمی دریافتی از اپلیکیشن)
 
 🔹 <b>روش دوم: تعیین نام کاربری و پسورد برای همین اکانت تلگرام:</b>
@@ -1114,13 +1053,13 @@ pub async fn handle_link_account_prompt(
 
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
+        .reply_markup(back_to_main_inline_keyboard())
         .await?;
 
     Ok(())
 }
 
 /// Handle /link command with or without 6-digit code
-#[allow(dead_code)]
 pub async fn handle_link_command(
     bot: &Bot,
     msg: &Message,
@@ -1156,7 +1095,10 @@ pub async fn handle_link_command(
 می‌توانید این کد را در بخش اتصال اپلیکیشن وارد کنید تا دستگاه شما به این حساب تلگرام متصل گردد."#,
             code
         );
-        bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).await?;
+        bot.send_message(msg.chat.id, text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(back_to_main_inline_keyboard())
+            .await?;
         return Ok(());
     }
 
@@ -1166,6 +1108,7 @@ pub async fn handle_link_command(
             "⚠️ کد اتصال باید یک عدد ۶ رقمی باشد. مثال: <code>/link 123456</code>",
         )
         .parse_mode(ParseMode::Html)
+        .reply_markup(back_to_main_inline_keyboard())
         .await?;
         return Ok(());
     }
@@ -1179,6 +1122,7 @@ pub async fn handle_link_command(
     )
     .await {
         Ok(user) => {
+            clear_user_state(tid).await;
             let text = format!(
                 r#"🎉 <b>حساب کاربری با موفقیت متصل شد!</b>
 
@@ -1189,7 +1133,10 @@ pub async fn handle_link_command(
                 user.username.as_deref().unwrap_or("کاربر سنترا"),
                 user.user_uuid
             );
-            bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).await?;
+            bot.send_message(msg.chat.id, text)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(back_to_main_inline_keyboard())
+                .await?;
         }
         Err(e) => {
             let err_msg = match e {
@@ -1197,7 +1144,10 @@ pub async fn handle_link_command(
                 _ => "کد اتصال نامعتبر است یا منقضی شده است.".to_string(),
             };
             let text = format!("❌ <b>خطا در اتصال حساب:</b>\n\n{}", err_msg);
-            bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).await?;
+            bot.send_message(msg.chat.id, text)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(back_to_main_inline_keyboard())
+                .await?;
         }
     }
 
@@ -1205,7 +1155,6 @@ pub async fn handle_link_command(
 }
 
 /// Handle /setpassword <username> <password> command
-#[allow(dead_code)]
 pub async fn handle_setpassword_command(
     bot: &Bot,
     msg: &Message,
@@ -1226,6 +1175,7 @@ pub async fn handle_setpassword_command(
             "⚠️ فرمت دستور نادرست است.\nفرمت صحیح: <code>/setpassword username password</code>\nمثال: <code>/setpassword ali_reza 12345678</code>",
         )
         .parse_mode(ParseMode::Html)
+        .reply_markup(back_to_main_inline_keyboard())
         .await?;
         return Ok(());
     }
@@ -1238,6 +1188,7 @@ pub async fn handle_setpassword_command(
             msg.chat.id,
             "⚠️ نام کاربری باید بین ۳ تا ۳۲ کاراکتر و فقط شامل حروف انگلیسی، اعداد و زیرخط (_) باشد.",
         )
+        .reply_markup(back_to_main_inline_keyboard())
         .await?;
         return Ok(());
     }
@@ -1247,6 +1198,7 @@ pub async fn handle_setpassword_command(
             msg.chat.id,
             "⚠️ رمز عبور باید حداقل ۶ کاراکتر باشد.",
         )
+        .reply_markup(back_to_main_inline_keyboard())
         .await?;
         return Ok(());
     }
@@ -1271,11 +1223,16 @@ pub async fn handle_setpassword_command(
 اکنون می‌توانید در اپلیکیشن کلاینت ویندوز و اندروید از تب <b>«ورود با حساب کاربری»</b> استفاده نمایید."#,
                 username, password
             );
-            bot.send_message(msg.chat.id, text).parse_mode(ParseMode::Html).await?;
+            bot.send_message(msg.chat.id, text)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(back_to_main_inline_keyboard())
+                .await?;
         }
         Err(e) => {
             let text = format!("❌ خطا در تنظیم مشخصات: {}", e);
-            bot.send_message(msg.chat.id, text).await?;
+            bot.send_message(msg.chat.id, text)
+                .reply_markup(back_to_main_inline_keyboard())
+                .await?;
         }
     }
 
@@ -1286,68 +1243,56 @@ pub async fn handle_setpassword_command(
 pub async fn handle_download_app_menu(
     bot: &Bot,
     msg: &Message,
-    pool: &DbPool,
 ) -> anyhow::Result<()> {
-    let release_opt = Repository::get_latest_app_release(pool).await.unwrap_or(None);
-    let (version, changelog) = match &release_opt {
-        Some(r) => (r.version.as_str(), r.changelog.as_str()),
-        None => ("1.0.0", "نسخه رسمی کلاینت هوشمند Sentra Connect"),
-    };
-
-    let text = format!(
-        r#"📥 <b>دانلود اپلیکیشن اختصاصی Sentra Connect</b>
-
-🔹 <b>آخرین نسخه:</b> <code>{}</code>
-📝 <b>تغییرات این نسخه:</b>
-<i>{}</i>
+    let text = r#"📥 <b>دانلود اپلیکیشن اختصاصی Sentra Connect</b>
 
 نرم‌افزار هوشمند سنترا کانکت مجهز به سیستم سوییچ خودکار پروتکل و ضدفیلترینگ هوشمند:
 • اتصال تک‌کلیک و بدون قطعی
-• حالت‌های ۴ گانه هوشمند (وب‌گردی، دانلود پرسرعت، گیمینگ و آی‌پی ثابت)
+• حالت‌های هوشمند اتصال (وب‌گردی، دانلود پرسرعت و آی‌پی ثابت)
 • محافظت نشت DNS و Kill Switch داخلی
 
-👇 <b>لطفاً نسخه مورد نظر خود را جهت دریافت انتخاب نمایید:</b>"#,
-        version,
-        if changelog.is_empty() { "نسخه رسمی با قابلیت سوییچ هوشمند و پروتکل‌های ضد فیلترینگ" } else { changelog }
-    );
+👇 <b>لطفاً سیستم‌عامل دستگاه خود را جهت دانلود انتخاب نمایید:</b>"#;
 
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
-        .reply_markup(download_app_inline_keyboard(release_opt.as_ref()))
+        .reply_markup(download_app_inline_keyboard())
         .await?;
 
     Ok(())
 }
 
-/// Handle download for Windows or Android directly via Telegram file_id or GitHub Release
+/// Handle download for Windows or Android directly via Telegram file_id
 pub async fn handle_download_platform_callback(
     bot: &Bot,
     q: &CallbackQuery,
     pool: &DbPool,
     platform: &str,
 ) -> anyhow::Result<()> {
-    let release_opt = Repository::get_latest_app_release(pool).await?;
+    let release_opt = Repository::get_app_release_by_platform(pool, platform).await?;
 
     match release_opt {
         Some(release) => {
-            let is_windows = platform == "windows";
-            let platform_fa = if is_windows { "ویندوز (Windows 10/11)" } else { "اندروید (Android)" };
-            let file_id_opt = if is_windows { &release.windows_file_id } else { &release.android_file_id };
-            let github_url_opt = if is_windows { &release.windows_github_url } else { &release.android_github_url };
+            let platform_fa = if release.platform == "windows" {
+                "ویندوز (Windows 10/11)"
+            } else {
+                "اندروید (Android)"
+            };
 
             let caption = format!(
                 r#"🚀 <b>اپلیکیشن اختصاصی Sentra Connect برای {}</b>
 
 🔹 <b>نسخه:</b> <code>{}</code>
+📦 <b>حجم فایل:</b> <b>{:.2} مگابایت</b>
 📝 <b>تغییرات این نسخه:</b>
 {}
 
 💡 <b>راهنمای ورود و استفاده:</b>
-۱. فایل را نصب و اجرا نمایید.
-۲. با ایمیل و رمز عبور خود وارد شوید یا حساب جدید بسازید.
-۳. جهت فعال‌سازی بخش دانلود، حساب تلگرام خود را تایید نمایید."#,
+۱. فایل را دانلود و نصب نمایید.
+۲. می‌توانید مستقیماً داخل برنامه حساب کاربری جدید ایجاد کنید، یا
+۳. از دکمه «🔗 اتصال حساب اپلیکیشن» در ربات، کد یکبارمصرف یا لینک سریع دریافت کرده و در برنامه وارد نمایید."#,
                 platform_fa,
                 release.version,
+                release.file_size_mb,
                 if release.changelog.is_empty() {
                     "نسخه رسمی با قابلیت سوییچ هوشمند پروتکل‌ها و ضد فیلترینگ"
                 } else {
@@ -1355,66 +1300,33 @@ pub async fn handle_download_platform_callback(
                 }
             );
 
-            if let Some(file_id) = file_id_opt {
-                if let Some(msg) = &q.message {
-                    bot.send_document(msg.chat().id, InputFile::file_id(file_id.clone()))
-                        .caption(caption)
-                        .parse_mode(ParseMode::Html)
-                        .await?;
-                }
-                bot.answer_callback_query(q.id.clone())
-                    .text(format!("فایل نصبی {} ارسال شد.", platform_fa))
-                    .await?;
-            } else {
-                let default_direct_url = if is_windows {
-                    crate::bot::keyboards::GITHUB_RELEASE_WINDOWS_URL
-                } else {
-                    crate::bot::keyboards::GITHUB_RELEASE_ANDROID_URL
-                };
-                let download_url = github_url_opt.as_deref().unwrap_or(default_direct_url);
-                let msg_text = format!(
-                    r#"🌐 <b>دانلود مستقیم {} از گیت‌هاب (Sentra Release):</b>
-
-🔹 <b>نسخه:</b> <code>{}</code>
-🔗 <b>لینک دانلود مستقیم:</b>
-{}
-
-💡 <i>فایل نصب استاندارد و امضاشده به محض کلیک دانلود می‌شود.</i>"#,
-                    platform_fa, release.version, download_url
-                );
-                if let Some(msg) = &q.message {
-                    bot.send_message(msg.chat().id, msg_text)
-                        .parse_mode(ParseMode::Html)
-                        .await?;
-                }
-                bot.answer_callback_query(q.id.clone()).await?;
-            }
-        }
-        None => {
-            let is_windows = platform == "windows";
-            let platform_fa = if is_windows { "ویندوز (Windows 10/11)" } else { "اندروید (Android)" };
-            let direct_url = if is_windows {
-                crate::bot::keyboards::GITHUB_RELEASE_WINDOWS_URL
-            } else {
-                crate::bot::keyboards::GITHUB_RELEASE_ANDROID_URL
-            };
-            let msg_text = format!(
-                r#"🚀 <b>دانلود آخرین نسخه رسمی {} (Sentra Connect v1.0):</b>
-
-🔗 <b>لینک مستقیم انتشار گیتهاب:</b>
-{}
-
-💡 <i>می‌توانید آخرین نسخه رسمی و امضاشده را مستقیماً از لینک فوق دریافت فرمایید.</i>"#,
-                platform_fa, direct_url
-            );
-
+            // Send document directly via Telegram file_id (instant delivery, 0 server bandwidth)
             if let Some(msg) = &q.message {
-                bot.send_message(msg.chat().id, msg_text)
+                bot.send_document(msg.chat().id, InputFile::file_id(release.telegram_file_id))
+                    .caption(caption)
                     .parse_mode(ParseMode::Html)
+                    .reply_markup(back_to_main_inline_keyboard())
                     .await?;
             }
             bot.answer_callback_query(q.id.clone())
-                .text(format!("لینک دانلود مستقیم {} ارسال شد.", platform_fa))
+                .text(format!("فایل نصبی {} ارسال شد.", platform_fa))
+                .await?;
+        }
+        None => {
+            let msg_text = if platform == "android" {
+                "⏳ نسخه اندروید در حال آماده‌سازی نهایی است و به‌زودی از همین بخش منتشر می‌شود."
+            } else {
+                "⏳ نسخه ویندوز در حال آماده‌سازی نهایی است و به‌زودی از همین بخش منتشر می‌شود."
+            };
+
+            if let Some(msg) = &q.message {
+                bot.send_message(msg.chat().id, msg_text)
+                    .reply_markup(back_to_main_inline_keyboard())
+                    .await?;
+            }
+            bot.answer_callback_query(q.id.clone())
+                .text(msg_text)
+                .show_alert(true)
                 .await?;
         }
     }
@@ -1452,8 +1364,7 @@ pub async fn handle_ios_download_callback(
 
 🌐 <b>۱. وب‌گردی (Web Browsing):</b> ۲ گیگابایت سهمیه روزانه رایگان، مناسب گشت‌وگذار روزمره
 ⚡ <b>۲. دانلود (Download):</b> ۳ گیگابایت سهمیه روزانه رایگان، بهینه‌سازی سرعت بالا
-🎮 <b>۳. گیمینگ (Gaming):</b> کاهش پینگ و جیتر (به‌زودی اضافه می‌شود)
-🔒 <b>۴. آی‌پی ثابت ترید/جمنای (Static IP):</b> آی‌پی ثابت تمیز مسکونی آمریکا (ویژه کاربران Pro و Flow+)
+🔒 <b>۳. آی‌پی ثابت ترید/جمنای (Static IP):</b> آی‌پی ثابت تمیز مسکونی آمریکا (ویژه کاربران Pro و Flow+)
 
 👇 <b>لطفاً حالت اتصال مورد نظر خود را انتخاب نمایید:</b>"#,
         sub.tier

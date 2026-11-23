@@ -5,8 +5,33 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 
 pub const BACKEND_FALLBACK_URLS: &[&str] = &[
+    "http://116.203.188.124:8080",
     "https://head.cyberservice.sbs:8443",
 ];
+
+/// Returns ordered list of backend API base URLs (never localhost unless explicitly configured).
+/// Checks SENTRA_API_BASE_URL / VITE_API_BASE_URL env vars first, then production endpoints.
+pub fn get_backend_urls() -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    for env_key in ["SENTRA_API_BASE_URL", "VITE_API_BASE_URL"] {
+        if let Ok(raw) = std::env::var(env_key) {
+            let trimmed = raw.trim().trim_end_matches('/');
+            if !trimmed.is_empty()
+                && !trimmed.contains("localhost")
+                && !trimmed.contains("127.0.0.1")
+                && !urls.iter().any(|u| u == trimmed)
+            {
+                urls.push(trimmed.to_string());
+            }
+        }
+    }
+    for &fallback in BACKEND_FALLBACK_URLS {
+        if !urls.iter().any(|u| u == fallback) {
+            urls.push(fallback.to_string());
+        }
+    }
+    urls
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SessionData {
@@ -16,31 +41,17 @@ pub struct SessionData {
     pub username: String,
     pub remaining_bytes: i64,
     pub expires_at: Option<String>,
-    #[serde(default)]
-    pub telegram_verified: bool,
-    #[serde(default)]
-    pub email: Option<String>,
 }
 
 pub struct AuthManager;
 
 impl AuthManager {
-    /// Return candidate backend API URLs in priority order
-    pub fn get_backend_urls() -> Vec<String> {
-        let mut urls = Vec::new();
-        if let Ok(env_url) = std::env::var("SENTRA_API_BASE_URL") {
-            let trimmed = env_url.trim().trim_end_matches('/').to_string();
-            if !trimmed.is_empty() {
-                urls.push(trimmed);
-            }
-        }
-        for u in BACKEND_FALLBACK_URLS {
-            urls.push(u.to_string());
-        }
-        if !urls.iter().any(|u| u.contains("127.0.0.1:8080") || u.contains("localhost:8080")) {
-            urls.push("http://127.0.0.1:8080".to_string());
-        }
-        urls
+    fn build_http_client() -> Result<reqwest::Client, String> {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(6))
+            .timeout(std::time::Duration::from_secs(12))
+            .build()
+            .map_err(|e| format!("خطا در ساخت کلاینت ارتباطی HTTP: {}", e))
     }
 
     /// Return the path to the persisted session file
@@ -100,22 +111,22 @@ impl AuthManager {
         }
     }
 
-    /// Register a new account with email and password directly in the app
-    pub async fn register_with_credentials(identifier: &str, password: &str) -> Result<SessionData, String> {
-        let clean_identifier = identifier.trim().to_lowercase();
+    /// Register a new account with username and password directly in the app
+    pub async fn register_with_credentials(username: &str, password: &str) -> Result<SessionData, String> {
+        let clean_username = username.trim().to_lowercase();
         let clean_password = password.trim();
 
-        if clean_identifier.len() < 3 || clean_identifier.len() > 64 {
-            return Err("ایمیل یا نام کاربری باید بین ۳ تا ۶۴ کاراکتر باشد.".to_string());
+        if clean_username.len() < 3 || clean_username.len() > 32 {
+            return Err("نام کاربری باید بین ۳ تا ۳۲ کاراکتر باشد.".to_string());
         }
-        if clean_password.len() < 6 {
-            return Err("رمز عبور باید حداقل ۶ کاراکتر باشد.".to_string());
+        if !clean_username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err("نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و زیرخط (_) باشد.".to_string());
+        }
+        if clean_password.len() < 8 {
+            return Err("رمز عبور باید حداقل ۸ کاراکتر باشد.".to_string());
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(4))
-            .build()
-            .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
+        let client = Self::build_http_client()?;
 
         let dev_id = Self::get_or_create_device_id();
         let dev_name = if cfg!(target_os = "android") {
@@ -125,8 +136,7 @@ impl AuthManager {
         };
 
         let request_payload = json!({
-            "email": clean_identifier,
-            "username": clean_identifier,
+            "username": clean_username,
             "password": clean_password,
             "device_identifier": dev_id,
             "device_name": dev_name,
@@ -137,14 +147,21 @@ impl AuthManager {
         let mut resp_opt = None;
         let mut last_err = None;
 
-        for base_url in Self::get_backend_urls() {
+        for base_url in get_backend_urls() {
             let url = format!("{}/api/v1/auth/register", base_url);
+            info!("Registering user via endpoint: {}", url);
             match client.post(&url).json(&request_payload).send().await {
                 Ok(resp) => {
+                    if resp.status().is_server_error() {
+                        warn!("Backend {} returned HTTP {} on register; trying next fallback...", base_url, resp.status());
+                        resp_opt = Some(resp);
+                        continue;
+                    }
                     resp_opt = Some(resp);
                     break;
                 }
                 Err(e) => {
+                    warn!("Failed to reach {} on register: {}", base_url, e);
                     last_err = Some(e);
                 }
             }
@@ -160,13 +177,9 @@ impl AuthManager {
                 let auth_token = data.get("access_token").and_then(|v| v.as_str()).unwrap_or("token_jwt_local").to_string();
                 let sub_token = data.get("subscription").and_then(|s| s.get("token")).and_then(|t| t.as_str()).unwrap_or("sub_token_default").to_string();
                 let tier = data.get("subscription").and_then(|s| s.get("tier")).and_then(|t| t.as_str()).unwrap_or("Sentra Lite").to_string();
-                let email_val = data.get("user").and_then(|u| u.get("email")).and_then(|e| e.as_str()).map(|s| s.to_string()).or_else(|| Some(clean_identifier.clone()));
-                let uname = data.get("user").and_then(|u| u.get("username")).and_then(|n| n.as_str()).unwrap_or(&clean_identifier).to_string();
+                let uname = data.get("user").and_then(|u| u.get("username")).and_then(|n| n.as_str()).unwrap_or(&clean_username).to_string();
                 let remaining_bytes = data.get("subscription").and_then(|s| s.get("remaining_bytes")).and_then(|b| b.as_i64()).unwrap_or(10_737_418_240);
                 let expires_at = data.get("subscription").and_then(|s| s.get("expires_at")).and_then(|e| e.as_str()).map(|s| s.to_string());
-                let telegram_verified = data.get("telegram_verified").and_then(|v| v.as_bool())
-                    .or_else(|| data.get("user").and_then(|u| u.get("telegram_verified")).and_then(|v| v.as_bool()))
-                    .unwrap_or(false);
 
                 let session = SessionData {
                     auth_token,
@@ -175,38 +188,41 @@ impl AuthManager {
                     username: uname,
                     remaining_bytes,
                     expires_at,
-                    telegram_verified,
-                    email: email_val,
                 };
 
                 let _ = Self::save_session(&session);
                 Ok(session)
             }
             Some(resp) => {
+                let status = resp.status();
                 let err_text = resp.text().await.unwrap_or_default();
                 if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&err_text) {
                     if let Some(msg) = err_json.get("message").and_then(|m| m.as_str()) {
                         return Err(msg.to_string());
                     }
+                    if let Some(msg) = err_json.get("error").and_then(|m| m.as_str()) {
+                        return Err(msg.to_string());
+                    }
                 }
-                Err("خطا در ثبت‌نام حساب کاربری جدید.".to_string())
+                Err(format!("خطا در ثبت‌نام حساب کاربری جدید (کد وضعیت {}).", status.as_u16()))
             }
             None => {
-                let err_msg = last_err.map(|e| e.to_string()).unwrap_or_else(|| "Network unreachable".to_string());
-                Err(format!("عدم برقراری ارتباط با سرور: {}", err_msg))
+                let err_msg = last_err.map(|e| e.to_string()).unwrap_or_else(|| "سرور پاسخگو نیست".to_string());
+                Err(format!("عدم برقراری ارتباط با سرور سنترا (116.203.188.124): لطفاً اتصال اینترنت را بررسی کنید ({})", err_msg))
             }
         }
     }
 
-    /// Login directly with email/username and password
-    pub async fn login_with_credentials(identifier: &str, password: &str) -> Result<SessionData, String> {
-        let clean_identifier = identifier.trim().to_lowercase();
+    /// Login directly with username and password
+    pub async fn login_with_credentials(username: &str, password: &str) -> Result<SessionData, String> {
+        let clean_username = username.trim().to_lowercase();
         let clean_password = password.trim();
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(4))
-            .build()
-            .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
+        if clean_username.is_empty() || clean_password.is_empty() {
+            return Err("لطفاً نام کاربری و رمز عبور خود را وارد نمایید.".to_string());
+        }
+
+        let client = Self::build_http_client()?;
 
         let dev_id = Self::get_or_create_device_id();
         let dev_name = if cfg!(target_os = "android") {
@@ -216,8 +232,7 @@ impl AuthManager {
         };
 
         let request_payload = json!({
-            "email": clean_identifier,
-            "username": clean_identifier,
+            "username": clean_username,
             "password": clean_password,
             "device_identifier": dev_id,
             "device_name": dev_name,
@@ -228,14 +243,21 @@ impl AuthManager {
         let mut resp_opt = None;
         let mut last_err = None;
 
-        for base_url in Self::get_backend_urls() {
+        for base_url in get_backend_urls() {
             let url = format!("{}/api/v1/auth/login", base_url);
+            info!("Logging in via endpoint: {}", url);
             match client.post(&url).json(&request_payload).send().await {
                 Ok(resp) => {
+                    if resp.status().is_server_error() {
+                        warn!("Backend {} returned HTTP {} on login; trying next fallback...", base_url, resp.status());
+                        resp_opt = Some(resp);
+                        continue;
+                    }
                     resp_opt = Some(resp);
                     break;
                 }
                 Err(e) => {
+                    warn!("Failed to reach {} on login: {}", base_url, e);
                     last_err = Some(e);
                 }
             }
@@ -251,13 +273,9 @@ impl AuthManager {
                 let auth_token = data.get("access_token").and_then(|v| v.as_str()).unwrap_or("token_jwt_local").to_string();
                 let sub_token = data.get("subscription").and_then(|s| s.get("token")).and_then(|t| t.as_str()).unwrap_or("sub_token_default").to_string();
                 let tier = data.get("subscription").and_then(|s| s.get("tier")).and_then(|t| t.as_str()).unwrap_or("Sentra Lite").to_string();
-                let email_val = data.get("user").and_then(|u| u.get("email")).and_then(|e| e.as_str()).map(|s| s.to_string()).or_else(|| Some(clean_identifier.clone()));
-                let uname = data.get("user").and_then(|u| u.get("username")).and_then(|n| n.as_str()).unwrap_or(&clean_identifier).to_string();
+                let uname = data.get("user").and_then(|u| u.get("username")).and_then(|n| n.as_str()).unwrap_or(&clean_username).to_string();
                 let remaining_bytes = data.get("subscription").and_then(|s| s.get("remaining_bytes")).and_then(|b| b.as_i64()).unwrap_or(10_737_418_240);
                 let expires_at = data.get("subscription").and_then(|s| s.get("expires_at")).and_then(|e| e.as_str()).map(|s| s.to_string());
-                let telegram_verified = data.get("telegram_verified").and_then(|v| v.as_bool())
-                    .or_else(|| data.get("user").and_then(|u| u.get("telegram_verified")).and_then(|v| v.as_bool()))
-                    .unwrap_or(false);
 
                 let session = SessionData {
                     auth_token,
@@ -266,8 +284,6 @@ impl AuthManager {
                     username: uname,
                     remaining_bytes,
                     expires_at,
-                    telegram_verified,
-                    email: email_val,
                 };
 
                 let _ = Self::save_session(&session);
@@ -289,24 +305,24 @@ impl AuthManager {
                     if let Some(msg) = err_json.get("message").and_then(|m| m.as_str()) {
                         return Err(msg.to_string());
                     }
+                    if let Some(msg) = err_json.get("error").and_then(|m| m.as_str()) {
+                        return Err(msg.to_string());
+                    }
                 }
                 Err("نام کاربری یا رمز عبور اشتباه است.".to_string())
             }
             None => {
-                let err_msg = last_err.map(|e| e.to_string()).unwrap_or_else(|| "Network unreachable".to_string());
-                Err(format!("عدم برقراری ارتباط با سرور: {}", err_msg))
+                let err_msg = last_err.map(|e| e.to_string()).unwrap_or_else(|| "سرور پاسخگو نیست".to_string());
+                Err(format!("عدم برقراری ارتباط با سرور سنترا (116.203.188.124): لطفاً اتصال اینترنت را بررسی کنید ({})", err_msg))
             }
         }
     }
 
     /// Request a 6-digit link token from the backend to connect this client account to Telegram
     pub async fn get_telegram_link_code(subscription_token: &str) -> Result<String, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(4))
-            .build()
-            .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
+        let client = Self::build_http_client()?;
 
-        for base_url in Self::get_backend_urls() {
+        for base_url in get_backend_urls() {
             let url = format!("{}/api/v1/auth/link-token", base_url);
             let resp_res = client
                 .post(&url)
@@ -337,10 +353,7 @@ impl AuthManager {
 
         info!("Sending 8-digit auth code [{}] to Sentra Core API...", clean_code);
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(4))
-            .build()
-            .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
+        let client = Self::build_http_client()?;
 
         let dev_id = Self::get_or_create_device_id();
         let dev_name = if cfg!(target_os = "android") {
@@ -361,11 +374,16 @@ impl AuthManager {
         let mut resp_opt = None;
         let mut last_err = None;
 
-        for base_url in Self::get_backend_urls() {
+        for base_url in get_backend_urls() {
             let url = format!("{}/api/v1/auth/code-login", base_url);
             info!("Attempting authentication via endpoint: {}", url);
             match client.post(&url).json(&request_payload).send().await {
                 Ok(resp) => {
+                    if resp.status().is_server_error() {
+                        warn!("Backend {} returned HTTP {} on code-login; trying next fallback...", base_url, resp.status());
+                        resp_opt = Some(resp);
+                        continue;
+                    }
                     resp_opt = Some(resp);
                     break;
                 }
@@ -422,11 +440,6 @@ impl AuthManager {
                     .and_then(|e| e.as_str())
                     .map(|s| s.to_string());
 
-                let telegram_verified = data.get("telegram_verified").and_then(|v| v.as_bool())
-                    .or_else(|| data.get("user").and_then(|u| u.get("telegram_verified")).and_then(|v| v.as_bool()))
-                    .unwrap_or(false);
-                let email = data.get("user").and_then(|u| u.get("email")).and_then(|e| e.as_str()).map(|s| s.to_string());
-
                 let session = SessionData {
                     auth_token,
                     subscription_token: sub_token,
@@ -434,8 +447,6 @@ impl AuthManager {
                     username,
                     remaining_bytes,
                     expires_at,
-                    telegram_verified,
-                    email,
                 };
 
                 let _ = Self::save_session(&session);
@@ -519,208 +530,6 @@ impl AuthManager {
             username,
             remaining_bytes: remaining,
             expires_at: Some("2026-12-31T23:59:59Z".to_string()),
-            telegram_verified: true,
-            email: Some("tester@sentra.local".to_string()),
-        }
-    }
-
-    /// Request a 6-digit Telegram verification code from backend for unlocking download mode
-    pub async fn request_telegram_verify(auth_token: &str) -> Result<serde_json::Value, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
-
-        for base_url in Self::get_backend_urls() {
-            let url = format!("{}/api/v1/auth/request-telegram-verify", base_url);
-            let resp_res = client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", auth_token))
-                .send()
-                .await;
-
-            if let Ok(resp) = resp_res {
-                if resp.status().is_success() {
-                    if let Ok(val) = resp.json::<serde_json::Value>().await {
-                        return Ok(val);
-                    }
-                }
-            }
-        }
-
-        // Offline / sandbox fallback
-        Ok(json!({
-            "success": true,
-            "verify_code": "849201",
-            "bot_username": "SentraVpnBot",
-            "verify_url": "https://t.me/SentraVpnBot?start=verify_849201",
-            "expires_in_seconds": 900
-        }))
-    }
-
-    /// Check if user has verified Telegram account
-    pub async fn check_telegram_verify_status(auth_token: &str) -> Result<bool, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
-
-        for base_url in Self::get_backend_urls() {
-            let url = format!("{}/api/v1/auth/verify-status", base_url);
-            let resp_res = client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", auth_token))
-                .send()
-                .await;
-
-            if let Ok(resp) = resp_res {
-                if resp.status().is_success() {
-                    if let Ok(val) = resp.json::<serde_json::Value>().await {
-                        let verified = val.get("telegram_verified").and_then(|v| v.as_bool()).unwrap_or(false);
-                        return Ok(verified);
-                    }
-                }
-            }
-        }
-
-        // In sandbox fallback, consider verified
-        Ok(true)
-    }
-
-    /// Request 6-digit Telegram password reset code
-    pub async fn request_password_reset(identifier: &str) -> Result<serde_json::Value, String> {
-        let clean_identifier = identifier.trim();
-        if clean_identifier.is_empty() {
-            return Err("لطفاً ایمیل یا نام کاربری خود را وارد فرمایید.".to_string());
-        }
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
-
-        let request_payload = json!({
-            "email": clean_identifier,
-            "username": clean_identifier
-        });
-
-        let mut resp_opt = None;
-        let mut last_err = None;
-
-        for base_url in Self::get_backend_urls() {
-            let url = format!("{}/api/v1/auth/password-reset/request", base_url);
-            match client.post(&url).json(&request_payload).send().await {
-                Ok(resp) => {
-                    resp_opt = Some(resp);
-                    break;
-                }
-                Err(e) => {
-                    warn!("Failed to request password reset via {} ({}). Trying next URL...", base_url, e);
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        match resp_opt {
-            Some(resp) if resp.status().is_success() => {
-                let data: serde_json::Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| format!("خطا در پردازش پاسخ سرور: {}", e))?;
-                Ok(data)
-            }
-            Some(resp) => {
-                let err_text = resp.text().await.unwrap_or_default();
-                if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&err_text) {
-                    if let Some(msg) = err_json.get("message").and_then(|m| m.as_str()) {
-                        return Err(msg.to_string());
-                    }
-                    if let Some(msg) = err_json.get("error").and_then(|m| m.as_str()) {
-                        return Err(msg.to_string());
-                    }
-                }
-                Err("خطا در ارسال درخواست بازیابی رمز عبور.".to_string())
-            }
-            None => {
-                let err_msg = last_err.map(|e| e.to_string()).unwrap_or_else(|| "Network unreachable".to_string());
-                Err(format!("عدم برقراری ارتباط با سرور: {}", err_msg))
-            }
-        }
-    }
-
-    /// Confirm password reset with 6-digit Telegram code and set new password
-    pub async fn confirm_password_reset(
-        identifier: &str,
-        code: &str,
-        new_password: &str,
-    ) -> Result<serde_json::Value, String> {
-        let clean_identifier = identifier.trim();
-        let clean_code = code.trim();
-        let clean_new_password = new_password.trim();
-
-        if clean_identifier.is_empty() {
-            return Err("لطفاً ایمیل یا نام کاربری را وارد نمایید.".to_string());
-        }
-        if clean_code.len() != 6 || !clean_code.chars().all(|c| c.is_ascii_digit()) {
-            return Err("کد تایید باید یک عدد ۶ رقمی باشد.".to_string());
-        }
-        if clean_new_password.len() < 8 {
-            return Err("رمز عبور جدید باید حداقل ۸ کاراکتر باشد.".to_string());
-        }
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
-
-        let request_payload = json!({
-            "email": clean_identifier,
-            "username": clean_identifier,
-            "code": clean_code,
-            "new_password": clean_new_password
-        });
-
-        let mut resp_opt = None;
-        let mut last_err = None;
-
-        for base_url in Self::get_backend_urls() {
-            let url = format!("{}/api/v1/auth/password-reset/confirm", base_url);
-            match client.post(&url).json(&request_payload).send().await {
-                Ok(resp) => {
-                    resp_opt = Some(resp);
-                    break;
-                }
-                Err(e) => {
-                    warn!("Failed to confirm password reset via {} ({}). Trying next URL...", base_url, e);
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        match resp_opt {
-            Some(resp) if resp.status().is_success() => {
-                let data: serde_json::Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| format!("خطا در پردازش پاسخ سرور: {}", e))?;
-                Ok(data)
-            }
-            Some(resp) => {
-                let err_text = resp.text().await.unwrap_or_default();
-                if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&err_text) {
-                    if let Some(msg) = err_json.get("message").and_then(|m| m.as_str()) {
-                        return Err(msg.to_string());
-                    }
-                    if let Some(msg) = err_json.get("error").and_then(|m| m.as_str()) {
-                        return Err(msg.to_string());
-                    }
-                }
-                Err("خطا در بازنشانی رمز عبور.".to_string())
-            }
-            None => {
-                let err_msg = last_err.map(|e| e.to_string()).unwrap_or_else(|| "Network unreachable".to_string());
-                Err(format!("عدم برقراری ارتباط با سرور: {}", err_msg))
-            }
         }
     }
 }
