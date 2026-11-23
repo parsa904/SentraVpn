@@ -3864,3 +3864,23 @@ pub struct AdminRealtimeStats {
     pub active_sessions: i64,
     pub traffic_24h_bytes: i64,
 }
+
+impl Repository {
+    pub async fn check_duplicate_fingerprint(pool: &sqlx::SqlitePool, fingerprint: &str) -> sqlx::Result<bool> {
+        if let Ok(cnt) = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbounds WHERE fingerprint = ?")
+            .bind(fingerprint)
+            .fetch_one(pool)
+            .await
+        {
+            if cnt > 0 { return Ok(true); }
+        }
+        if let Ok(cnt) = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM donated_outbounds WHERE fingerprint = ?")
+            .bind(fingerprint)
+            .fetch_one(pool)
+            .await
+        {
+            if cnt > 0 { return Ok(true); }
+        }
+        Ok(false)
+    }
+}
