@@ -89,6 +89,20 @@ pub async fn login_with_credentials(
 }
 
 #[tauri::command]
+pub async fn request_password_reset(email: String) -> Result<serde_json::Value, String> {
+    AuthManager::request_password_reset(&email).await
+}
+
+#[tauri::command]
+pub async fn confirm_password_reset(
+    email: String,
+    code: String,
+    new_password: String,
+) -> Result<serde_json::Value, String> {
+    AuthManager::confirm_password_reset(&email, &code, &new_password).await
+}
+
+#[tauri::command]
 pub async fn request_telegram_verify(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let auth_token = {
         let app_state = state.lock().await;
@@ -334,6 +348,10 @@ pub async fn set_connection_mode(
         app_state.routing_mode = "tunnel".to_string();
         app_state.kill_switch = true;
         app_state.logs.push("[SECURITY] در حالت آی‌پی ثابت، برای امنیت حساب‌های مالی فقط حالت Tunnel (همراه با Kill-Switch) فعال است.".to_string());
+    } else if mode == "gaming" {
+        app_state.routing_mode = "tunnel".to_string();
+        app_state.tun_mode = true;
+        app_state.logs.push("[GAMING] حالت گیمینگ انتخاب شد (هدایت کامل ترافیک UDP با استک سیستم و پینگ بهینه).".to_string());
     }
     let msg = format!("[CONFIG] Connection mode switched to [{}]", mode);
     app_state.logs.push(msg);
@@ -353,6 +371,22 @@ pub async fn set_connection_protocol(
     app_state.selected_protocol = protocol.clone();
     let msg = format!("[CONFIG] Connection protocol switched to [{}]", protocol);
     app_state.logs.push(msg);
+    Ok(app_state.clone())
+}
+
+#[tauri::command]
+pub async fn set_gaming_submode(
+    submode: String,
+    state: State<'_, AppState>,
+) -> Result<ClientState, String> {
+    let mut app_state = state.lock().await;
+    let sm = match submode.as_str() {
+        "anti_sanction" => "anti_sanction".to_string(),
+        _ => "full_udp".to_string(),
+    };
+    app_state.gaming_submode = sm.clone();
+    let label = if sm == "anti_sanction" { "ضدتحریم پینگ صفر" } else { "تونل کامل گیمینگ" };
+    app_state.logs.push(format!("[GAMING] حالت فرعی گیمینگ به [{}] تنظیم شد.", label));
     Ok(app_state.clone())
 }
 

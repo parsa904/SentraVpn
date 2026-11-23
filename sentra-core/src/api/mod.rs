@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -42,19 +42,27 @@ impl LoginRateLimiter {
         }
     }
 
-    /// Check if IP has exceeded 5 failed attempts in 10 minutes and is blocked
-    pub async fn check_ip(&self, ip: &str) -> Result<(), CoreError> {
+    /// Check if target key has exceeded 5 failed attempts in 15 minutes and is blocked
+    pub async fn check_key(&self, key: &str, is_ip: bool) -> Result<(), CoreError> {
         let mut map = self.records.lock().await;
         let now = Instant::now();
 
-        if let Some(entry) = map.get_mut(ip) {
+        if let Some(entry) = map.get_mut(key) {
             if let Some(blocked_until) = entry.blocked_until {
                 if now < blocked_until {
                     let rem_secs = blocked_until.duration_since(now).as_secs();
-                    return Err(CoreError::TooManyRequests(format!(
-                        "به دلیل ۵ تلاش ناموفق مکرر، دسترسی از این IP موقتاً مسدود شده است. لطفاً {} ثانیه دیگر تلاش فرمایید.",
-                        rem_secs
-                    )));
+                    let msg = if is_ip {
+                        format!(
+                            "به دلیل ۵ تلاش ناموفق مکرر، دسترسی از این IP موقتاً مسدود شده است. لطفاً {} ثانیه دیگر تلاش فرمایید.",
+                            rem_secs
+                        )
+                    } else {
+                        format!(
+                            "به دلیل ۵ درخواست مکرر برای این حساب، دسترسی موقتاً محدود شده است (حداکثر ۵ درخواست در هر ۱۵ دقیقه). لطفاً {} ثانیه دیگر تلاش فرمایید.",
+                            rem_secs
+                        )
+                    };
+                    return Err(CoreError::TooManyRequests(msg));
                 } else {
                     entry.blocked_until = None;
                     entry.failed_count = 0;
@@ -62,7 +70,7 @@ impl LoginRateLimiter {
                 }
             }
 
-            if now.duration_since(entry.window_start).as_secs() > 600 {
+            if now.duration_since(entry.window_start).as_secs() > 900 {
                 entry.failed_count = 0;
                 entry.window_start = now;
             }
@@ -70,16 +78,32 @@ impl LoginRateLimiter {
         Ok(())
     }
 
-    pub async fn record_failure(&self, ip: &str) {
+    /// Check both IP and optional email/username identifier (max 5 requests per 15 minutes)
+    pub async fn check_limit(&self, ip: &str, identifier: Option<&str>) -> Result<(), CoreError> {
+        self.check_key(ip, true).await?;
+        if let Some(id) = identifier {
+            let norm = id.trim().to_lowercase();
+            if !norm.is_empty() {
+                self.check_key(&format!("id:{}", norm), false).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn check_ip(&self, ip: &str) -> Result<(), CoreError> {
+        self.check_limit(ip, None).await
+    }
+
+    pub async fn record_failure_key(&self, key: &str) {
         let mut map = self.records.lock().await;
         let now = Instant::now();
-        let entry = map.entry(ip.to_string()).or_insert(IpAttempt {
+        let entry = map.entry(key.to_string()).or_insert(IpAttempt {
             failed_count: 0,
             window_start: now,
             blocked_until: None,
         });
 
-        if now.duration_since(entry.window_start).as_secs() > 600 {
+        if now.duration_since(entry.window_start).as_secs() > 900 {
             entry.failed_count = 1;
             entry.window_start = now;
         } else {
@@ -88,13 +112,41 @@ impl LoginRateLimiter {
 
         if entry.failed_count >= 5 {
             entry.blocked_until = Some(now + std::time::Duration::from_secs(900));
-            tracing::warn!("IP {} exceeded 5 failed login attempts in 10 minutes. Blocked for 15 minutes.", ip);
+            tracing::warn!("Target {} exceeded 5 failed attempts in 15 minutes. Blocked for 15 minutes.", key);
         }
     }
 
-    pub async fn record_success(&self, ip: &str) {
+    pub async fn record_failure(&self, ip: &str) {
+        self.record_failure_key(ip).await;
+    }
+
+    pub async fn record_failure_with_id(&self, ip: &str, identifier: Option<&str>) {
+        self.record_failure_key(ip).await;
+        if let Some(id) = identifier {
+            let norm = id.trim().to_lowercase();
+            if !norm.is_empty() {
+                self.record_failure_key(&format!("id:{}", norm)).await;
+            }
+        }
+    }
+
+    pub async fn record_success_key(&self, key: &str) {
         let mut map = self.records.lock().await;
-        map.remove(ip);
+        map.remove(key);
+    }
+
+    pub async fn record_success(&self, ip: &str) {
+        self.record_success_key(ip).await;
+    }
+
+    pub async fn record_success_with_id(&self, ip: &str, identifier: Option<&str>) {
+        self.record_success_key(ip).await;
+        if let Some(id) = identifier {
+            let norm = id.trim().to_lowercase();
+            if !norm.is_empty() {
+                self.record_success_key(&format!("id:{}", norm)).await;
+            }
+        }
     }
 }
 
@@ -128,6 +180,7 @@ pub struct AppState {
     pub admin_chat_id: i64,
     pub rate_limiter: LoginRateLimiter,
     pub server_host: String,
+    pub load_tracker: crate::quality_engine::OutboundLoadTracker,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +200,7 @@ pub struct RegisterRequest {
     pub device_identifier: Option<String>,
     pub device_name: Option<String>,
     pub os: Option<String>,
+    #[allow(dead_code)]
     pub client_version: Option<String>,
 }
 
@@ -158,6 +212,7 @@ pub struct LoginRequest {
     pub device_identifier: Option<String>,
     pub device_name: Option<String>,
     pub os: Option<String>,
+    #[allow(dead_code)]
     pub client_version: Option<String>,
 }
 
@@ -182,6 +237,7 @@ pub struct ConfigRequest {
     pub protocol: Option<String>,
     pub location_code: Option<String>,
     pub use_warp: Option<bool>,
+    pub gaming_submode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +299,7 @@ pub fn create_router(
         admin_chat_id,
         rate_limiter: LoginRateLimiter::new(),
         server_host,
+        load_tracker: crate::quality_engine::OutboundLoadTracker::new(),
     };
 
     let cors = CorsLayer::new()
@@ -435,23 +492,24 @@ async fn auth_login(
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response, CoreError> {
     let client_ip = extract_client_ip(&headers);
-    state.rate_limiter.check_ip(&client_ip).await?;
-
-    let identifier = payload.email.as_deref()
+    let raw_identifier = payload.email.as_deref()
         .or(payload.username.as_deref())
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty());
+    state.rate_limiter.check_limit(&client_ip, raw_identifier).await?;
+
+    let identifier = raw_identifier
         .ok_or_else(|| CoreError::BadRequest("لطفاً ایمیل و رمز عبور را وارد فرمایید.".to_string()))?;
 
     let password = payload.password.trim();
 
     let (user, sub) = match Repository::login_user_with_email_and_password(&state.pool, identifier, password).await {
         Ok(res) => {
-            state.rate_limiter.record_success(&client_ip).await;
+            state.rate_limiter.record_success_with_id(&client_ip, Some(identifier)).await;
             res
         }
         Err(e) => {
-            state.rate_limiter.record_failure(&client_ip).await;
+            state.rate_limiter.record_failure_with_id(&client_ip, Some(identifier)).await;
             return Err(e);
         }
     };
@@ -606,11 +664,11 @@ async fn auth_code_login(
     Json(payload): Json<CodeLoginRequest>,
 ) -> Result<Response, CoreError> {
     let client_ip = extract_client_ip(&headers);
-    state.rate_limiter.check_ip(&client_ip).await?;
-
     let code = payload.code.trim();
+    state.rate_limiter.check_limit(&client_ip, Some(code)).await?;
+
     if code.len() != 8 {
-        state.rate_limiter.record_failure(&client_ip).await;
+        state.rate_limiter.record_failure_with_id(&client_ip, Some(code)).await;
         return Err(CoreError::BadRequest("کد ورود باید دقیقاً ۸ رقم باشد.".to_string()));
     }
 
@@ -631,11 +689,11 @@ async fn auth_code_login(
     .await
     {
         Ok(res) => {
-            state.rate_limiter.record_success(&client_ip).await;
+            state.rate_limiter.record_success_with_id(&client_ip, Some(code)).await;
             res
         }
         Err(e) => {
-            state.rate_limiter.record_failure(&client_ip).await;
+            state.rate_limiter.record_failure_with_id(&client_ip, Some(code)).await;
             return Err(e);
         }
     };
@@ -802,14 +860,7 @@ async fn client_config(
     let requested_mode = payload.mode.as_deref().unwrap_or("web_browsing");
 
     // Enforce mode rules:
-    // A. Gaming is coming soon
-    if requested_mode == "gaming" {
-        return Err(CoreError::ModeComingSoon {
-            mode: "گیمینگ (Gaming)".to_string(),
-        });
-    }
-
-    // A2. Download mode lock check: Requires telegram verification for Free/Lite users
+    // A. Download mode lock check: Requires telegram verification for Free/Lite users
     if requested_mode == "download" && sub.tier == "Sentra Lite" {
         if let Some(ref u) = user_opt {
             if u.telegram_verified == 0 {
@@ -850,6 +901,12 @@ async fn client_config(
             return Err(CoreError::DailyQuotaExceeded {
                 mode: "دانلود".to_string(),
                 used_mb: sub.download_used_mb,
+                limit_mb: 3072,
+            });
+        } else if requested_mode == "gaming" && sub.gaming_used_mb >= 3072 {
+            return Err(CoreError::DailyQuotaExceeded {
+                mode: "گیمینگ".to_string(),
+                used_mb: sub.gaming_used_mb,
                 limit_mb: 3072,
             });
         }
@@ -925,7 +982,6 @@ async fn client_config(
     } else {
         requested_location
     };
-    let _assigned_outbounds = Repository::get_active_outbounds_for_mode_and_location(&state.pool, requested_mode, Some(chosen_location_code)).await.unwrap_or_default();
     let chosen_location_name = match chosen_location_code.to_uppercase().as_str() {
         "US" => "آمریکا 🇺🇸",
         "DE" => "آلمان 🇩🇪",
@@ -936,6 +992,28 @@ async fn client_config(
         "TR" => "ترکیه 🇹🇷",
         _ => "⚡️ انتخاب خودکار سریع‌ترین لوکیشن (Auto)",
     };
+
+    // Quality Engine: Select best outbound for client based on Rank & deterministic hashing
+    let client_user = user_opt.unwrap_or_else(|| crate::models::User::fallback_user(sub.user_id));
+    let selection = crate::quality_engine::QualityEngine::select_outbounds_for_client(
+        &state.pool,
+        &state.load_tracker,
+        &client_user,
+        &sub,
+        Some(requested_mode),
+        Some(chosen_location_code),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        let fb = crate::quality_engine::UnifiedOutbound::sandbox_fallback(requested_mode);
+        crate::quality_engine::OutboundSelectionResult {
+            selected: fb.clone(),
+            ranked_outbounds: vec![fb],
+            rank: 1,
+            is_priority_user: false,
+            is_balanced_rank2: false,
+        }
+    });
 
     // Cloudflare WARP opt-in: Strictly disabled in static_ip mode, opt-in for web & download
     let use_warp = if requested_mode == "static_ip" {
@@ -951,25 +1029,41 @@ async fn client_config(
         "10.8.0.0/24"
     };
 
+    let singbox_cfg = compiler::compile_singbox_config_with_unified_ext(
+        &sub,
+        &selection.ranked_outbounds,
+        &selection.selected.tag,
+        Some(requested_mode),
+        payload.gaming_submode.as_deref(),
+    );
+
+    let mut resp_map = match singbox_cfg {
+        Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    resp_map.insert("success".to_string(), json!(true));
+    resp_map.insert("protocol".to_string(), json!(requested_protocol));
+    resp_map.insert("mode".to_string(), json!(requested_mode));
+    resp_map.insert("location_code".to_string(), json!(chosen_location_code));
+    resp_map.insert("location_name".to_string(), json!(chosen_location_name));
+    resp_map.insert("use_warp".to_string(), json!(use_warp));
+    resp_map.insert("warp_subnet".to_string(), json!(warp_subnet));
+    resp_map.insert("remote_host".to_string(), json!(server_host));
+    resp_map.insert("remote_port".to_string(), json!(remote_port));
+    resp_map.insert("auth_username".to_string(), json!(sub.token));
+    resp_map.insert("auth_password".to_string(), json!(sub.token));
+    resp_map.insert("ovpn_config".to_string(), json!(ovpn_config));
+    resp_map.insert("stunnel".to_string(), json!(stunnel_data));
+    resp_map.insert("ikev2".to_string(), json!(ikev2_data));
+    resp_map.insert("selected_tag".to_string(), json!(selection.selected.tag));
+    resp_map.insert("selected_rank".to_string(), json!(selection.rank));
+    resp_map.insert("is_priority_user".to_string(), json!(selection.is_priority_user));
+    resp_map.insert("is_balanced_rank2".to_string(), json!(selection.is_balanced_rank2));
+
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-        Json(json!({
-            "success": true,
-            "protocol": requested_protocol,
-            "mode": requested_mode,
-            "location_code": chosen_location_code,
-            "location_name": chosen_location_name,
-            "use_warp": use_warp,
-            "warp_subnet": warp_subnet,
-            "remote_host": server_host,
-            "remote_port": remote_port,
-            "auth_username": sub.token,
-            "auth_password": sub.token,
-            "ovpn_config": ovpn_config,
-            "stunnel": stunnel_data,
-            "ikev2": ikev2_data
-        })),
+        Json(Value::Object(resp_map)),
     )
         .into_response())
 }
@@ -1304,7 +1398,7 @@ async fn get_subscription(
 
     // Check suspension
     let user_opt = Repository::get_user_by_id(&state.pool, sub.user_id).await?;
-    if let Some(user) = user_opt {
+    if let Some(ref user) = user_opt {
         if user.status == "suspended" || sub.status == "suspended" {
             return Err(CoreError::AccountSuspended(
                 "حساب شما به دلیل الگوی مصرف ترافیک غیرعادی موقتاً متوقف شده است. لطفاً با پشتیبانی در ارتباط باشید.".to_string(),
@@ -1330,8 +1424,6 @@ async fn get_subscription(
         || user_agent.contains("sing-box")
         || user_agent.contains("singbox");
 
-    let outbounds = Repository::get_allowed_outbounds(&state.pool, &sub.tier).await?;
-
     let sub_userinfo = format!(
         "upload={}; download={}; total={}; expire={}",
         sub.upload_bytes,
@@ -1340,8 +1432,34 @@ async fn get_subscription(
         sub.expires_at.timestamp()
     );
 
+    let client_user = user_opt.unwrap_or_else(|| crate::models::User::fallback_user(sub.user_id));
+    let selection = crate::quality_engine::QualityEngine::select_outbounds_for_client(
+        &state.pool,
+        &state.load_tracker,
+        &client_user,
+        &sub,
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|_| {
+        let fb = crate::quality_engine::UnifiedOutbound::sandbox_fallback("web_browsing");
+        crate::quality_engine::OutboundSelectionResult {
+            selected: fb.clone(),
+            ranked_outbounds: vec![fb],
+            rank: 1,
+            is_priority_user: false,
+            is_balanced_rank2: false,
+        }
+    });
+
     if wants_singbox {
-        let singbox_json = compiler::compile_singbox_config(&sub, &outbounds, None);
+        let singbox_json = compiler::compile_singbox_config_with_unified(
+            &sub,
+            &selection.ranked_outbounds,
+            &selection.selected.tag,
+            None,
+        );
         Ok((
             StatusCode::OK,
             [
@@ -1355,22 +1473,13 @@ async fn get_subscription(
         )
             .into_response())
     } else {
-        // Base64 V2Ray list
+        // Base64 V2Ray list: primary selected outbound first, followed by ranked healthy fallbacks
         let mut lines = Vec::new();
-        for ob in outbounds {
-            let uri = match ob.protocol.as_str() {
-                "socks" => format!("socks://{}:{}#{}", ob.server_address, ob.server_port, urlencoding_simple(&ob.tag)),
-                "http" => format!("http://{}:{}#{}", ob.server_address, ob.server_port, urlencoding_simple(&ob.tag)),
-                "vless" => format!(
-                    "vless://{}@{}:{}?security=reality&type=tcp#{}",
-                    ob.uuid.as_deref().unwrap_or("00000000-0000-0000-0000-000000000000"),
-                    ob.server_address,
-                    ob.server_port,
-                    urlencoding_simple(&ob.tag)
-                ),
-                _ => format!("socks://{}:{}#{}", ob.server_address, ob.server_port, urlencoding_simple(&ob.tag)),
-            };
-            lines.push(uri);
+        lines.push(selection.selected.to_v2ray_uri());
+        for ob in &selection.ranked_outbounds {
+            if ob.tag != selection.selected.tag {
+                lines.push(ob.to_v2ray_uri());
+            }
         }
 
         let raw_payload = lines.join("\n");
@@ -1529,11 +1638,6 @@ async fn get_mobileconfig_profile(
     .await;
 
     let mode = query.mode.as_deref().unwrap_or("web_browsing");
-    if mode == "gaming" {
-        return Err(CoreError::ModeComingSoon {
-            mode: "گیمینگ (Gaming)".to_string(),
-        });
-    }
     if mode == "static_ip" {
         if sub.tier == "Sentra Lite" {
             return Err(CoreError::ModeLocked {
@@ -1723,6 +1827,7 @@ async fn health_check(State(state): State<AppState>) -> Result<Response, CoreErr
         .into_response())
 }
 
+#[allow(dead_code)]
 fn urlencoding_simple(input: &str) -> String {
     input.replace(' ', "%20")
 }

@@ -26,6 +26,7 @@ interface ClientState {
   selected_mode: string;
   selected_protocol?: string;
   selected_location: string;
+  gaming_submode?: string;
   routing_mode?: string;
   local_socks5_port?: number;
   local_http_port?: number;
@@ -131,6 +132,7 @@ let currentState: ClientState = {
   selected_mode: "web_browsing",
   selected_protocol: "openvpn_udp",
   selected_location: "auto",
+  gaming_submode: "full_udp",
   routing_mode: "tunnel",
   local_socks5_port: 10808,
   local_http_port: 10809,
@@ -162,7 +164,26 @@ let uptimeSeconds: number = 0;
 async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Promise<T> {
   const tauri = (window as any).__TAURI__;
   if (tauri && tauri.core && typeof tauri.core.invoke === 'function') {
-    return await tauri.core.invoke(cmd, args);
+    try {
+      return await tauri.core.invoke(cmd, args);
+    } catch (err: any) {
+      const errMsg = String(err?.message || err || '');
+      if (
+        errMsg.includes('401') ||
+        errMsg.toLowerCase().includes('unauthorized') ||
+        errMsg.includes('TOKEN_EXPIRED') ||
+        errMsg.includes('INVALID_TOKEN') ||
+        errMsg.includes('SESSION_EXPIRED')
+      ) {
+        console.warn('[Auth] Received 401 Unauthorized. Redirecting to login screen...', errMsg);
+        currentState.is_authenticated = false;
+        currentState.auth_token = null;
+        currentState.subscription_token = null;
+        currentState.status = 'Disconnected';
+        renderUI();
+      }
+      throw err;
+    }
   }
 
   // --- Browser Dev Mock Fallback ---
@@ -208,6 +229,10 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
     updateTelemetryDisplay(currentState.metrics);
     return { ...currentState } as unknown as T;
   }
+  if (cmd === 'set_gaming_submode') {
+    currentState.gaming_submode = (args?.submode as string) || 'full_udp';
+    return { ...currentState } as unknown as T;
+  }
   if (cmd === 'test_api_connection') {
     return "اتصال آزمایشی به API برقرار است (حالت پیش‌نمایش مرورگر)" as unknown as T;
   }
@@ -250,6 +275,46 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
     currentState.status = 'Disconnected';
     stopTimer();
     return { ...currentState } as unknown as T;
+  }
+  if (cmd === 'request_password_reset') {
+    const email = (args.email || '').trim();
+    if (!email) throw new Error("لطفاً ایمیل یا نام کاربری خود را وارد فرمایید.");
+    const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || 'https://head.cyberservice.sbs:8443';
+    try {
+      const resp = await fetch(`${baseUrl}/api/v1/auth/password-reset/request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.message || data.error || "خطا در ارسال درخواست بازیابی رمز عبور.");
+      return data as unknown as T;
+    } catch (e: any) {
+      if (e.message && !e.message.includes('fetch')) throw e;
+      return { success: true, delivery: "telegram", expires_in_seconds: 600 } as unknown as T;
+    }
+  }
+  if (cmd === 'confirm_password_reset') {
+    const email = (args.email || '').trim();
+    const code = (args.code || '').trim();
+    const new_password = (args.new_password || '').trim();
+    if (!email) throw new Error("لطفاً ایمیل یا نام کاربری را وارد نمایید.");
+    if (code.length !== 6 || !/^\d{6}$/.test(code)) throw new Error("کد تایید باید ۶ رقم باشد.");
+    if (new_password.length < 8) throw new Error("رمز عبور جدید باید حداقل ۸ کاراکتر باشد.");
+    const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || 'https://head.cyberservice.sbs:8443';
+    try {
+      const resp = await fetch(`${baseUrl}/api/v1/auth/password-reset/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, code, new_password })
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.message || data.error || "خطا در بازنشانی رمز عبور.");
+      return data as unknown as T;
+    } catch (e: any) {
+      if (e.message && !e.message.includes('fetch')) throw e;
+      return { success: true, message: "رمز عبور با موفقیت تغییر یافت." } as unknown as T;
+    }
   }
   if (cmd === 'get_available_locations') {
     return [
@@ -653,6 +718,24 @@ function renderPowerButton() {
   }
 }
 
+let recentPings: number[] = [];
+let currentJitterMs = 0;
+
+function updateGamingJitter(newPing: number) {
+  if (newPing <= 0) return;
+  recentPings.push(newPing);
+  if (recentPings.length > 6) recentPings.shift();
+  if (recentPings.length >= 2) {
+    let diffSum = 0;
+    for (let i = 1; i < recentPings.length; i++) {
+      diffSum += Math.abs(recentPings[i] - recentPings[i - 1]);
+    }
+    currentJitterMs = Math.round(diffSum / (recentPings.length - 1));
+  } else {
+    currentJitterMs = 1;
+  }
+}
+
 function updateTelemetryDisplay(metrics: TelemetryMetrics) {
   const downEl = document.getElementById('down-speed');
   const upEl = document.getElementById('up-speed');
@@ -663,6 +746,23 @@ function updateTelemetryDisplay(metrics: TelemetryMetrics) {
   if (upEl) upEl.textContent = formatSpeed(metrics.upload_speed_bps);
   if (pingEl) pingEl.textContent = metrics.ping_ms > 0 ? `${metrics.ping_ms} ms` : '- ms';
   if (timerEl) timerEl.textContent = formatDuration(metrics.uptime_seconds);
+
+  // Live Gaming Telemetry Display
+  const gamingBar = document.getElementById('gaming-telemetry-bar');
+  if (gamingBar) {
+    if (currentState.selected_mode === 'gaming' && currentState.status === 'Connected') {
+      gamingBar.classList.remove('hidden');
+      const gPing = document.getElementById('gaming-ping-val');
+      const gJitter = document.getElementById('gaming-jitter-val');
+      if (gPing) gPing.textContent = metrics.ping_ms > 0 ? `${metrics.ping_ms} ms` : '- ms';
+      if (gJitter) {
+        updateGamingJitter(metrics.ping_ms);
+        gJitter.textContent = `±${currentJitterMs} ms`;
+      }
+    } else {
+      gamingBar.classList.add('hidden');
+    }
+  }
 }
 
 function startTimer() {
@@ -810,6 +910,56 @@ function updateModesUI() {
         staticBadge.textContent = 'فعال • آی‌پی ثابت اختصاصی';
         staticBadge.className = 'text-[9px] px-1.5 py-0.5 rounded bg-[#10B981]/15 text-[#10B981] font-medium border border-[#10B981]/20';
       }
+    }
+  }
+
+  // 3. Gaming Mode Box & Quota Display
+  const gamingSubmodeBox = document.getElementById('gaming-submode-box');
+  const gamingQuotaText = document.getElementById('gaming-quota-text');
+  const gamingBadge = document.getElementById('gaming-badge');
+  const gm = connectionModes.find(m => m.id === 'gaming');
+
+  if (currentState.selected_mode === 'gaming') {
+    if (gamingSubmodeBox) gamingSubmodeBox.classList.remove('hidden');
+    const submode = currentState.gaming_submode || 'full_udp';
+    const btnFull = document.getElementById('submode-full-udp');
+    const btnAnti = document.getElementById('submode-anti-sanction');
+    if (btnFull && btnAnti) {
+      if (submode === 'full_udp') {
+        btnFull.className = 'gaming-submode-btn p-1.5 rounded-lg bg-[#0F172A] border border-[#F59E0B] text-right transition flex flex-col cursor-pointer';
+        btnAnti.className = 'gaming-submode-btn p-1.5 rounded-lg bg-[#0F172A] border border-white/10 hover:border-white/20 text-right transition flex flex-col cursor-pointer';
+      } else {
+        btnFull.className = 'gaming-submode-btn p-1.5 rounded-lg bg-[#0F172A] border border-white/10 hover:border-white/20 text-right transition flex flex-col cursor-pointer';
+        btnAnti.className = 'gaming-submode-btn p-1.5 rounded-lg bg-[#0F172A] border border-[#F59E0B] text-right transition flex flex-col cursor-pointer';
+      }
+    }
+
+    const smBadge = document.getElementById('gaming-submode-badge');
+    if (smBadge) {
+      smBadge.textContent = submode === 'anti_sanction' ? 'ضدتحریم پینگ صفر' : 'Full UDP';
+    }
+  } else {
+    if (gamingSubmodeBox) gamingSubmodeBox.classList.add('hidden');
+  }
+
+  if (isFreeTier) {
+    const gmUsed = gm ? gm.daily_used_mb || 0 : 0;
+    const gmRem = Math.max(0, 3072 - gmUsed);
+    if (gamingQuotaText) gamingQuotaText.textContent = `سهمیه امروز: ${(gmRem / 1024).toFixed(1)} GB باقیمانده`;
+    if (gamingBadge) {
+      if (gmRem === 0) {
+        gamingBadge.textContent = 'سقف ۳ گیگ امروز پر شد';
+        gamingBadge.className = 'text-[9px] px-1.5 py-0.5 rounded bg-[#EF4444]/15 text-[#EF4444] font-medium border border-[#EF4444]/20';
+      } else {
+        gamingBadge.textContent = '۳ گیگابایت روزانه رایگان';
+        gamingBadge.className = 'text-[9px] px-1.5 py-0.5 rounded bg-[#F59E0B]/15 text-[#F59E0B] font-medium border border-[#F59E0B]/20';
+      }
+    }
+  } else {
+    if (gamingQuotaText) gamingQuotaText.textContent = 'سهمیه گیمینگ: نامحدود (VIP)';
+    if (gamingBadge) {
+      gamingBadge.textContent = 'ترافیک نامحدود گیمینگ';
+      gamingBadge.className = 'text-[9px] px-1.5 py-0.5 rounded bg-[#10B981]/15 text-[#10B981] font-medium border border-[#10B981]/20';
     }
   }
 
@@ -1007,10 +1157,91 @@ function handleCoreError(errStr: string): boolean {
 }
 
 // ------------------------------------------------------------------------------
+// Password Reset API Calls (Two-Step Verification)
+// ------------------------------------------------------------------------------
+async function apiPasswordResetRequest(email: string): Promise<any> {
+  const tauri = (window as any).__TAURI__;
+  if (tauri && tauri.core && typeof tauri.core.invoke === 'function') {
+    return await invokeTauri('request_password_reset', { email });
+  }
+
+  const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || 'https://head.cyberservice.sbs:8443';
+  const endpoints = [baseUrl, 'https://head.cyberservice.sbs:8443', 'http://127.0.0.1:8080'];
+  let lastErr = 'عدم برقراری ارتباط با سرور.';
+
+  for (const base of endpoints) {
+    try {
+      const res = await fetch(`${base}/api/v1/auth/password-reset/request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        return data;
+      }
+      throw new Error(data.message || data.error || 'خطا در ارسال درخواست بازیابی رمز عبور.');
+    } catch (e: any) {
+      if (e.message && !e.message.includes('fetch')) throw e;
+      lastErr = e.message || lastErr;
+    }
+  }
+  throw new Error(lastErr);
+}
+
+async function apiPasswordResetConfirm(email: string, code: string, newPassword: string): Promise<any> {
+  const tauri = (window as any).__TAURI__;
+  if (tauri && tauri.core && typeof tauri.core.invoke === 'function') {
+    return await invokeTauri('confirm_password_reset', { email, code, new_password: newPassword });
+  }
+
+  const baseUrl = (import.meta as any).env?.VITE_API_BASE_URL || 'https://head.cyberservice.sbs:8443';
+  const endpoints = [baseUrl, 'https://head.cyberservice.sbs:8443', 'http://127.0.0.1:8080'];
+  let lastErr = 'عدم برقراری ارتباط با سرور.';
+
+  for (const base of endpoints) {
+    try {
+      const res = await fetch(`${base}/api/v1/auth/password-reset/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, code, new_password: newPassword })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        return data;
+      }
+      throw new Error(data.message || data.error || 'خطا در تغییر رمز عبور.');
+    } catch (e: any) {
+      if (e.message && !e.message.includes('fetch')) throw e;
+      lastErr = e.message || lastErr;
+    }
+  }
+  throw new Error(lastErr);
+}
+
+// ------------------------------------------------------------------------------
 // Event Listeners Initialization
 // ------------------------------------------------------------------------------
 function initEventListeners() {
   const authErr = document.getElementById('auth-error-msg');
+  const authSuccess = document.getElementById('auth-success-msg');
+  const authTabs = document.getElementById('auth-tabs');
+
+  // Forgot Password DOM Elements
+  const formForgot = document.getElementById('auth-form-forgot');
+  const forgotLink = document.getElementById('forgot-password-link');
+  const forgotBackBtn = document.getElementById('forgot-back-btn');
+  const forgotStep1 = document.getElementById('forgot-step-1');
+  const forgotStep2 = document.getElementById('forgot-step-2');
+  const forgotIdentifierInput = document.getElementById('forgot-identifier-input') as HTMLInputElement;
+  const forgotRequestBtn = document.getElementById('forgot-request-btn');
+  const forgotCodeInput = document.getElementById('forgot-code-input') as HTMLInputElement;
+  const forgotPassInput = document.getElementById('forgot-password-input') as HTMLInputElement;
+  const forgotConfirmBtn = document.getElementById('forgot-confirm-btn');
+  const forgotStep2ChangeEmail = document.getElementById('forgot-step2-change-email');
+  const forgotStep2Info = document.getElementById('forgot-step2-info');
+  const forgotErr = document.getElementById('forgot-error-msg');
+  const forgotSuccess = document.getElementById('forgot-success-msg');
 
   // 1a. Auth Tabs Switcher
   const tabLogin = document.getElementById('auth-tab-login');
@@ -1022,6 +1253,10 @@ function initEventListeners() {
 
   const selectAuthTab = (activeTab: 'login' | 'register' | 'otp') => {
     if (authErr) authErr.classList.add('hidden');
+    if (authSuccess) authSuccess.classList.add('hidden');
+    formForgot?.classList.add('hidden');
+    authTabs?.classList.remove('hidden');
+
     const tabs = [
       { id: 'login', tab: tabLogin, form: formLogin },
       { id: 'register', tab: tabRegister, form: formRegister },
@@ -1089,6 +1324,180 @@ function initEventListeners() {
   loginSubmitBtn?.addEventListener('click', handleCredentialsLogin);
   loginPassInput?.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') handleCredentialsLogin();
+  });
+
+  // 1e. Forgot Password Two-Step Flow
+  const returnToLogin = (prefillIdentifier?: string) => {
+    if (forgotErr) forgotErr.classList.add('hidden');
+    if (forgotSuccess) forgotSuccess.classList.add('hidden');
+    formForgot?.classList.add('hidden');
+    authTabs?.classList.remove('hidden');
+    selectAuthTab('login');
+    if (prefillIdentifier && loginUserInput) {
+      loginUserInput.value = prefillIdentifier;
+    }
+  };
+
+  forgotLink?.addEventListener('click', () => {
+    if (authErr) authErr.classList.add('hidden');
+    if (authSuccess) authSuccess.classList.add('hidden');
+    if (forgotErr) forgotErr.classList.add('hidden');
+    if (forgotSuccess) forgotSuccess.classList.add('hidden');
+
+    formLogin?.classList.add('hidden');
+    formRegister?.classList.add('hidden');
+    formOtp?.classList.add('hidden');
+    authTabs?.classList.add('hidden');
+
+    formForgot?.classList.remove('hidden');
+    forgotStep1?.classList.remove('hidden');
+    forgotStep2?.classList.add('hidden');
+
+    const currentEntered = loginUserInput?.value?.trim() || '';
+    if (currentEntered && forgotIdentifierInput) {
+      forgotIdentifierInput.value = currentEntered;
+    }
+    forgotIdentifierInput?.focus();
+  });
+
+  forgotBackBtn?.addEventListener('click', () => returnToLogin());
+
+  forgotStep2ChangeEmail?.addEventListener('click', () => {
+    if (forgotErr) forgotErr.classList.add('hidden');
+    if (forgotSuccess) forgotSuccess.classList.add('hidden');
+    forgotStep2?.classList.add('hidden');
+    forgotStep1?.classList.remove('hidden');
+    forgotIdentifierInput?.focus();
+  });
+
+  // Step 1: Request OTP Code to Telegram
+  const handleForgotRequest = async () => {
+    const identifier = forgotIdentifierInput?.value?.trim() || '';
+    if (!identifier) {
+      if (forgotErr) {
+        forgotErr.textContent = 'لطفاً ایمیل یا نام کاربری خود را وارد فرمایید.';
+        forgotErr.classList.remove('hidden');
+      }
+      if (forgotSuccess) forgotSuccess.classList.add('hidden');
+      return;
+    }
+    if (forgotErr) forgotErr.classList.add('hidden');
+    if (forgotSuccess) forgotSuccess.classList.add('hidden');
+
+    try {
+      if (forgotRequestBtn) {
+        forgotRequestBtn.textContent = 'در حال ارسال کد به تلگرام...';
+        (forgotRequestBtn as HTMLButtonElement).disabled = true;
+      }
+      await apiPasswordResetRequest(identifier);
+
+      forgotStep1?.classList.add('hidden');
+      forgotStep2?.classList.remove('hidden');
+      if (forgotStep2Info) {
+        forgotStep2Info.textContent = `کد ۶ رقمی به تلگرام مرتبط با «${identifier}» ارسال شد.`;
+      }
+      if (forgotSuccess) {
+        forgotSuccess.textContent = 'کد تایید ۶ رقمی به ربات تلگرام ارسال گردید.';
+        forgotSuccess.classList.remove('hidden');
+      }
+      if (forgotCodeInput) {
+        forgotCodeInput.value = '';
+        forgotCodeInput.focus();
+      }
+      if (forgotPassInput) {
+        forgotPassInput.value = '';
+      }
+    } catch (e: any) {
+      const errStr = e?.message || e?.toString() || 'خطا در ارسال درخواست بازیابی رمز عبور.';
+      if (forgotErr) {
+        forgotErr.textContent = errStr;
+        forgotErr.classList.remove('hidden');
+      }
+    } finally {
+      if (forgotRequestBtn) {
+        forgotRequestBtn.textContent = 'ارسال کد تایید به تلگرام';
+        (forgotRequestBtn as HTMLButtonElement).disabled = false;
+      }
+    }
+  };
+
+  forgotRequestBtn?.addEventListener('click', handleForgotRequest);
+  forgotIdentifierInput?.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') handleForgotRequest();
+  });
+
+  // Step 2: Confirm OTP & Set New Password
+  const handleForgotConfirm = async () => {
+    const identifier = forgotIdentifierInput?.value?.trim() || '';
+    const code = forgotCodeInput?.value?.trim() || '';
+    const newPassword = forgotPassInput?.value || '';
+
+    if (!identifier) {
+      if (forgotErr) {
+        forgotErr.textContent = 'لطفاً ایمیل یا نام کاربری را در مرحله اول وارد نمایید.';
+        forgotErr.classList.remove('hidden');
+      }
+      return;
+    }
+    if (!code || code.length !== 6 || !/^\d{6}$/.test(code)) {
+      if (forgotErr) {
+        forgotErr.textContent = 'کد تایید باید یک عدد ۶ رقمی باشد.';
+        forgotErr.classList.remove('hidden');
+      }
+      if (forgotSuccess) forgotSuccess.classList.add('hidden');
+      return;
+    }
+    if (!newPassword || newPassword.length < 8) {
+      if (forgotErr) {
+        forgotErr.textContent = 'رمز عبور جدید باید حداقل ۸ کاراکتر باشد.';
+        forgotErr.classList.remove('hidden');
+      }
+      if (forgotSuccess) forgotSuccess.classList.add('hidden');
+      return;
+    }
+
+    if (forgotErr) forgotErr.classList.add('hidden');
+    if (forgotSuccess) forgotSuccess.classList.add('hidden');
+
+    try {
+      if (forgotConfirmBtn) {
+        forgotConfirmBtn.textContent = 'در حال تغییر رمز عبور...';
+        (forgotConfirmBtn as HTMLButtonElement).disabled = true;
+      }
+      await apiPasswordResetConfirm(identifier, code, newPassword);
+
+      // Return user to login form and show success message
+      returnToLogin(identifier);
+      if (authSuccess) {
+        authSuccess.textContent = '✅ رمز عبور با موفقیت تغییر یافت. اکنون می‌توانید با رمز جدید وارد شوید.';
+        authSuccess.classList.remove('hidden');
+      }
+      if (loginPassInput) {
+        loginPassInput.value = '';
+        loginPassInput.focus();
+      }
+    } catch (e: any) {
+      const errStr = e?.message || e?.toString() || 'خطا در بازنشانی رمز عبور.';
+      if (forgotErr) {
+        forgotErr.textContent = errStr;
+        forgotErr.classList.remove('hidden');
+      }
+    } finally {
+      if (forgotConfirmBtn) {
+        forgotConfirmBtn.textContent = 'تغییر رمز عبور و ورود';
+        (forgotConfirmBtn as HTMLButtonElement).disabled = false;
+      }
+    }
+  };
+
+  forgotConfirmBtn?.addEventListener('click', handleForgotConfirm);
+  forgotCodeInput?.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') {
+      if (forgotPassInput) forgotPassInput.focus();
+    }
+  });
+  forgotPassInput?.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') handleForgotConfirm();
   });
 
   // 1c. Register Free Account
@@ -1721,11 +2130,6 @@ function initEventListeners() {
       const mode = (e.currentTarget as HTMLElement).getAttribute('data-mode');
       if (!mode) return;
 
-      if (mode === 'gaming') {
-        alert('🎮 حالت گیمینگ (کاهش پینگ و جیتر UDP) در حال توسعه است و به‌زودی اضافه می‌شود.');
-        return;
-      }
-
       if (mode === 'static_ip' && currentState.tier === 'Sentra Lite') {
         upgradeModal?.classList.remove('hidden');
         return;
@@ -1739,6 +2143,21 @@ function initEventListeners() {
       currentState = await invokeTauri<ClientState>('set_connection_mode', { mode });
       renderState();
       updateModesUI();
+    });
+  });
+
+  // Gaming Submode Buttons
+  document.querySelectorAll('.gaming-submode-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const submode = (e.currentTarget as HTMLElement).getAttribute('data-submode');
+      if (!submode) return;
+      try {
+        currentState = await invokeTauri<ClientState>('set_gaming_submode', { submode });
+        updateModesUI();
+      } catch (err: any) {
+        console.warn('Failed to set gaming submode:', err);
+      }
     });
   });
 

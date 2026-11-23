@@ -4,6 +4,8 @@ import android.app.Activity
 import android.content.Intent
 import android.net.VpnService
 import android.util.Log
+import androidx.activity.result.ActivityResult
+import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
@@ -25,7 +27,6 @@ class ConnectArgs {
 @TauriPlugin
 class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
 
-    private var pendingInvoke: Invoke? = null
     private var pendingConfigJson: String? = null
     private var pendingSplitTunnel: Boolean = true
     private var pendingMode: String = "Sentra Auto"
@@ -36,7 +37,6 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
 
     companion object {
         private const val TAG = "SentraVpnPlugin"
-        private const val VPN_PERMISSION_REQUEST_CODE = 20262
 
         @Volatile
         private var instance: SentraVpnPlugin? = null
@@ -58,19 +58,20 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
                     put("download_speed_bps", dl)
                     put("upload_speed_bps", ul)
                     put("ping_ms", 36)
-                    put("total_download_bytes", totalDl)
-                    put("total_upload_bytes", totalUl)
+                    put("jitter_ms", 2)
+                    put("total_down_bytes", totalDl)
+                    put("total_up_bytes", totalUl)
                     put("uptime_seconds", uptime)
                 }
-                plugin.trigger("telemetry-speed", payload)
+                plugin.trigger("speed-stats", payload)
             }
         }
 
-        fun broadcastStatus(status: String, mode: String) {
+        fun broadcastStatus(status: String, active: Boolean) {
             instance?.let { plugin ->
                 val payload = JSObject().apply {
                     put("status", status)
-                    put("mode", mode)
+                    put("is_active", active)
                 }
                 plugin.trigger("connection-status-changed", payload)
             }
@@ -85,9 +86,10 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         val args = try {
             invoke.parseArgs(ConnectArgs::class.java)
         } catch (e: Exception) {
-            val configRaw = invoke.getString("config_json") ?: invoke.getString("configJson") ?: ""
-            val splitRaw = invoke.getBoolean("split_tunnel_ir") ?: invoke.getBoolean("splitTunnelIr") ?: true
-            val modeRaw = invoke.getString("mode") ?: "Sentra Auto"
+            val argsObj = try { invoke.getArgs() } catch (_: Exception) { JSObject() }
+            val configRaw = argsObj.getString("config_json", argsObj.getString("configJson", "")) ?: ""
+            val splitRaw = argsObj.getBoolean("split_tunnel_ir", argsObj.getBoolean("splitTunnelIr", true))
+            val modeRaw = argsObj.getString("mode", "Sentra Auto") ?: "Sentra Auto"
             ConnectArgs().apply {
                 configJson = configRaw
                 splitTunnelIr = splitRaw
@@ -108,17 +110,38 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         val prepareIntent = VpnService.prepare(activity)
         if (prepareIntent != null) {
             Log.i(TAG, "Requesting Android system VPN permission via startActivityForResult...")
-            pendingInvoke = invoke
-            activity.startActivityForResult(prepareIntent, VPN_PERMISSION_REQUEST_CODE)
-        } else {
-            Log.i(TAG, "VPN permission already granted. Launching SentraVpnService directly...")
-            launchVpnService(args.configJson, args.mode, args.splitTunnelIr)
+            startActivityForResult(invoke, prepareIntent, "onVpnPrepareResult")
+            return
+        }
+
+        Log.i(TAG, "VPN permission already granted. Launching SentraVpnService directly...")
+        launchVpnService(args.configJson, args.mode, args.splitTunnelIr)
+        val res = JSObject().apply {
+            put("success", true)
+            put("status", "Connected")
+            put("mode", args.mode)
+        }
+        invoke.resolve(res)
+    }
+
+    @ActivityCallback
+    private fun onVpnPrepareResult(invoke: Invoke, result: ActivityResult) {
+        if (result.resultCode == Activity.RESULT_OK) {
+            Log.i(TAG, "User granted Android VPN permission!")
+            val config = pendingConfigJson ?: ""
+            val split = pendingSplitTunnel
+            val mode = pendingMode
+            launchVpnService(config, mode, split)
+
             val res = JSObject().apply {
                 put("success", true)
                 put("status", "Connected")
-                put("mode", args.mode)
+                put("mode", mode)
             }
             invoke.resolve(res)
+        } else {
+            Log.w(TAG, "User denied Android VPN permission.")
+            invoke.reject("مجوز اتصال VPN توسط کاربر تایید نشد.")
         }
     }
 
@@ -155,32 +178,6 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
             put("uptime_seconds", SentraVpnService.uptimeSeconds)
         }
         invoke.resolve(res)
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == VPN_PERMISSION_REQUEST_CODE) {
-            val invoke = pendingInvoke
-            pendingInvoke = null
-
-            if (resultCode == Activity.RESULT_OK) {
-                Log.i(TAG, "User granted Android VPN permission!")
-                val config = pendingConfigJson ?: ""
-                val split = pendingSplitTunnel
-                val mode = pendingMode
-                launchVpnService(config, mode, split)
-
-                val res = JSObject().apply {
-                    put("success", true)
-                    put("status", "Connected")
-                    put("mode", mode)
-                }
-                invoke?.resolve(res)
-            } else {
-                Log.w(TAG, "User denied Android VPN permission.")
-                invoke?.reject("مجوز اتصال VPN توسط کاربر تایید نشد.")
-            }
-        }
     }
 
     private fun launchVpnService(configJson: String, mode: String, split: Boolean) {

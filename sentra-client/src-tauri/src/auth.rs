@@ -25,6 +25,24 @@ pub struct SessionData {
 pub struct AuthManager;
 
 impl AuthManager {
+    /// Return candidate backend API URLs in priority order
+    pub fn get_backend_urls() -> Vec<String> {
+        let mut urls = Vec::new();
+        if let Ok(env_url) = std::env::var("SENTRA_API_BASE_URL") {
+            let trimmed = env_url.trim().trim_end_matches('/').to_string();
+            if !trimmed.is_empty() {
+                urls.push(trimmed);
+            }
+        }
+        for u in BACKEND_FALLBACK_URLS {
+            urls.push(u.to_string());
+        }
+        if !urls.iter().any(|u| u.contains("127.0.0.1:8080") || u.contains("localhost:8080")) {
+            urls.push("http://127.0.0.1:8080".to_string());
+        }
+        urls
+    }
+
     /// Return the path to the persisted session file
     pub fn session_file_path() -> PathBuf {
         let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -119,7 +137,7 @@ impl AuthManager {
         let mut resp_opt = None;
         let mut last_err = None;
 
-        for base_url in BACKEND_FALLBACK_URLS {
+        for base_url in Self::get_backend_urls() {
             let url = format!("{}/api/v1/auth/register", base_url);
             match client.post(&url).json(&request_payload).send().await {
                 Ok(resp) => {
@@ -210,7 +228,7 @@ impl AuthManager {
         let mut resp_opt = None;
         let mut last_err = None;
 
-        for base_url in BACKEND_FALLBACK_URLS {
+        for base_url in Self::get_backend_urls() {
             let url = format!("{}/api/v1/auth/login", base_url);
             match client.post(&url).json(&request_payload).send().await {
                 Ok(resp) => {
@@ -288,7 +306,7 @@ impl AuthManager {
             .build()
             .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
 
-        for base_url in BACKEND_FALLBACK_URLS {
+        for base_url in Self::get_backend_urls() {
             let url = format!("{}/api/v1/auth/link-token", base_url);
             let resp_res = client
                 .post(&url)
@@ -343,7 +361,7 @@ impl AuthManager {
         let mut resp_opt = None;
         let mut last_err = None;
 
-        for base_url in BACKEND_FALLBACK_URLS {
+        for base_url in Self::get_backend_urls() {
             let url = format!("{}/api/v1/auth/code-login", base_url);
             info!("Attempting authentication via endpoint: {}", url);
             match client.post(&url).json(&request_payload).send().await {
@@ -513,7 +531,7 @@ impl AuthManager {
             .build()
             .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
 
-        for base_url in BACKEND_FALLBACK_URLS {
+        for base_url in Self::get_backend_urls() {
             let url = format!("{}/api/v1/auth/request-telegram-verify", base_url);
             let resp_res = client
                 .post(&url)
@@ -547,7 +565,7 @@ impl AuthManager {
             .build()
             .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
 
-        for base_url in BACKEND_FALLBACK_URLS {
+        for base_url in Self::get_backend_urls() {
             let url = format!("{}/api/v1/auth/verify-status", base_url);
             let resp_res = client
                 .get(&url)
@@ -567,5 +585,142 @@ impl AuthManager {
 
         // In sandbox fallback, consider verified
         Ok(true)
+    }
+
+    /// Request 6-digit Telegram password reset code
+    pub async fn request_password_reset(identifier: &str) -> Result<serde_json::Value, String> {
+        let clean_identifier = identifier.trim();
+        if clean_identifier.is_empty() {
+            return Err("لطفاً ایمیل یا نام کاربری خود را وارد فرمایید.".to_string());
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
+
+        let request_payload = json!({
+            "email": clean_identifier,
+            "username": clean_identifier
+        });
+
+        let mut resp_opt = None;
+        let mut last_err = None;
+
+        for base_url in Self::get_backend_urls() {
+            let url = format!("{}/api/v1/auth/password-reset/request", base_url);
+            match client.post(&url).json(&request_payload).send().await {
+                Ok(resp) => {
+                    resp_opt = Some(resp);
+                    break;
+                }
+                Err(e) => {
+                    warn!("Failed to request password reset via {} ({}). Trying next URL...", base_url, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        match resp_opt {
+            Some(resp) if resp.status().is_success() => {
+                let data: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("خطا در پردازش پاسخ سرور: {}", e))?;
+                Ok(data)
+            }
+            Some(resp) => {
+                let err_text = resp.text().await.unwrap_or_default();
+                if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&err_text) {
+                    if let Some(msg) = err_json.get("message").and_then(|m| m.as_str()) {
+                        return Err(msg.to_string());
+                    }
+                    if let Some(msg) = err_json.get("error").and_then(|m| m.as_str()) {
+                        return Err(msg.to_string());
+                    }
+                }
+                Err("خطا در ارسال درخواست بازیابی رمز عبور.".to_string())
+            }
+            None => {
+                let err_msg = last_err.map(|e| e.to_string()).unwrap_or_else(|| "Network unreachable".to_string());
+                Err(format!("عدم برقراری ارتباط با سرور: {}", err_msg))
+            }
+        }
+    }
+
+    /// Confirm password reset with 6-digit Telegram code and set new password
+    pub async fn confirm_password_reset(
+        identifier: &str,
+        code: &str,
+        new_password: &str,
+    ) -> Result<serde_json::Value, String> {
+        let clean_identifier = identifier.trim();
+        let clean_code = code.trim();
+        let clean_new_password = new_password.trim();
+
+        if clean_identifier.is_empty() {
+            return Err("لطفاً ایمیل یا نام کاربری را وارد نمایید.".to_string());
+        }
+        if clean_code.len() != 6 || !clean_code.chars().all(|c| c.is_ascii_digit()) {
+            return Err("کد تایید باید یک عدد ۶ رقمی باشد.".to_string());
+        }
+        if clean_new_password.len() < 8 {
+            return Err("رمز عبور جدید باید حداقل ۸ کاراکتر باشد.".to_string());
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
+
+        let request_payload = json!({
+            "email": clean_identifier,
+            "username": clean_identifier,
+            "code": clean_code,
+            "new_password": clean_new_password
+        });
+
+        let mut resp_opt = None;
+        let mut last_err = None;
+
+        for base_url in Self::get_backend_urls() {
+            let url = format!("{}/api/v1/auth/password-reset/confirm", base_url);
+            match client.post(&url).json(&request_payload).send().await {
+                Ok(resp) => {
+                    resp_opt = Some(resp);
+                    break;
+                }
+                Err(e) => {
+                    warn!("Failed to confirm password reset via {} ({}). Trying next URL...", base_url, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        match resp_opt {
+            Some(resp) if resp.status().is_success() => {
+                let data: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("خطا در پردازش پاسخ سرور: {}", e))?;
+                Ok(data)
+            }
+            Some(resp) => {
+                let err_text = resp.text().await.unwrap_or_default();
+                if let Ok(err_json) = serde_json::from_str::<serde_json::Value>(&err_text) {
+                    if let Some(msg) = err_json.get("message").and_then(|m| m.as_str()) {
+                        return Err(msg.to_string());
+                    }
+                    if let Some(msg) = err_json.get("error").and_then(|m| m.as_str()) {
+                        return Err(msg.to_string());
+                    }
+                }
+                Err("خطا در بازنشانی رمز عبور.".to_string())
+            }
+            None => {
+                let err_msg = last_err.map(|e| e.to_string()).unwrap_or_else(|| "Network unreachable".to_string());
+                Err(format!("عدم برقراری ارتباط با سرور: {}", err_msg))
+            }
+        }
     }
 }

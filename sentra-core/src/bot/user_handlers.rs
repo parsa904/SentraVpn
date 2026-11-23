@@ -199,6 +199,7 @@ pub async fn handle_support_guide(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn handle_free_account(bot: &Bot, msg: &Message, pool: &DbPool) -> anyhow::Result<()> {
     let telegram_user = match msg.from.as_ref() {
         Some(u) => u,
@@ -246,6 +247,7 @@ pub async fn handle_free_account(bot: &Bot, msg: &Message, pool: &DbPool) -> any
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn handle_upgrade_prompt(bot: &Bot, msg: &Message) -> anyhow::Result<()> {
     let text = r#"⚡ <b>تعرفه‌ها و پلن‌های ضدسانسور سنترا:</b>
 
@@ -319,6 +321,7 @@ pub async fn handle_payment_simulation(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn handle_get_config_and_links(
     bot: &Bot,
     msg: &Message,
@@ -507,6 +510,7 @@ pub async fn handle_ticket_callback(
 }
 
 /// Prompt iOS user to pick one of the 4 connection modes for OpenVPN
+#[allow(dead_code)]
 pub async fn handle_ios_subscription_prompt(
     bot: &Bot,
     msg: &Message,
@@ -977,6 +981,7 @@ pub async fn handle_donation_prompt(bot: &Bot, msg: &Message) -> anyhow::Result<
 }
 
 /// Prompt explaining Financial Support / Donation
+#[allow(dead_code)]
 pub async fn handle_financial_donation_prompt(
     bot: &Bot,
     msg: &Message,
@@ -1066,6 +1071,7 @@ pub async fn handle_donation_submission(
 }
 
 /// Prompt explaining Account Linking
+#[allow(dead_code)]
 pub async fn handle_link_account_prompt(
     bot: &Bot,
     msg: &Message,
@@ -1114,6 +1120,7 @@ pub async fn handle_link_account_prompt(
 }
 
 /// Handle /link command with or without 6-digit code
+#[allow(dead_code)]
 pub async fn handle_link_command(
     bot: &Bot,
     msg: &Message,
@@ -1198,6 +1205,7 @@ pub async fn handle_link_command(
 }
 
 /// Handle /setpassword <username> <password> command
+#[allow(dead_code)]
 pub async fn handle_setpassword_command(
     bot: &Bot,
     msg: &Message,
@@ -1357,14 +1365,22 @@ pub async fn handle_download_platform_callback(
                 bot.answer_callback_query(q.id.clone())
                     .text(format!("فایل نصبی {} ارسال شد.", platform_fa))
                     .await?;
-            } else if let Some(github_url) = github_url_opt {
+            } else {
+                let default_direct_url = if is_windows {
+                    crate::bot::keyboards::GITHUB_RELEASE_WINDOWS_URL
+                } else {
+                    crate::bot::keyboards::GITHUB_RELEASE_ANDROID_URL
+                };
+                let download_url = github_url_opt.as_deref().unwrap_or(default_direct_url);
                 let msg_text = format!(
-                    r#"🌐 <b>دانلود مستقیم {} از گیت‌هاب:</b>
+                    r#"🌐 <b>دانلود مستقیم {} از گیت‌هاب (Sentra Release):</b>
 
-🔹 نسخه: <code>{}</code>
-🔗 <b>آدرس دانلود:</b>
-{}"#,
-                    platform_fa, release.version, github_url
+🔹 <b>نسخه:</b> <code>{}</code>
+🔗 <b>لینک دانلود مستقیم:</b>
+{}
+
+💡 <i>فایل نصب استاندارد و امضاشده به محض کلیک دانلود می‌شود.</i>"#,
+                    platform_fa, release.version, download_url
                 );
                 if let Some(msg) = &q.message {
                     bot.send_message(msg.chat().id, msg_text)
@@ -1372,27 +1388,33 @@ pub async fn handle_download_platform_callback(
                         .await?;
                 }
                 bot.answer_callback_query(q.id.clone()).await?;
-            } else {
-                let msg_text = format!("⏳ فایل نصبی {} در حال حاضر در حال بارگذاری است.", platform_fa);
-                bot.answer_callback_query(q.id.clone())
-                    .text(msg_text)
-                    .show_alert(true)
-                    .await?;
             }
         }
         None => {
-            let msg_text = if platform == "android" {
-                "⏳ نسخه اندروید در حال آماده‌سازی نهایی است و به‌زودی از همین بخش منتشر می‌شود."
+            let is_windows = platform == "windows";
+            let platform_fa = if is_windows { "ویندوز (Windows 10/11)" } else { "اندروید (Android)" };
+            let direct_url = if is_windows {
+                crate::bot::keyboards::GITHUB_RELEASE_WINDOWS_URL
             } else {
-                "⏳ نسخه ویندوز در حال آماده‌سازی نهایی است و به‌زودی از همین بخش منتشر می‌شود."
+                crate::bot::keyboards::GITHUB_RELEASE_ANDROID_URL
             };
+            let msg_text = format!(
+                r#"🚀 <b>دانلود آخرین نسخه رسمی {} (Sentra Connect v1.0):</b>
+
+🔗 <b>لینک مستقیم انتشار گیتهاب:</b>
+{}
+
+💡 <i>می‌توانید آخرین نسخه رسمی و امضاشده را مستقیماً از لینک فوق دریافت فرمایید.</i>"#,
+                platform_fa, direct_url
+            );
 
             if let Some(msg) = &q.message {
-                bot.send_message(msg.chat().id, msg_text).await?;
+                bot.send_message(msg.chat().id, msg_text)
+                    .parse_mode(ParseMode::Html)
+                    .await?;
             }
             bot.answer_callback_query(q.id.clone())
-                .text(msg_text)
-                .show_alert(true)
+                .text(format!("لینک دانلود مستقیم {} ارسال شد.", platform_fa))
                 .await?;
         }
     }

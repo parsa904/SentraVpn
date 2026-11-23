@@ -62,7 +62,7 @@ pub async fn run_telegram_bot(
                 let rate_limiter = Arc::clone(&rate_limiter);
                 move |bot: Bot, msg: Message| {
                     let pool = Arc::clone(&pool);
-                    let base_url = Arc::clone(&base_url);
+                    let _base_url = Arc::clone(&base_url);
                     let rate_limiter = Arc::clone(&rate_limiter);
                     async move {
                         // Anti-spam / Flood Protection (> 5 reqs in < 10s -> 5m Cooldown)

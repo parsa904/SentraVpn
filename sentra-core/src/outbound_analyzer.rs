@@ -76,6 +76,10 @@ impl OutboundAnalyzer {
             return Self::parse_shadowsocks(trimmed);
         }
 
+        if trimmed.starts_with("wireguard://") || trimmed.starts_with("wg://") {
+            return Self::parse_wireguard(trimmed);
+        }
+
         if trimmed.starts_with("vless://")
             || trimmed.starts_with("trojan://")
             || trimmed.starts_with("hy2://")
@@ -85,7 +89,7 @@ impl OutboundAnalyzer {
             return Self::parse_standard_uri(trimmed);
         }
 
-        Err("فرمت لینک پروکسی شناسایی نشد. لینک‌های پشتیبانی شده: vless://, vmess://, trojan://, hy2://, ss:// یا Sing-box JSON".to_string())
+        Err("فرمت لینک پروکسی شناسایی نشد. لینک‌های پشتیبانی شده: vless://, vmess://, trojan://, hy2://, tuic://, wireguard://, ss:// یا Sing-box JSON".to_string())
     }
 
     /// Parse standard URI schemes: vless, trojan, hy2/hysteria2, tuic
@@ -113,6 +117,19 @@ impl OutboundAnalyzer {
         if protocol == "vless" {
             let uuid = url.username();
             config["uuid"] = serde_json::Value::String(uuid.to_string());
+        } else if protocol == "tuic" {
+            let uuid = url.username();
+            let password = if !url.password().unwrap_or("").is_empty() {
+                url.password().unwrap_or("")
+            } else {
+                ""
+            };
+            config["uuid"] = serde_json::Value::String(uuid.to_string());
+            config["password"] = serde_json::Value::String(password.to_string());
+            config["congestion_control"] = serde_json::json!("bbr");
+            config["udp_relay_mode"] = serde_json::json!("native");
+            config["zero_rtt_handshake"] = serde_json::json!(false);
+            config["heartbeat"] = serde_json::json!("10s");
         } else if protocol == "trojan" || protocol == "hysteria2" {
             let password = if !url.password().unwrap_or("").is_empty() {
                 url.password().unwrap_or("")
@@ -127,10 +144,10 @@ impl OutboundAnalyzer {
         let mut tls_obj = serde_json::json!({ "enabled": true });
         let mut transport_obj = serde_json::json!({});
 
-        for (k, v) in query_pairs {
+        for (k, v) in &query_pairs {
             match k.as_str() {
                 "sni" | "peer" => {
-                    tls_obj["server_name"] = serde_json::Value::String(v);
+                    tls_obj["server_name"] = serde_json::Value::String(v.clone());
                 }
                 "security" => {
                     if v == "reality" {
@@ -141,25 +158,46 @@ impl OutboundAnalyzer {
                     if tls_obj.get("reality").is_none() {
                         tls_obj["reality"] = serde_json::json!({ "enabled": true });
                     }
-                    tls_obj["reality"]["public_key"] = serde_json::Value::String(v);
+                    tls_obj["reality"]["public_key"] = serde_json::Value::String(v.clone());
                 }
                 "sid" => {
                     if tls_obj.get("reality").is_none() {
                         tls_obj["reality"] = serde_json::json!({ "enabled": true });
                     }
-                    tls_obj["reality"]["short_id"] = serde_json::Value::String(v);
+                    tls_obj["reality"]["short_id"] = serde_json::Value::String(v.clone());
                 }
                 "type" => {
-                    transport_obj["type"] = serde_json::Value::String(v);
+                    transport_obj["type"] = serde_json::Value::String(v.clone());
                 }
                 "path" => {
-                    transport_obj["path"] = serde_json::Value::String(v);
+                    transport_obj["path"] = serde_json::Value::String(v.clone());
                 }
                 "host" => {
                     transport_obj["headers"] = serde_json::json!({ "Host": v });
                 }
+                "obfs" | "obfs-password" => {
+                    if v != "none" && !v.is_empty() {
+                        config["obfs"] = serde_json::json!({
+                            "type": "salamander",
+                            "password": v
+                        });
+                    }
+                }
+                "congestion_control" => {
+                    config["congestion_control"] = serde_json::Value::String(v.clone());
+                }
+                "udp_relay_mode" => {
+                    config["udp_relay_mode"] = serde_json::Value::String(v.clone());
+                }
+                "alpn" => {
+                    tls_obj["alpn"] = serde_json::json!([v]);
+                }
                 _ => {}
             }
+        }
+
+        if protocol == "tuic" && tls_obj.get("alpn").is_none() {
+            tls_obj["alpn"] = serde_json::json!(["h3"]);
         }
 
         if tls_obj.as_object().map(|o| o.len() > 1).unwrap_or(false) {
@@ -172,6 +210,99 @@ impl OutboundAnalyzer {
         Ok(ParsedProxy {
             tag,
             protocol,
+            server_address,
+            server_port,
+            config_json: config,
+        })
+    }
+
+    /// Parse WireGuard & AmneziaWG URI: wireguard://privkey@host:port?public_key=...&ip=...&preshared_key=...#tag
+    pub fn parse_wireguard(raw: &str) -> Result<ParsedProxy, String> {
+        let url = Url::parse(raw).map_err(|e| format!("لینک WireGuard نامعتبر است: {}", e))?;
+        let server_address = url.host_str().ok_or("آدرس سرور در لینک WireGuard موجود نیست")?.to_string();
+        let server_port = url.port().unwrap_or(51820);
+        let tag = url.fragment().unwrap_or("donated-wireguard").to_string();
+        let tag = urlencoding_decode(&tag);
+
+        let mut private_key = url.username().to_string();
+        let mut peer_public_key = String::new();
+        let mut preshared_key: Option<String> = None;
+        let mut local_address = vec!["10.0.0.2/32".to_string()];
+        let mut mtu = 1420u16;
+        let mut reserved: Option<Vec<u8>> = None;
+        let mut amnezia_obfs = serde_json::Map::new();
+
+        for (k, v) in url.query_pairs() {
+            let key_lower = k.to_lowercase();
+            match key_lower.as_str() {
+                "public_key" | "peer_public_key" | "pubkey" | "pbk" => {
+                    peer_public_key = v.to_string();
+                }
+                "private_key" | "privkey" => {
+                    if private_key.is_empty() {
+                        private_key = v.to_string();
+                    }
+                }
+                "preshared_key" | "psk" => {
+                    preshared_key = Some(v.to_string());
+                }
+                "ip" | "address" | "local_address" => {
+                    local_address = v.split(',').map(|s| s.trim().to_string()).collect();
+                }
+                "mtu" => {
+                    if let Ok(m) = v.parse::<u16>() {
+                        mtu = m;
+                    }
+                }
+                "reserved" => {
+                    let bytes: Vec<u8> = v.split(',')
+                        .filter_map(|s| s.trim().parse::<u8>().ok())
+                        .collect();
+                    if !bytes.is_empty() {
+                        reserved = Some(bytes);
+                    }
+                }
+                // AmneziaWG obfuscation parameters
+                "jc" | "jmin" | "jmax" | "s1" | "s2" | "h1" | "h2" | "h3" | "h4" => {
+                    if let Ok(num) = v.parse::<i64>() {
+                        amnezia_obfs.insert(key_lower, serde_json::json!(num));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if private_key.is_empty() {
+            return Err("کلید خصوصی (private_key) در لینک WireGuard مشخص نشده است".to_string());
+        }
+
+        let mut config = serde_json::json!({
+            "type": "wireguard",
+            "tag": tag,
+            "server": server_address,
+            "server_port": server_port,
+            "system_interface": false,
+            "interface_name": "wg-out",
+            "local_address": local_address,
+            "private_key": private_key,
+            "peer_public_key": peer_public_key,
+            "mtu": mtu
+        });
+
+        if let Some(psk) = preshared_key {
+            config["pre_shared_key"] = serde_json::Value::String(psk);
+        }
+        if let Some(res) = reserved {
+            config["reserved"] = serde_json::json!(res);
+        }
+        if !amnezia_obfs.is_empty() {
+            amnezia_obfs.insert("enabled".to_string(), serde_json::json!(true));
+            config["obfs"] = serde_json::Value::Object(amnezia_obfs);
+        }
+
+        Ok(ParsedProxy {
+            tag,
+            protocol: "wireguard".to_string(),
             server_address,
             server_port,
             config_json: config,

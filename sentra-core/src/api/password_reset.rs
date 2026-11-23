@@ -33,7 +33,6 @@ pub(super) async fn auth_password_reset_request(
     Json(payload): Json<PasswordResetRequestPayload>,
 ) -> Result<Response, CoreError> {
     let client_ip = extract_client_ip(&headers);
-    state.rate_limiter.check_ip(&client_ip).await?;
 
     let identifier = payload
         .email
@@ -42,10 +41,12 @@ pub(super) async fn auth_password_reset_request(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
 
+    state.rate_limiter.check_limit(&client_ip, identifier).await?;
+
     let identifier = match identifier {
         Some(id) => id,
         None => {
-            state.rate_limiter.record_failure(&client_ip).await;
+            state.rate_limiter.record_failure_with_id(&client_ip, None).await;
             return Err(CoreError::BadRequest(
                 "لطفاً ایمیل یا نام کاربری خود را وارد فرمایید.".to_string(),
             ));
@@ -58,7 +59,7 @@ pub(super) async fn auth_password_reset_request(
     let user = match user_opt {
         Some(u) if u.status != "suspended" && u.status != "banned" => u,
         _ => {
-            state.rate_limiter.record_success(&client_ip).await;
+            state.rate_limiter.record_success_with_id(&client_ip, Some(identifier)).await;
             return Ok((
                 StatusCode::OK,
                 Json(json!({
@@ -75,7 +76,7 @@ pub(super) async fn auth_password_reset_request(
     let telegram_id = match user.telegram_id {
         Some(tid) if tid > 0 => tid,
         _ => {
-            state.rate_limiter.record_failure(&client_ip).await;
+            state.rate_limiter.record_failure_with_id(&client_ip, Some(identifier)).await;
             return Err(CoreError::BadRequest(
                 "حساب کاربری شما هنوز به ربات تلگرام متصل نشده است. لطفاً ابتدا در اپلیکیشن از بخش «تایید حساب در ربات تلگرام» حساب خود را متصل فرمایید یا با پشتیبانی در ارتباط باشید.".to_string(),
             ));
@@ -110,7 +111,7 @@ pub(super) async fn auth_password_reset_request(
             );
             // Invalidate code if Telegram send fails
             let _ = Repository::invalidate_password_resets_by_telegram_id(&state.pool, telegram_id).await;
-            state.rate_limiter.record_failure(&client_ip).await;
+            state.rate_limiter.record_failure_with_id(&client_ip, Some(identifier)).await;
             return Err(CoreError::Internal(
                 "ارسال پیام به ربات تلگرام با خطا مواجه شد. لطفاً بررسی فرمایید که ربات را مسدود نکرده باشید و مجدداً تلاش نمایید.".to_string(),
             ));
@@ -118,13 +119,13 @@ pub(super) async fn auth_password_reset_request(
     } else {
         tracing::error!("Telegram bot client not available in AppState for password reset");
         let _ = Repository::invalidate_password_resets_by_telegram_id(&state.pool, telegram_id).await;
-        state.rate_limiter.record_failure(&client_ip).await;
+        state.rate_limiter.record_failure_with_id(&client_ip, Some(identifier)).await;
         return Err(CoreError::Internal(
             "سیستم اطلاع‌رسانی تلگرام در دسترس نیست.".to_string(),
         ));
     }
 
-    state.rate_limiter.record_success(&client_ip).await;
+    state.rate_limiter.record_success_with_id(&client_ip, Some(identifier)).await;
 
     Ok((
         StatusCode::OK,
@@ -143,7 +144,6 @@ pub(super) async fn auth_password_reset_confirm(
     Json(payload): Json<PasswordResetConfirmPayload>,
 ) -> Result<Response, CoreError> {
     let client_ip = extract_client_ip(&headers);
-    state.rate_limiter.check_ip(&client_ip).await?;
 
     let identifier = payload
         .email
@@ -155,6 +155,8 @@ pub(super) async fn auth_password_reset_confirm(
             CoreError::BadRequest("لطفاً ایمیل یا نام کاربری را وارد نمایید.".to_string())
         })?;
 
+    state.rate_limiter.check_limit(&client_ip, Some(identifier)).await?;
+
     let user = match Repository::confirm_password_reset(
         &state.pool,
         identifier,
@@ -164,11 +166,11 @@ pub(super) async fn auth_password_reset_confirm(
     .await
     {
         Ok(u) => {
-            state.rate_limiter.record_success(&client_ip).await;
+            state.rate_limiter.record_success_with_id(&client_ip, Some(identifier)).await;
             u
         }
         Err(e) => {
-            state.rate_limiter.record_failure(&client_ip).await;
+            state.rate_limiter.record_failure_with_id(&client_ip, Some(identifier)).await;
             return Err(e);
         }
     };

@@ -1664,6 +1664,7 @@ pub async fn handle_official_outbounds_hub(
     let web_nodes = Repository::get_official_outbounds_by_category(pool, "web_browsing").await.unwrap_or_default();
     let dl_nodes = Repository::get_official_outbounds_by_category(pool, "download").await.unwrap_or_default();
     let static_nodes = Repository::get_official_outbounds_by_category(pool, "static_ip").await.unwrap_or_default();
+    let gaming_nodes = Repository::get_official_outbounds_by_category(pool, "gaming").await.unwrap_or_default();
     let warp_account = Repository::get_active_warp_account(pool).await.unwrap_or(None);
     let warp_status = if let Some(ref w) = warp_account {
         format!("فعال ⚡️ ({})", if w.account_type == "plus" { "WARP+ 🌟" } else { "رایگان" })
@@ -1674,12 +1675,13 @@ pub async fn handle_official_outbounds_hub(
     let text = format!(
         r#"🌐 <b>مرکز مدیریت اوتباندهای رسمی و اختصاصی سنترا (Official Outbounds Hub)</b>
 
-در این بخش می‌توانید سرورهای اصلی هر ۳ حالت فعال شبکه را اضافه، پایش و مدیریت فرمایید:
+در این بخش می‌توانید سرورهای اصلی هر ۴ حالت فعال شبکه را اضافه، پایش و مدیریت فرمایید:
 
 📊 <b>آمار نودهای اختصاصی فعال:</b>
 • 🌐 نودهای وب‌گردی (Web Browsing): <b>{} نود</b>
 • 📥 نودهای دانلود پرسرعت (Download): <b>{} نود</b>
 • 🔒 نودهای آی‌پی ثابت مسکونی (Static IP): <b>{} نود</b>
+• 🎮 نودهای گیمینگ و ضدتحریم (Gaming): <b>{} نود</b>
 • ⚡️ اکانت Cloudflare WARP سرور: <b>{}</b>
 
 <i>نکته: نودهای رسمی ادمین بر خلاف نودهای اهدایی کاربران، هرگز منقضی نشده و در تولید کانفیگ کلاینت‌ها بالاترین اولویت را دارند.</i>
@@ -1688,6 +1690,7 @@ pub async fn handle_official_outbounds_hub(
         web_nodes.len(),
         dl_nodes.len(),
         static_nodes.len(),
+        gaming_nodes.len(),
         warp_status,
     );
 
@@ -1715,6 +1718,7 @@ pub async fn handle_official_outbounds_hub_callback(
     let web_nodes = Repository::get_official_outbounds_by_category(pool, "web_browsing").await.unwrap_or_default();
     let dl_nodes = Repository::get_official_outbounds_by_category(pool, "download").await.unwrap_or_default();
     let static_nodes = Repository::get_official_outbounds_by_category(pool, "static_ip").await.unwrap_or_default();
+    let gaming_nodes = Repository::get_official_outbounds_by_category(pool, "gaming").await.unwrap_or_default();
     let warp_account = Repository::get_active_warp_account(pool).await.unwrap_or(None);
     let warp_status = if let Some(ref w) = warp_account {
         format!("فعال ⚡️ ({})", if w.account_type == "plus" { "WARP+ 🌟" } else { "رایگان" })
@@ -1725,12 +1729,13 @@ pub async fn handle_official_outbounds_hub_callback(
     let text = format!(
         r#"🌐 <b>مرکز مدیریت اوتباندهای رسمی و اختصاصی سنترا (Official Outbounds Hub)</b>
 
-در این بخش می‌توانید سرورهای اصلی هر ۳ حالت فعال شبکه را اضافه، پایش و مدیریت فرمایید:
+در این بخش می‌توانید سرورهای اصلی هر ۴ حالت فعال شبکه را اضافه، پایش و مدیریت فرمایید:
 
 📊 <b>آمار نودهای اختصاصی فعال:</b>
 • 🌐 نودهای وب‌گردی (Web Browsing): <b>{} نود</b>
 • 📥 نودهای دانلود پرسرعت (Download): <b>{} نود</b>
 • 🔒 نودهای آی‌پی ثابت مسکونی (Static IP): <b>{} نود</b>
+• 🎮 نودهای گیمینگ و ضدتحریم (Gaming): <b>{} نود</b>
 • ⚡️ اکانت Cloudflare WARP سرور: <b>{}</b>
 
 <i>نکته: نودهای رسمی ادمین بر خلاف نودهای اهدایی کاربران، هرگز منقضی نشده و در تولید کانفیگ کلاینت‌ها بالاترین اولویت را دارند.</i>
@@ -1739,6 +1744,7 @@ pub async fn handle_official_outbounds_hub_callback(
         web_nodes.len(),
         dl_nodes.len(),
         static_nodes.len(),
+        gaming_nodes.len(),
         warp_status,
     );
 
@@ -1801,6 +1807,7 @@ pub async fn handle_target_category_chosen(
     .await;
 
     let cat_fa = match category {
+        "gaming" => "🎮 بخش گیمینگ و ضدتحریم (WireGuard / TUIC / Hysteria 2)",
         "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
         "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
         "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
@@ -1949,6 +1956,8 @@ pub async fn handle_admin_outbound_text_input(
             || rest.starts_with("hy2://")
             || rest.starts_with("hysteria2://")
             || rest.starts_with("tuic://")
+            || rest.starts_with("wireguard://")
+            || rest.starts_with("wg://")
             || rest.starts_with("ss://")
             || (rest.starts_with('{') && rest.contains("\"server\"")))
             && !first_word.starts_with("vless://")
@@ -1957,6 +1966,8 @@ pub async fn handle_admin_outbound_text_input(
             && !first_word.starts_with("hy2://")
             && !first_word.starts_with("hysteria2://")
             && !first_word.starts_with("tuic://")
+            && !first_word.starts_with("wireguard://")
+            && !first_word.starts_with("wg://")
             && !first_word.starts_with("ss://")
             && !first_word.starts_with('{')
         {
@@ -2042,6 +2053,7 @@ pub async fn handle_admin_outbound_text_input(
     clear_admin_outbound_state(telegram_user_id).await;
 
     let cat_fa = match category {
+        "gaming" => "🎮 بخش گیمینگ و ضدتحریم (WireGuard / TUIC / Hysteria 2)",
         "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
         "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
         "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
@@ -2096,6 +2108,7 @@ pub async fn handle_list_official_outbounds(
     }
 
     let cat_fa = match category {
+        "gaming" => "🎮 بخش گیمینگ و ضدتحریم (WireGuard / TUIC / Hysteria 2)",
         "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
         "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
         "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
@@ -2238,6 +2251,7 @@ pub async fn handle_ping_official_outbound_callback(
         jitter_ms,
         speed_mbps,
         speed_score,
+        ob.quality_score,
         gemini_ok,
         trading_safe,
         is_online,
@@ -2356,6 +2370,7 @@ pub async fn handle_set_outbound_allocation_callback(
     }
 
     let (allow_web, allow_download, allow_static_ip) = match alloc_mode {
+        "gaming" => (false, false, false),
         "free_only" => (true, true, false),
         "static_only" => (false, false, true),
         "both" => (true, true, true),
@@ -2376,6 +2391,7 @@ pub async fn handle_set_outbound_allocation_callback(
     let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
 
     let desc = match alloc_mode {
+        "gaming" => "🎮 بخش گیمینگ و ضدتحریم",
         "free_only" => "🌐 فقط بخش رایگان (وب / دانلود)",
         "static_only" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
         "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت)",
@@ -2447,6 +2463,7 @@ pub async fn handle_test_gemini_outbound_callback(
         jitter_ms,
         ob.speed_mbps,
         ob.speed_score,
+        ob.quality_score,
         gemini_ok,
         trading_safe,
         true,

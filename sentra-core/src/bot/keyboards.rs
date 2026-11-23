@@ -33,6 +33,7 @@ pub fn user_main_keyboard() -> KeyboardMarkup {
 }
 
 /// Admin Panel persistent reply keyboard (100% button-driven UI)
+#[allow(dead_code)]
 pub fn admin_main_keyboard() -> KeyboardMarkup {
     KeyboardMarkup::new(vec![
         vec![
@@ -109,6 +110,7 @@ pub fn ios_protocol_choice_keyboard(mode: &str) -> InlineKeyboardMarkup {
 }
 
 /// Inline keyboard for Plan Upgrade & Payment Simulation
+#[allow(dead_code)]
 pub fn upgrade_plans_inline_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::callback(
@@ -174,6 +176,9 @@ pub fn admin_select_outbound_target_keyboard() -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("💎 فقط بخش آی‌پی ثابت (ترید و جمنای)", "adm_ob_alloc_static_only"),
         ],
         vec![
+            InlineKeyboardButton::callback("🎮 بخش گیمینگ و ضدتحریم (WireGuard / TUIC / Hysteria 2)", "adm_ob_alloc_gaming"),
+        ],
+        vec![
             InlineKeyboardButton::callback("⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)", "adm_ob_alloc_both"),
         ],
         vec![
@@ -214,6 +219,9 @@ pub fn admin_outbound_reallocation_keyboard(outbound_id: i64) -> InlineKeyboardM
             InlineKeyboardButton::callback("💎 فقط بخش آی‌پی ثابت (ترید و جمنای)", format!("adm_set_alloc_{}_static_only", outbound_id)),
         ],
         vec![
+            InlineKeyboardButton::callback("🎮 بخش گیمینگ و ضدتحریم", format!("adm_set_alloc_{}_gaming", outbound_id)),
+        ],
+        vec![
             InlineKeyboardButton::callback("⚡️ هر دو بخش (رایگان + آی‌پی ثابت)", format!("adm_set_alloc_{}_both", outbound_id)),
         ],
         vec![
@@ -242,30 +250,37 @@ pub fn admin_app_release_inline_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
+pub const GITHUB_RELEASE_WINDOWS_URL: &str = "https://github.com/Illidan009/SentraVpn/releases/latest/download/SentraVPN-Windows-Setup.exe";
+pub const GITHUB_RELEASE_ANDROID_URL: &str = "https://github.com/Illidan009/SentraVpn/releases/latest/download/SentraVPN-Android.apk";
+pub const GITHUB_RELEASE_PAGE_URL: &str = "https://github.com/Illidan009/SentraVpn/releases/latest";
+
 /// Inline keyboard for downloading the Sentra Connect client apps
 pub fn download_app_inline_keyboard(release: Option<&AppRelease>) -> InlineKeyboardMarkup {
-    let github_url = release
-        .and_then(|r| {
-            if let Some(ref w) = r.windows_github_url {
-                Some(w.as_str())
-            } else if let Some(ref a) = r.android_github_url {
-                Some(a.as_str())
-            } else {
-                None
-            }
-        })
-        .unwrap_or("https://github.com/sentravpn/client/releases/latest");
+    let win_url = release
+        .and_then(|r| r.windows_github_url.as_deref())
+        .unwrap_or(GITHUB_RELEASE_WINDOWS_URL);
+    let android_url = release
+        .and_then(|r| r.android_github_url.as_deref())
+        .unwrap_or(GITHUB_RELEASE_ANDROID_URL);
 
-    let valid_url = url::Url::parse(github_url)
-        .unwrap_or_else(|_| url::Url::parse("https://github.com").unwrap());
+    let win_valid_url = url::Url::parse(win_url)
+        .unwrap_or_else(|_| url::Url::parse(GITHUB_RELEASE_WINDOWS_URL).unwrap());
+    let android_valid_url = url::Url::parse(android_url)
+        .unwrap_or_else(|_| url::Url::parse(GITHUB_RELEASE_ANDROID_URL).unwrap());
+    let page_valid_url = url::Url::parse(GITHUB_RELEASE_PAGE_URL)
+        .unwrap_or_else(|_| url::Url::parse("https://github.com/Illidan009/SentraVpn").unwrap());
 
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("🖥 دانلود نسخه ویندوز (.exe)", "dl_app_windows"),
-            InlineKeyboardButton::callback("📱 دانلود نسخه اندروید (.apk)", "dl_app_android"),
+            InlineKeyboardButton::url("🖥 دانلود مستقیم ویندوز (.exe)", win_valid_url),
+            InlineKeyboardButton::url("📱 دانلود مستقیم اندروید (.apk)", android_valid_url),
         ],
         vec![
-            InlineKeyboardButton::url("🔗 صفحه انتشار گیتهاب", valid_url),
+            InlineKeyboardButton::callback("📥 دریافت فایل در تلگرام (ویندوز)", "dl_app_windows"),
+            InlineKeyboardButton::callback("📥 دریافت فایل در تلگرام (اندروید)", "dl_app_android"),
+        ],
+        vec![
+            InlineKeyboardButton::url("🔗 صفحه رسمی انتشار در گیت‌هاب", page_valid_url),
         ],
     ])
 }

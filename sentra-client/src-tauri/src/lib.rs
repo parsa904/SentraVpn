@@ -60,6 +60,8 @@ pub fn run() {
             commands::login_with_code,
             commands::register_with_credentials,
             commands::login_with_credentials,
+            commands::request_password_reset,
+            commands::confirm_password_reset,
             commands::request_telegram_verify,
             commands::check_telegram_verify_status,
             commands::get_telegram_link_code,
@@ -72,6 +74,7 @@ pub fn run() {
             commands::toggle_kill_switch,
             commands::get_connection_modes,
             commands::set_connection_mode,
+            commands::set_gaming_submode,
             commands::set_connection_protocol,
             commands::test_api_connection,
             commands::get_logs,
@@ -108,5 +111,9 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Sentra Connect tauri application");
 
-    app.run(|_app_handle, _event| {});
+    app.run(|_app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+            let _ = sysproxy::disable_system_proxy();
+        }
+    });
 }
