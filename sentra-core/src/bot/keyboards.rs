@@ -250,9 +250,9 @@ pub fn admin_app_release_inline_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
-pub const GITHUB_RELEASE_WINDOWS_URL: &str = "https://github.com/Illidan009/SentraVpn/releases/latest/download/SentraVPN-Windows-Setup.exe";
-pub const GITHUB_RELEASE_ANDROID_URL: &str = "https://github.com/Illidan009/SentraVpn/releases/latest/download/SentraVPN-Android.apk";
-pub const GITHUB_RELEASE_PAGE_URL: &str = "https://github.com/Illidan009/SentraVpn/releases/latest";
+pub const GITHUB_RELEASE_WINDOWS_URL: &str = "https://github.com/parsa904/SentraVpn/releases/latest/download/SentraVPN-Windows-Setup.exe";
+pub const GITHUB_RELEASE_ANDROID_URL: &str = "https://github.com/parsa904/SentraVpn/releases/latest/download/SentraVPN-Android.apk";
+pub const GITHUB_RELEASE_PAGE_URL: &str = "https://github.com/parsa904/SentraVpn/releases/latest";
 
 /// Inline keyboard for downloading the Sentra Connect client apps
 pub fn download_app_inline_keyboard(release: Option<&AppRelease>) -> InlineKeyboardMarkup {
@@ -268,7 +268,7 @@ pub fn download_app_inline_keyboard(release: Option<&AppRelease>) -> InlineKeybo
     let android_valid_url = url::Url::parse(android_url)
         .unwrap_or_else(|_| url::Url::parse(GITHUB_RELEASE_ANDROID_URL).unwrap());
     let page_valid_url = url::Url::parse(GITHUB_RELEASE_PAGE_URL)
-        .unwrap_or_else(|_| url::Url::parse("https://github.com/Illidan009/SentraVpn").unwrap());
+        .unwrap_or_else(|_| url::Url::parse("https://github.com/parsa904/SentraVpn").unwrap());
 
     InlineKeyboardMarkup::new(vec![
         vec![
