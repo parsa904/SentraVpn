@@ -37,6 +37,21 @@ impl<R: Runtime> SentraVpn<R> {
             uptime_seconds: 0,
         })
     }
+
+    pub fn save_session(&self, _payload: String) -> Result<SessionSaveResponse, String> {
+        Ok(SessionSaveResponse { success: true })
+    }
+
+    pub fn load_session(&self) -> Result<SessionLoadResponse, String> {
+        Ok(SessionLoadResponse {
+            found: false,
+            payload: String::new(),
+        })
+    }
+
+    pub fn clear_session(&self) -> Result<SessionSaveResponse, String> {
+        Ok(SessionSaveResponse { success: true })
+    }
 }
 
 impl<R: Runtime> Default for SentraVpn<R> {

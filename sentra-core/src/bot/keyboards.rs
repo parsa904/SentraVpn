@@ -439,3 +439,31 @@ pub fn subscription_status_inline_keyboard(devices_count: usize) -> InlineKeyboa
         vec![InlineKeyboardButton::callback("🔙 بازگشت", "user_back_main")],
     ])
 }
+
+/// Inline keyboard sent to Admin Telegram when a user donates an outbound from the app
+pub fn donated_outbound_review_keyboard(outbound_id: i64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback(
+                "✅ تایید + ۷ روز اشتراک",
+                format!("ob_donate_ok_{}_7", outbound_id),
+            ),
+            InlineKeyboardButton::callback(
+                "✅ تایید + ۱۵ روز اشتراک",
+                format!("ob_donate_ok_{}_15", outbound_id),
+            ),
+        ],
+        vec![InlineKeyboardButton::callback(
+            "✅ تایید + ۳۰ روز اشتراک",
+            format!("ob_donate_ok_{}_30", outbound_id),
+        )],
+        vec![InlineKeyboardButton::callback(
+            "❌ رد کردن",
+            format!("ob_donate_rej_{}", outbound_id),
+        )],
+        vec![InlineKeyboardButton::callback(
+            "🔙 بازگشت",
+            "adm_back_main",
+        )],
+    ])
+}

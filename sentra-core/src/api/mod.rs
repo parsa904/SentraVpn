@@ -126,6 +126,7 @@ pub struct AppState {
     pub admin_chat_id: i64,
     pub rate_limiter: LoginRateLimiter,
     pub server_host: String,
+    pub bot_username: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,12 +228,20 @@ pub struct OpenVpnAccountingRequest {
     pub mode: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DonateOutboundRequest {
+    pub uri: String,
+    pub name: Option<String>,
+    pub note: Option<String>,
+}
+
 pub fn create_router(
     pool: DbPool,
     anomaly_detector: crate::anomaly_detector::AnomalyDetector,
     bot: Option<teloxide::Bot>,
     admin_chat_id: i64,
     server_host: String,
+    bot_username: String,
 ) -> Router {
     let state = AppState {
         pool,
@@ -241,6 +250,7 @@ pub fn create_router(
         admin_chat_id,
         rate_limiter: LoginRateLimiter::new(),
         server_host,
+        bot_username,
     };
 
     let cors = CorsLayer::new()
@@ -263,9 +273,13 @@ pub fn create_router(
         .route("/api/v1/auth/code-login", post(auth_code_login))
         .route("/api/v1/auth/exchange-code", post(auth_code_login))
         .route("/api/v1/auth/link-token", post(auth_link_token))
-        // 2. Client Connection Modes & Locations catalog
+        // 2. Client Bootstrap, Connection Modes & Live Outbounds catalog
+        .route("/api/v1/client/bootstrap", get(get_client_bootstrap))
         .route("/api/v1/client/modes", get(get_client_modes))
         .route("/api/v1/client/locations", get(get_client_locations))
+        // 2b. Community Outbound Donation endpoints
+        .route("/api/v1/client/outbounds/donate", post(donate_client_outbound))
+        .route("/api/v1/client/outbounds/my-donations", get(get_my_donated_outbounds))
         // 3. Client Sing-box dynamic config compiler
         .route("/api/v1/client/config", post(client_config))
         .route("/api/v1/client/connect", post(client_config))
@@ -1091,6 +1105,12 @@ async fn client_version(
         ),
     };
 
+    let download_url = if state.bot_username.is_empty() {
+        String::new()
+    } else {
+        format!("https://t.me/{}", state.bot_username)
+    };
+
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
@@ -1100,7 +1120,8 @@ async fn client_version(
             "platform": target_platform,
             "file_name": file_name,
             "file_size_mb": file_size_mb,
-            "download_url": "https://t.me/SentraVpnBot",
+            "bot_username": state.bot_username,
+            "download_url": download_url,
             "release_notes": release_notes,
             "release_date": release_date,
             "mandatory": false
@@ -1594,6 +1615,309 @@ async fn health_check(State(state): State<AppState>) -> Result<Response, CoreErr
                 "active_outbounds": stats.active_outbounds,
                 "open_tickets": stats.open_tickets
             }
+        })),
+    )
+        .into_response())
+}
+
+/// Helper to extract authenticated subscription token from query or headers
+fn extract_auth_token(headers: &HeaderMap, query_token: Option<&str>) -> Option<String> {
+    if let Some(t) = query_token {
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.strip_prefix("jwt_sentra_").unwrap_or(trimmed).to_string());
+        }
+    }
+    if let Some(h) = headers.get("X-Subscription-Token").and_then(|v| v.to_str().ok()) {
+        let trimmed = h.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.strip_prefix("jwt_sentra_").unwrap_or(trimmed).to_string());
+        }
+    }
+    if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        if let Some(raw) = auth.trim().strip_prefix("Bearer ") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.strip_prefix("jwt_sentra_").unwrap_or(trimmed).to_string());
+            }
+        }
+    }
+    None
+}
+
+/// GET /api/v1/client/bootstrap
+/// Returns complete live user account state, real subscription metrics, active devices count,
+/// real Telegram bot username from .env, non-gaming connection modes, and ALL active outbounds in SQLite.
+async fn get_client_bootstrap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ModesQuery>,
+) -> Result<Response, CoreError> {
+    let token = extract_auth_token(&headers, query.token.as_deref())
+        .ok_or_else(|| CoreError::AuthFailed("توکن احراز هویت ارسال نشده است.".to_string()))?;
+
+    let mut sub = Repository::get_subscription_by_token(&state.pool, &token).await?;
+    Repository::check_and_reset_daily_quota(&state.pool, &mut sub).await?;
+
+    let user = Repository::get_user_by_id(&state.pool, sub.user_id)
+        .await?
+        .ok_or_else(|| CoreError::AuthFailed("کاربر یافت نشد.".to_string()))?;
+
+    if user.status == "banned" || sub.status == "disabled" {
+        return Err(CoreError::UserBanned("حساب کاربری شما مسدود شده است.".to_string()));
+    }
+
+    let devices = Repository::get_user_devices(&state.pool, user.id)
+        .await
+        .unwrap_or_default();
+    let outbounds = Repository::get_all_live_client_outbounds(&state.pool)
+        .await
+        .unwrap_or_default();
+    let mut modes = Repository::build_modes_info(&sub);
+    modes.retain(|m| m.id != "gaming");
+
+    let used_bytes = (sub.upload_bytes + sub.download_bytes).max(0);
+    let remaining_bytes = (sub.traffic_limit_bytes - used_bytes).max(0);
+    let now = Utc::now();
+    let remaining_days = if sub.expires_at > now {
+        let secs = (sub.expires_at - now).num_seconds();
+        ((secs + 86_399) / 86_400).max(0)
+    } else {
+        0
+    };
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        Json(json!({
+            "success": true,
+            "server_time": now.to_rfc3339(),
+            "bot_username": state.bot_username,
+            "user": {
+                "id": user.id,
+                "user_uuid": user.user_uuid,
+                "username": user.username,
+                "first_name": user.first_name,
+                "telegram_id": user.telegram_id,
+                "role": user.role,
+                "status": user.status
+            },
+            "subscription": {
+                "tier": sub.tier,
+                "token": sub.token,
+                "status": sub.status,
+                "upload_bytes": sub.upload_bytes,
+                "download_bytes": sub.download_bytes,
+                "used_bytes": used_bytes,
+                "traffic_limit_bytes": sub.traffic_limit_bytes,
+                "remaining_bytes": remaining_bytes,
+                "web_browsing_used_mb": sub.web_browsing_used_mb,
+                "download_used_mb": sub.download_used_mb,
+                "static_ip_used_mb": sub.static_ip_used_mb,
+                "active_devices_count": devices.len(),
+                "max_concurrent_devices": sub.max_concurrent_devices.max(3),
+                "remaining_days": remaining_days,
+                "expires_at": sub.expires_at.to_rfc3339()
+            },
+            "devices": devices,
+            "modes": modes,
+            "outbounds": outbounds
+        })),
+    )
+        .into_response())
+}
+
+/// POST /api/v1/client/outbounds/donate
+/// Allows an authenticated user to donate a personal proxy URI (vless/vmess/trojan/ss/hy2/tuic/wireguard)
+/// for Admin Telegram approval with +7 / +15 / +30 day subscription rewards.
+async fn donate_client_outbound(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<DonateOutboundRequest>,
+) -> Result<Response, CoreError> {
+    let token = extract_auth_token(&headers, None)
+        .ok_or_else(|| CoreError::AuthFailed("برای اهدای اوتباند ابتدا وارد حساب کاربری خود شوید.".to_string()))?;
+
+    let sub = Repository::get_subscription_by_token(&state.pool, &token).await?;
+    let user = Repository::get_user_by_id(&state.pool, sub.user_id)
+        .await?
+        .ok_or_else(|| CoreError::AuthFailed("کاربر یافت نشد.".to_string()))?;
+
+    if user.outbound_reward_banned != 0 {
+        return Err(CoreError::BadRequest(
+            "دسترسی ارسال اوتباند اهدایی برای این حساب محدود شده است.".to_string(),
+        ));
+    }
+
+    let raw_uri = payload.uri.trim();
+    if raw_uri.is_empty() || raw_uri.len() > 8192 {
+        return Err(CoreError::BadRequest("لینک کانفیگ نامعتبر یا خالی است.".to_string()));
+    }
+
+    let parsed = crate::outbound_analyzer::OutboundAnalyzer::parse_input(raw_uri)
+        .map_err(CoreError::BadRequest)?;
+
+    // Anti-SSRF check to block internal/private IP ranges
+    let resolved_ip = crate::outbound_analyzer::OutboundAnalyzer::check_anti_ssrf(&parsed.server_address)
+        .await
+        .map_err(CoreError::BadRequest)?;
+
+    // Compute unique SHA-256 fingerprint to prevent duplicate submissions
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(
+        format!(
+            "{}:{}:{}",
+            parsed.protocol.to_lowercase(),
+            parsed.server_address.to_lowercase(),
+            parsed.server_port
+        )
+        .as_bytes(),
+    );
+    let fingerprint = format!("{:x}", hasher.finalize());
+
+    if Repository::check_duplicate_fingerprint(&state.pool, &fingerprint).await? {
+        return Err(CoreError::BadRequest(
+            "این سرور قبلاً در شبکه سنترا ثبت شده است. لطفاً سرور دیگری ارسال نمایید.".to_string(),
+        ));
+    }
+
+    // Measure live TCP latency & detect country
+    let (latency_ms, _speed_mbps, is_online, err_opt) =
+        crate::outbound_analyzer::OutboundAnalyzer::benchmark_proxy(resolved_ip, parsed.server_port).await;
+    if !is_online {
+        let reason = err_opt.unwrap_or_else(|| "سرور در دسترس نیست یا پاسخگو نبود.".to_string());
+        return Err(CoreError::BadRequest(format!(
+            "تست اتصال اولیه به سرور ناموفق بود: {}",
+            reason
+        )));
+    }
+
+    let (country_code, country_name) =
+        crate::outbound_analyzer::OutboundAnalyzer::detect_country(resolved_ip, &parsed.tag).await;
+    let flag = crate::outbound_analyzer::OutboundAnalyzer::country_code_to_flag(&country_code);
+
+    let final_tag = payload
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&parsed.tag)
+        .to_string();
+
+    let clean_note = payload
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(400).collect::<String>());
+
+    let config_json_str = serde_json::to_string(&parsed.config_json).unwrap_or_else(|_| "{}".to_string());
+
+    let outbound_id = Repository::create_pending_donated_outbound(
+        &state.pool,
+        user.id,
+        &final_tag,
+        &parsed.protocol,
+        &parsed.server_address,
+        parsed.server_port as i64,
+        &config_json_str,
+        latency_ms,
+        raw_uri,
+        &country_code,
+        &country_name,
+        &fingerprint,
+        clean_note.as_deref(),
+    )
+    .await?;
+
+    // Immediately notify Admin in Telegram with inline review buttons (+7 / +15 / +30 days / Reject / Back)
+    if let Some(ref bot) = state.bot {
+        if state.admin_chat_id != 0 {
+            use teloxide::prelude::*;
+            use teloxide::types::{ChatId, ParseMode};
+
+            let donor_label = user
+                .username
+                .as_deref()
+                .map(|u| format!("@{} (ID: {})", u, user.id))
+                .unwrap_or_else(|| format!("{} (ID: {})", user.first_name, user.id));
+            let short_uri: String = raw_uri.chars().take(320).collect();
+            let note_section = clean_note
+                .as_deref()
+                .map(|n| format!("\n📝 <b>توضیحات کاربر:</b> <i>{}</i>", n))
+                .unwrap_or_default();
+
+            let admin_msg = format!(
+                "🎁 <b>درخواست جدید اهدای اوتباند از اپلیکیشن</b> (#{})\n\n\
+                 👤 <b>کاربر اهداکننده:</b> <code>{}</code>\n\
+                 🏷 <b>نام سرور:</b> <code>{}</code>\n\
+                 🔌 <b>پروتکل:</b> <b>{}</b>\n\
+                 🌍 <b>موقعیت:</b> {} {} (<code>{}:{}</code>)\n\
+                 ⚡ <b>پینگ تست‌شده:</b> <b>{} ms</b>{}\n\n\
+                 🔗 <b>لینک ارسالی:</b>\n<code>{}</code>\n\n\
+                 👇 جهت انتشار برای تمام کاربران و اهدای اشتراک رایگان تصمیم بگیرید:",
+                outbound_id,
+                donor_label,
+                final_tag,
+                parsed.protocol.to_uppercase(),
+                flag,
+                country_name,
+                parsed.server_address,
+                parsed.server_port,
+                latency_ms,
+                note_section,
+                short_uri
+            );
+
+            let kb = crate::bot::keyboards::donated_outbound_review_keyboard(outbound_id);
+            if let Err(e) = bot
+                .send_message(ChatId(state.admin_chat_id), admin_msg)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(kb)
+                .await
+            {
+                tracing::error!("Failed to send donated outbound review to Admin Telegram: {:?}", e);
+            }
+        }
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        Json(json!({
+            "success": true,
+            "id": outbound_id,
+            "status": "pending",
+            "latency_ms": latency_ms,
+            "protocol": parsed.protocol,
+            "country_code": country_code,
+            "flag": flag,
+            "message": "اوتباند شما با موفقیت تست و برای تایید مدیر ارسال شد. پس از تایید، اشتراک رایگان شما به‌صورت خودکار فعال می‌شود."
+        })),
+    )
+        .into_response())
+}
+
+/// GET /api/v1/client/outbounds/my-donations
+/// Returns the authenticated user's submitted community outbounds and approval/reward statuses
+async fn get_my_donated_outbounds(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ModesQuery>,
+) -> Result<Response, CoreError> {
+    let token = extract_auth_token(&headers, query.token.as_deref())
+        .ok_or_else(|| CoreError::AuthFailed("توکن احراز هویت نامعتبر است.".to_string()))?;
+
+    let sub = Repository::get_subscription_by_token(&state.pool, &token).await?;
+    let donations = Repository::get_user_donated_outbounds(&state.pool, sub.user_id).await?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        Json(json!({
+            "success": true,
+            "donations": donations
         })),
     )
         .into_response())

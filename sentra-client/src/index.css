@@ -1,0 +1,118 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  html {
+    font-family: 'Vazirmatn', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+}
+
+@keyframes sentra-stroke-draw {
+  0% {
+    stroke-dashoffset: 320;
+    opacity: 0.2;
+  }
+  20% {
+    opacity: 1;
+  }
+  100% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
+
+@keyframes sentra-arch-draw {
+  0% {
+    stroke-dashoffset: 160;
+    opacity: 0;
+  }
+  30% {
+    opacity: 1;
+  }
+  100% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
+
+@keyframes sentra-soft-glow {
+  0%, 100% {
+    opacity: 0.35;
+    transform: scale(0.96);
+  }
+  50% {
+    opacity: 0.7;
+    transform: scale(1.06);
+  }
+}
+
+@keyframes sentra-ripple {
+  0% {
+    transform: scale(0.94);
+    opacity: 0.65;
+  }
+  100% {
+    transform: scale(1.42);
+    opacity: 0;
+  }
+}
+
+@keyframes sentra-orbit {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-sentra-s {
+  stroke-dasharray: 320;
+  stroke-dashoffset: 320;
+  animation: sentra-stroke-draw 1.05s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.animate-sentra-arch {
+  stroke-dasharray: 160;
+  stroke-dashoffset: 160;
+  animation: sentra-arch-draw 0.85s cubic-bezier(0.22, 1, 0.36, 1) 0.25s forwards;
+}
+
+.animate-sentra-glow {
+  animation: sentra-soft-glow 2.4s ease-in-out infinite;
+}
+
+.animate-sentra-ripple {
+  animation: sentra-ripple 1.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+.animate-sentra-ripple-delayed {
+  animation: sentra-ripple 1.8s cubic-bezier(0.16, 1, 0.3, 1) 0.6s infinite;
+}
+
+.animate-sentra-orbit {
+  animation: sentra-orbit 1.4s linear infinite;
+}
+
+/* Crisp custom scrollbars for dark & light surfaces */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.28);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.48);
+}

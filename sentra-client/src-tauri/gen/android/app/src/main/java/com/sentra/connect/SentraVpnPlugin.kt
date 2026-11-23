@@ -2,8 +2,11 @@ package com.sentra.connect
 
 import android.app.Activity
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.VpnService
 import android.util.Log
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
@@ -18,9 +21,15 @@ class ConnectArgs {
     var mode: String = "Sentra Auto"
 }
 
+@InvokeArg
+class SessionSaveArgs {
+    var payload: String = ""
+}
+
 /**
  * SentraVpnPlugin: Native Android Tauri Plugin
- * Bridges the TypeScript/Rust frontend with Android VpnService & libbox.
+ * Bridges the TypeScript/Rust frontend with Android VpnService, libbox,
+ * and AES-256 EncryptedSharedPreferences for one-time persistent authentication.
  */
 @TauriPlugin
 class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
@@ -34,8 +43,28 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         instance = this
     }
 
+    private fun getSecurePrefs(): SharedPreferences {
+        return try {
+            val masterKey = MasterKey.Builder(activity.applicationContext)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            EncryptedSharedPreferences.create(
+                activity.applicationContext,
+                PREFS_NAME,
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "EncryptedSharedPreferences fallback to MODE_PRIVATE: ${e.message}")
+            activity.applicationContext.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+        }
+    }
+
     companion object {
         private const val TAG = "SentraVpnPlugin"
+        private const val PREFS_NAME = "sentra_secure_auth_prefs"
+        private const val KEY_SESSION_JSON = "sentra_session_json"
         private const val VPN_PERMISSION_REQUEST_CODE = 20262
 
         @Volatile
@@ -52,12 +81,12 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
             }
         }
 
-        fun broadcastSpeed(dl: Long, ul: Long, totalDl: Long, totalUl: Long, uptime: Long) {
+        fun broadcastSpeed(dl: Long, ul: Long, totalDl: Long, totalUl: Long, uptime: Long, pingMs: Int = 0) {
             instance?.let { plugin ->
                 val payload = JSObject().apply {
                     put("download_speed_bps", dl)
                     put("upload_speed_bps", ul)
-                    put("ping_ms", 36)
+                    put("ping_ms", pingMs)
                     put("total_download_bytes", totalDl)
                     put("total_upload_bytes", totalUl)
                     put("uptime_seconds", uptime)
@@ -75,6 +104,48 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
                 plugin.trigger("connection-status-changed", payload)
             }
         }
+    }
+
+    /**
+     * saveSession: Persists auth/session JSON in Android EncryptedSharedPreferences
+     */
+    @Command
+    fun saveSession(invoke: Invoke) {
+        val raw = try {
+            invoke.parseArgs(SessionSaveArgs::class.java).payload
+        } catch (_: Exception) {
+            invoke.getString("payload") ?: ""
+        }
+        if (raw.isBlank()) {
+            invoke.reject("داده نشست برای ذخیره خالی است.")
+            return
+        }
+        getSecurePrefs().edit().putString(KEY_SESSION_JSON, raw).apply()
+        val res = JSObject().apply { put("success", true) }
+        invoke.resolve(res)
+    }
+
+    /**
+     * loadSession: Reads persisted auth/session JSON from EncryptedSharedPreferences
+     */
+    @Command
+    fun loadSession(invoke: Invoke) {
+        val stored = getSecurePrefs().getString(KEY_SESSION_JSON, null)
+        val res = JSObject().apply {
+            put("found", !stored.isNullOrBlank())
+            put("payload", stored ?: "")
+        }
+        invoke.resolve(res)
+    }
+
+    /**
+     * clearSession: Clears persisted auth/session on explicit user logout or token expiry
+     */
+    @Command
+    fun clearSession(invoke: Invoke) {
+        getSecurePrefs().edit().remove(KEY_SESSION_JSON).apply()
+        val res = JSObject().apply { put("success", true) }
+        invoke.resolve(res)
     }
 
     /**

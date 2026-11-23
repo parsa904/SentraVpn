@@ -29,3 +29,19 @@ pub struct VpnStatusResponse {
     pub total_up_bytes: u64,
     pub uptime_seconds: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPayloadRequest {
+    pub payload: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSaveResponse {
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionLoadResponse {
+    pub found: bool,
+    pub payload: String,
+}

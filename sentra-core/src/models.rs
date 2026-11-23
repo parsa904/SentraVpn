@@ -64,6 +64,12 @@ pub struct DonatedOutbound {
     pub jitter_ms: i64,
     pub last_online_at: Option<DateTime<Utc>>,
     pub allocation_mode: String,
+    #[sqlx(default)]
+    pub reward_days: i64,
+    #[sqlx(default)]
+    pub user_note: Option<String>,
+    #[sqlx(default)]
+    pub approved_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -241,4 +247,42 @@ pub struct WarpAccount {
     pub account_type: String, // "free" or "plus"
     pub is_active: i64,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientOutboundInfo {
+    pub id: String,
+    pub db_id: i64,
+    pub name: String,
+    pub tag: String,
+    pub protocol: String,
+    pub category: String,
+    pub country_code: String,
+    pub country_name: String,
+    pub flag: String,
+    pub latency_ms: i64,
+    pub health_score: i64,
+    pub is_official: bool,
+    pub is_online: bool,
+    pub server_address: String,
+    pub server_port: i64,
+    pub uri: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MyDonatedOutboundItem {
+    pub id: i64,
+    pub name: String,
+    pub protocol: String,
+    pub server_address: String,
+    pub server_port: i64,
+    pub country_code: String,
+    pub flag: String,
+    pub latency_ms: i64,
+    pub status: String, // "pending" | "approved" | "rejected" | "inactive"
+    pub reward_days: i64,
+    pub user_note: Option<String>,
+    pub rejection_reason: Option<String>,
+    pub created_at: String,
+    pub approved_at: Option<String>,
 }

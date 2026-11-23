@@ -733,6 +733,22 @@ pub async fn run_telegram_bot(
                                     }
                                 }
                             }
+                            // Community Outbound Donation Review Callbacks (+7 / +15 / +30 days or Reject)
+                            else if let Some(rest) = data.strip_prefix("ob_donate_ok_") {
+                                if let Some((id_str, days_str)) = rest.rsplit_once('_') {
+                                    if let (Ok(ob_id), Ok(days)) = (id_str.parse::<i64>(), days_str.parse::<i64>()) {
+                                        if let Err(e) = admin_handlers::handle_donated_outbound_approve(&bot, &q, &pool, admin_chat_id, ob_id, days).await {
+                                            error!("Error in ob_donate_ok: {:?}", e);
+                                        }
+                                    }
+                                }
+                            } else if let Some(ob_id_str) = data.strip_prefix("ob_donate_rej_") {
+                                if let Ok(ob_id) = ob_id_str.parse::<i64>() {
+                                    if let Err(e) = admin_handlers::handle_donated_outbound_reject(&bot, &q, &pool, admin_chat_id, ob_id).await {
+                                        error!("Error in ob_donate_rej: {:?}", e);
+                                    }
+                                }
+                            }
                             // Outbounds & General Callbacks
                             else if let Some(ob_id_str) = data.strip_prefix("toggle_ob_") {
                                 if let Ok(ob_id) = ob_id_str.parse::<i64>() {

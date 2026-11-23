@@ -81,24 +81,27 @@ impl OutboundAnalyzer {
             || trimmed.starts_with("hy2://")
             || trimmed.starts_with("hysteria2://")
             || trimmed.starts_with("tuic://")
+            || trimmed.starts_with("wireguard://")
+            || trimmed.starts_with("wg://")
         {
             return Self::parse_standard_uri(trimmed);
         }
 
-        Err("فرمت لینک پروکسی شناسایی نشد. لینک‌های پشتیبانی شده: vless://, vmess://, trojan://, hy2://, ss:// یا Sing-box JSON".to_string())
+        Err("فرمت لینک پروکسی شناسایی نشد. لینک‌های پشتیبانی شده: vless://, vmess://, trojan://, hy2://, tuic://, wireguard://, ss:// یا Sing-box JSON".to_string())
     }
 
-    /// Parse standard URI schemes: vless, trojan, hy2/hysteria2, tuic
+    /// Parse standard URI schemes: vless, trojan, hy2/hysteria2, tuic, wireguard
     fn parse_standard_uri(raw: &str) -> Result<ParsedProxy, String> {
         let url = Url::parse(raw).map_err(|e| format!("لینک پروکسی نامعتبر است: {}", e))?;
         let scheme = url.scheme().to_lowercase();
         let protocol = match scheme.as_str() {
             "hy2" | "hysteria2" => "hysteria2".to_string(),
+            "wg" | "wireguard" => "wireguard".to_string(),
             other => other.to_string(),
         };
 
         let server_address = url.host_str().ok_or("آدرس سرور در لینک موجود نیست")?.to_string();
-        let server_port = url.port().unwrap_or(443);
+        let server_port = url.port().unwrap_or(if protocol == "wireguard" { 51820 } else { 443 });
         let tag = url.fragment().unwrap_or("donated-node").to_string();
         let tag = urlencoding_decode(&tag);
 
@@ -120,6 +123,11 @@ impl OutboundAnalyzer {
                 url.username()
             };
             config["password"] = serde_json::Value::String(password.to_string());
+        } else if protocol == "wireguard" {
+            let private_key = urlencoding_decode(url.username());
+            if !private_key.is_empty() {
+                config["private_key"] = serde_json::Value::String(private_key);
+            }
         }
 
         // Parse query params (sni, security, type, etc.)

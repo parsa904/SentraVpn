@@ -59,10 +59,7 @@ impl VpnManager {
 
     /// Return path to local crash-safe unsynced traffic persistence file
     pub fn unsynced_traffic_file() -> PathBuf {
-        let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let dir = base_dir.join(".sentra");
-        let _ = fs::create_dir_all(&dir);
-        dir.join("unsynced_traffic.json")
+        crate::auth::AuthManager::app_data_dir().join("unsynced_traffic.json")
     }
 
     /// Send pending unsynced traffic from previous abnormal termination (Crash-Safe Sync)

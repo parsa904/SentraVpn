@@ -70,4 +70,44 @@ impl<R: Runtime> SentraVpn<R> {
             Err("Mobile VPN plugin is only supported on Android".to_string())
         }
     }
+
+    pub fn save_session(&self, payload: String) -> Result<SessionSaveResponse, String> {
+        #[cfg(target_os = "android")]
+        {
+            self.0
+                .run_mobile_plugin("saveSession", SessionPayloadRequest { payload })
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = payload;
+            Err("Android secure storage is only available on mobile".to_string())
+        }
+    }
+
+    pub fn load_session(&self) -> Result<SessionLoadResponse, String> {
+        #[cfg(target_os = "android")]
+        {
+            self.0
+                .run_mobile_plugin("loadSession", ())
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Err("Android secure storage is only available on mobile".to_string())
+        }
+    }
+
+    pub fn clear_session(&self) -> Result<SessionSaveResponse, String> {
+        #[cfg(target_os = "android")]
+        {
+            self.0
+                .run_mobile_plugin("clearSession", ())
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Err("Android secure storage is only available on mobile".to_string())
+        }
+    }
 }

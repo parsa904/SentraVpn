@@ -234,51 +234,7 @@ pub async fn get_connection_modes(
         }
     }
 
-    // High-fidelity fallback (Gaming mode temporarily hidden)
-    Ok(serde_json::json!({
-        "success": true,
-        "modes": [
-            {
-                "id": "web_browsing",
-                "title": "وب‌گردی",
-                "description": "مرور روزمره وب و شبکه‌های اجتماعی (۲ گیگابایت روزانه)",
-                "protocol": "WS + Fragment",
-                "speed": "متوسط",
-                "security": "کم",
-                "is_locked": false,
-                "is_coming_soon": false,
-                "daily_quota_mb": 2048,
-                "daily_used_mb": 0,
-                "allowed_tiers": ["Sentra Lite", "Sentra Pro", "Sentra Flow+"]
-            },
-            {
-                "id": "download",
-                "title": "دانلود",
-                "description": "انتقال فایل پرسرعت بر بستر Hysteria 2 (۳ گیگابایت روزانه)",
-                "protocol": "Hysteria 2",
-                "speed": "حداکثر",
-                "security": "متوسط",
-                "is_locked": false,
-                "is_coming_soon": false,
-                "daily_quota_mb": 3072,
-                "daily_used_mb": 0,
-                "allowed_tiers": ["Sentra Lite", "Sentra Pro", "Sentra Flow+"]
-            },
-            {
-                "id": "static_ip",
-                "title": "آی‌پی ثابت",
-                "description": "مسیریابی مسکونی تمیز آمریکا برای صرافی‌های ترید و جمنای (Google Gemini)",
-                "protocol": "Residential VLESS Reality",
-                "speed": "بالا",
-                "security": "حداکثر",
-                "is_locked": true,
-                "is_coming_soon": false,
-                "daily_quota_mb": 0,
-                "daily_used_mb": 0,
-                "allowed_tiers": ["Sentra Pro", "Sentra Flow+"]
-            }
-        ]
-    }))
+    Err("امکان دریافت حالت‌های اتصال از سرور وجود ندارد.".to_string())
 }
 
 #[tauri::command]
@@ -421,8 +377,8 @@ pub async fn logout(
     app_state.is_authenticated = false;
     app_state.auth_token = None;
     app_state.subscription_token = None;
-    app_state.username = "مهمان".to_string();
-    app_state.tier = "Sentra Lite".to_string();
+    app_state.username = String::new();
+    app_state.tier = String::new();
     app_state.expires_at = None;
     app_state.logs.push("[INFO] [Auth] Session cleared. Returned to login screen.".to_string());
 
@@ -464,23 +420,7 @@ pub async fn get_user_devices(
         }
     }
 
-    // High-fidelity fallback for offline / sandbox session
-    let cur_dev = AuthManager::get_or_create_device_id();
-    Ok(serde_json::json!({
-        "success": true,
-        "count": 1,
-        "max_allowed": 3,
-        "devices": [
-            {
-                "id": 1,
-                "device_id": cur_dev,
-                "device_name": if cfg!(target_os = "android") { "Samsung Android" } else { "Windows PC" },
-                "platform": if cfg!(target_os = "android") { "android" } else { "windows" },
-                "last_active_at": chrono::Utc::now().to_rfc3339(),
-                "created_at": chrono::Utc::now().to_rfc3339()
-            }
-        ]
-    }))
+    Err("خطا در دریافت لیست دستگاه‌های متصل از سرور.".to_string())
 }
 
 #[tauri::command]
@@ -531,12 +471,7 @@ pub async fn remove_user_device(
         }
     }
 
-    // Offline fallback
-    info!("Offline device removal simulation.");
-    Ok(serde_json::json!({
-        "success": true,
-        "message": "دستگاه با موفقیت حذف گردید."
-    }))
+    Err("عدم ارتباط با سرور برای حذف دستگاه.".to_string())
 }
 
 #[tauri::command]
@@ -557,14 +492,7 @@ pub async fn check_client_version() -> Result<serde_json::Value, String> {
         }
     }
 
-    Ok(serde_json::json!({
-        "latest_version": "1.1.0",
-        "min_supported_version": "1.0.0",
-        "download_url": "https://github.com/sentravpn/client/releases/latest",
-        "release_notes": "نسخه ۱.۱.۰: افزوده شدن همگام‌سازی لحظه‌ای حجم مصرفی (Heartbeat)، محافظت نشت آی‌پی پیشرفته در حالت آی‌پی ثابت، پایداری خودکار سوییچ شبکه در اندروید و پشتیبان‌گیری خودکار.",
-        "release_date": "2026-11-19",
-        "mandatory": false
-    }))
+    Err("بررسی نسخه جدید از سرور در دسترس نیست.".to_string())
 }
 
 #[tauri::command]
@@ -599,41 +527,19 @@ pub async fn test_anti_dpi_settings(
 
     match res {
         Ok(resp) if resp.status().is_success() => {
-            let ping = if elapsed < 10 { 142 + (elapsed % 30) } else { elapsed };
             Ok(serde_json::json!({
                 "success": true,
-                "ping_ms": ping,
-                "status_text": format!("✅ متصل شد - پینگ: {}ms", ping),
+                "ping_ms": elapsed.max(1),
+                "status_text": format!("متصل شد ({} ms)", elapsed.max(1)),
                 "is_blocked": false
             }))
         }
-        _ => {
-            // Check if sandbox is active
-            let is_sandbox = {
-                let s = state.lock().await;
-                s.sandbox_loopback
-            };
-            if is_sandbox {
-                let simulated_ping = match settings.preset.as_str() {
-                    "national_disruption" => 195,
-                    "severe_filtering" => 168,
-                    _ => 135,
-                };
-                Ok(serde_json::json!({
-                    "success": true,
-                    "ping_ms": simulated_ping,
-                    "status_text": format!("✅ متصل شد - پینگ: {}ms", simulated_ping),
-                    "is_blocked": false
-                }))
-            } else {
-                Ok(serde_json::json!({
-                    "success": false,
-                    "ping_ms": 0,
-                    "status_text": "❌ مسدود یا قطع - حالت ضد DPI را تغییر دهید",
-                    "is_blocked": true
-                }))
-            }
-        }
+        _ => Ok(serde_json::json!({
+            "success": false,
+            "ping_ms": 0,
+            "status_text": "عدم پاسخ - تنظیمات ضد DPI را بررسی کنید",
+            "is_blocked": true
+        })),
     }
 }
 
@@ -683,51 +589,7 @@ pub async fn get_available_locations(
         }
     }
 
-    {
-        // Local dev fallback
-            Ok(serde_json::json!({
-                "success": true,
-                "default": "auto",
-                "locations": [
-                    {
-                        "code": "auto",
-                        "name": "⚡️ انتخاب خودکار سریع‌ترین لوکیشن (Auto)",
-                        "country_code": "AUTO",
-                        "flag": "⚡️",
-                        "ping_ms": 42,
-                        "active_nodes": 6,
-                        "is_auto": true
-                    },
-                    {
-                        "code": "DE",
-                        "name": "آلمان 🇩🇪",
-                        "country_code": "DE",
-                        "flag": "🇩🇪",
-                        "ping_ms": 48,
-                        "active_nodes": 3,
-                        "is_auto": false
-                    },
-                    {
-                        "code": "NL",
-                        "name": "هلند 🇳🇱",
-                        "country_code": "NL",
-                        "flag": "🇳🇱",
-                        "ping_ms": 62,
-                        "active_nodes": 2,
-                        "is_auto": false
-                    },
-                    {
-                        "code": "FI",
-                        "name": "فنلاند 🇫🇮",
-                        "country_code": "FI",
-                        "flag": "🇫🇮",
-                        "ping_ms": 71,
-                        "active_nodes": 1,
-                        "is_auto": false
-                    }
-        ]
-    }))
-    }
+    Err("خطا در دریافت لیست لوکیشن‌ها از سرور.".to_string())
 }
 
 #[tauri::command]
@@ -853,4 +715,129 @@ pub async fn set_use_warp(
     app_state.use_warp = enabled;
     app_state.logs.push(format!("[WARP] Cloudflare WARP tunnel set to: {}", if enabled { "روشن (Enabled)" } else { "خاموش (Disabled)" }));
     Ok(app_state.clone())
+}
+
+#[tauri::command]
+pub async fn fetch_client_bootstrap(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let token_opt = {
+        let s = state.lock().await;
+        s.subscription_token.clone()
+    };
+    let token = token_opt.ok_or("نشست فعالی یافت نشد. لطفاً وارد حساب خود شوید.".to_string())?;
+
+    match AuthManager::fetch_bootstrap(&token).await {
+        Ok(data) => {
+            let mut s = state.lock().await;
+            if let Some(sub) = data.get("subscription") {
+                if let Some(tier) = sub.get("tier").and_then(|v| v.as_str()) {
+                    s.tier = tier.to_string();
+                }
+                if let Some(rem) = sub.get("remaining_bytes").and_then(|v| v.as_i64()) {
+                    s.remaining_bytes = rem;
+                }
+                if let Some(exp) = sub.get("expires_at").and_then(|v| v.as_str()) {
+                    s.expires_at = Some(exp.to_string());
+                }
+            }
+            if let Some(user) = data.get("user") {
+                if let Some(uname) = user
+                    .get("username")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| user.get("first_name").and_then(|v| v.as_str()))
+                {
+                    s.username = uname.to_string();
+                }
+            }
+            let out_count = data
+                .get("outbounds")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            s.logs.push(format!(
+                "[INFO] [Sync] Bootstrap synced from server ({} active outbounds).",
+                out_count
+            ));
+            Ok(data)
+        }
+        Err(err) => {
+            if err.starts_with("AUTH_EXPIRED:") {
+                AuthManager::clear_session();
+                let mut s = state.lock().await;
+                s.is_authenticated = false;
+                s.auth_token = None;
+                s.subscription_token = None;
+            }
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn ping_server_node(host: String, port: u16) -> Result<i64, String> {
+    Ok(AuthManager::ping_tcp(&host, port).await)
+}
+
+#[tauri::command]
+pub async fn donate_user_outbound(
+    uri: String,
+    name: Option<String>,
+    note: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let token = {
+        let s = state.lock().await;
+        s.subscription_token.clone()
+    }
+    .ok_or("ابتدا وارد حساب کاربری خود شوید.".to_string())?;
+
+    let res = AuthManager::donate_outbound(&token, &uri, name.as_deref(), note.as_deref()).await?;
+    let mut s = state.lock().await;
+    s.logs.push("[INFO] [Donate] Outbound submitted for admin approval.".to_string());
+    Ok(res)
+}
+
+#[tauri::command]
+pub async fn get_my_donated_outbounds(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let token = {
+        let s = state.lock().await;
+        s.subscription_token.clone()
+    }
+    .ok_or("ابتدا وارد حساب کاربری خود شوید.".to_string())?;
+
+    AuthManager::get_my_donations(&token).await
+}
+
+#[tauri::command]
+pub async fn save_personal_configs(configs_json: String) -> Result<(), String> {
+    let path = AuthManager::personal_configs_path();
+    std::fs::write(path, configs_json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn load_personal_configs() -> Result<String, String> {
+    let path = AuthManager::personal_configs_path();
+    if !path.exists() {
+        return Ok("[]".to_string());
+    }
+    std::fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_selected_outbound(
+    outbound_id: Option<String>,
+    personal_uri: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ClientState, String> {
+    let mut s = state.lock().await;
+    s.selected_outbound_id = outbound_id.clone();
+    s.selected_personal_uri = personal_uri;
+    s.logs.push(format!(
+        "[CONFIG] Active outbound updated: {:?}",
+        outbound_id.as_deref().unwrap_or("auto")
+    ));
+    Ok(s.clone())
 }

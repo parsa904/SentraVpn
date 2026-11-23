@@ -131,14 +131,23 @@ async fn main() -> anyhow::Result<()> {
         config.admin_chat_id,
     );
 
-    let app = api::create_router(pool, anomaly_detector, bot_for_api, config.admin_chat_id, config.host.clone());
+    let app = api::create_router(
+        pool,
+        anomaly_detector,
+        bot_for_api,
+        config.admin_chat_id,
+        config.host.clone(),
+        config.bot_username.clone(),
+    );
 
     // 6. Bind TCP listener on configured address (port 8080)
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
     info!("🚀 Sentra Core REST API running on http://{}", addr);
-    info!("👉 Auth Code Login:     POST http://{}/api/v1/auth/code-login", addr);
+    info!("👉 Auth Code Login:       POST http://{}/api/v1/auth/code-login", addr);
+    info!("👉 Client Bootstrap:      GET  http://{}/api/v1/client/bootstrap", addr);
     info!("👉 Client Dynamic Config: POST http://{}/api/v1/client/config", addr);
+    info!("👉 Donate Outbound:       POST http://{}/api/v1/client/outbounds/donate", addr);
     info!("👉 V2Ray/Sing-box Sub:    GET  http://{}/api/v1/sub/{{token}}", addr);
     info!("👉 System Health:         GET  http://{}/health", addr);
 

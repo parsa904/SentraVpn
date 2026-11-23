@@ -5,7 +5,7 @@
   "identifier": "com.sentra.connect",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:3000",
     "beforeDevCommand": "",
     "beforeBuildCommand": "npm run build"
   },
@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "Sentra Connect",
-        "width": 440,
-        "height": 700,
+        "width": 1080,
+        "height": 720,
         "minWidth": 380,
         "minHeight": 600,
         "resizable": true,
@@ -23,11 +23,11 @@
         "center": true,
         "decorations": true,
         "transparent": false,
-        "theme": "Light"
+        "theme": "Dark"
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: blob: https: http:; font-src 'self' https: data:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; connect-src 'self' http://116.203.188.124:8080 http://116.203.188.124:* https://116.203.188.124:* https://head.cyberservice.sbs:8443 ipc: http://ipc.localhost tauri://localhost http://tauri.localhost https://tauri.localhost;"
+      "csp": "default-src 'self'; img-src 'self' data: blob: https: http:; font-src 'self' https: data:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline'; connect-src 'self' http://116.203.188.124:8080 http://116.203.188.124:* https://116.203.188.124:* https://head.cyberservice.sbs:8443 https: http: ipc: http://ipc.localhost tauri://localhost http://tauri.localhost https://tauri.localhost;"
     }
   },
   "bundle": {
@@ -49,6 +49,9 @@
       "binaries/sing-box"
     ],
     "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
       "nsis": {
         "installMode": "perMachine",
         "displayLanguageSelector": false,

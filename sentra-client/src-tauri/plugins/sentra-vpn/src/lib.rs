@@ -35,6 +35,21 @@ async fn get_status<R: Runtime>(app: AppHandle<R>) -> Result<VpnStatusResponse, 
     app.sentra_vpn().get_status()
 }
 
+#[tauri::command]
+async fn save_session<R: Runtime>(app: AppHandle<R>, payload: String) -> Result<SessionSaveResponse, String> {
+    app.sentra_vpn().save_session(payload)
+}
+
+#[tauri::command]
+async fn load_session<R: Runtime>(app: AppHandle<R>) -> Result<SessionLoadResponse, String> {
+    app.sentra_vpn().load_session()
+}
+
+#[tauri::command]
+async fn clear_session<R: Runtime>(app: AppHandle<R>) -> Result<SessionSaveResponse, String> {
+    app.sentra_vpn().clear_session()
+}
+
 pub trait SentraVpnPluginExt<R: Runtime> {
     fn sentra_vpn(&self) -> &SentraVpn<R>;
 }
@@ -47,7 +62,14 @@ impl<R: Runtime, T: Manager<R>> SentraVpnPluginExt<R> for T {
 
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     Builder::new("sentra-vpn")
-        .invoke_handler(tauri::generate_handler![connect, disconnect, get_status])
+        .invoke_handler(tauri::generate_handler![
+            connect,
+            disconnect,
+            get_status,
+            save_session,
+            load_session,
+            clear_session
+        ])
         .setup(|app, _api| {
             #[cfg(mobile)]
             let sentra_vpn = mobile::init(app, _api)?;

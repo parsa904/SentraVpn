@@ -8,6 +8,7 @@ pub struct Config {
     pub database_url: String,
     pub teloxide_token: Option<String>,
     pub teloxide_proxy: Option<String>,
+    pub bot_username: String,
     pub admin_chat_id: i64,
     pub pro_subscription_price: i64,
 }
@@ -37,6 +38,13 @@ impl Config {
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty());
 
+        let bot_username = env::var("BOT_USERNAME")
+            .or_else(|_| env::var("TELEGRAM_BOT_USERNAME"))
+            .ok()
+            .map(|u| u.trim().trim_start_matches('@').to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_default();
+
         let admin_chat_id = env::var("ADMIN_CHAT_ID")
             .ok()
             .and_then(|id| id.parse::<i64>().ok())
@@ -54,6 +62,7 @@ impl Config {
             database_url,
             teloxide_token,
             teloxide_proxy,
+            bot_username,
             admin_chat_id,
             pro_subscription_price,
         }

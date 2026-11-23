@@ -2608,3 +2608,165 @@ pub async fn handle_generate_warp_callback(
 
     Ok(())
 }
+
+/// Admin approves a user-donated outbound with +7, +15, or +30 days subscription reward
+pub async fn handle_donated_outbound_approve(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+    admin_chat_id: i64,
+    outbound_id: i64,
+    reward_days: i64,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone())
+            .text("⛔ دسترسی غیرمجاز!")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+
+    let existing = Repository::get_donated_outbound_by_id(pool, outbound_id).await?;
+    if let Some(ref ob) = existing {
+        if ob.status == "active" && ob.reward_granted == 1 {
+            bot.answer_callback_query(q.id.clone())
+                .text("⚠️ این اوتباند قبلاً تایید و پاداش آن اعمال شده است.")
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+    }
+
+    let (ob, donor_opt, sub_opt) =
+        Repository::approve_donated_outbound_with_reward_days(pool, outbound_id, reward_days).await?;
+
+    // Immediately sync server bridge & client pool so all users see this outbound
+    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
+
+    let donor_name = donor_opt
+        .as_ref()
+        .and_then(|u| u.username.clone())
+        .or_else(|| donor_opt.as_ref().map(|u| u.first_name.clone()))
+        .unwrap_or_else(|| format!("کاربر #{}", ob.donor_user_id.unwrap_or(0)));
+
+    // Notify donor on Telegram if their account is linked
+    if let Some(ref donor) = donor_opt {
+        if let Some(tg_id) = donor.telegram_id {
+            let new_exp = sub_opt
+                .as_ref()
+                .map(|s| s.expires_at.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "تمدید شد".to_string());
+            let notify_msg = format!(
+                "🎉 <b>تبریک! اوتباند اهدایی شما تایید شد</b>\n\n\
+                 🌐 نام سرور: <code>{}</code> ({})\n\
+                 🎁 پاداش فعال‌شده: <b>+{} روز اشتراک ویژه Sentra Pro</b>\n\
+                 📅 اعتبار جدید اشتراک: <code>{}</code>\n\n\
+                 سپاس از همراهی و حمایت شما از شبکه آزاد سنترا 💚",
+                ob.tag,
+                ob.protocol.to_uppercase(),
+                reward_days,
+                new_exp
+            );
+            let _ = bot
+                .send_message(ChatId(tg_id), notify_msg)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(back_to_main_inline_keyboard())
+                .await;
+        }
+    }
+
+    let admin_updated = format!(
+        "✅ <b>اوتباند اهدایی #{} تایید و در شبکه فعال شد!</b>\n\n\
+         👤 اهداکننده: <code>{}</code>\n\
+         🌐 سرور: <code>{}</code> (<code>{}:{}</code>)\n\
+         🔌 پروتکل: <b>{}</b> | پینگ: <b>{} ms</b>\n\
+         🎁 پاداش اعمال‌شده: <b>+{} روز اشتراک ویژه</b>\n\
+         🔄 وضعیت: به لیست زنده کلاینت‌ها (ویندوز و اندروید) اضافه شد.",
+        ob.id,
+        donor_name,
+        ob.tag,
+        ob.server_address,
+        ob.server_port,
+        ob.protocol.to_uppercase(),
+        ob.latency_ms,
+        reward_days
+    );
+
+    if let Some(msg) = &q.message {
+        let _ = bot
+            .edit_message_text(msg.chat().id, msg.id(), admin_updated)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(back_to_admin_inline_keyboard())
+            .await;
+    }
+
+    bot.answer_callback_query(q.id.clone())
+        .text(format!("✅ تایید شد (+{} روز اشتراک)", reward_days))
+        .await?;
+
+    Ok(())
+}
+
+/// Admin rejects a user-donated outbound
+pub async fn handle_donated_outbound_reject(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+    admin_chat_id: i64,
+    outbound_id: i64,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone())
+            .text("⛔ دسترسی غیرمجاز!")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+
+    let (ob, donor_opt) = Repository::reject_donated_outbound(
+        pool,
+        outbound_id,
+        "توسط مدیر سیستم تایید نشد (عدم احراز شرایط کیفیت یا پایداری).",
+    )
+    .await?;
+
+    if let Some(ref donor) = donor_opt {
+        if let Some(tg_id) = donor.telegram_id {
+            let notify_msg = format!(
+                "❌ <b>اوتباند اهدایی شما تایید نشد</b>\n\n\
+                 🌐 سرور: <code>{}</code>\n\
+                 📝 دلیل: عدم احراز شرایط کیفیت یا پایداری لازم.\n\
+                 می‌توانید کانفیگ پرسرعت و پایدار دیگری از داخل اپلیکیشن ارسال نمایید.",
+                ob.tag
+            );
+            let _ = bot
+                .send_message(ChatId(tg_id), notify_msg)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(back_to_main_inline_keyboard())
+                .await;
+        }
+    }
+
+    let admin_updated = format!(
+        "❌ <b>اوتباند اهدایی #{} رد شد.</b>\n\n\
+         🌐 سرور: <code>{}</code> (<code>{}:{}</code>)\n\
+         وضعیت در حساب کاربر به «رد شده» تغییر یافت.",
+        ob.id, ob.tag, ob.server_address, ob.server_port
+    );
+
+    if let Some(msg) = &q.message {
+        let _ = bot
+            .edit_message_text(msg.chat().id, msg.id(), admin_updated)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(back_to_admin_inline_keyboard())
+            .await;
+    }
+
+    bot.answer_callback_query(q.id.clone())
+        .text("❌ اوتباند رد شد.")
+        .await?;
+
+    Ok(())
+}

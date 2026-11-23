@@ -93,6 +93,8 @@ pub struct ClientState {
     pub selected_mode: String,
     pub selected_protocol: String,
     pub selected_location: String,
+    pub selected_outbound_id: Option<String>,
+    pub selected_personal_uri: Option<String>,
     pub routing_mode: String, // "tunnel" | "system_proxy" | "proxy"
     pub local_socks5_port: u16,
     pub local_http_port: u16,
@@ -114,21 +116,23 @@ impl Default for ClientState {
             is_authenticated: false,
             auth_token: None,
             subscription_token: None,
-            tier: "Sentra Lite".to_string(),
-            username: "مهمان".to_string(),
-            remaining_bytes: 10_737_418_240, // 10 GB default
+            tier: String::new(),
+            username: String::new(),
+            remaining_bytes: 0,
             expires_at: None,
             status: ConnectionStatus::Disconnected,
             selected_mode: "web_browsing".to_string(),
             selected_protocol: "openvpn_udp".to_string(),
             selected_location: "auto".to_string(),
+            selected_outbound_id: None,
+            selected_personal_uri: None,
             routing_mode: "tunnel".to_string(),
             local_socks5_port: 10808,
             local_http_port: 10809,
             use_warp: false,
-            sandbox_loopback: true, // Enabled for zero-cost testing
+            sandbox_loopback: false,
             split_tunneling: true,
-            tun_mode: false, // Default to System Proxy mode (Windows safe unprivileged execution)
+            tun_mode: false,
             kill_switch: false,
             anti_dpi: AntiDpiSettings::default(),
             dns_config: DnsConfig::default(),
@@ -136,9 +140,6 @@ impl Default for ClientState {
             metrics: TelemetryMetrics::default(),
             logs: vec![
                 "[INFO] [Core] Sentra Connect engine initialized.".to_string(),
-                "[INFO] [Mode] Defaulting to System Proxy mode (Kernel TUN requires Administrator).".to_string(),
-                "[INFO] [Anti-DPI] Laboratory ready with Normal, Severe Filtering & National presets.".to_string(),
-                "[INFO] [Sandbox] Local loopback sandbox ready on 127.0.0.1:10801-10804.".to_string(),
             ],
         }
     }

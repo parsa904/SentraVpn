@@ -54,22 +54,40 @@ impl AuthManager {
             .map_err(|e| format!("خطا در ساخت کلاینت ارتباطی HTTP: {}", e))
     }
 
-    /// Return the path to the persisted session file
+    /// Return OS-safe persistent application data directory (%APPDATA%/com.sentra.connect on Windows)
+    pub fn app_data_dir() -> PathBuf {
+        let base = if cfg!(target_os = "windows") {
+            std::env::var_os("APPDATA")
+                .or_else(|| std::env::var_os("LOCALAPPDATA"))
+                .map(PathBuf::from)
+        } else {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+                })
+        };
+
+        let app_dir = base
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .join("com.sentra.connect");
+        let _ = fs::create_dir_all(&app_dir);
+        app_dir
+    }
+
+    /// Return the path to the persisted session file in OS AppData
     pub fn session_file_path() -> PathBuf {
-        let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let app_dir = base_dir.join(".sentra");
-        if !app_dir.exists() {
-            let _ = fs::create_dir_all(&app_dir);
-        }
-        app_dir.join("session.json")
+        Self::app_data_dir().join("session.json")
+    }
+
+    /// Return the path to persisted personal configs file
+    pub fn personal_configs_path() -> PathBuf {
+        Self::app_data_dir().join("personal_configs.json")
     }
 
     /// Return persistent unique device identifier for this client instance
     pub fn get_or_create_device_id() -> String {
-        let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let app_dir = base_dir.join(".sentra");
-        let _ = fs::create_dir_all(&app_dir);
-        let path = app_dir.join("device_id.txt");
+        let path = Self::app_data_dir().join("device_id.txt");
         if let Ok(id) = fs::read_to_string(&path) {
             let trimmed = id.trim();
             if !trimmed.is_empty() {
@@ -82,32 +100,44 @@ impl AuthManager {
         new_id
     }
 
-    /// Load persisted session from disk if available
+    /// Load persisted session from OS AppData (migrating legacy .sentra/session.json if present)
     pub fn load_saved_session() -> Option<SessionData> {
         let path = Self::session_file_path();
-        if !path.exists() {
-            return None;
+        if path.exists() {
+            let content = fs::read_to_string(path).ok()?;
+            return serde_json::from_str::<SessionData>(&content).ok();
         }
-
-        let content = fs::read_to_string(path).ok()?;
-        serde_json::from_str::<SessionData>(&content).ok()
+        // Migrate legacy relative .sentra/session.json once if present
+        let legacy = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".sentra")
+            .join("session.json");
+        if legacy.exists() {
+            if let Ok(content) = fs::read_to_string(&legacy) {
+                if let Ok(sess) = serde_json::from_str::<SessionData>(&content) {
+                    let _ = Self::save_session(&sess);
+                    return Some(sess);
+                }
+            }
+        }
+        None
     }
 
-    /// Save session securely to disk
+    /// Save session securely to OS AppData
     pub fn save_session(session: &SessionData) -> Result<(), String> {
         let path = Self::session_file_path();
         let content = serde_json::to_string_pretty(session).map_err(|e| e.to_string())?;
         fs::write(path, content).map_err(|e| e.to_string())?;
-        info!("Saved active user session locally.");
+        info!("Saved active user session persistently to AppData.");
         Ok(())
     }
 
-    /// Clear persisted session upon logout
+    /// Clear persisted session upon explicit logout or revocation
     pub fn clear_session() {
         let path = Self::session_file_path();
         if path.exists() {
             let _ = fs::remove_file(path);
-            info!("Local session file cleared.");
+            info!("Local persistent session cleared.");
         }
     }
 
@@ -473,63 +503,144 @@ impl AuthManager {
                     }
                 }
 
-                // Check if user entered a known sandbox testing code
-                if clean_code == "12345678" || clean_code == "88888888" || clean_code == "99999999" {
-                    info!("Activating Local Sandbox Session for developer test code [{}]...", clean_code);
-                    let session = Self::create_sandbox_session(clean_code);
-                    let _ = Self::save_session(&session);
-                    return Ok(session);
-                }
-
                 Err(format!("کد ورود نامعتبر است یا منقضی شده است (HTTP {}).", status))
             }
             None => {
                 let err_msg = last_err.map(|e| e.to_string()).unwrap_or_else(|| "Network unreachable".to_string());
                 warn!("Could not reach any Sentra Core backend ({}).", err_msg);
-
-                // Development sandbox fallback for test codes
-                if clean_code == "12345678" || clean_code == "88888888" || clean_code == "99999999" {
-                    info!("Offline mode: Activating Local Sandbox Session for developer test code [{}]...", clean_code);
-                    let session = Self::create_sandbox_session(clean_code);
-                    let _ = Self::save_session(&session);
-                    return Ok(session);
-                }
-
-                Err("ارتباط با هیچ‌یک از سرورهای پشتیبان برقرار نشد. لطفاً اتصال اینترنت خود را بررسی نمایید.".to_string())
+                Err("ارتباط با سرور سنترا برقرار نشد. لطفاً اتصال اینترنت خود را بررسی نمایید.".to_string())
             }
         }
     }
 
-    /// Helper to generate instant sandbox session for zero-cost local developer testing
-    fn create_sandbox_session(code: &str) -> SessionData {
-        let (tier, token, username, remaining) = match code {
-            "99999999" => (
-                "Sentra Flow+".to_string(),
-                "token_flow_sandbox_003".to_string(),
-                "تستر اختصاصی Flow+".to_string(),
-                1_099_511_627_776, // 1 TB
-            ),
-            "88888888" => (
-                "Sentra Pro".to_string(),
-                "token_pro_sandbox_002".to_string(),
-                "تستر حرفه‌ای Pro".to_string(),
-                161_061_273_600, // 150 GB
-            ),
-            _ => (
-                "Sentra Lite".to_string(),
-                "token_lite_sandbox_001".to_string(),
-                "تستر عمومی سنترا".to_string(),
-                10_737_418_240, // 10 GB
-            ),
-        };
+    /// Fetch live user profile, subscription, devices, and ALL active outbounds from /api/v1/client/bootstrap
+    pub async fn fetch_bootstrap(subscription_token: &str) -> Result<serde_json::Value, String> {
+        let client = Self::build_http_client()?;
+        let mut last_err = String::new();
 
-        SessionData {
-            auth_token: format!("sandbox_jwt_{}", token),
-            subscription_token: token,
-            tier,
-            username,
-            remaining_bytes: remaining,
-            expires_at: Some("2026-12-31T23:59:59Z".to_string()),
+        for base_url in get_backend_urls() {
+            let url = format!("{}/api/v1/client/bootstrap", base_url);
+            match client
+                .get(&url)
+                .header("X-Subscription-Token", subscription_token)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let data: serde_json::Value = resp
+                        .json()
+                        .await
+                        .map_err(|e| format!("خطا در پردازش پاسخ سرور: {}", e))?;
+                    return Ok(data);
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if status.as_u16() == 401 || status.as_u16() == 403 || status.as_u16() == 404 {
+                        return Err(format!("AUTH_EXPIRED: {}", body));
+                    }
+                    last_err = format!("HTTP {} از {}", status, base_url);
+                }
+                Err(e) => {
+                    last_err = format!("{} ({})", base_url, e);
+                }
+            }
+        }
+
+        Err(format!("خطا در همگام‌سازی اطلاعات از سرور: {}", last_err))
+    }
+
+    /// Submit a personal proxy URI as a community-donated outbound for Admin Telegram review
+    pub async fn donate_outbound(
+        subscription_token: &str,
+        uri: &str,
+        name: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let client = Self::build_http_client()?;
+        let payload = json!({
+            "uri": uri,
+            "name": name,
+            "note": note,
+        });
+
+        let mut last_err = String::new();
+        for base_url in get_backend_urls() {
+            let url = format!("{}/api/v1/client/outbounds/donate", base_url);
+            match client
+                .post(&url)
+                .header("X-Subscription-Token", subscription_token)
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    return resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .map_err(|e| format!("خطا در پردازش پاسخ سرور: {}", e));
+                }
+                Ok(resp) => {
+                    let body = resp.text().await.unwrap_or_default();
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(m) = v.get("message").or_else(|| v.get("error")).and_then(|x| x.as_str()) {
+                            return Err(m.to_string());
+                        }
+                    }
+                    return Err(format!("خطا در ثبت اوتباند اهدایی (HTTP {}).", resp.status()));
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+        }
+
+        Err(format!("عدم ارتباط با سرور سنترا: {}", last_err))
+    }
+
+    /// Fetch the authenticated user's submitted outbound donations and reward status
+    pub async fn get_my_donations(subscription_token: &str) -> Result<serde_json::Value, String> {
+        let client = Self::build_http_client()?;
+        let mut last_err = String::new();
+
+        for base_url in get_backend_urls() {
+            let url = format!("{}/api/v1/client/outbounds/my-donations", base_url);
+            match client
+                .get(&url)
+                .header("X-Subscription-Token", subscription_token)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    return resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .map_err(|e| format!("خطا در پردازش پاسخ سرور: {}", e));
+                }
+                Ok(resp) => {
+                    last_err = format!("HTTP {}", resp.status());
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+        }
+
+        Err(format!("خطا در دریافت لیست اوتباندهای اهدایی: {}", last_err))
+    }
+
+    /// Measure real TCP connect latency to a target host:port in milliseconds (-1 if unreachable)
+    pub async fn ping_tcp(host: &str, port: u16) -> i64 {
+        let target = format!("{}:{}", host.trim(), port);
+        let start = std::time::Instant::now();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(3000),
+            tokio::net::TcpStream::connect(&target),
+        )
+        .await
+        {
+            Ok(Ok(_)) => start.elapsed().as_millis().max(1) as i64,
+            _ => -1,
         }
     }
 }

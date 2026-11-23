@@ -251,23 +251,28 @@ class SentraVpnService : VpnService(), PlatformInterface {
     private fun startTelemetryTicker() {
         Thread {
             var counter = 0L
+            var prevRx = android.net.TrafficStats.getTotalRxBytes().coerceAtLeast(0L)
+            var prevTx = android.net.TrafficStats.getTotalTxBytes().coerceAtLeast(0L)
             while (isServiceRunning.get()) {
                 try {
                     Thread.sleep(1000)
                     counter++
                     uptimeSeconds = counter
 
-                    // Realistic telemetry for mobile network (12-24 MB/s download, 1.8-3.8 MB/s upload)
-                    val dl = (12_500_000L + (Math.random() * 11_500_000).toLong())
-                    val ul = (1_800_000L + (Math.random() * 2_000_000).toLong())
+                    val curRx = android.net.TrafficStats.getTotalRxBytes().coerceAtLeast(0L)
+                    val curTx = android.net.TrafficStats.getTotalTxBytes().coerceAtLeast(0L)
+                    val dl = (curRx - prevRx).coerceAtLeast(0L)
+                    val ul = (curTx - prevTx).coerceAtLeast(0L)
+                    prevRx = curRx
+                    prevTx = curTx
 
                     downloadSpeedBps = dl
                     uploadSpeedBps = ul
                     totalDownBytes += dl
                     totalUpBytes += ul
 
-                    // Periodic broadcast to Tauri UI
-                    SentraVpnPlugin.broadcastSpeed(dl, ul, totalDownBytes, totalUpBytes, uptimeSeconds)
+                    // Broadcast real traffic throughput to Tauri UI
+                    SentraVpnPlugin.broadcastSpeed(dl, ul, totalDownBytes, totalUpBytes, uptimeSeconds, 0)
 
                 } catch (e: InterruptedException) {
                     break

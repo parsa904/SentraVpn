@@ -397,6 +397,9 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN jitter_ms INTEGER NOT NULL DEFAULT 0").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN last_online_at DATETIME").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN allocation_mode TEXT NOT NULL DEFAULT 'auto'").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN reward_days INTEGER NOT NULL DEFAULT 0").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN user_note TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN approved_at DATETIME").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_speed_score ON donated_outbounds(speed_score)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_allow_static ON donated_outbounds(allow_static_ip)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_allow_web ON donated_outbounds(allow_web)").execute(pool).await;
@@ -3365,51 +3368,353 @@ impl Repository {
             });
         }
 
-        // Add Auto option as the very first choice
+        // Add Auto option as the very first choice only when at least one real active node exists
         let mut final_locations = Vec::new();
-        final_locations.push(crate::models::ActiveLocationInfo {
-            code: "auto".to_string(),
-            name: "⚡️ انتخاب خودکار سریع‌ترین لوکیشن (Auto)".to_string(),
-            country_code: "AUTO".to_string(),
-            flag: "⚡️".to_string(),
-            ping_ms: best_auto_ping,
-            active_nodes: total_active_nodes.max(1),
-            is_auto: true,
-        });
-        final_locations.extend(locations);
-
-        // If no locations configured yet in local dev environment, provide default fast locations
-        if final_locations.len() <= 1 {
+        if total_active_nodes > 0 {
             final_locations.push(crate::models::ActiveLocationInfo {
-                code: "DE".to_string(),
-                name: "آلمان 🇩🇪".to_string(),
-                country_code: "DE".to_string(),
-                flag: "🇩🇪".to_string(),
-                ping_ms: 48,
-                active_nodes: 3,
-                is_auto: false,
+                code: "auto".to_string(),
+                name: "انتخاب خودکار سریع‌ترین سرور".to_string(),
+                country_code: "AUTO".to_string(),
+                flag: "⚡".to_string(),
+                ping_ms: best_auto_ping,
+                active_nodes: total_active_nodes,
+                is_auto: true,
             });
-            final_locations.push(crate::models::ActiveLocationInfo {
-                code: "NL".to_string(),
-                name: "هلند 🇳🇱".to_string(),
-                country_code: "NL".to_string(),
-                flag: "🇳🇱".to_string(),
-                ping_ms: 62,
-                active_nodes: 2,
-                is_auto: false,
-            });
-            final_locations.push(crate::models::ActiveLocationInfo {
-                code: "FI".to_string(),
-                name: "فنلاند 🇫🇮".to_string(),
-                country_code: "FI".to_string(),
-                flag: "🇫🇮".to_string(),
-                ping_ms: 70,
-                active_nodes: 1,
-                is_auto: false,
-            });
+            final_locations.extend(locations);
         }
 
         Ok(final_locations)
+    }
+
+    /// Return all live active outbounds registered in SQLite (Telegram admin nodes + approved donated nodes + non-loopback outbounds)
+    pub async fn get_all_live_client_outbounds(
+        pool: &DbPool,
+    ) -> Result<Vec<crate::models::ClientOutboundInfo>, CoreError> {
+        let mut results: Vec<crate::models::ClientOutboundInfo> = Vec::new();
+
+        // 1. All active nodes from donated_outbounds (includes both Telegram admin official outbounds & approved user donations)
+        let donated_rows = sqlx::query_as::<_, DonatedOutbound>(
+            r#"
+            SELECT * FROM donated_outbounds
+            WHERE status = 'active'
+            ORDER BY is_official DESC, health_score DESC, latency_ms ASC, id DESC
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        for row in donated_rows {
+            let code = if row.country_code.trim().is_empty() {
+                "XX".to_string()
+            } else {
+                row.country_code.to_uppercase()
+            };
+            let cname = if row.country_name.trim().is_empty() || row.country_name == "Unknown" {
+                crate::outbound_analyzer::OutboundAnalyzer::country_code_to_name(&code)
+            } else {
+                row.country_name.clone()
+            };
+            let flag = crate::outbound_analyzer::OutboundAnalyzer::country_code_to_flag(&code);
+            let display_name = row
+                .label
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(row.tag.trim())
+                .to_string();
+
+            results.push(crate::models::ClientOutboundInfo {
+                id: format!("node-{}", row.id),
+                db_id: row.id,
+                name: if display_name.is_empty() {
+                    format!("{} - {}", row.protocol.to_uppercase(), code)
+                } else {
+                    display_name
+                },
+                tag: row.tag,
+                protocol: row.protocol,
+                category: row.assigned_tier,
+                country_code: code,
+                country_name: cname,
+                flag,
+                latency_ms: if row.latency_ms > 0 && row.latency_ms < 9999 {
+                    row.latency_ms
+                } else {
+                    0
+                },
+                health_score: row.health_score,
+                is_official: row.is_official == 1,
+                is_online: row.status == "active" && row.fail_count < 5,
+                server_address: row.server_address,
+                server_port: row.server_port,
+                uri: row.raw_link,
+            });
+        }
+
+        // 2. Also include any non-loopback active rows from legacy outbounds table (excluding gaming)
+        let base_rows = sqlx::query_as::<_, Outbound>(
+            r#"
+            SELECT * FROM outbounds
+            WHERE is_active = 1
+              AND server_address != '127.0.0.1'
+              AND mode_category != 'gaming'
+            ORDER BY weight DESC, id DESC
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        for ob in base_rows {
+            let duplicate = results
+                .iter()
+                .any(|r| r.server_address.eq_ignore_ascii_case(&ob.server_address) && r.server_port == ob.server_port);
+            if duplicate {
+                continue;
+            }
+            let code = if ob.country_code.trim().is_empty() {
+                "XX".to_string()
+            } else {
+                ob.country_code.to_uppercase()
+            };
+            results.push(crate::models::ClientOutboundInfo {
+                id: format!("core-{}", ob.id),
+                db_id: ob.id,
+                name: ob.tag.clone(),
+                tag: ob.tag,
+                protocol: ob.protocol,
+                category: ob.mode_category,
+                country_code: code.clone(),
+                country_name: crate::outbound_analyzer::OutboundAnalyzer::country_code_to_name(&code),
+                flag: crate::outbound_analyzer::OutboundAnalyzer::country_code_to_flag(&code),
+                latency_ms: 0,
+                health_score: 100,
+                is_official: true,
+                is_online: true,
+                server_address: ob.server_address,
+                server_port: ob.server_port,
+                uri: None,
+            });
+        }
+
+        Ok(results)
+    }
+
+    /// Create a pending community-donated outbound submitted from the client app for admin Telegram review
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_pending_donated_outbound(
+        pool: &DbPool,
+        donor_user_id: i64,
+        tag: &str,
+        protocol: &str,
+        server_address: &str,
+        server_port: i64,
+        config_json: &str,
+        latency_ms: i64,
+        raw_link: &str,
+        country_code: &str,
+        country_name: &str,
+        fingerprint_sha256: &str,
+        user_note: Option<&str>,
+    ) -> Result<i64, CoreError> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO donated_outbounds (
+                donor_user_id, tag, protocol, server_address, server_port, config_json,
+                latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
+                reward_granted, raw_link, fingerprint_sha256, is_official, label,
+                country_code, country_name, allow_web, allow_download, allow_static_ip,
+                reward_days, user_note, last_checked_at, created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?,
+                ?, 0.0, 'web_browsing', 100, 'pending', 0,
+                0, ?, ?, 0, ?,
+                ?, ?, 1, 1, 0,
+                0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(donor_user_id)
+        .bind(tag)
+        .bind(protocol)
+        .bind(server_address)
+        .bind(server_port)
+        .bind(config_json)
+        .bind(latency_ms)
+        .bind(raw_link)
+        .bind(fingerprint_sha256)
+        .bind(tag)
+        .bind(country_code)
+        .bind(country_name)
+        .bind(user_note)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(row.try_get("id").unwrap_or(0))
+    }
+
+    /// Fetch authenticated user's submitted donated outbounds and their review status / reward days
+    pub async fn get_user_donated_outbounds(
+        pool: &DbPool,
+        user_id: i64,
+    ) -> Result<Vec<crate::models::MyDonatedOutboundItem>, CoreError> {
+        let rows = sqlx::query_as::<_, DonatedOutbound>(
+            r#"
+            SELECT * FROM donated_outbounds
+            WHERE donor_user_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 50
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+
+        let items = rows
+            .into_iter()
+            .map(|r| {
+                let api_status = match r.status.as_str() {
+                    "active" => "approved".to_string(),
+                    other => other.to_string(),
+                };
+                let code = if r.country_code.trim().is_empty() {
+                    "XX".to_string()
+                } else {
+                    r.country_code.to_uppercase()
+                };
+                let name = r
+                    .label
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(r.tag.trim())
+                    .to_string();
+                crate::models::MyDonatedOutboundItem {
+                    id: r.id,
+                    name,
+                    protocol: r.protocol,
+                    server_address: r.server_address,
+                    server_port: r.server_port,
+                    country_code: code.clone(),
+                    flag: crate::outbound_analyzer::OutboundAnalyzer::country_code_to_flag(&code),
+                    latency_ms: r.latency_ms,
+                    status: api_status,
+                    reward_days: r.reward_days,
+                    user_note: r.user_note,
+                    rejection_reason: r.rejection_reason,
+                    created_at: r.created_at.to_rfc3339(),
+                    approved_at: r.approved_at.map(|d| d.to_rfc3339()),
+                }
+            })
+            .collect();
+
+        Ok(items)
+    }
+
+    /// Approve a community-donated outbound, activate it for all users, and reward donor with +N subscription days
+    pub async fn approve_donated_outbound_with_reward_days(
+        pool: &DbPool,
+        outbound_id: i64,
+        reward_days: i64,
+    ) -> Result<(DonatedOutbound, Option<User>, Option<Subscription>), CoreError> {
+        let ob = sqlx::query_as::<_, DonatedOutbound>(
+            r#"
+            UPDATE donated_outbounds
+            SET status = 'active',
+                reward_days = ?,
+                reward_granted = 1,
+                allow_web = 1,
+                allow_download = 1,
+                approved_at = CURRENT_TIMESTAMP,
+                last_online_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            RETURNING *
+            "#,
+        )
+        .bind(reward_days)
+        .bind(outbound_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| CoreError::BadRequest("اوتباند مورد نظر یافت نشد.".to_string()))?;
+
+        let mut donor_user = None;
+        let mut updated_sub = None;
+
+        if let Some(uid) = ob.donor_user_id {
+            donor_user = Self::get_user_by_id(pool, uid).await.unwrap_or(None);
+
+            // Extend or upgrade donor's subscription by reward_days
+            if let Some(sub) = Self::get_subscription_by_user_id(pool, uid).await? {
+                let now = Utc::now();
+                let base_expiry = if sub.expires_at > now { sub.expires_at } else { now };
+                let new_expiry = base_expiry + Duration::days(reward_days);
+                let new_tier = if sub.tier == "Sentra Flow+" {
+                    "Sentra Flow+"
+                } else {
+                    "Sentra Pro"
+                };
+                let new_traffic_limit = sub.traffic_limit_bytes.max(161_061_273_600); // at least 150 GB
+                let new_max_devices = sub.max_concurrent_devices.max(3);
+
+                let sub_after = sqlx::query_as::<_, Subscription>(
+                    r#"
+                    UPDATE subscriptions
+                    SET tier = ?,
+                        status = 'active',
+                        traffic_limit_bytes = ?,
+                        max_concurrent_devices = ?,
+                        expires_at = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    RETURNING *
+                    "#,
+                )
+                .bind(new_tier)
+                .bind(new_traffic_limit)
+                .bind(new_max_devices)
+                .bind(new_expiry)
+                .bind(sub.id)
+                .fetch_one(pool)
+                .await?;
+                updated_sub = Some(sub_after);
+            }
+        }
+
+        Ok((ob, donor_user, updated_sub))
+    }
+
+    /// Reject a community-donated outbound
+    pub async fn reject_donated_outbound(
+        pool: &DbPool,
+        outbound_id: i64,
+        reason: &str,
+    ) -> Result<(DonatedOutbound, Option<User>), CoreError> {
+        let ob = sqlx::query_as::<_, DonatedOutbound>(
+            r#"
+            UPDATE donated_outbounds
+            SET status = 'rejected',
+                rejection_reason = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            RETURNING *
+            "#,
+        )
+        .bind(reason)
+        .bind(outbound_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| CoreError::BadRequest("اوتباند مورد نظر یافت نشد.".to_string()))?;
+
+        let donor_user = if let Some(uid) = ob.donor_user_id {
+            Self::get_user_by_id(pool, uid).await.unwrap_or(None)
+        } else {
+            None
+        };
+
+        Ok((ob, donor_user))
     }
 
     /// Save or update subscription source URL in database
