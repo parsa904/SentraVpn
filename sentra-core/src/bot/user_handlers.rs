@@ -49,7 +49,7 @@ pub async fn handle_user_back_to_main_callback(
     clear_user_state(tid).await;
     crate::bot::admin_handlers::clear_all_admin_states(tid).await;
 
-    let is_admin = admin_chat_id != 0 && tid == admin_chat_id;
+    let is_admin = crate::bot::admin_handlers::is_authorized_admin(tid, admin_chat_id);
 
     let _ = bot
         .answer_callback_query(q.id.clone())

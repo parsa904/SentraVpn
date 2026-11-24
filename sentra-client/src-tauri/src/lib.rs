@@ -9,12 +9,96 @@ pub mod telemetry;
 pub mod vpn_manager;
 
 use auth::AuthManager;
-use state::{AppState, ClientState};
+use state::{AppState, ClientState, ConnectionStatus};
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::Mutex;
 use tracing::info;
 use vpn_manager::VpnManager;
+
+#[cfg(desktop)]
+fn setup_desktop_tray(
+    app: &tauri::App,
+    vpn_manager: Arc<VpnManager>,
+    app_state: AppState,
+) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let open_item = MenuItem::with_id(app, "tray_open", "Open Sentra", true, None::<&str>)?;
+    let toggle_item =
+        MenuItem::with_id(app, "tray_toggle", "Connect / Disconnect", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "tray_quit", "Quit", true, None::<&str>)?;
+
+    let menu = Menu::with_items(app, &[&open_item, &toggle_item, &quit_item])?;
+
+    let mut builder = TrayIconBuilder::with_id("sentra-tray")
+        .menu(&menu)
+        .tooltip("Sentra Connect")
+        .show_menu_on_left_click(false)
+        .on_menu_event(move |app_handle, event| match event.id.as_ref() {
+            "tray_open" => {
+                if let Some(win) = app_handle.get_webview_window("main") {
+                    let _ = win.unminimize();
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+            "tray_toggle" => {
+                let vpn = Arc::clone(&vpn_manager);
+                let state = Arc::clone(&app_state);
+                let handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let is_active = {
+                        let s = state.lock().await;
+                        matches!(
+                            s.status,
+                            ConnectionStatus::Connected | ConnectionStatus::Connecting
+                        )
+                    };
+                    if is_active {
+                        let _ = vpn.stop_vpn(handle, state).await;
+                    } else {
+                        let _ = vpn.start_vpn(handle, state).await;
+                    }
+                });
+            }
+            "tray_quit" => {
+                info!("Tray Quit triggered: disconnecting VPN & resetting Windows system proxy...");
+                let vpn = Arc::clone(&vpn_manager);
+                let state = Arc::clone(&app_state);
+                let handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = vpn.stop_vpn(handle.clone(), state).await;
+                    let _ = sysproxy::disable_system_proxy();
+                    handle.exit(0);
+                });
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app_handle = tray.app_handle();
+                if let Some(win) = app_handle.get_webview_window("main") {
+                    let _ = win.unminimize();
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+
+    let _tray = builder.build(app)?;
+    Ok(())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -25,9 +109,9 @@ pub fn run() {
         )
         .init();
 
-    info!("Initializing Sentra Connect Tauri v2 Desktop Application...");
+    info!("Initializing Sentra Connect Tauri v2 Application...");
 
-    // Safe startup reset: Ensure System Proxy is clean if prior run abnormal exit
+    // Safe startup reset: Ensure System Proxy is clean if prior run terminated abnormally
     let _ = sysproxy::disable_system_proxy();
 
     let mut initial_state = ClientState::default();
@@ -41,19 +125,40 @@ pub fn run() {
         initial_state.tier = session.tier;
         initial_state.username = session.username;
         initial_state.remaining_bytes = session.remaining_bytes;
-        initial_state.logs.push("[INFO] [Auth] Restored active session from local storage.".to_string());
+        initial_state
+            .logs
+            .push("[INFO] [Auth] Restored active session from local storage.".to_string());
     }
 
     let app_state: AppState = Arc::new(Mutex::new(initial_state));
     let vpn_manager = Arc::new(VpnManager::new());
 
-    let vpn_manager_for_shutdown = Arc::clone(&vpn_manager);
-    let app_state_for_shutdown = Arc::clone(&app_state);
+    let vpn_for_tray = Arc::clone(&vpn_manager);
+    let state_for_tray = Arc::clone(&app_state);
+
+    let vpn_for_close = Arc::clone(&vpn_manager);
+    let state_for_close = Arc::clone(&app_state);
+
+    let vpn_for_exit = Arc::clone(&vpn_manager);
+    let state_for_exit = Arc::clone(&app_state);
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_sentra_vpn::init())
         .manage(app_state)
         .manage(vpn_manager)
+        .setup(move |app| {
+            #[cfg(desktop)]
+            {
+                if let Err(err) = setup_desktop_tray(app, vpn_for_tray, state_for_tray) {
+                    tracing::warn!("Failed to initialize System Tray icon: {}", err);
+                }
+            }
+            #[cfg(not(desktop))]
+            {
+                let _ = (app, vpn_for_tray, state_for_tray);
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::login_with_code,
             commands::register_with_credentials,
@@ -100,19 +205,53 @@ pub fn run() {
             commands::clear_persisted_session
         ])
         .on_window_event(move |window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                info!("Window close requested. Performing graceful VPN shutdown & interface cleanup...");
-                let _ = sysproxy::disable_system_proxy();
-                let vpn = Arc::clone(&vpn_manager_for_shutdown);
-                let state = Arc::clone(&app_state_for_shutdown);
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let vpn = Arc::clone(&vpn_for_close);
+                let state = Arc::clone(&state_for_close);
+
+                #[cfg(desktop)]
+                {
+                    let is_active = tauri::async_runtime::block_on(async {
+                        let s = state.lock().await;
+                        matches!(
+                            s.status,
+                            ConnectionStatus::Connected | ConnectionStatus::Connecting
+                        )
+                    });
+
+                    if is_active {
+                        info!("VPN is active on close request: minimizing Sentra Connect to System Tray.");
+                        api.prevent_close();
+                        let _ = window.hide();
+                        return;
+                    }
+                }
+                #[cfg(not(desktop))]
+                {
+                    let _ = api;
+                }
+
+                info!("Window close requested while disconnected. Ensuring proxy/tunnel cleanup...");
                 let handle = window.app_handle().clone();
                 tauri::async_runtime::block_on(async move {
                     let _ = vpn.stop_vpn(handle, state).await;
+                    let _ = sysproxy::disable_system_proxy();
                 });
             }
         })
         .build(tauri::generate_context!())
         .expect("error while building Sentra Connect tauri application");
 
-    app.run(|_app_handle, _event| {});
+    app.run(move |app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            info!("Application exiting: running final safe disconnect & Windows system proxy reset.");
+            let vpn = Arc::clone(&vpn_for_exit);
+            let state = Arc::clone(&state_for_exit);
+            let handle = app_handle.clone();
+            tauri::async_runtime::block_on(async move {
+                let _ = vpn.stop_vpn(handle, state).await;
+                let _ = sysproxy::disable_system_proxy();
+            });
+        }
+    });
 }

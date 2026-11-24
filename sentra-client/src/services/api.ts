@@ -8,6 +8,8 @@ import type {
   TelemetrySnapshot,
 } from '../types/sentra';
 import {
+  isNewerVersion,
+  isSafeReleaseUrl,
   parseAuthSessionResponse,
   type RawAuthApiResponse,
 } from '../utils/proxyParser';
@@ -590,7 +592,7 @@ export async function setUseWarpNative(enabled: boolean): Promise<void> {
 export async function connectVpnNative(): Promise<void> {
   if (!isTauriRuntime()) {
     throw new Error(
-      'اتصال واقعی تونل VPN فقط در نسخه نصبی ویندوز یا اندروید Sentra فعال است.'
+      'Native VPN tunnel is only available in the installed Windows or Android Sentra app.'
     );
   }
   await invokeTauri('connect_vpn');
@@ -599,6 +601,48 @@ export async function connectVpnNative(): Promise<void> {
 export async function disconnectVpnNative(): Promise<void> {
   if (!isTauriRuntime()) return;
   await invokeTauri('disconnect_vpn');
+}
+
+export interface GithubReleaseUpdate {
+  version: string;
+  url: string;
+  name?: string;
+}
+
+const GITHUB_RELEASES_API =
+  'https://api.github.com/repos/parsa904/SentraVpn/releases/latest';
+
+export async function checkGithubLatestRelease(
+  currentVersion: string
+): Promise<GithubReleaseUpdate | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const resp = await fetch(GITHUB_RELEASES_API, {
+      headers: { Accept: 'application/vnd.github+json' },
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as {
+      tag_name?: string;
+      html_url?: string;
+      name?: string;
+    };
+    const tag = (data.tag_name || '').trim();
+    const url = (data.html_url || '').trim();
+    if (!tag || !url || !isSafeReleaseUrl(url)) return null;
+    if (!isNewerVersion(currentVersion, tag)) return null;
+    return {
+      version: tag,
+      url,
+      name: data.name?.trim() || undefined,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function removeUserDevice(token: string, deviceId: string): Promise<void> {
@@ -670,7 +714,8 @@ export async function savePersonalConfigs(items: PersonalConfigItem[]): Promise<
 
 export async function subscribeNativeTelemetry(
   onTelemetry: (snap: TelemetrySnapshot) => void,
-  onLog: (line: string) => void
+  onLog: (line: string) => void,
+  onStatus?: (status: 'connected' | 'connecting' | 'disconnected' | 'error', error?: string) => void
 ): Promise<() => void> {
   if (!isTauriRuntime()) return () => {};
   const listen = getTauriBridge().__TAURI__?.event?.listen;
@@ -687,6 +732,10 @@ export async function subscribeNativeTelemetry(
     type RawLogPayload =
       | string
       | { timestamp?: string; level?: string; message?: string };
+    type RawStatusPayload = {
+      status?: string;
+      error?: string | null;
+    };
 
     const handleTelemetry = (ev: { payload: RawTelemetryPayload }) => {
       const p = ev.payload || {};
@@ -709,16 +758,27 @@ export async function subscribeNativeTelemetry(
       }
     };
 
+    const handleStatus = (ev: { payload: RawStatusPayload }) => {
+      if (!onStatus) return;
+      const raw = (ev.payload?.status || '').toLowerCase();
+      if (raw === 'connected') onStatus('connected');
+      else if (raw === 'connecting') onStatus('connecting');
+      else if (raw === 'error') onStatus('error', ev.payload?.error || undefined);
+      else if (raw === 'disconnected') onStatus('disconnected', ev.payload?.error || undefined);
+    };
+
     const unlisten1 = await listen<RawTelemetryPayload>('vpn-telemetry', handleTelemetry);
     const unlisten2 = await listen<RawTelemetryPayload>('telemetry-speed', handleTelemetry);
     const unlisten3 = await listen<RawLogPayload>('vpn-log', handleLog);
     const unlisten4 = await listen<RawLogPayload>('telemetry-log', handleLog);
+    const unlisten5 = await listen<RawStatusPayload>('connection-status-changed', handleStatus);
 
     return () => {
       unlisten1();
       unlisten2();
       unlisten3();
       unlisten4();
+      unlisten5();
     };
   } catch {
     return () => {};

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import {
   Check,
   Copy,
+  Globe,
   Link2,
   LogOut,
   Moon,
@@ -18,8 +19,11 @@ import type {
   ThemeMode,
   UserDeviceItem,
 } from '../types/sentra';
+import { type Language, type TranslationKey, t } from '../i18n/translations';
 
 interface SettingsViewProps {
+  lang: Language;
+  onChangeLanguage: (lang: Language) => void;
   theme: ThemeMode;
   onToggleTheme: () => void;
   routingMode: RoutingMode;
@@ -42,13 +46,19 @@ interface SettingsViewProps {
   onRequestTelegramLinkCode: () => Promise<string>;
 }
 
-const ROUTING_OPTIONS: Array<{ id: RoutingMode; title: string; desc: string }> = [
-  { id: 'tunnel', title: 'حالت Tunnel (سراسری)', desc: 'عبور کل ترافیک سیستم از تونل امن' },
-  { id: 'system_proxy', title: 'پروکسی سیستم (System Proxy)', desc: 'تنظیم خودکار پروکسی برای مرورگرها' },
-  { id: 'proxy', title: 'پروکسی محلی (Local Proxy)', desc: 'فقط پورت SOCKS/HTTP بدون تغییر سیستم' },
+const ROUTING_OPTIONS: Array<{
+  id: RoutingMode;
+  titleKey: TranslationKey;
+  descKey: TranslationKey;
+}> = [
+  { id: 'tunnel', titleKey: 'routeTunnelTitle', descKey: 'routeTunnelDesc' },
+  { id: 'system_proxy', titleKey: 'routeSysProxyTitle', descKey: 'routeSysProxyDesc' },
+  { id: 'proxy', titleKey: 'routeLocalProxyTitle', descKey: 'routeLocalProxyDesc' },
 ];
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
+  lang,
+  onChangeLanguage,
   theme,
   onToggleTheme,
   routingMode,
@@ -86,7 +96,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       const code = await onRequestTelegramLinkCode();
       setLinkCode(code);
     } catch (err) {
-      setLinkError(err instanceof Error ? err.message : 'دریافت کد اتصال ناموفق بود.');
+      setLinkError(err instanceof Error ? err.message : t(lang, 'otpFailed'));
     } finally {
       setLinkLoading(false);
     }
@@ -104,19 +114,75 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   return (
-    <div className="flex-1 overflow-y-auto px-4 md:px-8 py-6 pb-24 md:pb-10">
-      <div className="mx-auto max-w-4xl space-y-6">
+    <div className="animate-sentra-view flex-1 overflow-y-auto px-4 md:px-8 py-6 pb-24 md:pb-10">
+      <div className="mx-auto max-w-4xl space-y-5">
+        {/* Language Selector (English default LTR / فارسی RTL) */}
+        <section className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900/80 p-5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                <Globe size={18} />
+              </div>
+              <div>
+                <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+                  {t(lang, 'languageTitle')}
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  {t(lang, 'languageDesc')}
+                </p>
+              </div>
+            </div>
+
+            <div
+              role="radiogroup"
+              aria-label={t(lang, 'languageTitle')}
+              className="grid grid-cols-2 gap-1.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-100/80 dark:bg-slate-950/60 p-1 sm:w-auto w-full"
+            >
+              <button
+                type="button"
+                role="radio"
+                aria-checked={lang === 'en'}
+                data-testid="lang-option-en"
+                onClick={() => onChangeLanguage('en')}
+                className={`rounded-lg px-3.5 py-2 text-xs font-semibold transition-all duration-150 active:scale-[0.98] ${
+                  lang === 'en'
+                    ? 'bg-emerald-600 text-white shadow-sm'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                {t(lang, 'langEnglish')}
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={lang === 'fa'}
+                data-testid="lang-option-fa"
+                onClick={() => onChangeLanguage('fa')}
+                className={`rounded-lg px-3.5 py-2 text-xs font-semibold transition-all duration-150 active:scale-[0.98] ${
+                  lang === 'fa'
+                    ? 'bg-emerald-600 text-white shadow-sm'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                {t(lang, 'langPersian')}
+              </button>
+            </div>
+          </div>
+        </section>
+
         {/* Appearance */}
         <section className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900/80 p-5">
           <div className="flex items-center justify-between gap-4">
             <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200">
                 {theme === 'dark' ? <Moon size={18} /> : <Sun size={18} />}
               </div>
               <div>
-                <h2 className="text-sm font-bold text-slate-900 dark:text-white">ظاهر برنامه</h2>
+                <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+                  {t(lang, 'appearanceTitle')}
+                </h2>
                 <p className="text-xs text-slate-500 dark:text-slate-400">
-                  تغییر آنی بین پوسته تاریک (Dark) و روشن (Light)
+                  {t(lang, 'appearanceDesc')}
                 </p>
               </div>
             </div>
@@ -124,10 +190,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <button
               type="button"
               onClick={onToggleTheme}
-              className="inline-flex items-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 py-2 text-xs font-semibold text-slate-800 dark:text-slate-100 hover:border-emerald-500/50 transition"
+              className="inline-flex shrink-0 items-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-3.5 py-2 text-xs font-semibold text-slate-800 dark:text-slate-100 hover:border-emerald-500/50 active:scale-[0.97] transition"
             >
               {theme === 'dark' ? <Sun size={15} className="text-amber-400" /> : <Moon size={15} />}
-              <span>{theme === 'dark' ? 'حالت روشن' : 'حالت تاریک'}</span>
+              <span>{theme === 'dark' ? t(lang, 'lightMode') : t(lang, 'darkMode')}</span>
             </button>
           </div>
         </section>
@@ -137,7 +203,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           <div className="flex items-center gap-2.5">
             <Network size={18} className="text-emerald-500" />
             <h2 className="text-sm font-bold text-slate-900 dark:text-white">
-              مسیریابی و امنیت شبکه
+              {t(lang, 'routingTitle')}
             </h2>
           </div>
 
@@ -151,7 +217,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   type="button"
                   disabled={disabled}
                   onClick={() => onChangeRoutingMode(opt.id)}
-                  className={`rounded-xl border p-3.5 text-right transition ${
+                  className={`rounded-xl border p-3.5 text-start transition active:scale-[0.99] ${
                     active
                       ? 'border-emerald-500 bg-emerald-500/[0.07]'
                       : disabled
@@ -159,9 +225,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       : 'border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700'
                   }`}
                 >
-                  <div className="text-xs font-bold text-slate-900 dark:text-white">{opt.title}</div>
+                  <div className="text-xs font-bold text-slate-900 dark:text-white">
+                    {t(lang, opt.titleKey)}
+                  </div>
                   <div className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
-                    {opt.desc}
+                    {t(lang, opt.descKey)}
                   </div>
                 </button>
               );
@@ -172,25 +240,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div className="flex items-center justify-between gap-4 py-3">
               <div>
                 <div className="text-xs font-semibold text-slate-900 dark:text-white">
-                  مسیریابی هوشمند ایران (Split Tunneling)
+                  {t(lang, 'splitTunnelTitle')}
                 </div>
                 <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                  عبور مستقیم سایت‌ها و بانک‌های داخلی (.ir) بدون افت سرعت
+                  {t(lang, 'splitTunnelDesc')}
                 </div>
               </div>
               <button
                 type="button"
                 role="switch"
+                dir="ltr"
                 aria-checked={splitTunneling}
-                aria-label="تغییر وضعیت Split Tunneling"
+                aria-label={t(lang, 'splitTunnelAria')}
                 onClick={() => onToggleSplitTunneling(!splitTunneling)}
-                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition ${
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
                   splitTunneling ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-slate-700'
                 }`}
               >
                 <span
-                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition ${
-                    splitTunneling ? '-translate-x-6' : '-translate-x-1'
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform duration-150 ${
+                    splitTunneling ? 'translate-x-6' : 'translate-x-1'
                   }`}
                 />
               </button>
@@ -199,25 +268,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div className="flex items-center justify-between gap-4 py-3">
               <div>
                 <div className="text-xs font-semibold text-slate-900 dark:text-white">
-                  محافظ قطع ناگهانی (Kill-Switch)
+                  {t(lang, 'killSwitchTitle')}
                 </div>
                 <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                  جلوگیری از نشت آی‌پی واقعی در صورت قطع شدن تونل
+                  {t(lang, 'killSwitchDesc')}
                 </div>
               </div>
               <button
                 type="button"
                 role="switch"
+                dir="ltr"
                 aria-checked={killSwitch}
-                aria-label="تغییر وضعیت Kill-Switch"
+                aria-label={t(lang, 'killSwitchAria')}
                 onClick={() => onToggleKillSwitch(!killSwitch)}
-                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition ${
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
                   killSwitch ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-slate-700'
                 }`}
               >
                 <span
-                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition ${
-                    killSwitch ? '-translate-x-6' : '-translate-x-1'
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform duration-150 ${
+                    killSwitch ? 'translate-x-6' : 'translate-x-1'
                   }`}
                 />
               </button>
@@ -226,28 +296,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div className="flex items-center justify-between gap-4 py-3">
               <div>
                 <div className="text-xs font-semibold text-slate-900 dark:text-white">
-                  لایه Cloudflare WARP
+                  {t(lang, 'warpTitle')}
                 </div>
                 <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                  {isStaticIp
-                    ? 'در حالت آی‌پی ثابت برای حفظ ثبات آی‌پی به‌صورت خودکار خاموش است'
-                    : 'بهبود دسترسی به سرویس‌های حساس و کاهش کپچا'}
+                  {isStaticIp ? t(lang, 'warpStaticDisabled') : t(lang, 'warpDesc')}
                 </div>
               </div>
               <button
                 type="button"
                 role="switch"
+                dir="ltr"
                 disabled={isStaticIp}
                 aria-checked={useWarp && !isStaticIp}
-                aria-label="تغییر وضعیت Cloudflare WARP"
+                aria-label={t(lang, 'warpAria')}
                 onClick={() => onToggleWarp(!useWarp)}
-                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition disabled:opacity-40 ${
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-40 ${
                   useWarp && !isStaticIp ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-slate-700'
                 }`}
               >
                 <span
-                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition ${
-                    useWarp && !isStaticIp ? '-translate-x-6' : '-translate-x-1'
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform duration-150 ${
+                    useWarp && !isStaticIp ? 'translate-x-6' : 'translate-x-1'
                   }`}
                 />
               </button>
@@ -259,10 +328,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   htmlFor="custom-dns-input"
                   className="text-xs font-semibold text-slate-900 dark:text-white"
                 >
-                  سرور DNS اختصاصی
+                  {t(lang, 'customDnsTitle')}
                 </label>
                 <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                  پشتیبانی از DoH یا IPv4 استاندارد (مثلاً 1.1.1.1)
+                  {t(lang, 'customDnsDesc')}
                 </div>
               </div>
               <input
@@ -283,17 +352,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div className="flex items-center gap-2.5">
               <Smartphone size={18} className="text-emerald-500" />
               <h2 className="text-sm font-bold text-slate-900 dark:text-white">
-                دستگاه‌های متصل به حساب
+                {t(lang, 'devicesTitle')}
               </h2>
             </div>
-            <span className="font-mono text-xs tabular-nums text-slate-500 dark:text-slate-400">
+            <span className="font-mono text-xs tabular-nums text-slate-500 dark:text-slate-400" dir="ltr">
               {devices.length} / {maxDevices || '—'}
             </span>
           </div>
 
           {devices.length === 0 ? (
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              اطلاعات دستگاه‌های فعال هنوز از سرور دریافت نشده است.
+              {t(lang, 'noDevicesText')}
             </p>
           ) : (
             <div className="divide-y divide-slate-200/70 dark:divide-slate-800">
@@ -306,7 +375,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     <div className="truncate text-xs font-semibold text-slate-900 dark:text-white">
                       {dev.device_name || dev.platform}
                     </div>
-                    <div className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400 font-mono">
+                    <div
+                      className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400 font-mono"
+                      dir="ltr"
+                    >
                       {dev.platform} · {dev.device_id.slice(0, 12)}
                     </div>
                   </div>
@@ -321,11 +393,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         setRemovingId(null);
                       }
                     }}
-                    aria-label={`حذف دستگاه ${dev.device_name || dev.device_id}`}
-                    className="inline-flex items-center gap-1 rounded-lg border border-slate-200 dark:border-slate-700 px-2.5 py-1.5 text-xs text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 disabled:opacity-50 transition"
+                    aria-label={t(lang, 'removeDeviceAria', {
+                      name: dev.device_name || dev.device_id,
+                    })}
+                    className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 dark:border-slate-700 px-2.5 py-1.5 text-xs text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 active:scale-[0.97] disabled:opacity-50 transition"
                   >
                     <Trash2 size={14} />
-                    <span>حذف</span>
+                    <span>{t(lang, 'remove')}</span>
                   </button>
                 </div>
               ))}
@@ -335,15 +409,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         {/* Telegram Account Linking */}
         <section className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900/80 p-5 space-y-4">
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5">
-              <Shield size={18} className="text-emerald-500" />
-              <div>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <Shield size={18} className="shrink-0 text-emerald-500" />
+              <div className="min-w-0">
                 <h2 className="text-sm font-bold text-slate-900 dark:text-white">
-                  اتصال حساب به ربات تلگرام
+                  {t(lang, 'telegramLinkTitle')}
                 </h2>
                 <p className="text-xs text-slate-500 dark:text-slate-400">
-                  برای دریافت پیام تایید اوتباندهای اهدایی و مدیریت اشتراک در تلگرام
+                  {t(lang, 'telegramLinkDesc')}
                 </p>
               </div>
             </div>
@@ -352,10 +426,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               type="button"
               disabled={linkLoading}
               onClick={handleGenerateLinkCode}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 px-3.5 py-2 text-xs font-semibold text-white transition"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-[0.97] disabled:opacity-60 px-3.5 py-2 text-xs font-semibold text-white transition"
             >
               <Link2 size={15} />
-              <span>{linkLoading ? 'در حال دریافت...' : 'دریافت کد اتصال'}</span>
+              <span>{linkLoading ? t(lang, 'loadingCode') : t(lang, 'getLinkCode')}</span>
             </button>
           </div>
 
@@ -369,9 +443,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3">
               <div className="space-y-1">
                 <div className="text-xs text-slate-700 dark:text-slate-200">
-                  دستور زیر را برای ربات ارسال کنید:
+                  {t(lang, 'sendCommandToBot')}
                 </div>
-                <div className="font-mono text-sm font-bold text-emerald-700 dark:text-emerald-300" dir="ltr">
+                <div
+                  className="font-mono text-sm font-bold text-emerald-700 dark:text-emerald-300"
+                  dir="ltr"
+                >
                   /link {linkCode}
                 </div>
               </div>
@@ -379,17 +456,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <button
                   type="button"
                   onClick={handleCopyCode}
-                  className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/40 bg-white/80 dark:bg-slate-900 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-300"
+                  className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/40 bg-white/80 dark:bg-slate-900 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-300 active:scale-[0.97] transition"
                 >
                   {copied ? <Check size={14} /> : <Copy size={14} />}
-                  <span>{copied ? 'کپی شد' : 'کپی دستور'}</span>
+                  <span>{copied ? t(lang, 'copied') : t(lang, 'copyCommand')}</span>
                 </button>
                 {cleanBot && (
                   <a
                     href={`https://t.me/${cleanBot}`}
                     target="_blank"
                     rel="noreferrer"
-                    className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white"
+                    className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white active:scale-[0.97] transition"
                   >
                     <Send size={14} />
                     <span dir="ltr">@{cleanBot}</span>
@@ -404,18 +481,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         <section className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900/80 p-5">
           <div className="flex items-center justify-between gap-4">
             <div className="min-w-0">
-              <h2 className="text-sm font-bold text-slate-900 dark:text-white">حساب کاربری و نشست</h2>
+              <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+                {t(lang, 'accountTitle')}
+              </h2>
               <p className="mt-0.5 truncate text-xs text-slate-500 dark:text-slate-400">
-                {username ? `وارد شده با حساب ${username}` : 'نشست فعال روی این دستگاه ذخیره شده است'}
+                {username
+                  ? t(lang, 'signedInAs', { username })
+                  : t(lang, 'sessionSaved')}
               </p>
             </div>
             <button
               type="button"
               onClick={onLogout}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-rose-500/30 bg-rose-500/10 hover:bg-rose-500/20 px-3.5 py-2 text-xs font-semibold text-rose-600 dark:text-rose-400 transition"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-rose-500/30 bg-rose-500/10 hover:bg-rose-500/20 active:scale-[0.97] px-3.5 py-2 text-xs font-semibold text-rose-600 dark:text-rose-400 transition"
             >
               <LogOut size={15} />
-              <span>خروج از حساب</span>
+              <span>{t(lang, 'signOut')}</span>
             </button>
           </div>
         </section>

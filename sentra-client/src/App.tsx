@@ -15,6 +15,18 @@ import type {
   ThemeMode,
 } from './types/sentra';
 import {
+  type Language,
+  applyDocumentLanguage,
+  getInitialLanguage,
+  t,
+} from './i18n/translations';
+import {
+  APP_VERSION,
+  selectFastestHealthyServer,
+} from './utils/proxyParser';
+import {
+  type GithubReleaseUpdate,
+  checkGithubLatestRelease,
   connectVpnNative,
   disconnectVpnNative,
   donateOutboundToServer,
@@ -39,6 +51,7 @@ import { SplashScreen } from './components/SplashScreen';
 import { AuthView } from './components/AuthView';
 import { Sidebar } from './components/Sidebar';
 import { TopSubscriptionBar } from './components/TopSubscriptionBar';
+import { UpdateBanner } from './components/UpdateBanner';
 import { HomeView } from './components/HomeView';
 import { ProfilesView } from './components/ProfilesView';
 import { DonateOutboundView } from './components/DonateOutboundView';
@@ -85,16 +98,46 @@ function shouldSkipSplash(): boolean {
   return params.get('autostart') === '1';
 }
 
+function outboundToSelection(
+  node: LiveOutboundNode,
+  measuredPing: number | null | undefined
+): ActiveServerSelection {
+  return {
+    kind: 'server',
+    id: node.id,
+    name: node.name,
+    protocol: node.protocol,
+    country_code: node.country_code,
+    country_name: node.country_name,
+    flag: node.flag || '🌐',
+    server_address: node.server_address,
+    server_port: node.server_port,
+    latency_ms:
+      measuredPing !== undefined
+        ? measuredPing
+        : node.latency_ms > 0
+        ? node.latency_ms
+        : null,
+    uri: node.uri,
+  };
+}
+
 export const App: React.FC = () => {
+  const [lang, setLang] = useState<Language>(getInitialLanguage);
   const [theme, setTheme] = useState<ThemeMode>(getInitialTheme);
   const [splashDone, setSplashDone] = useState<boolean>(shouldSkipSplash);
-  const [splashStatus, setSplashStatus] = useState<string>('بررسی نشست کاربری و همگام‌سازی...');
+  const [splashStatusKey, setSplashStatusKey] = useState<'splashChecking' | 'splashSyncing'>(
+    'splashChecking'
+  );
   const [session, setSession] = useState<PersistedSession | null>(null);
   const [authNotice, setAuthNotice] = useState<string | null>(null);
 
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
+
+  const [releaseUpdate, setReleaseUpdate] = useState<GithubReleaseUpdate | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
 
   const [activeTab, setActiveTab] = useState<NavTab>('home');
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
@@ -109,6 +152,9 @@ export const App: React.FC = () => {
 
   const [personalConfigs, setPersonalConfigs] = useState<PersonalConfigItem[]>([]);
   const [activeServer, setActiveServer] = useState<ActiveServerSelection | null>(null);
+  const [autoMode, setAutoMode] = useState(true);
+  const [autoResolving, setAutoResolving] = useState(false);
+  const [testingAll, setTestingAll] = useState(false);
   const [livePings, setLivePings] = useState<Record<string, number | null>>({});
   const [pingingIds, setPingingIds] = useState<Record<string, boolean>>({});
 
@@ -123,6 +169,8 @@ export const App: React.FC = () => {
   const [toast, setToast] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
 
   const toastTimerRef = useRef<number | null>(null);
+  const langRef = useRef<Language>(lang);
+  langRef.current = lang;
 
   const pushLog = useCallback((level: LogEntry['level'], message: string) => {
     setLogs((prev) => [...prev.slice(-199), makeLogEntry(level, message)]);
@@ -133,6 +181,11 @@ export const App: React.FC = () => {
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
     toastTimerRef.current = window.setTimeout(() => setToast(null), 4200);
   }, []);
+
+  // Apply language & LTR/RTL direction immediately and persist
+  useEffect(() => {
+    applyDocumentLanguage(lang);
+  }, [lang]);
 
   // Apply Dark / Light theme class to <html>
   useEffect(() => {
@@ -149,6 +202,20 @@ export const App: React.FC = () => {
     }
   }, [theme]);
 
+  // Non-blocking background check for newer GitHub Releases
+  useEffect(() => {
+    let cancelled = false;
+    void checkGithubLatestRelease(APP_VERSION).then((update) => {
+      if (!cancelled && update) {
+        setReleaseUpdate(update);
+        pushLog('INFO', `Update available: ${update.version} (${update.url})`);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [pushLog]);
+
   const toggleTheme = useCallback(() => {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
   }, []);
@@ -157,67 +224,46 @@ export const App: React.FC = () => {
     async (activeSession: PersistedSession) => {
       setSyncing(true);
       setSyncError(null);
-      pushLog('SYNC', 'درخواست دریافت اطلاعات اشتراک و اوتباندهای زنده از سرور...');
+      pushLog('SYNC', 'Requesting live subscription and outbounds from core...');
       try {
         const data = await fetchBootstrap(activeSession.subscription_token);
         setBootstrap(data);
         pushLog(
           'SYNC',
-          `همگام‌سازی موفق: ${data.outbounds.length} اوتباند فعال دریافت شد (${data.subscription.tier}).`
+          `Synced ${data.outbounds.length} active outbounds (${data.subscription.tier}).`
         );
 
-        // Auto-select first online outbound if nothing selected yet
         setActiveServer((current) => {
           if (current) {
             if (current.kind === 'server') {
               const refreshed = data.outbounds.find((o) => o.id === current.id);
               if (refreshed) {
-                return {
-                  kind: 'server',
-                  id: refreshed.id,
-                  name: refreshed.name,
-                  protocol: refreshed.protocol,
-                  country_code: refreshed.country_code,
-                  country_name: refreshed.country_name,
-                  flag: refreshed.flag || '🌐',
-                  server_address: refreshed.server_address,
-                  server_port: refreshed.server_port,
-                  latency_ms: refreshed.latency_ms > 0 ? refreshed.latency_ms : current.latency_ms,
-                  uri: refreshed.uri,
-                };
+                return outboundToSelection(
+                  refreshed,
+                  refreshed.latency_ms > 0 ? refreshed.latency_ms : current.latency_ms
+                );
               }
             }
             return current;
           }
-          const first = data.outbounds[0];
-          if (!first) return null;
-          void setActiveOutboundNative(first.id, null);
-          return {
-            kind: 'server',
-            id: first.id,
-            name: first.name,
-            protocol: first.protocol,
-            country_code: first.country_code,
-            country_name: first.country_name,
-            flag: first.flag || '🌐',
-            server_address: first.server_address,
-            server_port: first.server_port,
-            latency_ms: first.latency_ms > 0 ? first.latency_ms : null,
-            uri: first.uri,
-          };
+          const fastestBaseline = selectFastestHealthyServer(data.outbounds, {});
+          const fallback = fastestBaseline?.node || data.outbounds[0];
+          if (!fallback) return null;
+          void setActiveOutboundNative(fallback.id, null);
+          return outboundToSelection(fallback, undefined);
         });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : 'خطا در همگام‌سازی با سرور';
+        const msg = err instanceof Error ? err.message : 'Sync failed';
         if (msg.startsWith('AUTH_EXPIRED:')) {
           const clean = msg.replace('AUTH_EXPIRED:', '').trim();
-          pushLog('ERROR', `نشست منقضی شد: ${clean}`);
+          pushLog('ERROR', `Session expired: ${clean}`);
           await logoutSession();
           setSession(null);
           setBootstrap(null);
-          setAuthNotice(clean || 'نشست کاربری شما منقضی شده است. لطفاً دوباره وارد شوید.');
+          setAuthNotice(clean || t(langRef.current, 'sessionExpiredNotice'));
         } else {
           setSyncError(msg);
-          pushLog('WARN', `عدم دریافت همگام‌سازی زنده: ${msg}`);
+          pushLog('WARN', `Live sync unavailable: ${msg}`);
         }
       } finally {
         setSyncing(false);
@@ -235,7 +281,7 @@ export const App: React.FC = () => {
       } catch (err) {
         pushLog(
           'WARN',
-          `دریافت تاریخچه اوتباندهای اهدایی ناموفق بود: ${err instanceof Error ? err.message : String(err)}`
+          `Failed to load donations: ${err instanceof Error ? err.message : String(err)}`
         );
       } finally {
         setLoadingDonations(false);
@@ -244,7 +290,7 @@ export const App: React.FC = () => {
     [pushLog]
   );
 
-  // Startup bootstrap: restore persisted auth + personal configs in parallel with ~1.3s splash logo
+  // Startup bootstrap: restore persisted auth + personal configs in parallel with splash
   useEffect(() => {
     let cancelled = false;
     const skipSplash = shouldSkipSplash();
@@ -252,7 +298,7 @@ export const App: React.FC = () => {
     const init = async () => {
       const minSplashDelay = skipSplash
         ? Promise.resolve()
-        : new Promise<void>((resolve) => window.setTimeout(resolve, 1300));
+        : new Promise<void>((resolve) => window.setTimeout(resolve, 1100));
 
       const [restored, savedPersonal] = await Promise.all([
         restorePersistedSession(),
@@ -264,7 +310,7 @@ export const App: React.FC = () => {
 
       if (restored) {
         setSession(restored);
-        setSplashStatus('در حال همگام‌سازی اوتباندهای زنده...');
+        setSplashStatusKey('splashSyncing');
         await Promise.all([syncWithServer(restored), minSplashDelay]);
         if (!cancelled) {
           void loadDonations(restored);
@@ -284,12 +330,23 @@ export const App: React.FC = () => {
     };
   }, [syncWithServer, loadDonations]);
 
-  // Subscribe to native Tauri telemetry & logs when available
+  // Subscribe to native Tauri telemetry, logs, and System Tray / Android Notification status
   useEffect(() => {
     let cleanup: (() => void) | null = null;
     void subscribeNativeTelemetry(
       (snap) => setTelemetry(snap),
-      (line) => pushLog('INFO', line)
+      (line) => pushLog('INFO', line),
+      (status, errorMsg) => {
+        setConnectionStatus(status);
+        if (status === 'disconnected') {
+          setTelemetry(EMPTY_TELEMETRY);
+        }
+        if (errorMsg) {
+          setConnectionError(errorMsg);
+        } else if (status === 'connected' || status === 'disconnected') {
+          setConnectionError(null);
+        }
+      }
     ).then((unsub) => {
       cleanup = unsub;
     });
@@ -301,7 +358,7 @@ export const App: React.FC = () => {
   const handleAuthenticated = async (newSession: PersistedSession) => {
     setAuthNotice(null);
     setSession(newSession);
-    pushLog('INFO', `ورود موفق با حساب ${newSession.username || 'کاربر'}. نشست به‌صورت دائمی ذخیره شد.`);
+    pushLog('INFO', `Signed in as ${newSession.username || 'user'}. Session persisted.`);
     await syncWithServer(newSession);
     void loadDonations(newSession);
   };
@@ -319,10 +376,11 @@ export const App: React.FC = () => {
     setBootstrap(null);
     setDonations([]);
     setActiveServer(null);
+    setAutoMode(true);
     setConnectionStatus('disconnected');
     setTelemetry(EMPTY_TELEMETRY);
     setActiveTab('home');
-    pushLog('INFO', 'خروج از حساب انجام شد و نشست محلی پاک شد.');
+    pushLog('INFO', 'Signed out and cleared local session.');
   };
 
   const handleSelectMode = async (mode: ConnectionModeId) => {
@@ -334,11 +392,100 @@ export const App: React.FC = () => {
     }
     try {
       await setConnectionModeNative(mode);
-      pushLog('INFO', `حالت اتصال به ${mode} تغییر یافت.`);
+      pushLog('INFO', `Connection mode switched to ${mode}.`);
     } catch (err) {
-      showToast('error', err instanceof Error ? err.message : 'تغییر حالت اتصال ناموفق بود.');
+      showToast('error', err instanceof Error ? err.message : t(lang, 'modeChangeFailed'));
     }
   };
+
+  const handlePingNode = useCallback(
+    async (id: string, host: string, port: number): Promise<number | null> => {
+      setPingingIds((prev) => ({ ...prev, [id]: true }));
+      try {
+        const ms = await pingServerNode(host, port);
+        setLivePings((prev) => ({ ...prev, [id]: ms }));
+        setActiveServer((curr) => (curr && curr.id === id ? { ...curr, latency_ms: ms } : curr));
+        pushLog('INFO', `Ping ${host}:${port} = ${ms ? `${ms} ms` : 'Timeout'}`);
+        return ms;
+      } finally {
+        setPingingIds((prev) => ({ ...prev, [id]: false }));
+      }
+    },
+    [pushLog]
+  );
+
+  const handlePingAllOutbounds = useCallback(async () => {
+    const serverList = bootstrap?.outbounds || [];
+    const personalList = personalConfigs.filter((c) => !c.is_subscription);
+    if (serverList.length === 0 && personalList.length === 0) return;
+
+    setTestingAll(true);
+    pushLog(
+      'INFO',
+      `Testing latency concurrently for ${serverList.length + personalList.length} endpoints...`
+    );
+    try {
+      await Promise.all([
+        ...serverList.map((node) =>
+          handlePingNode(node.id, node.server_address, node.server_port)
+        ),
+        ...personalList.map((cfg) =>
+          handlePingNode(cfg.id, cfg.server_address, cfg.server_port)
+        ),
+      ]);
+    } finally {
+      setTestingAll(false);
+    }
+  }, [bootstrap, personalConfigs, handlePingNode, pushLog]);
+
+  const handleSelectAutoFastest = useCallback(async (): Promise<ActiveServerSelection | null> => {
+    const list = (bootstrap?.outbounds || []).filter((o) => o.is_online !== false);
+    setAutoMode(true);
+    if (list.length === 0) {
+      showToast('error', t(langRef.current, 'noServersTitle'));
+      return null;
+    }
+
+    setAutoResolving(true);
+    pushLog('INFO', `Auto Select testing ${list.length} active servers...`);
+    try {
+      const entries = await Promise.all(
+        list.map(async (node) => {
+          const ms = await handlePingNode(node.id, node.server_address, node.server_port);
+          return [node.id, ms] as const;
+        })
+      );
+      const measuredMap: Record<string, number | null> = {};
+      for (const [id, ms] of entries) {
+        measuredMap[id] = ms;
+      }
+
+      const fastest = selectFastestHealthyServer(list, measuredMap);
+      if (!fastest) {
+        showToast('error', t(langRef.current, 'noHealthyServerFound'));
+        pushLog('WARN', 'Auto Select found no reachable server.');
+        return null;
+      }
+
+      const selection = outboundToSelection(fastest.node, fastest.latencyMs);
+      setActiveServer(selection);
+      await setActiveOutboundNative(fastest.node.id, null);
+      pushLog(
+        'INFO',
+        `Auto Select picked ${fastest.node.name} (${fastest.latencyMs} ms).`
+      );
+      showToast(
+        'success',
+        t(langRef.current, 'autoSelectedToast', {
+          name: fastest.node.name,
+          ms: fastest.latencyMs,
+        })
+      );
+      return selection;
+    } finally {
+      setAutoResolving(false);
+    }
+  }, [bootstrap, handlePingNode, pushLog, showToast]);
 
   const handleToggleConnect = async () => {
     setConnectionError(null);
@@ -348,24 +495,35 @@ export const App: React.FC = () => {
       } finally {
         setConnectionStatus('disconnected');
         setTelemetry(EMPTY_TELEMETRY);
-        pushLog('INFO', 'اتصال VPN قطع شد.');
+        pushLog('INFO', 'VPN disconnected cleanly.');
       }
       return;
     }
 
-    if (!activeServer) {
-      setConnectionError('ابتدا یک سرور یا کانفیگ شخصی از بخش «پروفایل‌ها و کانفیگ‌ها» انتخاب کنید.');
+    let targetServer = activeServer;
+    if (autoMode && (bootstrap?.outbounds.length || 0) > 0) {
+      const hasMeasuredPing = Boolean(targetServer && targetServer.id in livePings);
+      if (!targetServer || !hasMeasuredPing) {
+        const picked = await handleSelectAutoFastest();
+        if (picked) {
+          targetServer = picked;
+        }
+      }
+    }
+
+    if (!targetServer) {
+      setConnectionError(t(lang, 'selectServerFirst'));
       return;
     }
 
     setConnectionStatus('connecting');
-    pushLog('INFO', `شروع اتصال به ${activeServer.name} (${activeServer.protocol})...`);
+    pushLog('INFO', `Connecting to ${targetServer.name} (${targetServer.protocol})...`);
     try {
       await connectVpnNative();
       setConnectionStatus('connected');
-      pushLog('INFO', `اتصال امن به ${activeServer.name} برقرار شد.`);
+      pushLog('INFO', `Connected securely to ${targetServer.name}.`);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'برقراری اتصال ناموفق بود.';
+      const msg = err instanceof Error ? err.message : t(lang, 'connectFailed');
       setConnectionStatus('error');
       setConnectionError(msg);
       pushLog('ERROR', msg);
@@ -373,33 +531,27 @@ export const App: React.FC = () => {
   };
 
   const handleSelectServerOutbound = (node: LiveOutboundNode) => {
-    const selection: ActiveServerSelection = {
-      kind: 'server',
-      id: node.id,
-      name: node.name,
-      protocol: node.protocol,
-      country_code: node.country_code,
-      country_name: node.country_name,
-      flag: node.flag || '🌐',
-      server_address: node.server_address,
-      server_port: node.server_port,
-      latency_ms: node.id in livePings ? livePings[node.id] : node.latency_ms > 0 ? node.latency_ms : null,
-      uri: node.uri,
-    };
+    setAutoMode(false);
+    const selection = outboundToSelection(
+      node,
+      node.id in livePings ? livePings[node.id] : undefined
+    );
     setActiveServer(selection);
     void setActiveOutboundNative(node.id, null);
-    pushLog('INFO', `سرور فعال روی ${node.name} (${node.protocol}) تنظیم شد.`);
-    showToast('success', `سرور «${node.name}» انتخاب شد.`);
+    pushLog('INFO', `Active server set to ${node.name} (${node.protocol}).`);
+    showToast('success', t(lang, 'serverSelectedToast', { name: node.name }));
   };
 
   const handleSelectPersonalConfig = (cfg: PersonalConfigItem) => {
+    setAutoMode(false);
     const selection: ActiveServerSelection = {
       kind: 'personal',
       id: cfg.id,
       name: cfg.name,
       protocol: cfg.protocol,
       country_code: cfg.country_code,
-      country_name: cfg.country_code === 'XX' ? 'شخصی' : cfg.country_code,
+      country_name:
+        cfg.country_code === 'XX' ? t(lang, 'personalCountry') : cfg.country_code,
       flag: cfg.flag,
       server_address: cfg.server_address,
       server_port: cfg.server_port,
@@ -408,29 +560,8 @@ export const App: React.FC = () => {
     };
     setActiveServer(selection);
     void setActiveOutboundNative(null, cfg.uri);
-    pushLog('INFO', `کانفیگ شخصی «${cfg.name}» به عنوان سرور فعال انتخاب شد.`);
-    showToast('success', `کانفیگ شخصی «${cfg.name}» انتخاب شد.`);
-  };
-
-  const handlePingNode = async (id: string, host: string, port: number) => {
-    setPingingIds((prev) => ({ ...prev, [id]: true }));
-    try {
-      const ms = await pingServerNode(host, port);
-      setLivePings((prev) => ({ ...prev, [id]: ms }));
-      setActiveServer((curr) => (curr && curr.id === id ? { ...curr, latency_ms: ms } : curr));
-      pushLog('INFO', `پینگ واقعی ${host}:${port} = ${ms ? `${ms} ms` : 'عدم پاسخ'}`);
-    } finally {
-      setPingingIds((prev) => ({ ...prev, [id]: false }));
-    }
-  };
-
-  const handlePingAllOutbounds = async () => {
-    const list = bootstrap?.outbounds || [];
-    if (list.length === 0) return;
-    pushLog('INFO', `شروع تست پینگ واقعی برای ${list.length} اوتباند...`);
-    await Promise.all(
-      list.map((node) => handlePingNode(node.id, node.server_address, node.server_port))
-    );
+    pushLog('INFO', `Active profile set to ${cfg.name}.`);
+    showToast('success', t(lang, 'serverSelectedToast', { name: cfg.name }));
   };
 
   const handleAddPersonalConfig = (item: PersonalConfigItem) => {
@@ -441,7 +572,7 @@ export const App: React.FC = () => {
     });
     handleSelectPersonalConfig(item);
     setActiveTab('profiles');
-    showToast('success', `کانفیگ «${item.name}» با موفقیت اضافه شد.`);
+    showToast('success', t(lang, 'configAddedToast', { name: item.name }));
   };
 
   const handleDeletePersonalConfig = (id: string) => {
@@ -453,7 +584,7 @@ export const App: React.FC = () => {
     if (activeServer?.kind === 'personal' && activeServer.id === id) {
       setActiveServer(null);
     }
-    showToast('success', 'کانفیگ شخصی حذف شد.');
+    showToast('success', t(lang, 'configDeletedToast'));
   };
 
   const handleDonateSubmit = async (payload: {
@@ -461,13 +592,10 @@ export const App: React.FC = () => {
     name?: string;
     note?: string;
   }): Promise<{ message?: string }> => {
-    if (!session) throw new Error('ابتدا وارد حساب کاربری خود شوید.');
+    if (!session) throw new Error(t(lang, 'signInRequired'));
     const res = await donateOutboundToServer(session.subscription_token, payload);
-    pushLog('SYNC', `اوتباند اهدایی «${payload.name || 'جدید'}» برای بررسی ادمین ارسال شد.`);
-    showToast(
-      'success',
-      res.message || 'اوتباند شما برای تایید ادمین ارسال شد. پس از تایید، اشتراک رایگان فعال می‌شود.'
-    );
+    pushLog('SYNC', `Donated outbound "${payload.name || 'custom'}" submitted for review.`);
+    showToast('success', res.message || t(lang, 'donationSubmittedDefault'));
     void loadDonations(session);
     return res;
   };
@@ -475,25 +603,27 @@ export const App: React.FC = () => {
   const handleRemoveDevice = async (deviceId: string) => {
     if (!session) return;
     await removeUserDevice(session.subscription_token, deviceId);
-    pushLog('INFO', `دستگاه ${deviceId} از حساب حذف شد.`);
-    showToast('success', 'دستگاه با موفقیت حذف شد.');
+    pushLog('INFO', `Removed device ${deviceId}.`);
+    showToast('success', t(lang, 'deviceRemovedToast'));
     await syncWithServer(session);
   };
 
   const handleRequestTelegramLink = async (): Promise<string> => {
-    if (!session) throw new Error('ابتدا وارد حساب کاربری شوید.');
+    if (!session) throw new Error(t(lang, 'signInRequired'));
     const code = await requestTelegramLinkCode(session.subscription_token);
-    pushLog('INFO', 'کد اتصال حساب تلگرام صادر شد.');
+    pushLog('INFO', 'Telegram link code issued.');
     return code;
   };
 
   if (!splashDone) {
-    return <SplashScreen statusText={splashStatus} />;
+    return <SplashScreen statusText={t(lang, splashStatusKey)} />;
   }
 
   if (!session) {
     return (
       <AuthView
+        lang={lang}
+        onChangeLanguage={setLang}
         theme={theme}
         onToggleTheme={toggleTheme}
         onAuthenticated={handleAuthenticated}
@@ -509,6 +639,7 @@ export const App: React.FC = () => {
   return (
     <div className="flex h-screen w-full overflow-hidden bg-slate-50 dark:bg-[#090E1A] text-slate-900 dark:text-slate-100">
       <Sidebar
+        lang={lang}
         activeTab={activeTab}
         onSelectTab={setActiveTab}
         theme={theme}
@@ -520,24 +651,33 @@ export const App: React.FC = () => {
 
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <TopSubscriptionBar
+          lang={lang}
           subscription={bootstrap?.subscription || null}
           syncing={syncing}
           onSync={() => void syncWithServer(session)}
           onOpenAddConfig={() => setAddConfigOpen(true)}
         />
 
+        {!updateDismissed && (
+          <UpdateBanner
+            lang={lang}
+            update={releaseUpdate}
+            onDismiss={() => setUpdateDismissed(true)}
+          />
+        )}
+
         {syncError && (
           <div
             role="status"
             className="flex items-center justify-between gap-3 border-b border-amber-500/30 bg-amber-500/10 px-4 md:px-6 py-2 text-xs text-amber-800 dark:text-amber-200"
           >
-            <span>{syncError}</span>
+            <span className="truncate">{syncError}</span>
             <button
               type="button"
               onClick={() => void syncWithServer(session)}
               className="shrink-0 font-semibold underline"
             >
-              تلاش مجدد
+              {t(lang, 'retry')}
             </button>
           </div>
         )}
@@ -545,14 +685,18 @@ export const App: React.FC = () => {
         <main className="relative flex flex-1 flex-col overflow-hidden">
           {activeTab === 'home' && (
             <HomeView
+              lang={lang}
               connectionStatus={connectionStatus}
               connectionError={connectionError}
               selectedMode={selectedMode}
               modes={bootstrap?.modes || []}
               activeServer={activeServer}
+              autoMode={autoMode}
+              autoResolving={autoResolving}
               telemetry={telemetry}
               pingingActive={Boolean(activeServer && pingingIds[activeServer.id])}
-              onToggleConnect={handleToggleConnect}
+              activeServerTested={Boolean(activeServer && activeServer.id in livePings)}
+              onToggleConnect={() => void handleToggleConnect()}
               onSelectMode={(m) => void handleSelectMode(m)}
               onOpenProfiles={() => setActiveTab('profiles')}
               onPingActiveServer={() => {
@@ -569,14 +713,19 @@ export const App: React.FC = () => {
 
           {activeTab === 'profiles' && (
             <ProfilesView
+              lang={lang}
               outbounds={outbounds}
               personalConfigs={personalConfigs}
               activeServer={activeServer}
+              autoMode={autoMode}
+              autoResolving={autoResolving}
+              testingAll={testingAll}
               livePings={livePings}
               pingingIds={pingingIds}
               syncing={syncing}
               onSync={() => void syncWithServer(session)}
               onOpenAddConfig={() => setAddConfigOpen(true)}
+              onSelectAutoFastest={() => void handleSelectAutoFastest()}
               onSelectServerOutbound={handleSelectServerOutbound}
               onSelectPersonalConfig={handleSelectPersonalConfig}
               onPingServerOutbound={(node) =>
@@ -593,6 +742,7 @@ export const App: React.FC = () => {
 
           {activeTab === 'donate' && (
             <DonateOutboundView
+              lang={lang}
               personalConfigs={personalConfigs}
               donations={donations}
               loadingDonations={loadingDonations}
@@ -603,6 +753,8 @@ export const App: React.FC = () => {
 
           {activeTab === 'settings' && (
             <SettingsView
+              lang={lang}
+              onChangeLanguage={setLang}
               theme={theme}
               onToggleTheme={toggleTheme}
               routingMode={routingMode}
@@ -641,19 +793,21 @@ export const App: React.FC = () => {
           )}
 
           {activeTab === 'logs' && (
-            <LogsView logs={logs} onClearLogs={() => setLogs([])} />
+            <LogsView lang={lang} logs={logs} onClearLogs={() => setLogs([])} />
           )}
         </main>
       </div>
 
       {/* Modals */}
       <AddConfigModal
+        lang={lang}
         open={addConfigOpen}
         onClose={() => setAddConfigOpen(false)}
         onAddConfig={handleAddPersonalConfig}
       />
 
       <DonateModal
+        lang={lang}
         config={donateModalConfig}
         onClose={() => setDonateModalConfig(null)}
         onConfirmDonate={handleDonateSubmit}
@@ -663,7 +817,7 @@ export const App: React.FC = () => {
       {toast && (
         <div
           role="status"
-          className={`fixed top-16 md:top-auto md:bottom-6 left-4 md:left-6 z-50 max-w-sm rounded-xl border px-4 py-3 text-xs font-semibold shadow-xl backdrop-blur-md ${
+          className={`fixed top-16 md:top-auto md:bottom-6 end-4 md:end-6 z-50 max-w-sm rounded-xl border px-4 py-3 text-xs font-semibold shadow-xl backdrop-blur-md transition-opacity duration-200 ${
             toast.kind === 'error'
               ? 'border-rose-500/40 bg-rose-950/90 text-rose-100'
               : 'border-emerald-500/40 bg-slate-900/95 text-emerald-100'

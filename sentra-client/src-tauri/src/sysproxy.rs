@@ -91,7 +91,31 @@ pub fn disable_system_proxy() -> Result<(), String> {
         tracing::error!("Failed to execute reg.exe to disable ProxyEnable: {}", e);
     }
 
-    // Notify WinINet system subsystem
+    // Clear ProxyServer if it still points to Sentra's local HTTP proxy so third-party apps never stall
+    if let Ok(query_out) = Command::new("reg.exe")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "/v",
+            "ProxyServer",
+        ])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&query_out.stdout);
+        if stdout.contains("127.0.0.1:10809") {
+            let _ = Command::new("reg.exe")
+                .args([
+                    "delete",
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                    "/v",
+                    "ProxyServer",
+                    "/f",
+                ])
+                .output();
+        }
+    }
+
+    // Notify WinINet system subsystem immediately
     notify_wininet();
 
     Ok(())

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct ConnectRequest {
     pub config_json: String,
     pub split_tunnel_ir: bool,
+    pub mode: String,
+    pub server_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

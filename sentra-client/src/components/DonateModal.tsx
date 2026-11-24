@@ -1,8 +1,10 @@
 import React, { useState } from 'react';
 import { AlertCircle, Gift, Send, X } from 'lucide-react';
 import type { PersonalConfigItem } from '../types/sentra';
+import { type Language, t } from '../i18n/translations';
 
 interface DonateModalProps {
+  lang: Language;
   config: PersonalConfigItem | null;
   onClose: () => void;
   onConfirmDonate: (payload: {
@@ -13,6 +15,7 @@ interface DonateModalProps {
 }
 
 export const DonateModal: React.FC<DonateModalProps> = ({
+  lang,
   config,
   onClose,
   onConfirmDonate,
@@ -36,7 +39,7 @@ export const DonateModal: React.FC<DonateModalProps> = ({
       setNote('');
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'ارسال اوتباند با خطا مواجه شد.');
+      setError(err instanceof Error ? err.message : t(lang, 'donationSubmitError'));
     } finally {
       setSubmitting(false);
     }
@@ -49,19 +52,22 @@ export const DonateModal: React.FC<DonateModalProps> = ({
       aria-labelledby="donate-modal-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 px-4 backdrop-blur-sm"
     >
-      <div className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 shadow-2xl">
+      <div className="animate-sentra-view w-full max-w-md rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 shadow-2xl">
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <Gift size={18} className="text-amber-500" />
-            <h2 id="donate-modal-title" className="text-base font-bold text-slate-900 dark:text-white">
-              انتشار به عنوان اوتباند اهدایی
+            <h2
+              id="donate-modal-title"
+              className="text-base font-bold text-slate-900 dark:text-white"
+            >
+              {t(lang, 'donateModalTitle')}
             </h2>
           </div>
           <button
             type="button"
             onClick={onClose}
-            aria-label="بستن پنجره اهدا"
-            className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+            aria-label={t(lang, 'closeModalAria')}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 active:scale-95 transition"
           >
             <X size={18} />
           </button>
@@ -74,7 +80,10 @@ export const DonateModal: React.FC<DonateModalProps> = ({
               <div className="truncate text-xs font-bold text-slate-900 dark:text-white">
                 {config.name}
               </div>
-              <div className="mt-0.5 font-mono text-[11px] text-slate-500 dark:text-slate-400" dir="ltr">
+              <div
+                className="mt-0.5 font-mono text-[11px] text-slate-500 dark:text-slate-400"
+                dir="ltr"
+              >
                 {config.protocol} · {config.server_address}:{config.server_port}
               </div>
             </div>
@@ -82,7 +91,7 @@ export const DonateModal: React.FC<DonateModalProps> = ({
         </div>
 
         <p className="mt-3 text-xs leading-5 text-slate-500 dark:text-slate-400">
-          این کانفیگ برای بررسی و تست سلامت به پنل تلگرام ادمین ارسال می‌شود. پس از تایید، ۷ تا ۳۰ روز اشتراک رایگان روی حساب شما اعمال خواهد شد.
+          {t(lang, 'donateModalDesc')}
         </p>
 
         {error && (
@@ -101,14 +110,14 @@ export const DonateModal: React.FC<DonateModalProps> = ({
               htmlFor="donate-modal-note"
               className="mb-1.5 block text-xs font-medium text-slate-700 dark:text-slate-300"
             >
-              توضیحات اختیاری (مدت اعتبار یا ظرفیت سرور)
+              {t(lang, 'donateModalNoteLabel')}
             </label>
             <input
               id="donate-modal-note"
               type="text"
               value={note}
               onChange={(e) => setNote(e.target.value)}
-              placeholder="مثلاً: سرور اختصاصی آلمان، اعتبار ۱ ماهه"
+              placeholder={t(lang, 'donateModalNotePlaceholder')}
               className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/60 px-3.5 py-2.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
             />
           </div>
@@ -117,17 +126,19 @@ export const DonateModal: React.FC<DonateModalProps> = ({
             <button
               type="button"
               onClick={onClose}
-              className="rounded-xl border border-slate-200 dark:border-slate-700 px-4 py-2 text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+              className="rounded-xl border border-slate-200 dark:border-slate-700 px-4 py-2 text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 active:scale-[0.97] transition"
             >
-              انصراف
+              {t(lang, 'cancel')}
             </button>
             <button
               type="submit"
               disabled={submitting}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 px-4 py-2 text-xs font-semibold text-white transition"
+              className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-[0.97] disabled:opacity-60 px-4 py-2 text-xs font-semibold text-white transition"
             >
               <Send size={15} />
-              <span>{submitting ? 'در حال ارسال...' : 'ارسال برای تایید'}</span>
+              <span>
+                {submitting ? t(lang, 'donateModalSubmitting') : t(lang, 'donateModalSubmit')}
+              </span>
             </button>
           </div>
         </form>

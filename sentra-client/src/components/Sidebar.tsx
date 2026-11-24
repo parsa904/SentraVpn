@@ -10,9 +10,11 @@ import {
   Sun,
 } from 'lucide-react';
 import type { NavTab, ThemeMode } from '../types/sentra';
+import { type Language, type TranslationKey, t } from '../i18n/translations';
 import { SentraLogo } from './SentraLogo';
 
 interface SidebarProps {
+  lang: Language;
   activeTab: NavTab;
   onSelectTab: (tab: NavTab) => void;
   theme: ThemeMode;
@@ -24,18 +26,19 @@ interface SidebarProps {
 
 const NAV_ITEMS: Array<{
   id: NavTab;
-  label: string;
-  shortLabel: string;
+  labelKey: TranslationKey;
+  shortKey: TranslationKey;
   icon: React.ComponentType<{ size?: number; className?: string }>;
 }> = [
-  { id: 'home', label: 'خانه', shortLabel: 'خانه', icon: Home },
-  { id: 'profiles', label: 'پروفایل‌ها و کانفیگ‌ها', shortLabel: 'پروفایل‌ها', icon: Layers },
-  { id: 'donate', label: 'اهدای اوتباند (اشتراک رایگان)', shortLabel: 'اهدای سرور', icon: Gift },
-  { id: 'settings', label: 'تنظیمات', shortLabel: 'تنظیمات', icon: Settings },
-  { id: 'logs', label: 'گزارش‌ها (Logs)', shortLabel: 'گزارش‌ها', icon: FileTerminal },
+  { id: 'home', labelKey: 'navHome', shortKey: 'navHomeShort', icon: Home },
+  { id: 'profiles', labelKey: 'navProfiles', shortKey: 'navProfilesShort', icon: Layers },
+  { id: 'donate', labelKey: 'navDonate', shortKey: 'navDonateShort', icon: Gift },
+  { id: 'settings', labelKey: 'navSettings', shortKey: 'navSettingsShort', icon: Settings },
+  { id: 'logs', labelKey: 'navLogs', shortKey: 'navLogsShort', icon: FileTerminal },
 ];
 
 export const Sidebar: React.FC<SidebarProps> = ({
+  lang,
   activeTab,
   onSelectTab,
   theme,
@@ -46,20 +49,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   return (
     <>
-      {/* Desktop Right-Side RTL Sidebar */}
+      {/* Desktop Sidebar (flips automatically via logical border-e) */}
       <aside
-        aria-label="منوی اصلی"
-        className="hidden md:flex md:w-64 lg:w-[272px] shrink-0 flex-col justify-between border-l border-slate-200/80 dark:border-slate-800/90 bg-white/85 dark:bg-[#0B1220]/90 backdrop-blur-xl"
+        aria-label={t(lang, 'mainMenuAria')}
+        className="hidden md:flex md:w-60 lg:w-[260px] shrink-0 flex-col justify-between border-e border-slate-200/80 dark:border-slate-800/90 bg-white/85 dark:bg-[#0B1220]/90 backdrop-blur-xl"
       >
         <div>
           {/* Brand Header */}
           <div className="flex items-center gap-3 px-5 py-5 border-b border-slate-200/70 dark:border-slate-800/80">
-            <div className="rounded-[12px] shadow-sm ring-1 ring-slate-200/80 dark:ring-white/10">
-              <SentraLogo size={38} withSquircle />
+            <div className="rounded-[12px] shadow-sm ring-1 ring-slate-200/80 dark:ring-white/10 shrink-0">
+              <SentraLogo size={36} withSquircle />
             </div>
             <div className="min-w-0">
               <div className="text-base font-bold tracking-tight text-slate-900 dark:text-white">
-                Sentra
+                {t(lang, 'brand')}
               </div>
               {username && (
                 <div className="truncate text-xs text-slate-500 dark:text-slate-400" dir="ltr">
@@ -80,7 +83,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   type="button"
                   onClick={() => onSelectTab(item.id)}
                   aria-current={active ? 'page' : undefined}
-                  className={`flex w-full items-center justify-between gap-3 rounded-xl px-3.5 py-2.5 text-right text-[13px] font-medium transition ${
+                  className={`flex w-full items-center justify-between gap-3 rounded-xl px-3.5 py-2.5 text-start text-[13px] font-medium transition duration-150 active:scale-[0.98] ${
                     active
                       ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-400 font-semibold'
                       : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/70 hover:text-slate-900 dark:hover:text-slate-100'
@@ -88,14 +91,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 >
                   <span className="flex items-center gap-3 min-w-0">
                     <Icon
-                      size={20}
+                      size={19}
                       className={
                         active
                           ? 'shrink-0 text-emerald-600 dark:text-emerald-400'
                           : 'shrink-0 text-slate-400 dark:text-slate-500'
                       }
                     />
-                    <span className="truncate">{item.label}</span>
+                    <span className="truncate">{t(lang, item.labelKey)}</span>
                   </span>
                   {item.id === 'profiles' && outboundsCount > 0 && (
                     <span className="font-mono text-[11px] tabular-nums text-slate-400 dark:text-slate-500">
@@ -113,17 +116,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <button
             type="button"
             onClick={onToggleTheme}
-            className="flex w-full items-center gap-3 rounded-xl px-3.5 py-2.5 text-[13px] font-medium text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/70 hover:text-slate-900 dark:hover:text-slate-100 transition"
+            className="flex w-full items-center gap-3 rounded-xl px-3.5 py-2.5 text-[13px] font-medium text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/70 hover:text-slate-900 dark:hover:text-slate-100 transition duration-150 active:scale-[0.98]"
           >
             {theme === 'dark' ? (
               <>
                 <Sun size={18} className="shrink-0 text-amber-400" />
-                <span>حالت روشن</span>
+                <span>{t(lang, 'lightMode')}</span>
               </>
             ) : (
               <>
                 <Moon size={18} className="shrink-0 text-slate-500" />
-                <span>حالت تاریک</span>
+                <span>{t(lang, 'darkMode')}</span>
               </>
             )}
           </button>
@@ -131,18 +134,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <button
             type="button"
             onClick={onLogout}
-            className="flex w-full items-center gap-3 rounded-xl px-3.5 py-2.5 text-[13px] font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 transition"
+            className="flex w-full items-center gap-3 rounded-xl px-3.5 py-2.5 text-[13px] font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 transition duration-150 active:scale-[0.98]"
           >
             <LogOut size={18} className="shrink-0" />
-            <span>خروج از حساب</span>
+            <span>{t(lang, 'signOut')}</span>
           </button>
         </div>
       </aside>
 
       {/* Mobile Bottom Tab Bar */}
       <nav
-        aria-label="ناوبری موبایل"
-        className="fixed right-0 bottom-0 left-0 z-30 flex md:hidden items-center justify-around border-t border-slate-200/90 dark:border-slate-800 bg-white/95 dark:bg-[#0B1220]/95 px-1 py-1.5 backdrop-blur-xl"
+        aria-label={t(lang, 'mobileNavAria')}
+        className="fixed inset-x-0 bottom-0 z-30 flex md:hidden items-center justify-around border-t border-slate-200/90 dark:border-slate-800 bg-white/95 dark:bg-[#0B1220]/95 px-1 py-1.5 backdrop-blur-xl"
       >
         {NAV_ITEMS.map((item) => {
           const Icon = item.icon;
@@ -153,14 +156,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
               type="button"
               onClick={() => onSelectTab(item.id)}
               aria-current={active ? 'page' : undefined}
-              className={`flex flex-1 flex-col items-center justify-center gap-1 rounded-lg py-1.5 text-[10px] font-medium transition ${
+              className={`flex flex-1 flex-col items-center justify-center gap-1 rounded-lg py-1.5 text-[10px] font-medium transition duration-150 active:scale-95 ${
                 active
                   ? 'text-emerald-600 dark:text-emerald-400 font-semibold'
                   : 'text-slate-500 dark:text-slate-400'
               }`}
             >
-              <Icon size={20} />
-              <span className="truncate max-w-[68px]">{item.shortLabel}</span>
+              <Icon size={19} />
+              <span className="truncate max-w-[68px]">{t(lang, item.shortKey)}</span>
             </button>
           );
         })}

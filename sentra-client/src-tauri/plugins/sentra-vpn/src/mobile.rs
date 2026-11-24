@@ -32,15 +32,33 @@ pub struct SentraVpn<R: Runtime>(
 
 impl<R: Runtime> SentraVpn<R> {
     pub fn connect(&self, config_json: String, split_tunnel_ir: bool) -> Result<ConnectResponse, String> {
+        self.connect_with_server(config_json, split_tunnel_ir, "Auto".to_string(), "Sentra Auto".to_string())
+    }
+
+    pub fn connect_with_server(
+        &self,
+        config_json: String,
+        split_tunnel_ir: bool,
+        mode: String,
+        server_name: String,
+    ) -> Result<ConnectResponse, String> {
         #[cfg(target_os = "android")]
         {
             self.0
-                .run_mobile_plugin("startVpn", ConnectRequest { config_json, split_tunnel_ir })
+                .run_mobile_plugin(
+                    "startVpn",
+                    ConnectRequest {
+                        config_json,
+                        split_tunnel_ir,
+                        mode,
+                        server_name,
+                    },
+                )
                 .map_err(|e| e.to_string())
         }
         #[cfg(not(target_os = "android"))]
         {
-            let _ = (config_json, split_tunnel_ir);
+            let _ = (config_json, split_tunnel_ir, mode, server_name);
             Err("Mobile VPN plugin is only supported on Android".to_string())
         }
     }

@@ -803,10 +803,22 @@ impl VpnManager {
                 "[Android] Preparing Android VpnService via SentraVpnPlugin...",
             );
 
-            // Extract actual compiled Sing-box config JSON for libbox
+            // Extract actual compiled Sing-box config JSON and active server display name for Android notification
             let singbox_payload = config_json.get("singbox_config").unwrap_or(&config_json);
+            let active_server_label = selected_outbound_id
+                .clone()
+                .or_else(|| {
+                    config_json
+                        .get("server_name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "Sentra Auto".to_string());
             let config_str = serde_json::to_string(singbox_payload).unwrap_or_default();
-            match app_handle.sentra_vpn().connect(config_str, split) {
+            match app_handle
+                .sentra_vpn()
+                .connect_with_server(config_str, split, mode.clone(), active_server_label)
+            {
                 Ok(resp) => {
                     info!("SentraVpnPlugin connect responded: {:?}", resp);
                     let mut state = app_state.lock().await;
@@ -919,8 +931,9 @@ impl VpnManager {
                         TelemetryService::emit_status_change(&app_handle, "Connected", &mode, None);
                     }
                     Err(e) => {
-                        let err_msg = format!("خطا در اجرای هسته OpenVPN: {}", e);
+                        let err_msg = format!("Failed to start OpenVPN engine: {}", e);
                         self.is_running.store(false, Ordering::SeqCst);
+                        let _ = sysproxy::disable_system_proxy();
                         {
                             let mut state = app_state.lock().await;
                             state.status = ConnectionStatus::Disconnected;
@@ -931,6 +944,8 @@ impl VpnManager {
                     }
                 }
             } else {
+                self.is_running.store(false, Ordering::SeqCst);
+                let _ = sysproxy::disable_system_proxy();
                 SandboxEngine::run_simulation(
                     app_handle.clone(),
                     app_state.clone(),
@@ -938,7 +953,7 @@ impl VpnManager {
                     Arc::clone(&self.is_running),
                 )
                 .await;
-                return Err("هسته بومی VPN (sing-box یا OpenVPN) در مسیر binaries یا سیستم یافت نشد.".to_string());
+                return Err("Native VPN engine (sing-box or OpenVPN) was not found in binaries or system PATH.".to_string());
             }
 
             // Manage Local Proxy (SOCKS5/HTTP) & Windows System Proxy
@@ -1133,6 +1148,12 @@ impl VpnManager {
         app_handle: AppHandle,
         app_state: AppState,
     ) -> Result<(), String> {
+        // Always guarantee Windows system proxy is reset even if tunnel flag was already cleared
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = sysproxy::disable_system_proxy();
+        }
+
         if !self.is_running.load(Ordering::SeqCst) {
             return Ok(());
         }

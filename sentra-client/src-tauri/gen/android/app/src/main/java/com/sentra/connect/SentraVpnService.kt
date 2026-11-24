@@ -47,6 +47,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
         const val ACTION_STOP_VPN = "com.sentra.connect.ACTION_STOP_VPN"
         const val EXTRA_CONFIG_JSON = "EXTRA_CONFIG_JSON"
         const val EXTRA_ACTIVE_MODE = "EXTRA_ACTIVE_MODE"
+        const val EXTRA_SERVER_NAME = "EXTRA_SERVER_NAME"
         const val EXTRA_SPLIT_TUNNEL_IR = "EXTRA_SPLIT_TUNNEL_IR"
 
         // Telemetry stats shared with Tauri plugin
@@ -110,9 +111,10 @@ class SentraVpnService : VpnService(), PlatformInterface {
         when (intent.action) {
             ACTION_START_VPN -> {
                 val configJson = intent.getStringExtra(EXTRA_CONFIG_JSON) ?: ""
-                val mode = intent.getStringExtra(EXTRA_ACTIVE_MODE) ?: "Sentra Auto"
+                val mode = intent.getStringExtra(EXTRA_ACTIVE_MODE) ?: "Auto"
+                val serverName = intent.getStringExtra(EXTRA_SERVER_NAME)?.takeIf { it.isNotBlank() } ?: mode
                 val split = intent.getBooleanExtra(EXTRA_SPLIT_TUNNEL_IR, true)
-                startVpnTunnel(configJson, mode, split)
+                startVpnTunnel(configJson, mode, serverName, split)
             }
             ACTION_STOP_VPN -> {
                 stopVpnTunnel()
@@ -203,21 +205,21 @@ class SentraVpnService : VpnService(), PlatformInterface {
     // VPN Lifecycle Management
     // =========================================================================
 
-    private fun startVpnTunnel(configJson: String, mode: String, split: Boolean) {
+    private fun startVpnTunnel(configJson: String, mode: String, serverName: String, split: Boolean) {
         if (isServiceRunning.get()) {
             Log.w(TAG, "VPN service is already running. Refreshing notification...")
-            updateNotification(mode)
+            updateNotification(serverName)
             return
         }
 
-        Log.i(TAG, "Starting Sentra VPN Tunnel in mode [$mode] (Split Tunneling: $split)...")
+        Log.i(TAG, "Starting Sentra VPN Tunnel on [$serverName] in mode [$mode] (Split Tunneling: $split)...")
         activeConfig = configJson
         activeMode = mode
         splitTunnelIr = split
-        currentModeName = mode
+        currentModeName = serverName
 
         // 1. Enter foreground mode with persistent notification
-        val notification = buildPersistentNotification(mode)
+        val notification = buildPersistentNotification(serverName)
         startForeground(NOTIFICATION_ID, notification)
 
         try {
@@ -384,7 +386,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
         }
     }
 
-    private fun buildPersistentNotification(mode: String): Notification {
+    private fun buildPersistentNotification(serverName: String): Notification {
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
         val contentPendingIntent = PendingIntent.getActivity(
             this,
@@ -403,23 +405,27 @@ class SentraVpnService : VpnService(), PlatformInterface {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val label = serverName.ifBlank { "Auto" }
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("سنترا کانکت (Sentra Connect)")
-            .setContentText("متصل در حالت [$mode] - ترافیک امن و ضدنشت")
+            .setContentTitle("Sentra · Connected")
+            .setContentText("Server: $label")
             .setSmallIcon(android.R.drawable.ic_lock_lock)
             .setContentIntent(contentPendingIntent)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .addAction(
                 android.R.drawable.ic_menu_close_clear_cancel,
-                "قطع اتصال (Disconnect)",
+                "Disconnect",
                 disconnectPendingIntent
             )
             .build()
     }
 
-    private fun updateNotification(mode: String) {
+    private fun updateNotification(serverName: String) {
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(NOTIFICATION_ID, buildPersistentNotification(mode))
+        notificationManager.notify(NOTIFICATION_ID, buildPersistentNotification(serverName))
     }
 }

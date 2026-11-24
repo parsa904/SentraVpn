@@ -10,9 +10,11 @@ import {
   XCircle,
 } from 'lucide-react';
 import type { DonatedOutboundRecord, PersonalConfigItem } from '../types/sentra';
+import { type Language, t } from '../i18n/translations';
 import { formatPing, isSupportedProxyUri } from '../utils/proxyParser';
 
 interface DonateOutboundViewProps {
+  lang: Language;
   personalConfigs: PersonalConfigItem[];
   donations: DonatedOutboundRecord[];
   loadingDonations: boolean;
@@ -25,6 +27,7 @@ interface DonateOutboundViewProps {
 }
 
 export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
+  lang,
   personalConfigs,
   donations,
   loadingDonations,
@@ -45,7 +48,7 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
       const text = await navigator.clipboard.readText();
       if (text) setUri(text.trim());
     } catch {
-      setError('دسترسی به کلیپ‌بورد در دسترس نیست؛ لطفاً لینک را دستی وارد کنید.');
+      setError(t(lang, 'clipboardError'));
     }
   };
 
@@ -56,11 +59,11 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
 
     const trimmed = uri.trim();
     if (!trimmed) {
-      setError('لطفاً لینک کانفیگ (VLESS / VMess / Trojan / Hysteria2 / SS / TUIC / WireGuard) را وارد کنید.');
+      setError(t(lang, 'donationUriRequired'));
       return;
     }
     if (!isSupportedProxyUri(trimmed)) {
-      setError('فرمت لینک کانفیگ پشتیبانی نمی‌شود. لینک باید با پروتکل معتبر آغاز شود.');
+      setError(t(lang, 'donationUriUnsupported'));
       return;
     }
 
@@ -71,15 +74,12 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
         name: name.trim() || undefined,
         note: note.trim() || undefined,
       });
-      setSuccessMsg(
-        res.message ||
-          'کانفیگ شما با موفقیت بررسی و برای ادمین در تلگرام ارسال شد. پس از تایید، اشتراک رایگان شما فعال خواهد شد.'
-      );
+      setSuccessMsg(res.message || t(lang, 'donationSubmittedDefault'));
       setUri('');
       setName('');
       setNote('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'ارسال اوتباند ناموفق بود.');
+      setError(err instanceof Error ? err.message : t(lang, 'donationSubmitError'));
     } finally {
       setSubmitting(false);
     }
@@ -91,7 +91,9 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
         <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
           <CheckCircle2 size={15} />
           <span>
-            تایید شده{rec.reward_days > 0 ? ` (+${rec.reward_days} روز اشتراک)` : ''}
+            {rec.reward_days > 0
+              ? t(lang, 'statusApprovedDays', { days: rec.reward_days })
+              : t(lang, 'statusApproved')}
           </span>
         </span>
       );
@@ -100,33 +102,33 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
       return (
         <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-rose-600 dark:text-rose-400">
           <XCircle size={15} />
-          <span>رد شده</span>
+          <span>{t(lang, 'statusRejected')}</span>
         </span>
       );
     }
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-600 dark:text-amber-400">
         <Clock size={15} />
-        <span>در انتظار تایید ادمین</span>
+        <span>{t(lang, 'statusPending')}</span>
       </span>
     );
   };
 
   return (
-    <div className="flex-1 overflow-y-auto px-4 md:px-8 py-6 pb-24 md:pb-10">
-      <div className="mx-auto max-w-4xl space-y-8">
+    <div className="animate-sentra-view flex-1 overflow-y-auto px-4 md:px-8 py-6 pb-24 md:pb-10">
+      <div className="mx-auto max-w-4xl space-y-7">
         {/* Donation Form Card */}
-        <section className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900/80 p-6">
+        <section className="rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900/80 p-5 md:p-6">
           <div className="flex items-start gap-3">
             <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-amber-500/12 text-amber-600 dark:text-amber-400">
               <Gift size={22} />
             </div>
             <div>
-              <h2 className="text-lg font-bold text-slate-900 dark:text-white">
-                اهدای اوتباند و دریافت اشتراک رایگان
+              <h2 className="text-base md:text-lg font-bold text-slate-900 dark:text-white">
+                {t(lang, 'donateTitle')}
               </h2>
               <p className="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
-                کانفیگ سالم خود را به شبکه سنترا اهدا کنید. پس از تست خودکار سلامت و تایید ادمین در ربات تلگرام، ۷، ۱۵ یا ۳۰ روز اشتراک رایگان به حساب شما اضافه می‌شود.
+                {t(lang, 'donateDesc')}
               </p>
             </div>
           </div>
@@ -134,7 +136,7 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
           {donatablePersonal.length > 0 && (
             <div className="mt-5">
               <div className="mb-2 text-xs font-medium text-slate-600 dark:text-slate-300">
-                انتخاب سریع از کانفیگ‌های شخصی شما:
+                {t(lang, 'quickPickPersonal')}
               </div>
               <div className="flex flex-wrap gap-2">
                 {donatablePersonal.map((cfg) => (
@@ -146,7 +148,7 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
                       setName(cfg.name);
                       setError(null);
                     }}
-                    className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/80 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:border-emerald-500/50 transition"
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/80 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:border-emerald-500/50 active:scale-[0.97] transition"
                   >
                     <span>{cfg.flag}</span>
                     <span>{cfg.name}</span>
@@ -183,7 +185,7 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
                   htmlFor="donate-uri"
                   className="text-xs font-medium text-slate-700 dark:text-slate-300"
                 >
-                  لینک کانفیگ (URI)
+                  {t(lang, 'configUriLabel')}
                 </label>
                 <button
                   type="button"
@@ -191,7 +193,7 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
                   className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400 hover:underline"
                 >
                   <ClipboardPaste size={14} />
-                  <span>چسباندن از کلیپ‌بورد</span>
+                  <span>{t(lang, 'pasteClipboard')}</span>
                 </button>
               </div>
               <textarea
@@ -211,14 +213,14 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
                   htmlFor="donate-name"
                   className="mb-1.5 block text-xs font-medium text-slate-700 dark:text-slate-300"
                 >
-                  نام پیشنهادی سرور (اختیاری)
+                  {t(lang, 'serverNameOptional')}
                 </label>
                 <input
                   id="donate-name"
                   type="text"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
-                  placeholder="مثلاً: Frankfurt High-Speed"
+                  placeholder={t(lang, 'serverNamePlaceholder')}
                   className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-950/60 px-3.5 py-2.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
                 />
               </div>
@@ -228,14 +230,14 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
                   htmlFor="donate-note"
                   className="mb-1.5 block text-xs font-medium text-slate-700 dark:text-slate-300"
                 >
-                  توضیحات / مدت اعتبار یا ظرفیت سرور (اختیاری)
+                  {t(lang, 'noteOptional')}
                 </label>
                 <input
                   id="donate-note"
                   type="text"
                   value={note}
                   onChange={(e) => setNote(e.target.value)}
-                  placeholder="مثلاً: سرور هتزنر، اعتبار ۱ ماهه، ترافیک نامحدود"
+                  placeholder={t(lang, 'notePlaceholder')}
                   className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-950/60 px-3.5 py-2.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
                 />
               </div>
@@ -245,10 +247,12 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
               <button
                 type="submit"
                 disabled={submitting}
-                className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 px-5 py-2.5 text-xs font-semibold text-white shadow-sm shadow-emerald-600/20 transition"
+                className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-[0.98] disabled:opacity-60 px-5 py-2.5 text-xs font-semibold text-white shadow-sm shadow-emerald-600/20 transition"
               >
-                <Send size={16} />
-                <span>{submitting ? 'در حال تست و ارسال...' : 'ارسال برای تایید ادمین'}</span>
+                <Send size={15} />
+                <span>
+                  {submitting ? t(lang, 'submittingDonation') : t(lang, 'submitDonation')}
+                </span>
               </button>
             </div>
           </form>
@@ -257,33 +261,31 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
         {/* User Donation History & Reward Status */}
         <section className="space-y-4">
           <div className="flex items-center justify-between gap-3">
-            <div>
-              <h3 className="text-base font-bold text-slate-900 dark:text-white">
-                تاریخچه اوتباندهای اهدایی من
-              </h3>
-              <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                وضعیت بررسی ادمین و پاداش‌های دریافت‌شده روی حساب شما
-              </p>
-            </div>
+            <h3 className="text-base font-bold text-slate-900 dark:text-white">
+              {t(lang, 'myDonationsTitle')}
+            </h3>
 
             <button
               type="button"
               onClick={onRefreshDonations}
               disabled={loadingDonations}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:border-emerald-500/50 transition"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:border-emerald-500/50 active:scale-[0.97] transition"
             >
-              <RefreshCw size={15} className={loadingDonations ? 'animate-spin text-emerald-500' : ''} />
-              <span>بروزرسانی وضعیت</span>
+              <RefreshCw
+                size={15}
+                className={loadingDonations ? 'animate-spin text-emerald-500' : ''}
+              />
+              <span>{t(lang, 'refreshStatus')}</span>
             </button>
           </div>
 
           {donations.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-slate-300 dark:border-slate-800 bg-white/60 dark:bg-slate-900/40 px-6 py-10 text-center">
               <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">
-                هنوز اوتباندی اهدا نکرده‌اید
+                {t(lang, 'noDonationsTitle')}
               </p>
               <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                پس از ارسال اولین کانفیگ، وضعیت بررسی و پاداش آن در اینجا نمایش داده می‌شود.
+                {t(lang, 'noDonationsDesc')}
               </p>
             </div>
           ) : (
@@ -312,7 +314,7 @@ export const DonateOutboundView: React.FC<DonateOutboundViewProps> = ({
                         </span>
                         <span>·</span>
                         <span className="font-mono tabular-nums" dir="ltr">
-                          {formatPing(rec.latency_ms)}
+                          {formatPing(rec.latency_ms, lang)}
                         </span>
                         {rec.user_note && (
                           <>

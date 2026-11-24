@@ -1,13 +1,15 @@
 import React, { useMemo, useState } from 'react';
 import { Check, Copy, Trash2 } from 'lucide-react';
 import type { LogEntry } from '../types/sentra';
+import { type Language, t } from '../i18n/translations';
 
 interface LogsViewProps {
+  lang: Language;
   logs: LogEntry[];
   onClearLogs: () => void;
 }
 
-export const LogsView: React.FC<LogsViewProps> = ({ logs, onClearLogs }) => {
+export const LogsView: React.FC<LogsViewProps> = ({ lang, logs, onClearLogs }) => {
   const [filter, setFilter] = useState<'ALL' | 'INFO' | 'SYNC' | 'WARN' | 'ERROR'>('ALL');
   const [copied, setCopied] = useState(false);
 
@@ -30,32 +32,27 @@ export const LogsView: React.FC<LogsViewProps> = ({ logs, onClearLogs }) => {
   };
 
   return (
-    <div className="flex flex-1 flex-col overflow-hidden px-4 md:px-8 py-6 pb-24 md:pb-8">
+    <div className="animate-sentra-view flex flex-1 flex-col overflow-hidden px-4 md:px-8 py-6 pb-24 md:pb-8">
       <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-4 overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h2 className="text-lg font-bold text-slate-900 dark:text-white">
-              گزارش‌های سیستم (Logs)
-            </h2>
-            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-              رویدادهای واقعی اتصال، همگام‌سازی و هسته شبکه
-            </p>
-          </div>
+          <h2 className="text-lg font-bold text-slate-900 dark:text-white">
+            {t(lang, 'logsTitle')}
+          </h2>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <div className="flex items-center gap-1 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-1">
               {(['ALL', 'INFO', 'SYNC', 'WARN', 'ERROR'] as const).map((lvl) => (
                 <button
                   key={lvl}
                   type="button"
                   onClick={() => setFilter(lvl)}
-                  className={`rounded-lg px-2.5 py-1 font-mono text-[11px] font-semibold transition ${
+                  className={`rounded-lg px-2.5 py-1 font-mono text-[11px] font-semibold transition active:scale-[0.97] ${
                     filter === lvl
                       ? 'bg-emerald-600 text-white'
                       : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
                   }`}
                 >
-                  {lvl === 'ALL' ? 'همه' : lvl}
+                  {lvl === 'ALL' ? t(lang, 'filterAll') : lvl}
                 </button>
               ))}
             </div>
@@ -64,20 +61,20 @@ export const LogsView: React.FC<LogsViewProps> = ({ logs, onClearLogs }) => {
               type="button"
               onClick={handleCopyAll}
               disabled={visibleLogs.length === 0}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:border-emerald-500/50 disabled:opacity-50 transition"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:border-emerald-500/50 active:scale-[0.97] disabled:opacity-50 transition"
             >
               {copied ? <Check size={15} className="text-emerald-500" /> : <Copy size={15} />}
-              <span>{copied ? 'کپی شد' : 'کپی'}</span>
+              <span>{copied ? t(lang, 'copied') : t(lang, 'copy')}</span>
             </button>
 
             <button
               type="button"
               onClick={onClearLogs}
               disabled={logs.length === 0}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 disabled:opacity-50 transition"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 active:scale-[0.97] disabled:opacity-50 transition"
             >
               <Trash2 size={15} />
-              <span>پاک‌سازی</span>
+              <span>{t(lang, 'clear')}</span>
             </button>
           </div>
         </div>
@@ -88,7 +85,7 @@ export const LogsView: React.FC<LogsViewProps> = ({ logs, onClearLogs }) => {
         >
           {visibleLogs.length === 0 ? (
             <div className="py-12 text-center font-sans text-slate-500">
-              هنوز گزارشی ثبت نشده است.
+              {t(lang, 'noLogs')}
             </div>
           ) : (
             <div className="space-y-1">

@@ -323,45 +323,100 @@ export function formatDuration(totalSeconds: number): string {
   return [hrs, mins, secs].map((v) => String(v).padStart(2, '0')).join(':');
 }
 
-export function formatPing(ms: number | null | undefined): string {
+export const APP_VERSION = '1.0.0';
+
+export type LatencyTier = 'good' | 'fair' | 'poor' | 'timeout' | 'idle';
+
+/**
+ * Classifies server latency into standard color tiers:
+ * - good (<200ms): green
+ * - fair (200..=500ms): yellow/amber
+ * - poor (>500ms): red
+ * - timeout (tested & unreachable/null/<=0): red
+ * - idle (not yet tested & no baseline ping): neutral
+ */
+export function getLatencyTier(
+  ms: number | null | undefined,
+  tested = false
+): LatencyTier {
   if (ms === null || ms === undefined || !Number.isFinite(ms) || ms <= 0) {
-    return '—';
+    return tested ? 'timeout' : 'idle';
+  }
+  if (ms < 200) return 'good';
+  if (ms <= 500) return 'fair';
+  return 'poor';
+}
+
+export function formatPing(
+  ms: number | null | undefined,
+  lang: 'en' | 'fa' = 'en',
+  tested = false
+): string {
+  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms <= 0) {
+    return tested ? (lang === 'fa' ? 'تایم‌اوت' : 'Timeout') : '—';
   }
   return `${Math.round(ms)} ms`;
 }
 
-export function formatRemainingDays(days: number | null | undefined): string {
+export function formatRemainingDays(
+  days: number | null | undefined,
+  lang: 'en' | 'fa' = 'en'
+): string {
   if (days === null || days === undefined || !Number.isFinite(days)) return '—';
-  if (days <= 0) return 'منقضی شده';
-  return `${days} روز باقی‌مانده`;
+  if (days <= 0) return lang === 'fa' ? 'منقضی شده' : 'Expired';
+  return lang === 'fa' ? `${days} روز باقی‌مانده` : `${days}d left`;
 }
 
 export function validateCredentialsForm(
   username: string,
   password: string,
-  isRegister: boolean
+  isRegister: boolean,
+  lang: 'en' | 'fa' = 'en'
 ): string | null {
   const u = username.trim();
-  if (!u) return 'نام کاربری نمی‌تواند خالی باشد.';
-  if (u.length < 3 || u.length > 32) return 'نام کاربری باید بین ۳ تا ۳۲ کاراکتر باشد.';
+  if (!u) {
+    return lang === 'fa' ? 'نام کاربری نمی‌تواند خالی باشد.' : 'Username is required.';
+  }
+  if (u.length < 3 || u.length > 32) {
+    return lang === 'fa'
+      ? 'نام کاربری باید بین ۳ تا ۳۲ کاراکتر باشد.'
+      : 'Username must be between 3 and 32 characters.';
+  }
   const pattern = isRegister ? /^[a-zA-Z0-9_]+$/ : /^[a-zA-Z0-9_.-]+$/;
   if (!pattern.test(u)) {
     return isRegister
-      ? 'نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و زیرخط (_) باشد.'
-      : 'نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و _ . - باشد.';
+      ? lang === 'fa'
+        ? 'نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و زیرخط (_) باشد.'
+        : 'Username can only contain letters, numbers, and underscores (_).'
+      : lang === 'fa'
+      ? 'نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و _ . - باشد.'
+      : 'Username can only contain letters, numbers, and _ . - characters.';
   }
-  if (!password) return 'رمز عبور را وارد کنید.';
+  if (!password) {
+    return lang === 'fa' ? 'رمز عبور را وارد کنید.' : 'Password is required.';
+  }
   if (isRegister && password.length < 8) {
-    return 'رمز عبور برای ثبت‌نام باید حداقل ۸ کاراکتر باشد.';
+    return lang === 'fa'
+      ? 'رمز عبور برای ثبت‌نام باید حداقل ۸ کاراکتر باشد.'
+      : 'Password must be at least 8 characters.';
   }
   return null;
 }
 
-export function validateOtpCode(code: string): string | null {
+export function validateOtpCode(
+  code: string,
+  lang: 'en' | 'fa' = 'en'
+): string | null {
   const cleaned = code.trim();
-  if (!cleaned) return 'لطفاً کد ورود ۸ رقمی را وارد کنید.';
+  if (!cleaned) {
+    return lang === 'fa'
+      ? 'لطفاً کد ورود ۸ رقمی را وارد کنید.'
+      : 'Enter the 8-digit Telegram code.';
+  }
   if (!/^\d{8}$/.test(cleaned)) {
-    return 'کد ورود تلگرام باید دقیقاً ۸ رقم عددی باشد.';
+    return lang === 'fa'
+      ? 'کد ورود تلگرام باید دقیقاً ۸ رقم عددی باشد.'
+      : 'Telegram code must be exactly 8 digits.';
   }
   return null;
 }
@@ -370,6 +425,71 @@ export function computeUsagePercent(usedBytes: number, limitBytes: number): numb
   if (!Number.isFinite(limitBytes) || limitBytes <= 0) return 0;
   if (!Number.isFinite(usedBytes) || usedBytes <= 0) return 0;
   return Math.min(100, Math.round((usedBytes / limitBytes) * 100));
+}
+
+/**
+ * Deterministically picks the healthy server with the lowest positive latency.
+ */
+export function selectFastestHealthyServer<
+  T extends { id: string; is_online?: boolean; latency_ms?: number | null }
+>(
+  nodes: T[],
+  livePings: Record<string, number | null>
+): { node: T; latencyMs: number } | null {
+  let best: { node: T; latencyMs: number } | null = null;
+  for (const node of nodes) {
+    if (node.is_online === false) continue;
+    const measured =
+      node.id in livePings
+        ? livePings[node.id]
+        : typeof node.latency_ms === 'number' && node.latency_ms > 0
+        ? node.latency_ms
+        : null;
+    if (measured === null || !Number.isFinite(measured) || measured <= 0) {
+      continue;
+    }
+    if (!best || measured < best.latencyMs) {
+      best = { node, latencyMs: Math.round(measured) };
+    }
+  }
+  return best;
+}
+
+function parseSemverParts(tag: string): [number, number, number] | null {
+  const cleaned = tag.trim().replace(/^v/i, '').split('-')[0];
+  const parts = cleaned.split('.');
+  if (parts.length === 0 || parts.length > 3) return null;
+  const nums = [0, 0, 0];
+  for (let i = 0; i < parts.length; i += 1) {
+    if (!/^\d+$/.test(parts[i])) return null;
+    nums[i] = Number.parseInt(parts[i], 10);
+  }
+  return [nums[0], nums[1], nums[2]];
+}
+
+export function compareSemver(a: string, b: string): number {
+  const pa = parseSemverParts(a);
+  const pb = parseSemverParts(b);
+  if (!pa || !pb) return 0;
+  for (let i = 0; i < 3; i += 1) {
+    if (pa[i] !== pb[i]) return pa[i] > pb[i] ? 1 : -1;
+  }
+  return 0;
+}
+
+export function isNewerVersion(currentVersion: string, latestTag: string): boolean {
+  return compareSemver(latestTag, currentVersion) > 0;
+}
+
+export function isSafeReleaseUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'https:') return false;
+    if (parsed.hostname !== 'github.com') return false;
+    return parsed.pathname.toLowerCase().startsWith('/parsa904/sentravpn/');
+  } catch {
+    return false;
+  }
 }
 
 export interface RawAuthApiResponse {

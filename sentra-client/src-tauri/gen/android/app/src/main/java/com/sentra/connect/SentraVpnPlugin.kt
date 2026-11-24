@@ -20,7 +20,8 @@ import app.tauri.plugin.Plugin
 class ConnectArgs {
     var configJson: String = ""
     var splitTunnelIr: Boolean = true
-    var mode: String = "Sentra Auto"
+    var mode: String = "Auto"
+    var serverName: String = "Sentra Auto"
 }
 
 @InvokeArg
@@ -38,7 +39,8 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
 
     private var pendingConfigJson: String? = null
     private var pendingSplitTunnel: Boolean = true
-    private var pendingMode: String = "Sentra Auto"
+    private var pendingMode: String = "Auto"
+    private var pendingServerName: String = "Sentra Auto"
 
     init {
         instance = this
@@ -170,22 +172,26 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (_: Exception) {
             val configRaw = invoke.getString("configJson") ?: invoke.getString("config_json") ?: ""
             val splitRaw = invoke.getBoolean("splitTunnelIr") ?: invoke.getBoolean("split_tunnel_ir") ?: true
-            val modeRaw = invoke.getString("mode") ?: "Sentra Auto"
+            val modeRaw = invoke.getString("mode") ?: "Auto"
+            val serverRaw = invoke.getString("serverName") ?: invoke.getString("server_name") ?: modeRaw
             ConnectArgs().apply {
                 configJson = configRaw
                 splitTunnelIr = splitRaw
                 mode = modeRaw
+                serverName = serverRaw
             }
         }
 
         if (args.configJson.isBlank()) {
-            invoke.reject("پیکربندی Sing-box (configJson) خالی است.")
+            invoke.reject("Sing-box configuration (configJson) is empty.")
             return
         }
 
+        val resolvedServer = args.serverName.ifBlank { args.mode.ifBlank { "Sentra Auto" } }
         pendingConfigJson = args.configJson
         pendingSplitTunnel = args.splitTunnelIr
         pendingMode = args.mode
+        pendingServerName = resolvedServer
 
         // Check Android system VPN permission via Tauri v2 Activity Result API
         val prepareIntent = VpnService.prepare(activity)
@@ -194,7 +200,7 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
             startActivityForResult(invoke, prepareIntent, "onVpnPermissionResult")
         } else {
             Log.i(TAG, "VPN permission already granted. Launching SentraVpnService directly...")
-            launchVpnService(args.configJson, args.mode, args.splitTunnelIr)
+            launchVpnService(args.configJson, args.mode, resolvedServer, args.splitTunnelIr)
             val res = JSObject().apply {
                 put("success", true)
                 put("status", "Connected")
@@ -211,7 +217,8 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
             val config = pendingConfigJson ?: ""
             val split = pendingSplitTunnel
             val mode = pendingMode
-            launchVpnService(config, mode, split)
+            val server = pendingServerName
+            launchVpnService(config, mode, server, split)
 
             val res = JSObject().apply {
                 put("success", true)
@@ -221,7 +228,7 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.resolve(res)
         } else {
             Log.w(TAG, "User denied Android VPN permission.")
-            invoke.reject("مجوز اتصال VPN توسط کاربر تایید نشد.")
+            invoke.reject("Android VPN permission was denied.")
         }
     }
 
@@ -260,11 +267,12 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(res)
     }
 
-    private fun launchVpnService(configJson: String, mode: String, split: Boolean) {
+    private fun launchVpnService(configJson: String, mode: String, serverName: String, split: Boolean) {
         val intent = Intent(activity, SentraVpnService::class.java).apply {
             action = SentraVpnService.ACTION_START_VPN
             putExtra(SentraVpnService.EXTRA_CONFIG_JSON, configJson)
             putExtra(SentraVpnService.EXTRA_ACTIVE_MODE, mode)
+            putExtra(SentraVpnService.EXTRA_SERVER_NAME, serverName)
             putExtra(SentraVpnService.EXTRA_SPLIT_TUNNEL_IR, split)
         }
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
