@@ -13,6 +13,7 @@ import {
   parseAuthSessionResponse,
   type RawAuthApiResponse,
 } from '../utils/proxyParser';
+import type { BatteryOptimizationStatus } from '../utils/reconnectPolicy';
 
 const SESSION_STORAGE_KEY = 'sentra_session_v2';
 const PERSONAL_CONFIGS_KEY = 'sentra_personal_configs_v2';
@@ -584,6 +585,11 @@ export async function setKillSwitchNative(enabled: boolean): Promise<void> {
   await invokeTauri('toggle_kill_switch', { enabled });
 }
 
+export async function setAutoReconnectNative(enabled: boolean): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await invokeTauri('set_auto_reconnect', { enabled });
+}
+
 export async function setUseWarpNative(enabled: boolean): Promise<void> {
   if (!isTauriRuntime()) return;
   await invokeTauri('set_use_warp', { enabled });
@@ -596,6 +602,34 @@ export async function connectVpnNative(): Promise<void> {
     );
   }
   await invokeTauri('connect_vpn');
+}
+
+export async function reconnectVpnNative(reason: 'network_switch' | 'device_wake'): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await invokeTauri('reconnect_vpn', { reason });
+}
+
+export async function getBatteryOptimizationStatusNative(): Promise<BatteryOptimizationStatus> {
+  if (!isTauriRuntime()) {
+    return { isAndroid: false, isOptimized: false, canOpenSettings: false };
+  }
+  try {
+    const res = await invokeTauri<Partial<BatteryOptimizationStatus>>(
+      'get_battery_optimization_status'
+    );
+    return {
+      isAndroid: Boolean(res?.isAndroid),
+      isOptimized: Boolean(res?.isOptimized),
+      canOpenSettings: Boolean(res?.canOpenSettings),
+    };
+  } catch {
+    return { isAndroid: false, isOptimized: false, canOpenSettings: false };
+  }
+}
+
+export async function openBatteryOptimizationSettingsNative(): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  return invokeTauri<boolean>('open_battery_optimization_settings');
 }
 
 export async function disconnectVpnNative(): Promise<void> {

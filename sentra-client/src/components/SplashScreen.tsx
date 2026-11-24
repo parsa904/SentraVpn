@@ -9,20 +9,53 @@ export const SplashScreen: React.FC<SplashScreenProps> = ({ statusText }) => {
   return (
     <div
       data-testid="splash-screen"
-      className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-slate-50 dark:bg-[#080D18] text-slate-900 dark:text-slate-100 select-none"
+      className="fixed inset-0 z-50 flex flex-col items-center justify-center overflow-hidden bg-slate-50 dark:bg-[#080D18] text-slate-900 dark:text-slate-100 select-none px-6"
     >
-      <div className="relative flex items-center justify-center">
-        <div className="absolute h-44 w-44 rounded-full bg-emerald-500/20 blur-3xl animate-sentra-glow" />
-        <div className="relative rounded-[28px] p-1 shadow-2xl shadow-emerald-950/20 ring-1 ring-slate-200/80 dark:ring-white/10">
-          <SentraLogo size={96} animated withSquircle />
-        </div>
-      </div>
+      {/* Subtle architectural concentric aura behind the bridge emblem */}
+      <div className="relative flex flex-col items-center justify-center">
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute h-64 w-64 rounded-full bg-emerald-500/15 blur-3xl animate-sentra-glow"
+        />
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute h-52 w-52 rounded-full border border-emerald-500/20 animate-sentra-ripple"
+        />
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute h-52 w-52 rounded-full border border-emerald-500/15 animate-sentra-ripple-delayed"
+        />
 
-      <div className="mt-7 flex flex-col items-center gap-2 text-center">
-        <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">
-          Sentra
-        </h1>
-        <p className="text-xs font-medium text-slate-500 dark:text-slate-400">
+        {/* Official SENTRA / SECURE CONNECT Full Lockup */}
+        <div className="relative z-10">
+          <SentraLogo variant="full" size={188} animated />
+        </div>
+
+        {/* Suspension-Bridge Signal Arch Loader */}
+        <svg
+          width="176"
+          height="26"
+          viewBox="0 0 176 26"
+          fill="none"
+          aria-hidden="true"
+          className="relative z-10 mt-6"
+        >
+          <path
+            d="M8 20 Q88 2 168 20"
+            className="stroke-slate-300 dark:stroke-slate-800"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+          />
+          <path
+            d="M8 20 Q88 2 168 20"
+            stroke="#10B981"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            className="animate-sentra-cable-signal"
+          />
+        </svg>
+
+        <p className="relative z-10 mt-2 text-xs font-medium tracking-wide text-slate-500 dark:text-slate-400">
           {statusText}
         </p>
       </div>

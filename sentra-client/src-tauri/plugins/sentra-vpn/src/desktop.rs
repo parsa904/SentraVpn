@@ -52,6 +52,24 @@ impl<R: Runtime> SentraVpn<R> {
     pub fn clear_session(&self) -> Result<SessionSaveResponse, String> {
         Ok(SessionSaveResponse { success: true })
     }
+
+    pub fn set_auto_reconnect(&self, _enabled: bool) -> Result<SimpleSuccessResponse, String> {
+        Ok(SimpleSuccessResponse { success: true })
+    }
+
+    pub fn get_battery_optimization_status(
+        &self,
+    ) -> Result<BatteryOptimizationStatusResponse, String> {
+        Ok(BatteryOptimizationStatusResponse {
+            is_android: false,
+            is_optimized: false,
+            can_open_settings: false,
+        })
+    }
+
+    pub fn open_battery_optimization_settings(&self) -> Result<SimpleSuccessResponse, String> {
+        Ok(SimpleSuccessResponse { success: false })
+    }
 }
 
 impl<R: Runtime> Default for SentraVpn<R> {

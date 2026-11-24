@@ -136,6 +136,9 @@ pub fn run() {
     let vpn_for_tray = Arc::clone(&vpn_manager);
     let state_for_tray = Arc::clone(&app_state);
 
+    let vpn_for_watchdog = Arc::clone(&vpn_manager);
+    let state_for_watchdog = Arc::clone(&app_state);
+
     let vpn_for_close = Arc::clone(&vpn_manager);
     let state_for_close = Arc::clone(&app_state);
 
@@ -152,10 +155,14 @@ pub fn run() {
                 if let Err(err) = setup_desktop_tray(app, vpn_for_tray, state_for_tray) {
                     tracing::warn!("Failed to initialize System Tray icon: {}", err);
                 }
+                vpn_for_watchdog.spawn_network_and_wake_watchdog(
+                    app.handle().clone(),
+                    state_for_watchdog,
+                );
             }
             #[cfg(not(desktop))]
             {
-                let _ = (app, vpn_for_tray, state_for_tray);
+                let _ = (app, vpn_for_tray, state_for_tray, vpn_for_watchdog, state_for_watchdog);
             }
             Ok(())
         })
@@ -167,10 +174,14 @@ pub fn run() {
             commands::get_client_state,
             commands::connect_vpn,
             commands::disconnect_vpn,
+            commands::reconnect_vpn,
             commands::toggle_sandbox_mode,
             commands::toggle_split_tunneling,
             commands::toggle_tun_mode,
             commands::toggle_kill_switch,
+            commands::set_auto_reconnect,
+            commands::get_battery_optimization_status,
+            commands::open_battery_optimization_settings,
             commands::get_connection_modes,
             commands::set_connection_mode,
             commands::set_connection_protocol,

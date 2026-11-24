@@ -57,9 +57,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <div>
           {/* Brand Header */}
           <div className="flex items-center gap-3 px-5 py-5 border-b border-slate-200/70 dark:border-slate-800/80">
-            <div className="rounded-[12px] shadow-sm ring-1 ring-slate-200/80 dark:ring-white/10 shrink-0">
-              <SentraLogo size={36} withSquircle />
-            </div>
+            <SentraLogo size={38} withSquircle animated />
             <div className="min-w-0">
               <div className="text-base font-bold tracking-tight text-slate-900 dark:text-white">
                 {t(lang, 'brand')}

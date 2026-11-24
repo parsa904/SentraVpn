@@ -5,6 +5,7 @@ import {
   ArrowRight,
   Globe,
   KeyRound,
+  Loader2,
   Lock,
   Moon,
   Send,
@@ -105,7 +106,18 @@ export const AuthView: React.FC<AuthViewProps> = ({
 
   return (
     <div className="relative flex min-h-screen w-full items-center justify-center overflow-hidden bg-slate-50 dark:bg-[#080D18] px-4 py-10 text-slate-900 dark:text-slate-100">
-      <WorldMapBackdrop />
+      {/* Living dot-matrix world map with flowing encrypted bridge routes */}
+      <WorldMapBackdrop ambientRoutes />
+
+      {/* Subtle atmospheric depth orbs (pure compositor transforms, never harsh neon) */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute -top-28 start-1/4 h-96 w-96 rounded-full bg-emerald-500/[0.08] dark:bg-emerald-500/[0.11] blur-3xl animate-sentra-ambient-drift"
+      />
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute -bottom-32 end-1/4 h-[26rem] w-[26rem] rounded-full bg-sky-500/[0.07] dark:bg-sky-500/[0.09] blur-3xl animate-sentra-ambient-drift-reverse"
+      />
 
       {/* Top corner language & theme controls */}
       <div className="fixed top-4 end-4 z-20 flex items-center gap-2">
@@ -155,23 +167,96 @@ export const AuthView: React.FC<AuthViewProps> = ({
         </button>
       </div>
 
-      <main className="relative z-10 w-full max-w-[436px] animate-sentra-view">
-        <div className="rounded-2xl border border-slate-200/90 dark:border-slate-800/90 bg-white/94 dark:bg-slate-900/92 p-6 sm:p-7 shadow-2xl shadow-slate-950/10 dark:shadow-black/40 backdrop-blur-xl">
-          {/* Clean Brand Header — zero marketing copy */}
-          <div className="flex flex-col items-center text-center">
-            <div className="rounded-[20px] shadow-lg shadow-emerald-950/10 ring-1 ring-slate-200 dark:ring-white/10">
-              <SentraLogo size={60} withSquircle />
+      <main className="relative z-10 w-full max-w-[436px] animate-sentra-auth-card">
+        <div className="relative overflow-hidden rounded-2xl border border-slate-200/90 dark:border-slate-800/90 bg-white/92 dark:bg-slate-900/88 p-6 sm:p-7 shadow-2xl shadow-slate-950/10 dark:shadow-black/50 backdrop-blur-xl">
+          {/* Precision top-edge specular hairline */}
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-emerald-500/55 to-transparent"
+          />
+
+          {/* Official Brand Lockup with organic orbital halo + suspension-bridge signal arch */}
+          <div className="relative flex flex-col items-center text-center pt-2 pb-1">
+            <div className="relative flex items-center justify-center">
+              {/* Soft breathing radial aura behind emblem */}
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute h-40 w-40 rounded-full bg-emerald-500/[0.11] dark:bg-emerald-500/[0.15] blur-2xl animate-sentra-glow"
+              />
+
+              {/* Dual ultra-fine counter-rotating orbital arcs */}
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 196 196"
+                className="pointer-events-none absolute h-[188px] w-[188px] animate-sentra-orbit-gentle"
+              >
+                <circle
+                  cx="98"
+                  cy="98"
+                  r="90"
+                  fill="none"
+                  stroke="#10B981"
+                  strokeOpacity="0.22"
+                  strokeWidth="1.2"
+                  strokeDasharray="68 180 28 288"
+                  strokeLinecap="round"
+                />
+              </svg>
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 196 196"
+                className="pointer-events-none absolute h-[164px] w-[164px] animate-sentra-orbit-gentle-reverse"
+              >
+                <circle
+                  cx="98"
+                  cy="98"
+                  r="76"
+                  fill="none"
+                  stroke="#0EA5E9"
+                  strokeOpacity="0.18"
+                  strokeWidth="1"
+                  strokeDasharray="40 220 18 200"
+                  strokeLinecap="round"
+                />
+              </svg>
+
+              <div className="relative z-10">
+                <SentraLogo variant="full" size={148} animated />
+              </div>
             </div>
-            <h1 className="mt-4 text-xl font-bold tracking-tight text-slate-900 dark:text-white">
-              {t(lang, 'brand')}
-            </h1>
+
+            {/* Suspension-bridge signal arch mirroring the Sentra emblem */}
+            <svg
+              width="148"
+              height="18"
+              viewBox="0 0 148 18"
+              fill="none"
+              aria-hidden="true"
+              className="mt-2"
+            >
+              <path
+                d="M6 14 Q74 1 142 14"
+                className="stroke-slate-200 dark:stroke-slate-800"
+                strokeWidth="1.75"
+                strokeLinecap="round"
+              />
+              <path
+                d="M6 14 Q74 1 142 14"
+                stroke="#10B981"
+                strokeWidth="2"
+                strokeLinecap="round"
+                className="animate-sentra-cable-signal"
+              />
+            </svg>
+
+            <h1 className="sr-only">{t(lang, 'brand')}</h1>
           </div>
 
           {/* Auth Mode Tabs */}
           <div
             role="tablist"
             aria-label={t(lang, 'authMethodAria')}
-            className="mt-6 grid grid-cols-[1fr_1fr_1.35fr] gap-1 rounded-xl bg-slate-100 dark:bg-slate-800/80 p-1"
+            className="mt-5 grid grid-cols-[1fr_1fr_1.35fr] gap-1 rounded-xl bg-slate-100/90 dark:bg-slate-800/80 p-1 animate-sentra-stagger-1"
           >
             <button
               type="button"
@@ -236,7 +321,12 @@ export const AuthView: React.FC<AuthViewProps> = ({
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="mt-5 space-y-4" noValidate>
+          <form
+            key={tab}
+            onSubmit={handleSubmit}
+            className="mt-5 space-y-4 animate-sentra-tab-panel"
+            noValidate
+          >
             {tab === 'otp' ? (
               <div>
                 <label
@@ -328,10 +418,18 @@ export const AuthView: React.FC<AuthViewProps> = ({
             <button
               type="submit"
               disabled={loading}
-              className="flex w-full items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-[0.98] disabled:opacity-60 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-emerald-600/20 transition duration-150"
+              className="group flex w-full items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-[0.98] disabled:opacity-60 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-emerald-600/20 transition duration-150"
             >
+              {loading && <Loader2 size={16} className="animate-spin shrink-0" aria-hidden="true" />}
               <span>{loading ? t(lang, 'connectingServer') : t(lang, 'continueBtn')}</span>
-              <ArrowIcon size={17} />
+              {!loading && (
+                <ArrowIcon
+                  size={17}
+                  className={`transition-transform duration-150 ${
+                    isRtl ? 'group-hover:-translate-x-0.5' : 'group-hover:translate-x-0.5'
+                  }`}
+                />
+              )}
             </button>
           </form>
         </div>

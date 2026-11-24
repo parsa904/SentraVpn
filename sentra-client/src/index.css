@@ -15,52 +15,128 @@
   }
 }
 
-@keyframes sentra-stroke-draw {
+@keyframes sentra-logo-reveal {
   0% {
-    stroke-dashoffset: 320;
-    opacity: 0.2;
+    opacity: 0;
+    transform: translateY(12px) scale(0.94);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes sentra-bridge-float {
+  0%, 100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+@keyframes sentra-bridge-sheen {
+  0% {
+    transform: translateX(-160%) skewX(-22deg);
+    opacity: 0;
+  }
+  20% {
+    opacity: 0.65;
+  }
+  65% {
+    opacity: 0.65;
+  }
+  100% {
+    transform: translateX(260%) skewX(-22deg);
+    opacity: 0;
+  }
+}
+
+@keyframes sentra-cable-signal {
+  0% {
+    stroke-dashoffset: 220;
+    opacity: 0.25;
   }
   20% {
     opacity: 1;
   }
-  100% {
-    stroke-dashoffset: 0;
+  80% {
     opacity: 1;
+  }
+  100% {
+    stroke-dashoffset: -220;
+    opacity: 0.25;
   }
 }
 
-@keyframes sentra-arch-draw {
+@keyframes sentra-route-flow {
   0% {
-    stroke-dashoffset: 160;
+    stroke-dashoffset: 340;
     opacity: 0;
   }
-  30% {
-    opacity: 1;
+  15% {
+    opacity: 0.9;
+  }
+  80% {
+    opacity: 0.85;
   }
   100% {
-    stroke-dashoffset: 0;
-    opacity: 1;
+    stroke-dashoffset: -340;
+    opacity: 0;
+  }
+}
+
+@keyframes sentra-node-pulse {
+  0% {
+    transform: scale(0.75);
+    opacity: 0.7;
+  }
+  70% {
+    transform: scale(2.1);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(2.1);
+    opacity: 0;
+  }
+}
+
+@keyframes sentra-ambient-drift {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(24px, -18px, 0) scale(1.06);
+  }
+}
+
+@keyframes sentra-ambient-drift-reverse {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(-26px, 20px, 0) scale(1.08);
   }
 }
 
 @keyframes sentra-soft-glow {
   0%, 100% {
-    opacity: 0.35;
-    transform: scale(0.96);
+    opacity: 0.32;
+    transform: scale(0.95);
   }
   50% {
-    opacity: 0.7;
+    opacity: 0.65;
     transform: scale(1.06);
   }
 }
 
 @keyframes sentra-ripple {
   0% {
-    transform: scale(0.94);
-    opacity: 0.65;
+    transform: scale(0.92);
+    opacity: 0.62;
   }
   100% {
-    transform: scale(1.42);
+    transform: scale(1.44);
     opacity: 0;
   }
 }
@@ -74,7 +150,38 @@
   }
 }
 
+@keyframes sentra-orbit-reverse {
+  0% {
+    transform: rotate(360deg);
+  }
+  100% {
+    transform: rotate(0deg);
+  }
+}
+
 @keyframes sentra-view-enter {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes sentra-auth-card-enter {
+  0% {
+    opacity: 0;
+    transform: translateY(18px) scale(0.975);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes sentra-tab-panel {
   0% {
     opacity: 0;
     transform: translateY(6px);
@@ -85,46 +192,111 @@
   }
 }
 
-.animate-sentra-s {
-  stroke-dasharray: 320;
-  stroke-dashoffset: 320;
-  animation: sentra-stroke-draw 1.05s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+.animate-sentra-logo-reveal {
+  animation: sentra-logo-reveal 640ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
-.animate-sentra-arch {
-  stroke-dasharray: 160;
-  stroke-dashoffset: 160;
-  animation: sentra-arch-draw 0.85s cubic-bezier(0.22, 1, 0.36, 1) 0.25s forwards;
+.animate-sentra-bridge-float {
+  animation: sentra-bridge-float 4.8s ease-in-out infinite;
+}
+
+.animate-sentra-sheen {
+  animation: sentra-bridge-sheen 3.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.animate-sentra-cable-signal {
+  stroke-dasharray: 56 164;
+  animation: sentra-cable-signal 2.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.animate-sentra-route-flow {
+  stroke-dasharray: 72 268;
+  animation: sentra-route-flow 4.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.animate-sentra-node-pulse {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: sentra-node-pulse 3.2s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+.animate-sentra-ambient-drift {
+  animation: sentra-ambient-drift 13s ease-in-out infinite;
+}
+
+.animate-sentra-ambient-drift-reverse {
+  animation: sentra-ambient-drift-reverse 15s ease-in-out infinite;
 }
 
 .animate-sentra-glow {
-  animation: sentra-soft-glow 2.4s ease-in-out infinite;
+  animation: sentra-soft-glow 3.2s ease-in-out infinite;
 }
 
 .animate-sentra-ripple {
-  animation: sentra-ripple 1.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+  animation: sentra-ripple 1.85s cubic-bezier(0.16, 1, 0.3, 1) infinite;
 }
 
 .animate-sentra-ripple-delayed {
-  animation: sentra-ripple 1.8s cubic-bezier(0.16, 1, 0.3, 1) 0.6s infinite;
+  animation: sentra-ripple 1.85s cubic-bezier(0.16, 1, 0.3, 1) 0.65s infinite;
 }
 
 .animate-sentra-orbit {
-  animation: sentra-orbit 1.4s linear infinite;
+  animation: sentra-orbit 1.5s linear infinite;
+}
+
+.animate-sentra-orbit-gentle {
+  animation: sentra-orbit 22s linear infinite;
+}
+
+.animate-sentra-orbit-slow {
+  animation: sentra-orbit-reverse 9s linear infinite;
+}
+
+.animate-sentra-orbit-gentle-reverse {
+  animation: sentra-orbit-reverse 28s linear infinite;
 }
 
 .animate-sentra-view {
-  animation: sentra-view-enter 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: sentra-view-enter 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.animate-sentra-auth-card {
+  animation: sentra-auth-card-enter 560ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.animate-sentra-stagger-1 {
+  animation: sentra-view-enter 440ms cubic-bezier(0.16, 1, 0.3, 1) 90ms both;
+}
+
+.animate-sentra-stagger-2 {
+  animation: sentra-view-enter 440ms cubic-bezier(0.16, 1, 0.3, 1) 160ms both;
+}
+
+.animate-sentra-tab-panel {
+  animation: sentra-tab-panel 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .animate-sentra-s,
-  .animate-sentra-arch,
+  .animate-sentra-logo-reveal,
+  .animate-sentra-bridge-float,
+  .animate-sentra-sheen,
+  .animate-sentra-cable-signal,
+  .animate-sentra-route-flow,
+  .animate-sentra-node-pulse,
+  .animate-sentra-ambient-drift,
+  .animate-sentra-ambient-drift-reverse,
   .animate-sentra-glow,
   .animate-sentra-ripple,
   .animate-sentra-ripple-delayed,
   .animate-sentra-orbit,
-  .animate-sentra-view {
+  .animate-sentra-orbit-gentle,
+  .animate-sentra-orbit-slow,
+  .animate-sentra-orbit-gentle-reverse,
+  .animate-sentra-view,
+  .animate-sentra-auth-card,
+  .animate-sentra-stagger-1,
+  .animate-sentra-stagger-2,
+  .animate-sentra-tab-panel {
     animation: none !important;
   }
 }

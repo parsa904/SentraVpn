@@ -25,6 +25,37 @@ import {
   selectFastestHealthyServer,
 } from './utils/proxyParser';
 import {
+  type LatencyPoint,
+  appendLatencySample,
+  pruneLatencyHistory,
+} from './utils/latencyHistory';
+import {
+  EMPTY_SESSION_TIMER,
+  type PersistedSessionTimer,
+  clearPersistedSessionTimer,
+  computeSessionDurationSeconds,
+  loadPersistedSessionTimer,
+  pauseSessionTimer,
+  reconcileWithNativeUptime,
+  savePersistedSessionTimer,
+  startOrResumeSessionTimer,
+  stopSessionTimer,
+} from './utils/sessionTimer';
+import {
+  type BatteryOptimizationStatus,
+  type NetworkConnectionSnapshot,
+  type ReconnectReason,
+  RECONNECT_DEBOUNCE_MS,
+  buildNetworkFingerprint,
+  detectSleepWakeJump,
+  getInitialAutoReconnect,
+  getInitialBatteryWarningDismissed,
+  persistAutoReconnect,
+  persistBatteryWarningDismissed,
+  shouldShowBatteryOptimizationWarning,
+  shouldTriggerAutoReconnect,
+} from './utils/reconnectPolicy';
+import {
   type GithubReleaseUpdate,
   checkGithubLatestRelease,
   connectVpnNative,
@@ -32,14 +63,19 @@ import {
   donateOutboundToServer,
   fetchBootstrap,
   fetchMyDonations,
+  getBatteryOptimizationStatusNative,
+  isTauriRuntime,
   loadPersonalConfigs,
   logoutSession,
+  openBatteryOptimizationSettingsNative,
   pingServerNode,
+  reconnectVpnNative,
   removeUserDevice,
   requestTelegramLinkCode,
   restorePersistedSession,
   savePersonalConfigs,
   setActiveOutboundNative,
+  setAutoReconnectNative,
   setConnectionModeNative,
   setKillSwitchNative,
   setRoutingModeNative,
@@ -52,6 +88,7 @@ import { AuthView } from './components/AuthView';
 import { Sidebar } from './components/Sidebar';
 import { TopSubscriptionBar } from './components/TopSubscriptionBar';
 import { UpdateBanner } from './components/UpdateBanner';
+import { BatteryOptimizationBanner } from './components/BatteryOptimizationBanner';
 import { HomeView } from './components/HomeView';
 import { ProfilesView } from './components/ProfilesView';
 import { DonateOutboundView } from './components/DonateOutboundView';
@@ -147,6 +184,11 @@ export const App: React.FC = () => {
   const [routingMode, setRoutingMode] = useState<RoutingMode>('tunnel');
   const [splitTunneling, setSplitTunneling] = useState(true);
   const [killSwitch, setKillSwitch] = useState(true);
+  const [autoReconnect, setAutoReconnect] = useState<boolean>(getInitialAutoReconnect);
+  const [batteryOptStatus, setBatteryOptStatus] = useState<BatteryOptimizationStatus | null>(null);
+  const [batteryWarningDismissed, setBatteryWarningDismissed] = useState<boolean>(
+    getInitialBatteryWarningDismissed
+  );
   const [useWarp, setUseWarp] = useState(false);
   const [customDns, setCustomDns] = useState('1.1.1.1');
 
@@ -162,6 +204,12 @@ export const App: React.FC = () => {
   const [loadingDonations, setLoadingDonations] = useState(false);
 
   const [telemetry, setTelemetry] = useState<TelemetrySnapshot>(EMPTY_TELEMETRY);
+  const [sessionTimer, setSessionTimer] = useState<PersistedSessionTimer>(() =>
+    loadPersistedSessionTimer()
+  );
+  const [sessionNowMs, setSessionNowMs] = useState<number>(() => Date.now());
+  const [latencyHistory, setLatencyHistory] = useState<LatencyPoint[]>([]);
+  const [latencyNowMs, setLatencyNowMs] = useState<number>(() => Date.now());
   const [logs, setLogs] = useState<LogEntry[]>([]);
 
   const [addConfigOpen, setAddConfigOpen] = useState(false);
@@ -171,6 +219,17 @@ export const App: React.FC = () => {
   const toastTimerRef = useRef<number | null>(null);
   const langRef = useRef<Language>(lang);
   langRef.current = lang;
+  const autoReconnectRef = useRef<boolean>(autoReconnect);
+  autoReconnectRef.current = autoReconnect;
+  const sessionRef = useRef<PersistedSession | null>(session);
+  sessionRef.current = session;
+  const activeServerRef = useRef<ActiveServerSelection | null>(activeServer);
+  activeServerRef.current = activeServer;
+  const lastNativePingAtRef = useRef<number>(0);
+  const userWantsConnectedRef = useRef<boolean>(false);
+  const isReconnectingRef = useRef<boolean>(false);
+  const reconnectAttemptsRef = useRef<number>(0);
+  const reconnectDebounceRef = useRef<number | null>(null);
 
   const pushLog = useCallback((level: LogEntry['level'], message: string) => {
     setLogs((prev) => [...prev.slice(-199), makeLogEntry(level, message)]);
@@ -257,6 +316,7 @@ export const App: React.FC = () => {
         if (msg.startsWith('AUTH_EXPIRED:')) {
           const clean = msg.replace('AUTH_EXPIRED:', '').trim();
           pushLog('ERROR', `Session expired: ${clean}`);
+          userWantsConnectedRef.current = false;
           await logoutSession();
           setSession(null);
           setBootstrap(null);
@@ -330,16 +390,225 @@ export const App: React.FC = () => {
     };
   }, [syncWithServer, loadDonations]);
 
+  // Persist & synchronize Auto-Reconnect preference with native Rust/Android engines
+  useEffect(() => {
+    persistAutoReconnect(autoReconnect);
+    void setAutoReconnectNative(autoReconnect).catch(() => {
+      // ignore outside Tauri runtime
+    });
+  }, [autoReconnect]);
+
+  // Check Android battery optimization on startup and whenever user returns from system Settings
+  const refreshBatteryOptimizationStatus = useCallback(async () => {
+    const status = await getBatteryOptimizationStatusNative();
+    setBatteryOptStatus(status);
+    if (status.isAndroid && !status.isOptimized) {
+      setBatteryWarningDismissed(false);
+      persistBatteryWarningDismissed(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshBatteryOptimizationStatus();
+    const handleResumeCheck = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshBatteryOptimizationStatus();
+      }
+    };
+    const handleFocusCheck = () => {
+      void refreshBatteryOptimizationStatus();
+    };
+    document.addEventListener('visibilitychange', handleResumeCheck);
+    window.addEventListener('focus', handleFocusCheck);
+    return () => {
+      document.removeEventListener('visibilitychange', handleResumeCheck);
+      window.removeEventListener('focus', handleFocusCheck);
+    };
+  }, [refreshBatteryOptimizationStatus]);
+
+  const handleOpenBatteryOptimizationSettings = useCallback(() => {
+    void openBatteryOptimizationSettingsNative()
+      .then((opened) => {
+        if (opened) {
+          pushLog('INFO', '[Battery] Opened Android battery optimization settings.');
+        } else {
+          showToast('error', t(langRef.current, 'batteryOptOpenFailed'));
+        }
+      })
+      .catch(() => {
+        showToast('error', t(langRef.current, 'batteryOptOpenFailed'));
+      });
+  }, [pushLog, showToast]);
+
+  const handleDismissBatteryWarning = useCallback(() => {
+    setBatteryWarningDismissed(true);
+    persistBatteryWarningDismissed(true);
+  }, []);
+
+  // Monitor network switches (online / NetworkInformation change) and sleep/wake jumps
+  useEffect(() => {
+    type NavigatorWithConnection = Navigator & {
+      connection?: NetworkConnectionSnapshot & {
+        addEventListener?: (type: string, listener: () => void) => void;
+        removeEventListener?: (type: string, listener: () => void) => void;
+      };
+    };
+
+    const nav = navigator as NavigatorWithConnection;
+    const conn = nav.connection;
+    let lastFingerprint = buildNetworkFingerprint(conn, navigator.onLine);
+    let lastTickMs = Date.now();
+
+    const scheduleReconnect = (reason: ReconnectReason) => {
+      const canReconnect = shouldTriggerAutoReconnect({
+        autoReconnectEnabled: autoReconnectRef.current,
+        userWantsConnected: userWantsConnectedRef.current,
+        isOnline: navigator.onLine,
+        isAuthenticated: Boolean(sessionRef.current),
+        isReconnecting: isReconnectingRef.current,
+        attemptsUsed: reconnectAttemptsRef.current,
+      });
+      if (!canReconnect) return;
+
+      if (reconnectDebounceRef.current) {
+        window.clearTimeout(reconnectDebounceRef.current);
+      }
+
+      reconnectDebounceRef.current = window.setTimeout(() => {
+        reconnectDebounceRef.current = null;
+        const stillCanReconnect = shouldTriggerAutoReconnect({
+          autoReconnectEnabled: autoReconnectRef.current,
+          userWantsConnected: userWantsConnectedRef.current,
+          isOnline: navigator.onLine,
+          isAuthenticated: Boolean(sessionRef.current),
+          isReconnecting: isReconnectingRef.current,
+          attemptsUsed: reconnectAttemptsRef.current,
+        });
+        if (!stillCanReconnect) return;
+
+        isReconnectingRef.current = true;
+        reconnectAttemptsRef.current += 1;
+        setConnectionStatus('connecting');
+        setConnectionError(null);
+        setSessionTimer((prev) => pauseSessionTimer(prev, Date.now()));
+        const noticeKey =
+          reason === 'device_wake' ? 'reconnectingWake' : 'reconnectingNetwork';
+        pushLog('INFO', `[AutoReconnect] ${t(langRef.current, noticeKey)}`);
+
+        if (!isTauriRuntime()) {
+          isReconnectingRef.current = false;
+          return;
+        }
+
+        void reconnectVpnNative(reason)
+          .then(() => {
+            if (!userWantsConnectedRef.current) return;
+            reconnectAttemptsRef.current = 0;
+            const now = Date.now();
+            setSessionNowMs(now);
+            setSessionTimer((prev) => startOrResumeSessionTimer(prev, now));
+            setConnectionStatus('connected');
+            setConnectionError(null);
+            showToast('success', t(langRef.current, 'reconnectedToast'));
+          })
+          .catch((err) => {
+            if (!userWantsConnectedRef.current) return;
+            const msg =
+              err instanceof Error ? err.message : t(langRef.current, 'reconnectFailedToast');
+            setConnectionStatus('error');
+            setConnectionError(msg);
+            pushLog('WARN', `[AutoReconnect] ${msg}`);
+            showToast('error', t(langRef.current, 'reconnectFailedToast'));
+          })
+          .finally(() => {
+            isReconnectingRef.current = false;
+          });
+      }, RECONNECT_DEBOUNCE_MS);
+    };
+
+    const handleOnline = () => {
+      lastFingerprint = buildNetworkFingerprint(conn, true);
+      scheduleReconnect('network_switch');
+    };
+
+    const handleConnectionChange = () => {
+      const nextFp = buildNetworkFingerprint(conn, navigator.onLine);
+      if (nextFp !== lastFingerprint) {
+        lastFingerprint = nextFp;
+        if (navigator.onLine) {
+          scheduleReconnect('network_switch');
+        }
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      const jumped = detectSleepWakeJump(lastTickMs, now);
+      lastTickMs = now;
+      if (jumped) {
+        scheduleReconnect('device_wake');
+      }
+    };
+
+    const wakeInterval = window.setInterval(() => {
+      const now = Date.now();
+      const jumped = detectSleepWakeJump(lastTickMs, now);
+      lastTickMs = now;
+      if (jumped) {
+        scheduleReconnect('device_wake');
+      }
+    }, 5_000);
+
+    window.addEventListener('online', handleOnline);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    conn?.addEventListener?.('change', handleConnectionChange);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      conn?.removeEventListener?.('change', handleConnectionChange);
+      window.clearInterval(wakeInterval);
+      if (reconnectDebounceRef.current) {
+        window.clearTimeout(reconnectDebounceRef.current);
+        reconnectDebounceRef.current = null;
+      }
+    };
+  }, [pushLog, showToast]);
+
   // Subscribe to native Tauri telemetry, logs, and System Tray / Android Notification status
   useEffect(() => {
     let cleanup: (() => void) | null = null;
     void subscribeNativeTelemetry(
-      (snap) => setTelemetry(snap),
+      (snap) => {
+        setTelemetry(snap);
+        const now = Date.now();
+        if (snap.uptime_seconds > 0) {
+          setSessionNowMs(now);
+          setSessionTimer((prev) => reconcileWithNativeUptime(prev, snap.uptime_seconds, now));
+        }
+        if (snap.ping_ms !== null && snap.ping_ms > 0) {
+          lastNativePingAtRef.current = now;
+          setLatencyNowMs(now);
+          setLatencyHistory((prev) => appendLatencySample(prev, snap.ping_ms, now));
+        }
+      },
       (line) => pushLog('INFO', line),
       (status, errorMsg) => {
+        const now = Date.now();
         setConnectionStatus(status);
+        if (status === 'connected') {
+          reconnectAttemptsRef.current = 0;
+          setSessionNowMs(now);
+          setSessionTimer((prev) => startOrResumeSessionTimer(prev, now));
+        }
         if (status === 'disconnected') {
           setTelemetry(EMPTY_TELEMETRY);
+          if (userWantsConnectedRef.current && autoReconnectRef.current) {
+            setSessionTimer((prev) => pauseSessionTimer(prev, now));
+          } else {
+            setSessionTimer((prev) => stopSessionTimer(prev, now));
+          }
         }
         if (errorMsg) {
           setConnectionError(errorMsg);
@@ -355,6 +624,75 @@ export const App: React.FC = () => {
     };
   }, [pushLog]);
 
+  // Persist Session Time state to localStorage on every transition
+  useEffect(() => {
+    savePersistedSessionTimer(sessionTimer);
+  }, [sessionTimer]);
+
+  // Tick Session Time counter in real time every second while an active segment is running
+  const isSessionTimerRunning =
+    sessionTimer.isActive && sessionTimer.activeSegmentStartedAtMs !== null;
+  useEffect(() => {
+    if (!isSessionTimerRunning) return;
+    setSessionNowMs(Date.now());
+    const timer = window.setInterval(() => {
+      setSessionNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [isSessionTimerRunning]);
+
+  // Smoothly advance and prune the 60-second rolling latency window every second
+  const hasLatencyHistory = latencyHistory.length > 0;
+  useEffect(() => {
+    if (connectionStatus !== 'connected' && !hasLatencyHistory) return;
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      setLatencyNowMs(now);
+      setLatencyHistory((prev) => pruneLatencyHistory(prev, now));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [connectionStatus, hasLatencyHistory]);
+
+  // Reset latency chart history when switching to a different server so histories never mix
+  const activeServerId = activeServer?.id ?? null;
+  const activeServerAddress = activeServer?.server_address ?? '';
+  const activeServerPort = activeServer?.server_port ?? 0;
+  const prevServerIdRef = useRef<string | null>(activeServerId);
+  useEffect(() => {
+    if (prevServerIdRef.current && prevServerIdRef.current !== activeServerId) {
+      setLatencyHistory([]);
+    }
+    prevServerIdRef.current = activeServerId;
+  }, [activeServerId]);
+
+  // While connected, probe real active-server RTT every 3s if native telemetry isn't emitting ping_ms
+  useEffect(() => {
+    if (connectionStatus !== 'connected' || !activeServerId || !activeServerAddress || activeServerPort <= 0) return;
+    let cancelled = false;
+
+    const sampleNow = async () => {
+      if (cancelled) return;
+      if (Date.now() - lastNativePingAtRef.current < 2500) return;
+      const ms = await pingServerNode(activeServerAddress, activeServerPort);
+      if (cancelled) return;
+      const now = Date.now();
+      setLatencyNowMs(now);
+      setLatencyHistory((prev) => appendLatencySample(prev, ms, now));
+      setLivePings((prev) => ({ ...prev, [activeServerId]: ms }));
+      setActiveServer((curr) => (curr && curr.id === activeServerId ? { ...curr, latency_ms: ms } : curr));
+    };
+
+    void sampleNow();
+    const interval = window.setInterval(() => {
+      void sampleNow();
+    }, 3000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [connectionStatus, activeServerId, activeServerAddress, activeServerPort]);
+
   const handleAuthenticated = async (newSession: PersistedSession) => {
     setAuthNotice(null);
     setSession(newSession);
@@ -364,6 +702,12 @@ export const App: React.FC = () => {
   };
 
   const handleLogout = async () => {
+    userWantsConnectedRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    if (reconnectDebounceRef.current) {
+      window.clearTimeout(reconnectDebounceRef.current);
+      reconnectDebounceRef.current = null;
+    }
     if (connectionStatus === 'connected' || connectionStatus === 'connecting') {
       try {
         await disconnectVpnNative();
@@ -379,6 +723,9 @@ export const App: React.FC = () => {
     setAutoMode(true);
     setConnectionStatus('disconnected');
     setTelemetry(EMPTY_TELEMETRY);
+    setSessionTimer(EMPTY_SESSION_TIMER);
+    clearPersistedSessionTimer();
+    setLatencyHistory([]);
     setActiveTab('home');
     pushLog('INFO', 'Signed out and cleared local session.');
   };
@@ -405,6 +752,11 @@ export const App: React.FC = () => {
         const ms = await pingServerNode(host, port);
         setLivePings((prev) => ({ ...prev, [id]: ms }));
         setActiveServer((curr) => (curr && curr.id === id ? { ...curr, latency_ms: ms } : curr));
+        if (activeServerRef.current?.id === id) {
+          const now = Date.now();
+          setLatencyNowMs(now);
+          setLatencyHistory((prev) => appendLatencySample(prev, ms, now));
+        }
         pushLog('INFO', `Ping ${host}:${port} = ${ms ? `${ms} ms` : 'Timeout'}`);
         return ms;
       } finally {
@@ -490,11 +842,20 @@ export const App: React.FC = () => {
   const handleToggleConnect = async () => {
     setConnectionError(null);
     if (connectionStatus === 'connected' || connectionStatus === 'connecting') {
+      userWantsConnectedRef.current = false;
+      reconnectAttemptsRef.current = 0;
+      if (reconnectDebounceRef.current) {
+        window.clearTimeout(reconnectDebounceRef.current);
+        reconnectDebounceRef.current = null;
+      }
       try {
         await disconnectVpnNative();
       } finally {
+        const now = Date.now();
         setConnectionStatus('disconnected');
         setTelemetry(EMPTY_TELEMETRY);
+        setSessionNowMs(now);
+        setSessionTimer((prev) => stopSessionTimer(prev, now));
         pushLog('INFO', 'VPN disconnected cleanly.');
       }
       return;
@@ -516,14 +877,20 @@ export const App: React.FC = () => {
       return;
     }
 
+    userWantsConnectedRef.current = true;
+    reconnectAttemptsRef.current = 0;
     setConnectionStatus('connecting');
     pushLog('INFO', `Connecting to ${targetServer.name} (${targetServer.protocol})...`);
     try {
       await connectVpnNative();
+      const now = Date.now();
+      setSessionNowMs(now);
+      setSessionTimer((prev) => startOrResumeSessionTimer(prev, now));
       setConnectionStatus('connected');
       pushLog('INFO', `Connected securely to ${targetServer.name}.`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : t(lang, 'connectFailed');
+      userWantsConnectedRef.current = false;
       setConnectionStatus('error');
       setConnectionError(msg);
       pushLog('ERROR', msg);
@@ -666,6 +1033,17 @@ export const App: React.FC = () => {
           />
         )}
 
+        <BatteryOptimizationBanner
+          lang={lang}
+          visible={shouldShowBatteryOptimizationWarning({
+            status: batteryOptStatus,
+            autoReconnectEnabled: autoReconnect,
+            dismissed: batteryWarningDismissed,
+          })}
+          onOpenSettings={handleOpenBatteryOptimizationSettings}
+          onDismiss={handleDismissBatteryWarning}
+        />
+
         {syncError && (
           <div
             role="status"
@@ -694,6 +1072,10 @@ export const App: React.FC = () => {
               autoMode={autoMode}
               autoResolving={autoResolving}
               telemetry={telemetry}
+              sessionSeconds={computeSessionDurationSeconds(sessionTimer, sessionNowMs)}
+              isSessionTimerRunning={isSessionTimerRunning}
+              latencyHistory={latencyHistory}
+              latencyNowMs={latencyNowMs}
               pingingActive={Boolean(activeServer && pingingIds[activeServer.id])}
               activeServerTested={Boolean(activeServer && activeServer.id in livePings)}
               onToggleConnect={() => void handleToggleConnect()}
@@ -761,6 +1143,8 @@ export const App: React.FC = () => {
               selectedMode={selectedMode}
               splitTunneling={splitTunneling}
               killSwitch={killSwitch}
+              autoReconnect={autoReconnect}
+              batteryOptStatus={batteryOptStatus}
               useWarp={useWarp}
               customDns={customDns}
               devices={bootstrap?.devices || []}
@@ -782,6 +1166,14 @@ export const App: React.FC = () => {
                 setKillSwitch(v);
                 void setKillSwitchNative(v);
               }}
+              onToggleAutoReconnect={(v) => {
+                setAutoReconnect(v);
+                pushLog(
+                  'INFO',
+                  `Auto-Reconnect on network switch & wake ${v ? 'enabled' : 'disabled'}.`
+                );
+              }}
+              onOpenBatteryOptimizationSettings={handleOpenBatteryOptimizationSettings}
               onToggleWarp={(v) => {
                 setUseWarp(v);
                 void setUseWarpNative(v);
@@ -789,6 +1181,7 @@ export const App: React.FC = () => {
               onChangeCustomDns={setCustomDns}
               onRemoveDevice={handleRemoveDevice}
               onRequestTelegramLinkCode={handleRequestTelegramLink}
+              onLogEvent={(msg) => pushLog('INFO', msg)}
             />
           )}
 

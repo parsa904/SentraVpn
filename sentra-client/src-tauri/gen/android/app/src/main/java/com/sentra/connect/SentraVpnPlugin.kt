@@ -1,9 +1,14 @@
 package com.sentra.connect
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.net.Uri
 import android.net.VpnService
+import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.result.ActivityResult
 import androidx.security.crypto.EncryptedSharedPreferences
@@ -22,11 +27,17 @@ class ConnectArgs {
     var splitTunnelIr: Boolean = true
     var mode: String = "Auto"
     var serverName: String = "Sentra Auto"
+    var autoReconnect: Boolean = true
 }
 
 @InvokeArg
 class SessionSaveArgs {
     var payload: String = ""
+}
+
+@InvokeArg
+class AutoReconnectArgs {
+    var enabled: Boolean = true
 }
 
 /**
@@ -41,6 +52,7 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
     private var pendingSplitTunnel: Boolean = true
     private var pendingMode: String = "Auto"
     private var pendingServerName: String = "Sentra Auto"
+    private var pendingAutoReconnect: Boolean = true
 
     init {
         instance = this
@@ -174,11 +186,13 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
             val splitRaw = invoke.getBoolean("splitTunnelIr") ?: invoke.getBoolean("split_tunnel_ir") ?: true
             val modeRaw = invoke.getString("mode") ?: "Auto"
             val serverRaw = invoke.getString("serverName") ?: invoke.getString("server_name") ?: modeRaw
+            val autoReconnectRaw = invoke.getBoolean("autoReconnect") ?: invoke.getBoolean("auto_reconnect") ?: true
             ConnectArgs().apply {
                 configJson = configRaw
                 splitTunnelIr = splitRaw
                 mode = modeRaw
                 serverName = serverRaw
+                autoReconnect = autoReconnectRaw
             }
         }
 
@@ -192,6 +206,7 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         pendingSplitTunnel = args.splitTunnelIr
         pendingMode = args.mode
         pendingServerName = resolvedServer
+        pendingAutoReconnect = args.autoReconnect
 
         // Check Android system VPN permission via Tauri v2 Activity Result API
         val prepareIntent = VpnService.prepare(activity)
@@ -200,7 +215,13 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
             startActivityForResult(invoke, prepareIntent, "onVpnPermissionResult")
         } else {
             Log.i(TAG, "VPN permission already granted. Launching SentraVpnService directly...")
-            launchVpnService(args.configJson, args.mode, resolvedServer, args.splitTunnelIr)
+            launchVpnService(
+                args.configJson,
+                args.mode,
+                resolvedServer,
+                args.splitTunnelIr,
+                args.autoReconnect
+            )
             val res = JSObject().apply {
                 put("success", true)
                 put("status", "Connected")
@@ -218,7 +239,8 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
             val split = pendingSplitTunnel
             val mode = pendingMode
             val server = pendingServerName
-            launchVpnService(config, mode, server, split)
+            val autoReconnect = pendingAutoReconnect
+            launchVpnService(config, mode, server, split, autoReconnect)
 
             val res = JSObject().apply {
                 put("success", true)
@@ -230,6 +252,89 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
             Log.w(TAG, "User denied Android VPN permission.")
             invoke.reject("Android VPN permission was denied.")
         }
+    }
+
+    /**
+     * setAutoReconnect: Updates auto-reconnect behavior on network switches & Doze/sleep wake
+     */
+    @Command
+    fun setAutoReconnect(invoke: Invoke) {
+        val enabled = try {
+            invoke.parseArgs(AutoReconnectArgs::class.java).enabled
+        } catch (_: Exception) {
+            invoke.getBoolean("enabled") ?: true
+        }
+        SentraVpnService.autoReconnectEnabled = enabled
+        if (SentraVpnService.isVpnActive) {
+            val intent = Intent(activity, SentraVpnService::class.java).apply {
+                action = SentraVpnService.ACTION_SET_AUTO_RECONNECT
+                putExtra(SentraVpnService.EXTRA_AUTO_RECONNECT, enabled)
+            }
+            try {
+                activity.startService(intent)
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not forward auto-reconnect preference to running service: ${e.message}")
+            }
+        }
+        val res = JSObject().apply { put("success", true) }
+        invoke.resolve(res)
+    }
+
+    /**
+     * getBatteryOptimizationStatus: Checks whether Android Doze/Battery Optimization
+     * restricts Sentra Connect in the background (API 23+).
+     */
+    @Command
+    fun getBatteryOptimizationStatus(invoke: Invoke) {
+        val isOptimized = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = activity.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            val ignoring = pm?.isIgnoringBatteryOptimizations(activity.packageName) ?: true
+            !ignoring
+        } else {
+            false
+        }
+
+        val res = JSObject().apply {
+            put("isAndroid", true)
+            put("isOptimized", isOptimized)
+            put("canOpenSettings", Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+        }
+        invoke.resolve(res)
+    }
+
+    /**
+     * openBatteryOptimizationSettings: Opens the Android Battery Optimization settings screen,
+     * falling back cleanly to Sentra's App Details settings on restrictive OEM ROMs.
+     */
+    @Command
+    fun openBatteryOptimizationSettings(invoke: Invoke) {
+        val candidates = mutableListOf<Intent>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            candidates.add(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+        candidates.add(
+            Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:${activity.packageName}")
+            )
+        )
+        candidates.add(Intent(Settings.ACTION_SETTINGS))
+
+        for (intent in candidates) {
+            try {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (intent.resolveActivity(activity.packageManager) != null) {
+                    activity.startActivity(intent)
+                    val res = JSObject().apply { put("success", true) }
+                    invoke.resolve(res)
+                    return
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to launch intent ${intent.action}: ${e.message}")
+            }
+        }
+
+        invoke.reject("Could not open Android battery optimization settings.")
     }
 
     /**
@@ -267,13 +372,20 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(res)
     }
 
-    private fun launchVpnService(configJson: String, mode: String, serverName: String, split: Boolean) {
+    private fun launchVpnService(
+        configJson: String,
+        mode: String,
+        serverName: String,
+        split: Boolean,
+        autoReconnect: Boolean
+    ) {
         val intent = Intent(activity, SentraVpnService::class.java).apply {
             action = SentraVpnService.ACTION_START_VPN
             putExtra(SentraVpnService.EXTRA_CONFIG_JSON, configJson)
             putExtra(SentraVpnService.EXTRA_ACTIVE_MODE, mode)
             putExtra(SentraVpnService.EXTRA_SERVER_NAME, serverName)
             putExtra(SentraVpnService.EXTRA_SPLIT_TUNNEL_IR, split)
+            putExtra(SentraVpnService.EXTRA_AUTO_RECONNECT, autoReconnect)
         }
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
             activity.startForegroundService(intent)

@@ -50,6 +50,28 @@ async fn clear_session<R: Runtime>(app: AppHandle<R>) -> Result<SessionSaveRespo
     app.sentra_vpn().clear_session()
 }
 
+#[tauri::command]
+async fn set_auto_reconnect<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+) -> Result<SimpleSuccessResponse, String> {
+    app.sentra_vpn().set_auto_reconnect(enabled)
+}
+
+#[tauri::command]
+async fn get_battery_optimization_status<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<BatteryOptimizationStatusResponse, String> {
+    app.sentra_vpn().get_battery_optimization_status()
+}
+
+#[tauri::command]
+async fn open_battery_optimization_settings<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<SimpleSuccessResponse, String> {
+    app.sentra_vpn().open_battery_optimization_settings()
+}
+
 pub trait SentraVpnPluginExt<R: Runtime> {
     fn sentra_vpn(&self) -> &SentraVpn<R>;
 }
@@ -68,7 +90,10 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             get_status,
             save_session,
             load_session,
-            clear_session
+            clear_session,
+            set_auto_reconnect,
+            get_battery_optimization_status,
+            open_battery_optimization_settings
         ])
         .setup(|app, _api| {
             #[cfg(mobile)]

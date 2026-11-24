@@ -208,6 +208,60 @@ pub async fn toggle_kill_switch(
 }
 
 #[tauri::command]
+pub async fn set_auto_reconnect(
+    enabled: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ClientState, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_sentra_vpn::SentraVpnPluginExt;
+        let _ = app.sentra_vpn().set_auto_reconnect(enabled);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+    }
+
+    let mut app_state = state.lock().await;
+    app_state.auto_reconnect = enabled;
+    app_state.logs.push(format!(
+        "[CONFIG] Auto-Reconnect on network switch & wake set to {}",
+        if enabled { "ENABLED" } else { "DISABLED" }
+    ));
+    Ok(app_state.clone())
+}
+
+#[tauri::command]
+pub async fn reconnect_vpn(
+    reason: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    vpn: State<'_, Arc<VpnManager>>,
+) -> Result<ClientState, String> {
+    let trigger = reason.unwrap_or_else(|| "network_switch".to_string());
+    info!("Reconnect VPN requested (reason: {})", trigger);
+    vpn.reconnect_vpn(app, state.inner().clone(), &trigger).await?;
+    let app_state = state.lock().await;
+    Ok(app_state.clone())
+}
+
+#[tauri::command]
+pub async fn get_battery_optimization_status(
+    app: AppHandle,
+) -> Result<tauri_plugin_sentra_vpn::BatteryOptimizationStatusResponse, String> {
+    use tauri_plugin_sentra_vpn::SentraVpnPluginExt;
+    app.sentra_vpn().get_battery_optimization_status()
+}
+
+#[tauri::command]
+pub async fn open_battery_optimization_settings(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_sentra_vpn::SentraVpnPluginExt;
+    let res = app.sentra_vpn().open_battery_optimization_settings()?;
+    Ok(res.success)
+}
+
+#[tauri::command]
 pub async fn get_connection_modes(
     token: Option<String>,
 ) -> Result<serde_json::Value, String> {

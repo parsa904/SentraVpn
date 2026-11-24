@@ -3,6 +3,8 @@ import React from 'react';
 interface WorldMapBackdropProps {
   activeCountryCode?: string;
   isConnected?: boolean;
+  /** Renders subtle flowing global encrypted bridge routes across continents (e.g. on Auth screen) */
+  ambientRoutes?: boolean;
 }
 
 const COUNTRY_COORDS: Record<string, { x: number; y: number }> = {
@@ -25,9 +27,32 @@ const COUNTRY_COORDS: Record<string, { x: number; y: number }> = {
   IR: { x: 636, y: 228 },
 };
 
+const AMBIENT_BRIDGE_ARCS: Array<{
+  id: string;
+  from: { x: number; y: number };
+  to: { x: number; y: number };
+  lift: number;
+  delay: string;
+  duration: string;
+}> = [
+  { id: 'us-de', from: COUNTRY_COORDS.US, to: COUNTRY_COORDS.DE, lift: 84, delay: '0s', duration: '4.8s' },
+  { id: 'ir-de', from: COUNTRY_COORDS.IR, to: COUNTRY_COORDS.DE, lift: 56, delay: '1.1s', duration: '4.1s' },
+  { id: 'de-sg', from: COUNTRY_COORDS.DE, to: COUNTRY_COORDS.SG, lift: 74, delay: '2.1s', duration: '5.2s' },
+  { id: 'fi-jp', from: COUNTRY_COORDS.FI, to: COUNTRY_COORDS.JP, lift: 68, delay: '3.0s', duration: '5.0s' },
+];
+
+const AMBIENT_NODES = [
+  { id: 'us', ...COUNTRY_COORDS.US, delay: '0s' },
+  { id: 'de', ...COUNTRY_COORDS.DE, delay: '0.8s' },
+  { id: 'ir', ...COUNTRY_COORDS.IR, delay: '1.5s' },
+  { id: 'sg', ...COUNTRY_COORDS.SG, delay: '2.2s' },
+  { id: 'jp', ...COUNTRY_COORDS.JP, delay: '2.8s' },
+];
+
 export const WorldMapBackdrop: React.FC<WorldMapBackdropProps> = ({
   activeCountryCode,
   isConnected = false,
+  ambientRoutes = false,
 }) => {
   const uid = React.useId().replace(/:/g, '');
   const dotPatternId = `world-dots-${uid}`;
@@ -44,7 +69,9 @@ export const WorldMapBackdrop: React.FC<WorldMapBackdropProps> = ({
       <svg
         viewBox="0 0 1000 500"
         preserveAspectRatio="xMidYMid slice"
-        className="h-full w-full opacity-[0.14] dark:opacity-[0.18]"
+        className={`h-full w-full ${
+          ambientRoutes ? 'opacity-[0.22] dark:opacity-[0.28]' : 'opacity-[0.14] dark:opacity-[0.18]'
+        }`}
       >
         <defs>
           {/* Crisp Hiddify-style micro dot-matrix fill inside continent paths */}
@@ -95,6 +122,54 @@ export const WorldMapBackdrop: React.FC<WorldMapBackdropProps> = ({
           {/* New Zealand */}
           <path d="M926,440 L942,434 L946,458 L930,468 Z" />
         </g>
+
+        {/* Ambient flowing global bridge routes for Auth canvas */}
+        {ambientRoutes && !target && (
+          <g>
+            {AMBIENT_BRIDGE_ARCS.map((arc) => {
+              const cx = (arc.from.x + arc.to.x) / 2;
+              const cy = Math.min(arc.from.y, arc.to.y) - arc.lift;
+              const d = `M${arc.from.x},${arc.from.y} Q${cx},${cy} ${arc.to.x},${arc.to.y}`;
+              return (
+                <g key={arc.id}>
+                  <path
+                    d={d}
+                    fill="none"
+                    stroke="#10B981"
+                    strokeOpacity="0.22"
+                    strokeWidth="1.2"
+                    strokeDasharray="3 5"
+                  />
+                  <path
+                    d={d}
+                    fill="none"
+                    stroke="#10B981"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    className="animate-sentra-route-flow"
+                    style={{ animationDelay: arc.delay, animationDuration: arc.duration }}
+                  />
+                </g>
+              );
+            })}
+
+            {AMBIENT_NODES.map((node) => (
+              <g key={node.id}>
+                <circle
+                  cx={node.x}
+                  cy={node.y}
+                  r="6"
+                  fill="none"
+                  stroke="#10B981"
+                  strokeWidth="1.4"
+                  className="animate-sentra-node-pulse"
+                  style={{ animationDelay: node.delay }}
+                />
+                <circle cx={node.x} cy={node.y} r="3" fill="#10B981" fillOpacity="0.9" />
+              </g>
+            ))}
+          </g>
+        )}
 
         {/* Active route arc from origin to selected server */}
         {target && (

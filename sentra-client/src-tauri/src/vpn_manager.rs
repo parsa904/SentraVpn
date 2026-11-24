@@ -32,6 +32,7 @@ pub struct VpnManager {
     #[cfg(not(target_os = "android"))]
     child_process: Arc<Mutex<Option<Child>>>,
     is_running: Arc<AtomicBool>,
+    is_reconnecting: Arc<AtomicBool>,
     local_proxy: Arc<Mutex<Option<LocalProxyService>>>,
 }
 
@@ -53,6 +54,7 @@ impl VpnManager {
             #[cfg(not(target_os = "android"))]
             child_process: Arc::new(Mutex::new(None)),
             is_running: Arc::new(AtomicBool::new(false)),
+            is_reconnecting: Arc::new(AtomicBool::new(false)),
             local_proxy: Arc::new(Mutex::new(None)),
         }
     }
@@ -672,7 +674,21 @@ impl VpnManager {
 
         self.is_running.store(true, Ordering::SeqCst);
 
-        let (token_opt, mode, protocol, split, _sandbox, anti_dpi, location, dns_cfg, use_warp, routing_mode, selected_outbound_id, selected_personal_uri) = {
+        let (
+            token_opt,
+            mode,
+            protocol,
+            split,
+            _sandbox,
+            anti_dpi,
+            location,
+            dns_cfg,
+            use_warp,
+            routing_mode,
+            selected_outbound_id,
+            selected_personal_uri,
+            auto_reconnect,
+        ) = {
             let s = app_state.lock().await;
             (
                 s.subscription_token.clone(),
@@ -687,6 +703,7 @@ impl VpnManager {
                 s.routing_mode.clone(),
                 s.selected_outbound_id.clone(),
                 s.selected_personal_uri.clone(),
+                s.auto_reconnect,
             )
         };
 
@@ -697,6 +714,12 @@ impl VpnManager {
                 return Err("برای برقراری اتصال VPN ابتدا وارد حساب کاربری خود شوید.".to_string());
             }
         };
+
+        // Mark user intent as connected so wake / network-switch watchdog can recover cleanly
+        {
+            let mut s = app_state.lock().await;
+            s.user_wants_connected = true;
+        }
 
         // Enforce Strict Leak Protection on Static IP (Tunnel mode mandatory)
         if mode == "static_ip" {
@@ -713,14 +736,26 @@ impl VpnManager {
         {
             let mut state = app_state.lock().await;
             state.status = ConnectionStatus::Connecting;
-            state.logs.push(format!("[INFO] [Core] Initiating connection in mode [{}] with protocol [{}] (WARP: {})...", mode, protocol, if use_warp && mode != "static_ip" { "ON" } else { "OFF" }));
+            state.logs.push(format!(
+                "[INFO] [Core] Initiating connection in mode [{}] with protocol [{}] (WARP: {}, Auto-Reconnect: {})...",
+                mode,
+                protocol,
+                if use_warp && mode != "static_ip" { "ON" } else { "OFF" },
+                if auto_reconnect { "ON" } else { "OFF" }
+            ));
         }
 
         TelemetryService::emit_status_change(&app_handle, "Connecting", &mode, None);
         TelemetryService::emit_log(
             &app_handle,
             "INFO",
-            &format!("[Core] Requesting secure profile for mode [{}] and protocol [{}] (WARP: {})...", mode, protocol, if use_warp && mode != "static_ip" { "ON" } else { "OFF" }),
+            &format!(
+                "[Core] Requesting secure profile for mode [{}] and protocol [{}] (WARP: {}, Auto-Reconnect: {})...",
+                mode,
+                protocol,
+                if use_warp && mode != "static_ip" { "ON" } else { "OFF" },
+                if auto_reconnect { "ON" } else { "OFF" }
+            ),
         );
 
         // Fetch / compile live config from Sentra Core
@@ -817,7 +852,7 @@ impl VpnManager {
             let config_str = serde_json::to_string(singbox_payload).unwrap_or_default();
             match app_handle
                 .sentra_vpn()
-                .connect_with_server(config_str, split, mode.clone(), active_server_label)
+                .connect_with_server(config_str, split, mode.clone(), active_server_label, auto_reconnect)
             {
                 Ok(resp) => {
                     info!("SentraVpnPlugin connect responded: {:?}", resp);
@@ -1111,6 +1146,7 @@ impl VpnManager {
                                     heartbeat_running.store(false, Ordering::SeqCst);
                                     {
                                         let mut s = hb_app_state.lock().await;
+                                        s.user_wants_connected = false;
                                         s.status = ConnectionStatus::Disconnected;
                                         s.logs.push(format!("[DISCONNECT] {}", msg));
                                     }
@@ -1148,6 +1184,22 @@ impl VpnManager {
         app_handle: AppHandle,
         app_state: AppState,
     ) -> Result<(), String> {
+        self.stop_vpn_internal(app_handle, app_state, false).await
+    }
+
+    /// Internal teardown helper. When `preserve_intent` is true, keeps `user_wants_connected = true`
+    /// so an automatic reconnect cycle can cleanly rebuild the tunnel without flipping UI to Disconnected.
+    async fn stop_vpn_internal(
+        &self,
+        app_handle: AppHandle,
+        app_state: AppState,
+        preserve_intent: bool,
+    ) -> Result<(), String> {
+        if !preserve_intent {
+            let mut state = app_state.lock().await;
+            state.user_wants_connected = false;
+        }
+
         // Always guarantee Windows system proxy is reset even if tunnel flag was already cleared
         #[cfg(not(target_os = "android"))]
         {
@@ -1158,7 +1210,7 @@ impl VpnManager {
             return Ok(());
         }
 
-        info!("Stopping VPN and terminating Sing-box engine...");
+        info!("Stopping VPN and terminating Sing-box engine (preserve_intent={})...", preserve_intent);
         self.is_running.store(false, Ordering::SeqCst);
 
         // 1. Android stop
@@ -1189,26 +1241,217 @@ impl VpnManager {
         }
 
         // Clean up shared state
-        {
+        if preserve_intent {
             let mut state = app_state.lock().await;
-            state.status = ConnectionStatus::Disconnected;
-            state.connected_since = None;
+            state.status = ConnectionStatus::Connecting;
             state.metrics = crate::state::TelemetryMetrics::default();
-            state.logs.push("[INFO] [TUN] Interface [sentra-tun] released safely. System network restored.".to_string());
-            state.logs.push("[INFO] [Core] Sentra Connect disconnected cleanly.".to_string());
+            state.logs.push("[INFO] [AutoReconnect] Cleared stale tunnel before re-establishing connection.".to_string());
+        } else {
+            {
+                let mut state = app_state.lock().await;
+                state.status = ConnectionStatus::Disconnected;
+                state.connected_since = None;
+                state.metrics = crate::state::TelemetryMetrics::default();
+                state.logs.push("[INFO] [TUN] Interface [sentra-tun] released safely. System network restored.".to_string());
+                state.logs.push("[INFO] [Core] Sentra Connect disconnected cleanly.".to_string());
+            }
+
+            TelemetryService::emit_status_change(&app_handle, "Disconnected", "None", None);
+            TelemetryService::emit_speed_update(
+                &app_handle,
+                &crate::state::TelemetryMetrics::default(),
+            );
+            TelemetryService::emit_log(
+                &app_handle,
+                "INFO",
+                "[Core] Tunnel closed cleanly. Network routing restored.",
+            );
         }
 
-        TelemetryService::emit_status_change(&app_handle, "Disconnected", "None", None);
-        TelemetryService::emit_speed_update(
-            &app_handle,
-            &crate::state::TelemetryMetrics::default(),
-        );
+        Ok(())
+    }
+
+    /// Re-establish VPN tunnel cleanly after a network switch or wake from sleep.
+    /// Uses an atomic guard and bounded exponential backoff (2s, 4s, 8s; max 3 attempts)
+    /// and immediately aborts if the user manually disconnects.
+    pub async fn reconnect_vpn(
+        &self,
+        app_handle: AppHandle,
+        app_state: AppState,
+        reason: &str,
+    ) -> Result<(), String> {
+        let (should_run, mode) = {
+            let s = app_state.lock().await;
+            (
+                s.auto_reconnect && s.user_wants_connected && s.is_authenticated,
+                s.selected_mode.clone(),
+            )
+        };
+
+        if !should_run {
+            return Ok(());
+        }
+
+        if self
+            .is_reconnecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            info!("[AutoReconnect] Reconnect already in progress; coalescing trigger ({}).", reason);
+            return Ok(());
+        }
+
+        struct ReconnectGuard(Arc<AtomicBool>);
+        impl Drop for ReconnectGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = ReconnectGuard(Arc::clone(&self.is_reconnecting));
+
+        info!("[AutoReconnect] Triggered ({}). Re-establishing VPN tunnel...", reason);
+        {
+            let mut s = app_state.lock().await;
+            s.status = ConnectionStatus::Connecting;
+            s.logs.push(format!(
+                "[INFO] [AutoReconnect] Triggered ({}). Re-establishing VPN connection...",
+                reason
+            ));
+        }
+        TelemetryService::emit_status_change(&app_handle, "Connecting", &mode, None);
         TelemetryService::emit_log(
             &app_handle,
             "INFO",
-            "[Core] Tunnel closed cleanly. Network routing restored.",
+            &format!("[AutoReconnect] Triggered ({}). Re-establishing VPN tunnel...", reason),
         );
 
-        Ok(())
+        let _ = self
+            .stop_vpn_internal(app_handle.clone(), app_state.clone(), true)
+            .await;
+
+        // Initial settle delay + exponential retry backoff (seconds)
+        let delays_secs: [u64; 3] = [1, 3, 6];
+        let mut last_err = String::new();
+
+        for (idx, wait_secs) in delays_secs.iter().enumerate() {
+            tokio::time::sleep(std::time::Duration::from_secs(*wait_secs)).await;
+
+            let still_wanted = {
+                let s = app_state.lock().await;
+                s.auto_reconnect && s.user_wants_connected && s.is_authenticated
+            };
+            if !still_wanted {
+                info!("[AutoReconnect] Aborted because user disconnected or disabled auto-reconnect.");
+                return Ok(());
+            }
+
+            info!(
+                "[AutoReconnect] Attempt {}/{} (reason: {})...",
+                idx + 1,
+                delays_secs.len(),
+                reason
+            );
+            match self.start_vpn(app_handle.clone(), app_state.clone()).await {
+                Ok(()) => {
+                    {
+                        let mut s = app_state.lock().await;
+                        s.logs.push(format!(
+                            "[INFO] [AutoReconnect] VPN connection re-established ({}).",
+                            reason
+                        ));
+                    }
+                    TelemetryService::emit_log(
+                        &app_handle,
+                        "INFO",
+                        &format!("[AutoReconnect] VPN connection re-established ({}).", reason),
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("[AutoReconnect] Attempt {} failed: {}", idx + 1, e);
+                    last_err = e;
+                }
+            }
+        }
+
+        {
+            let mut s = app_state.lock().await;
+            s.status = ConnectionStatus::Disconnected;
+            s.logs.push(format!(
+                "[WARN] [AutoReconnect] Failed to re-establish VPN after {} attempts: {}",
+                delays_secs.len(),
+                last_err
+            ));
+        }
+        TelemetryService::emit_status_change(
+            &app_handle,
+            "Disconnected",
+            &mode,
+            Some(&last_err),
+        );
+        Err(last_err)
+    }
+
+    /// Background Desktop Watchdog: detects OS sleep/wake via wall-clock jump (>= 15s)
+    /// and default route / network interface switches (Wi-Fi <-> Ethernet <-> Hotspot)
+    /// using a zero-packet UDP route lookup.
+    #[cfg(desktop)]
+    pub fn spawn_network_and_wake_watchdog(
+        self: &Arc<Self>,
+        app_handle: AppHandle,
+        app_state: AppState,
+    ) {
+        let vpn = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let mut last_wall = std::time::SystemTime::now();
+            let mut last_route_ip = Self::probe_default_route_ip();
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                let now_wall = std::time::SystemTime::now();
+                let wall_jump_secs = now_wall
+                    .duration_since(last_wall)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                last_wall = now_wall;
+
+                let current_route_ip = Self::probe_default_route_ip();
+                let route_changed = current_route_ip.is_some() && current_route_ip != last_route_ip;
+                last_route_ip = current_route_ip;
+
+                let trigger_reason = if wall_jump_secs >= 15 {
+                    Some("device_wake")
+                } else if route_changed {
+                    Some("network_switch")
+                } else {
+                    None
+                };
+
+                if let Some(reason) = trigger_reason {
+                    let should_reconnect = {
+                        let s = app_state.lock().await;
+                        s.auto_reconnect && s.user_wants_connected && s.is_authenticated
+                    };
+                    if should_reconnect {
+                        let vpn_clone = Arc::clone(&vpn);
+                        let handle_clone = app_handle.clone();
+                        let state_clone = Arc::clone(&app_state);
+                        tauri::async_runtime::spawn(async move {
+                            let _ = vpn_clone
+                                .reconnect_vpn(handle_clone, state_clone, reason)
+                                .await;
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(desktop)]
+    fn probe_default_route_ip() -> Option<std::net::IpAddr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("1.1.1.1:80").ok()?;
+        socket.local_addr().ok().map(|addr| addr.ip())
     }
 }

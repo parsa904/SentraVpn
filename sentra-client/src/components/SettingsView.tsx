@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import {
+  BatteryWarning,
   Check,
+  ChevronDown,
   Copy,
   Globe,
   Link2,
@@ -8,7 +10,9 @@ import {
   Moon,
   Network,
   Send,
+  Settings,
   Shield,
+  SlidersHorizontal,
   Smartphone,
   Sun,
   Trash2,
@@ -20,6 +24,8 @@ import type {
   UserDeviceItem,
 } from '../types/sentra';
 import { type Language, type TranslationKey, t } from '../i18n/translations';
+import type { BatteryOptimizationStatus } from '../utils/reconnectPolicy';
+import { NetworkSpeedTestCard } from './NetworkSpeedTestCard';
 
 interface SettingsViewProps {
   lang: Language;
@@ -30,6 +36,8 @@ interface SettingsViewProps {
   selectedMode: ConnectionModeId;
   splitTunneling: boolean;
   killSwitch: boolean;
+  autoReconnect: boolean;
+  batteryOptStatus: BatteryOptimizationStatus | null;
   useWarp: boolean;
   customDns: string;
   devices: UserDeviceItem[];
@@ -40,10 +48,13 @@ interface SettingsViewProps {
   onChangeRoutingMode: (mode: RoutingMode) => void;
   onToggleSplitTunneling: (enabled: boolean) => void;
   onToggleKillSwitch: (enabled: boolean) => void;
+  onToggleAutoReconnect: (enabled: boolean) => void;
+  onOpenBatteryOptimizationSettings: () => void;
   onToggleWarp: (enabled: boolean) => void;
   onChangeCustomDns: (dns: string) => void;
   onRemoveDevice: (deviceId: string) => Promise<void>;
   onRequestTelegramLinkCode: () => Promise<string>;
+  onLogEvent?: (message: string) => void;
 }
 
 const ROUTING_OPTIONS: Array<{
@@ -65,6 +76,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   selectedMode,
   splitTunneling,
   killSwitch,
+  autoReconnect,
+  batteryOptStatus,
   useWarp,
   customDns,
   devices,
@@ -75,11 +88,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onChangeRoutingMode,
   onToggleSplitTunneling,
   onToggleKillSwitch,
+  onToggleAutoReconnect,
+  onOpenBatteryOptimizationSettings,
   onToggleWarp,
   onChangeCustomDns,
   onRemoveDevice,
   onRequestTelegramLinkCode,
+  onLogEvent,
 }) => {
+  const [advancedNetworkOpen, setAdvancedNetworkOpen] = useState(false);
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [linkCode, setLinkCode] = useState<string | null>(null);
   const [linkLoading, setLinkLoading] = useState(false);
@@ -296,52 +313,166 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div className="flex items-center justify-between gap-4 py-3">
               <div>
                 <div className="text-xs font-semibold text-slate-900 dark:text-white">
-                  {t(lang, 'warpTitle')}
+                  {t(lang, 'autoReconnectTitle')}
                 </div>
                 <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                  {isStaticIp ? t(lang, 'warpStaticDisabled') : t(lang, 'warpDesc')}
+                  {t(lang, 'autoReconnectDesc')}
                 </div>
               </div>
               <button
                 type="button"
                 role="switch"
                 dir="ltr"
-                disabled={isStaticIp}
-                aria-checked={useWarp && !isStaticIp}
-                aria-label={t(lang, 'warpAria')}
-                onClick={() => onToggleWarp(!useWarp)}
-                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-40 ${
-                  useWarp && !isStaticIp ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-slate-700'
+                data-testid="auto-reconnect-switch"
+                aria-checked={autoReconnect}
+                aria-label={t(lang, 'autoReconnectAria')}
+                onClick={() => onToggleAutoReconnect(!autoReconnect)}
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                  autoReconnect ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-slate-700'
                 }`}
               >
                 <span
                   className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform duration-150 ${
-                    useWarp && !isStaticIp ? 'translate-x-6' : 'translate-x-1'
+                    autoReconnect ? 'translate-x-6' : 'translate-x-1'
                   }`}
                 />
               </button>
             </div>
 
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3">
-              <div>
-                <label
-                  htmlFor="custom-dns-input"
-                  className="text-xs font-semibold text-slate-900 dark:text-white"
-                >
-                  {t(lang, 'customDnsTitle')}
-                </label>
-                <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                  {t(lang, 'customDnsDesc')}
+            {batteryOptStatus?.isAndroid && (
+              <div
+                data-testid="battery-opt-settings-row"
+                className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-3 py-3"
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-900 dark:text-white">
+                    {batteryOptStatus.isOptimized && (
+                      <BatteryWarning
+                        size={14}
+                        className="shrink-0 text-amber-500"
+                      />
+                    )}
+                    <span>{t(lang, 'batteryOptSettingsTitle')}</span>
+                  </div>
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                    {t(lang, 'batteryOptSettingsDesc')}
+                  </div>
                 </div>
+                {batteryOptStatus.isOptimized ? (
+                  <button
+                    type="button"
+                    data-testid="battery-opt-settings-row-btn"
+                    onClick={onOpenBatteryOptimizationSettings}
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 active:scale-[0.97] px-3 py-1.5 text-xs font-semibold text-amber-700 dark:text-amber-300 transition"
+                  >
+                    <Settings size={14} />
+                    <span>{t(lang, 'batteryOptOpenSettings')}</span>
+                  </button>
+                ) : (
+                  <span className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
+                    <Check size={13} />
+                    <span>{t(lang, 'batteryOptUnrestricted')}</span>
+                  </span>
+                )}
               </div>
-              <input
-                id="custom-dns-input"
-                type="text"
-                dir="ltr"
-                value={customDns}
-                onChange={(e) => onChangeCustomDns(e.target.value)}
-                className="w-full sm:w-56 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/60 px-3 py-2 font-mono text-xs text-slate-900 dark:text-slate-100 focus:border-emerald-500 focus:outline-none"
-              />
+            )}
+
+            {/* Collapsible Advanced Network Settings Accordion */}
+            <div className="pt-3">
+              <button
+                type="button"
+                data-testid="advanced-network-accordion-toggle"
+                aria-expanded={advancedNetworkOpen}
+                aria-controls="advanced-network-panel"
+                onClick={() => setAdvancedNetworkOpen((prev) => !prev)}
+                className="flex w-full items-center justify-between gap-3 rounded-xl border border-slate-200/80 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/50 px-3.5 py-3 text-start hover:border-emerald-500/40 transition"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <SlidersHorizontal
+                    size={16}
+                    aria-hidden="true"
+                    className="shrink-0 text-emerald-500"
+                  />
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold text-slate-900 dark:text-white">
+                      {t(lang, 'advancedNetworkTitle')}
+                    </div>
+                    <div className="truncate text-[11px] text-slate-500 dark:text-slate-400">
+                      {t(lang, 'advancedNetworkDesc')}
+                    </div>
+                  </div>
+                </div>
+                <ChevronDown
+                  size={16}
+                  aria-hidden="true"
+                  className={`shrink-0 text-slate-400 transition-transform duration-200 ${
+                    advancedNetworkOpen ? 'rotate-180 text-emerald-500' : ''
+                  }`}
+                />
+              </button>
+
+              {advancedNetworkOpen && (
+                <div
+                  id="advanced-network-panel"
+                  data-testid="advanced-network-accordion-panel"
+                  className="mt-3 rounded-xl border border-slate-200/80 dark:border-slate-800/90 bg-slate-50/40 dark:bg-slate-950/35 px-4 py-2 divide-y divide-slate-200/70 dark:divide-slate-800"
+                >
+                  <div className="flex items-center justify-between gap-4 py-3">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-900 dark:text-white">
+                        {t(lang, 'warpTitle')}
+                      </div>
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                        {isStaticIp ? t(lang, 'warpStaticDisabled') : t(lang, 'warpDesc')}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      dir="ltr"
+                      disabled={isStaticIp}
+                      aria-checked={useWarp && !isStaticIp}
+                      aria-label={t(lang, 'warpAria')}
+                      onClick={() => onToggleWarp(!useWarp)}
+                      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-40 ${
+                        useWarp && !isStaticIp ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-slate-700'
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform duration-150 ${
+                          useWarp && !isStaticIp ? 'translate-x-6' : 'translate-x-1'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 py-3">
+                    <div>
+                      <label
+                        htmlFor="custom-dns-input"
+                        className="text-xs font-semibold text-slate-900 dark:text-white"
+                      >
+                        {t(lang, 'customDnsTitle')}
+                      </label>
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                        {t(lang, 'customDnsDesc')}
+                      </div>
+                    </div>
+                    <input
+                      id="custom-dns-input"
+                      type="text"
+                      dir="ltr"
+                      value={customDns}
+                      onChange={(e) => onChangeCustomDns(e.target.value)}
+                      className="w-full sm:w-56 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950/80 px-3 py-2 font-mono text-xs text-slate-900 dark:text-slate-100 focus:border-emerald-500 focus:outline-none"
+                    />
+                  </div>
+
+                  <div className="pb-2">
+                    <NetworkSpeedTestCard lang={lang} onLogEvent={onLogEvent} />
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </section>

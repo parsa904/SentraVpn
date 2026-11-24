@@ -4,15 +4,22 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import io.nekohasekai.libbox.BoxService
@@ -25,30 +32,50 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * SentraVpnService: Android Foreground VpnService for Sentra Connect
- * Implements io.nekohasekai.libbox.PlatformInterface for native Sing-box TUN integration.
+ * Implements io.nekohasekai.libbox.PlatformInterface for native Sing-box TUN integration,
+ * with automatic reconnection on Wi-Fi <-> Cellular switches and Doze/sleep wake.
  */
 class SentraVpnService : VpnService(), PlatformInterface {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var isServiceRunning = AtomicBoolean(false)
+    private var isReconnecting = AtomicBoolean(false)
+    private var userDisconnected = AtomicBoolean(false)
+    private var lostNetworkPending = AtomicBoolean(false)
     private var boxService: BoxService? = null
     private var activeConfig: String? = null
     private var activeMode: String = "Sentra Auto"
+    private var activeServerName: String = "Sentra Auto"
     private var splitTunnelIr: Boolean = true
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var wakeReceiver: BroadcastReceiver? = null
+    private var activeNetworkId: Long? = null
+    @Volatile
+    private var lastHeartbeatWallMs: Long = System.currentTimeMillis()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var pendingReconnectRunnable: Runnable? = null
 
     companion object {
         private const val TAG = "SentraVpnService"
         const val NOTIFICATION_ID = 20261
+        const val BATTERY_WARNING_NOTIFICATION_ID = 20262
         const val CHANNEL_ID = "sentra_vpn_status_channel"
 
         const val ACTION_START_VPN = "com.sentra.connect.ACTION_START_VPN"
         const val ACTION_STOP_VPN = "com.sentra.connect.ACTION_STOP_VPN"
+        const val ACTION_SET_AUTO_RECONNECT = "com.sentra.connect.ACTION_SET_AUTO_RECONNECT"
         const val EXTRA_CONFIG_JSON = "EXTRA_CONFIG_JSON"
         const val EXTRA_ACTIVE_MODE = "EXTRA_ACTIVE_MODE"
         const val EXTRA_SERVER_NAME = "EXTRA_SERVER_NAME"
         const val EXTRA_SPLIT_TUNNEL_IR = "EXTRA_SPLIT_TUNNEL_IR"
+        const val EXTRA_AUTO_RECONNECT = "EXTRA_AUTO_RECONNECT"
+
+        private const val SLEEP_WAKE_GAP_MS = 15_000L
+        private const val RECONNECT_DEBOUNCE_MS = 1_500L
+
+        @Volatile
+        var autoReconnectEnabled: Boolean = true
 
         // Telemetry stats shared with Tauri plugin
         @Volatile
@@ -114,9 +141,19 @@ class SentraVpnService : VpnService(), PlatformInterface {
                 val mode = intent.getStringExtra(EXTRA_ACTIVE_MODE) ?: "Auto"
                 val serverName = intent.getStringExtra(EXTRA_SERVER_NAME)?.takeIf { it.isNotBlank() } ?: mode
                 val split = intent.getBooleanExtra(EXTRA_SPLIT_TUNNEL_IR, true)
+                autoReconnectEnabled = intent.getBooleanExtra(EXTRA_AUTO_RECONNECT, autoReconnectEnabled)
+                userDisconnected.set(false)
                 startVpnTunnel(configJson, mode, serverName, split)
             }
+            ACTION_SET_AUTO_RECONNECT -> {
+                autoReconnectEnabled = intent.getBooleanExtra(EXTRA_AUTO_RECONNECT, true)
+                Log.i(TAG, "Auto-Reconnect preference updated: $autoReconnectEnabled")
+                if (!autoReconnectEnabled) {
+                    cancelPendingReconnect()
+                }
+            }
             ACTION_STOP_VPN -> {
+                userDisconnected.set(true)
                 stopVpnTunnel()
                 stopSelf()
             }
@@ -208,18 +245,24 @@ class SentraVpnService : VpnService(), PlatformInterface {
     private fun startVpnTunnel(configJson: String, mode: String, serverName: String, split: Boolean) {
         if (isServiceRunning.get()) {
             Log.w(TAG, "VPN service is already running. Refreshing notification...")
-            updateNotification(serverName)
+            activeServerName = serverName
+            currentModeName = serverName
+            updateNotification(serverName, false)
             return
         }
 
-        Log.i(TAG, "Starting Sentra VPN Tunnel on [$serverName] in mode [$mode] (Split Tunneling: $split)...")
+        Log.i(TAG, "Starting Sentra VPN Tunnel on [$serverName] in mode [$mode] (Split Tunneling: $split, Auto-Reconnect: $autoReconnectEnabled)...")
         activeConfig = configJson
         activeMode = mode
+        activeServerName = serverName
         splitTunnelIr = split
         currentModeName = serverName
+        activeNetworkId = null
+        lostNetworkPending.set(false)
+        lastHeartbeatWallMs = System.currentTimeMillis()
 
         // 1. Enter foreground mode with persistent notification
-        val notification = buildPersistentNotification(serverName)
+        val notification = buildPersistentNotification(serverName, false)
         startForeground(NOTIFICATION_ID, notification)
 
         try {
@@ -236,11 +279,13 @@ class SentraVpnService : VpnService(), PlatformInterface {
             isServiceRunning.set(true)
             isVpnActive = true
 
-            // 4. Register NetworkCallback for automatic Wi-Fi <-> Cellular handoff
+            // 4. Register NetworkCallback and wake/Doze receiver for automatic reconnect
             registerNetworkCallback()
+            registerWakeReceiver()
 
-            // 5. Start telemetry metrics ticker
+            // 5. Start telemetry metrics ticker (also monitors wall-clock sleep jumps)
             startTelemetryTicker()
+            checkAndNotifyBatteryOptimization()
             SentraVpnPlugin.broadcastStatus("Connected", mode)
             writeLog("[Core] Sentra Connect Android VpnService online (mode: $mode)")
 
@@ -255,9 +300,20 @@ class SentraVpnService : VpnService(), PlatformInterface {
             var counter = 0L
             var prevRx = android.net.TrafficStats.getTotalRxBytes().coerceAtLeast(0L)
             var prevTx = android.net.TrafficStats.getTotalTxBytes().coerceAtLeast(0L)
+            lastHeartbeatWallMs = System.currentTimeMillis()
+
             while (isServiceRunning.get()) {
                 try {
                     Thread.sleep(1000)
+                    val nowWall = System.currentTimeMillis()
+                    val wallGap = nowWall - lastHeartbeatWallMs
+                    lastHeartbeatWallMs = nowWall
+
+                    if (wallGap >= SLEEP_WAKE_GAP_MS && autoReconnectEnabled && !userDisconnected.get()) {
+                        Log.i(TAG, "Detected device wake from sleep/Doze (gap=${wallGap}ms). Scheduling VPN auto-reconnect...")
+                        scheduleAutoReconnect("device_wake")
+                    }
+
                     counter++
                     uptimeSeconds = counter
 
@@ -283,15 +339,124 @@ class SentraVpnService : VpnService(), PlatformInterface {
         }.start()
     }
 
+    private fun cancelPendingReconnect() {
+        pendingReconnectRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingReconnectRunnable = null
+    }
+
+    private fun scheduleAutoReconnect(reason: String) {
+        if (!autoReconnectEnabled || userDisconnected.get()) return
+        if (activeConfig.isNullOrBlank()) return
+
+        cancelPendingReconnect()
+        val runnable = Runnable {
+            performAutoReconnect(reason)
+        }
+        pendingReconnectRunnable = runnable
+        mainHandler.postDelayed(runnable, RECONNECT_DEBOUNCE_MS)
+    }
+
+    private fun performAutoReconnect(reason: String) {
+        if (!autoReconnectEnabled || userDisconnected.get()) return
+        val cfg = activeConfig ?: return
+        if (!isReconnecting.compareAndSet(false, true)) {
+            Log.i(TAG, "Auto-reconnect already in progress; coalescing ($reason).")
+            return
+        }
+
+        Thread {
+            try {
+                Log.i(TAG, "Auto-reconnecting VPN tunnel due to $reason...")
+                writeLog("[AutoReconnect] Triggered ($reason). Re-establishing VPN tunnel...")
+                updateNotification(activeServerName, true)
+                SentraVpnPlugin.broadcastStatus("Connecting", activeMode)
+
+                // Cleanly release stale libbox instance and TUN fd before rebuilding
+                try {
+                    boxService?.close()
+                    boxService = null
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error closing stale BoxService during reconnect: ${e.message}")
+                }
+                try {
+                    vpnInterface?.close()
+                    vpnInterface = null
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error closing stale TUN interface during reconnect: ${e.message}")
+                }
+
+                val retryDelaysMs = longArrayOf(0L, 2_000L, 4_000L)
+                var reconnected = false
+
+                for (attemptIdx in retryDelaysMs.indices) {
+                    if (userDisconnected.get() || !autoReconnectEnabled) {
+                        Log.i(TAG, "Auto-reconnect aborted because user disconnected or disabled setting.")
+                        return@Thread
+                    }
+                    val waitMs = retryDelaysMs[attemptIdx]
+                    if (waitMs > 0L) {
+                        try {
+                            Thread.sleep(waitMs)
+                        } catch (_: InterruptedException) {
+                            return@Thread
+                        }
+                    }
+                    if (userDisconnected.get() || !autoReconnectEnabled) {
+                        return@Thread
+                    }
+
+                    try {
+                        Log.i(TAG, "Auto-reconnect attempt ${attemptIdx + 1}/${retryDelaysMs.size} ($reason)...")
+                        val newService = Libbox.newService(cfg, this)
+                        newService.start()
+                        boxService = newService
+                        isServiceRunning.set(true)
+                        isVpnActive = true
+                        lastHeartbeatWallMs = System.currentTimeMillis()
+                        updateNotification(activeServerName, false)
+                        SentraVpnPlugin.broadcastStatus("Connected", activeMode)
+                        writeLog("[AutoReconnect] VPN tunnel re-established after $reason.")
+                        reconnected = true
+                        break
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Auto-reconnect attempt ${attemptIdx + 1} failed: ${e.message}")
+                        try {
+                            boxService?.close()
+                            boxService = null
+                        } catch (_: Exception) {}
+                        try {
+                            vpnInterface?.close()
+                            vpnInterface = null
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                if (!reconnected && !userDisconnected.get()) {
+                    Log.e(TAG, "Failed to auto-reconnect VPN tunnel after ${retryDelaysMs.size} attempts.")
+                    writeLog("[AutoReconnect] Reconnect failed after ${retryDelaysMs.size} attempts.")
+                    isServiceRunning.set(false)
+                    isVpnActive = false
+                    SentraVpnPlugin.broadcastStatus("Disconnected", "None")
+                }
+            } finally {
+                isReconnecting.set(false)
+            }
+        }.start()
+    }
+
     private fun stopVpnTunnel() {
         Log.i(TAG, "Stopping Sentra VPN Tunnel...")
+        cancelPendingReconnect()
         isServiceRunning.set(false)
         isVpnActive = false
+        activeNetworkId = null
+        lostNetworkPending.set(false)
         downloadSpeedBps = 0
         uploadSpeedBps = 0
         uptimeSeconds = 0
 
         unregisterNetworkCallback()
+        unregisterWakeReceiver()
 
         try {
             boxService?.close()
@@ -313,35 +478,65 @@ class SentraVpnService : VpnService(), PlatformInterface {
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
+    private fun networkStableId(network: Network): Long {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            network.networkHandle
+        } else {
+            network.toString().hashCode().toLong()
+        }
+    }
+
     private fun registerNetworkCallback() {
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         if (connectivityManager == null) return
 
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
 
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 super.onAvailable(network)
-                Log.i(TAG, "Network interface transition detected: $network. Resetting libbox sockets for seamless handoff...")
-                try {
-                    boxService?.resetNetwork()
-                    writeLog("[Network] Underline network switched (Wi-Fi <-> Cellular). Libbox sockets refreshed.")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error refreshing network in boxService: ${e.message}")
+                val netId = networkStableId(network)
+                val previousId = activeNetworkId
+                activeNetworkId = netId
+                val recoveredFromLoss = lostNetworkPending.compareAndSet(true, false)
+
+                if (previousId == null && !recoveredFromLoss) {
+                    Log.d(TAG, "Initial underlying network recorded: $netId")
+                    return
+                }
+
+                if (previousId != netId || recoveredFromLoss) {
+                    Log.i(TAG, "Network transition detected (prev=$previousId -> curr=$netId, recovered=$recoveredFromLoss).")
+                    if (autoReconnectEnabled && !userDisconnected.get()) {
+                        scheduleAutoReconnect("network_switch")
+                    } else {
+                        try {
+                            boxService?.resetNetwork()
+                            writeLog("[Network] Underlying network switched. Libbox sockets refreshed.")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Error refreshing network in boxService: ${e.message}")
+                        }
+                    }
                 }
             }
 
             override fun onLost(network: Network) {
                 super.onLost(network)
-                Log.w(TAG, "Network connection lost: $network")
+                val netId = networkStableId(network)
+                Log.w(TAG, "Network connection lost: $netId")
+                if (activeNetworkId == null || activeNetworkId == netId) {
+                    lostNetworkPending.set(true)
+                    writeLog("[Network] Active network lost; awaiting next available interface...")
+                }
             }
         }
 
         try {
             connectivityManager?.registerNetworkCallback(request, networkCallback!!)
-            Log.i(TAG, "Registered ConnectivityManager.NetworkCallback for automatic network handoff.")
+            Log.i(TAG, "Registered ConnectivityManager.NetworkCallback for automatic network switch reconnect.")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to register network callback: ${e.message}")
         }
@@ -356,7 +551,66 @@ class SentraVpnService : VpnService(), PlatformInterface {
         }
     }
 
+    private fun registerWakeReceiver() {
+        if (wakeReceiver != null) return
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+            }
+        }
+
+        wakeReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val action = intent?.action ?: return
+                if (!autoReconnectEnabled || userDisconnected.get()) return
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                    action == PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED
+                ) {
+                    val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    if (pm != null && !pm.isDeviceIdleMode) {
+                        Log.i(TAG, "Exited Android Doze idle mode. Scheduling VPN auto-reconnect...")
+                        scheduleAutoReconnect("device_wake")
+                    }
+                    return
+                }
+
+                if (action == Intent.ACTION_SCREEN_ON || action == Intent.ACTION_USER_PRESENT) {
+                    val gapMs = System.currentTimeMillis() - lastHeartbeatWallMs
+                    if (gapMs >= SLEEP_WAKE_GAP_MS || !isVpnActive) {
+                        Log.i(TAG, "Device woke from sleep ($action, gap=${gapMs}ms). Scheduling VPN auto-reconnect...")
+                        scheduleAutoReconnect("device_wake")
+                    }
+                }
+            }
+        }
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(wakeReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(wakeReceiver, filter)
+            }
+            Log.i(TAG, "Registered device wake & Doze BroadcastReceiver for auto-reconnect.")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register wake BroadcastReceiver: ${e.message}")
+            wakeReceiver = null
+        }
+    }
+
+    private fun unregisterWakeReceiver() {
+        try {
+            wakeReceiver?.let { unregisterReceiver(it) }
+            wakeReceiver = null
+        } catch (e: Exception) {
+            Log.w(TAG, "Error unregistering wake BroadcastReceiver: ${e.message}")
+        }
+    }
+
     override fun onDestroy() {
+        userDisconnected.set(true)
         stopVpnTunnel()
         super.onDestroy()
         Log.i(TAG, "SentraVpnService destroyed.")
@@ -364,6 +618,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
 
     override fun onRevoke() {
         Log.w(TAG, "VPN permission was revoked by the Android OS.")
+        userDisconnected.set(true)
         stopVpnTunnel()
         super.onRevoke()
     }
@@ -386,7 +641,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
         }
     }
 
-    private fun buildPersistentNotification(serverName: String): Notification {
+    private fun buildPersistentNotification(serverName: String, reconnecting: Boolean): Notification {
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
         val contentPendingIntent = PendingIntent.getActivity(
             this,
@@ -406,10 +661,12 @@ class SentraVpnService : VpnService(), PlatformInterface {
         )
 
         val label = serverName.ifBlank { "Auto" }
+        val title = if (reconnecting) "Sentra · Reconnecting..." else "Sentra · Connected"
+        val body = if (reconnecting) "Restoring tunnel on $label" else "Server: $label"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Sentra · Connected")
-            .setContentText("Server: $label")
+            .setContentTitle(title)
+            .setContentText(body)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
             .setContentIntent(contentPendingIntent)
             .setOngoing(true)
@@ -424,8 +681,76 @@ class SentraVpnService : VpnService(), PlatformInterface {
             .build()
     }
 
-    private fun updateNotification(serverName: String) {
+    private fun updateNotification(serverName: String, reconnecting: Boolean) {
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(NOTIFICATION_ID, buildPersistentNotification(serverName))
+        notificationManager.notify(NOTIFICATION_ID, buildPersistentNotification(serverName, reconnecting))
+    }
+
+    private fun isBatteryOptimizationEnabled(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
+        return !pm.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun checkAndNotifyBatteryOptimization() {
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (!autoReconnectEnabled || !isBatteryOptimizationEnabled()) {
+            notificationManager.cancel(BATTERY_WARNING_NOTIFICATION_ID)
+            return
+        }
+
+        val settingsIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        } else {
+            Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:$packageName")
+            ).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        }
+
+        val resolvedIntent = if (settingsIntent.resolveActivity(packageManager) != null) {
+            settingsIntent
+        } else {
+            Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:$packageName")
+            ).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        }
+
+        val settingsPendingIntent = PendingIntent.getActivity(
+            this,
+            2,
+            resolvedIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val warningNotification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Battery optimization enabled")
+            .setContentText("Disable battery optimization so Sentra can reconnect automatically.")
+            .setStyle(
+                NotificationCompat.BigTextStyle().bigText(
+                    "Android battery optimization may interrupt background VPN reconnection. Open Settings and set Sentra to Unrestricted."
+                )
+            )
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentIntent(settingsPendingIntent)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .addAction(
+                android.R.drawable.ic_menu_preferences,
+                "Settings",
+                settingsPendingIntent
+            )
+            .build()
+
+        notificationManager.notify(BATTERY_WARNING_NOTIFICATION_ID, warningNotification)
+        writeLog("[Battery] Android battery optimization is enabled; background VPN reconnection may be restricted.")
     }
 }

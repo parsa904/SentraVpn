@@ -32,7 +32,13 @@ pub struct SentraVpn<R: Runtime>(
 
 impl<R: Runtime> SentraVpn<R> {
     pub fn connect(&self, config_json: String, split_tunnel_ir: bool) -> Result<ConnectResponse, String> {
-        self.connect_with_server(config_json, split_tunnel_ir, "Auto".to_string(), "Sentra Auto".to_string())
+        self.connect_with_server(
+            config_json,
+            split_tunnel_ir,
+            "Auto".to_string(),
+            "Sentra Auto".to_string(),
+            true,
+        )
     }
 
     pub fn connect_with_server(
@@ -41,6 +47,7 @@ impl<R: Runtime> SentraVpn<R> {
         split_tunnel_ir: bool,
         mode: String,
         server_name: String,
+        auto_reconnect: bool,
     ) -> Result<ConnectResponse, String> {
         #[cfg(target_os = "android")]
         {
@@ -52,13 +59,28 @@ impl<R: Runtime> SentraVpn<R> {
                         split_tunnel_ir,
                         mode,
                         server_name,
+                        auto_reconnect,
                     },
                 )
                 .map_err(|e| e.to_string())
         }
         #[cfg(not(target_os = "android"))]
         {
-            let _ = (config_json, split_tunnel_ir, mode, server_name);
+            let _ = (config_json, split_tunnel_ir, mode, server_name, auto_reconnect);
+            Err("Mobile VPN plugin is only supported on Android".to_string())
+        }
+    }
+
+    pub fn set_auto_reconnect(&self, enabled: bool) -> Result<SimpleSuccessResponse, String> {
+        #[cfg(target_os = "android")]
+        {
+            self.0
+                .run_mobile_plugin("setAutoReconnect", AutoReconnectRequest { enabled })
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = enabled;
             Err("Mobile VPN plugin is only supported on Android".to_string())
         }
     }
@@ -126,6 +148,38 @@ impl<R: Runtime> SentraVpn<R> {
         #[cfg(not(target_os = "android"))]
         {
             Err("Android secure storage is only available on mobile".to_string())
+        }
+    }
+
+    pub fn get_battery_optimization_status(
+        &self,
+    ) -> Result<BatteryOptimizationStatusResponse, String> {
+        #[cfg(target_os = "android")]
+        {
+            self.0
+                .run_mobile_plugin("getBatteryOptimizationStatus", ())
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Ok(BatteryOptimizationStatusResponse {
+                is_android: false,
+                is_optimized: false,
+                can_open_settings: false,
+            })
+        }
+    }
+
+    pub fn open_battery_optimization_settings(&self) -> Result<SimpleSuccessResponse, String> {
+        #[cfg(target_os = "android")]
+        {
+            self.0
+                .run_mobile_plugin("openBatteryOptimizationSettings", ())
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Ok(SimpleSuccessResponse { success: false })
         }
     }
 }
