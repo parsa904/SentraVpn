@@ -7,6 +7,10 @@ import type {
   RoutingMode,
   TelemetrySnapshot,
 } from '../types/sentra';
+import {
+  parseAuthSessionResponse,
+  type RawAuthApiResponse,
+} from '../utils/proxyParser';
 
 const SESSION_STORAGE_KEY = 'sentra_session_v2';
 const PERSONAL_CONFIGS_KEY = 'sentra_personal_configs_v2';
@@ -103,23 +107,44 @@ async function saveAndroidEncryptedSession(session: PersistedSession | null): Pr
   if (!isTauriRuntime()) return;
   try {
     if (!session) {
-      await invokeTauri('plugin:sentra-vpn|clear_session');
+      await invokeTauri('clear_persisted_session').catch(() =>
+        invokeTauri('plugin:sentra-vpn|clear_session')
+      );
     } else {
-      await invokeTauri('plugin:sentra-vpn|save_session', {
-        payload: { sessionJson: JSON.stringify(session) },
+      const serialized = JSON.stringify({
+        ...session,
+        remaining_bytes: 0,
       });
+      await invokeTauri('save_persisted_session', {
+        sessionJson: serialized,
+      }).catch(() =>
+        invokeTauri('plugin:sentra-vpn|save_session', {
+          payload: serialized,
+        })
+      );
     }
   } catch {
-    // On Windows/Linux desktop plugin returns fallback; Rust AuthManager handles AppData
+    // Rust AuthManager / localStorage already persists session on desktop
   }
 }
 
 async function loadAndroidEncryptedSession(): Promise<PersistedSession | null> {
   if (!isTauriRuntime()) return null;
   try {
-    const res = await invokeTauri<{ sessionJson?: string | null }>('plugin:sentra-vpn|load_session');
-    if (res?.sessionJson) {
-      const parsed = JSON.parse(res.sessionJson) as Partial<PersistedSession>;
+    const rawFromCommand = await invokeTauri<string | null>('load_persisted_session').catch(
+      () => null
+    );
+    let rawJson = rawFromCommand;
+    if (!rawJson) {
+      const pluginRes = await invokeTauri<{ found?: boolean; payload?: string }>(
+        'plugin:sentra-vpn|load_session'
+      ).catch(() => null);
+      if (pluginRes?.found && pluginRes.payload) {
+        rawJson = pluginRes.payload;
+      }
+    }
+    if (rawJson) {
+      const parsed = JSON.parse(rawJson) as Partial<PersistedSession>;
       if (parsed.subscription_token) {
         return {
           auth_token: parsed.auth_token || parsed.subscription_token,
@@ -276,35 +301,21 @@ export async function loginWithCredentials(
     return session;
   }
 
-  const data = await fetchBackendJson<{
-    auth_token?: string;
-    subscription_token?: string;
-    token?: string;
-    username?: string;
-    tier?: string;
-    expires_at?: string | null;
-  }>('/api/v1/auth/login', {
+  const data = await fetchBackendJson<RawAuthApiResponse>('/api/v1/auth/login', {
     method: 'POST',
     body: JSON.stringify({
       username,
       password,
-      device_id: getOrCreateWebDeviceId(),
+      device_identifier: getOrCreateWebDeviceId(),
       device_name: navigator.userAgent.slice(0, 48),
-      platform: 'desktop-web',
+      os: 'web',
     }),
   });
 
-  const subToken = data.subscription_token || data.token || data.auth_token;
-  if (!subToken) {
+  const session = parseAuthSessionResponse(data, username);
+  if (!session) {
     throw new Error('پاسخ ورود از سرور فاقد توکن معتبر است.');
   }
-  const session: PersistedSession = {
-    auth_token: data.auth_token || subToken,
-    subscription_token: subToken,
-    username: data.username || username,
-    tier: data.tier || '',
-    expires_at: data.expires_at ?? null,
-  };
   saveLocalSession(session);
   return session;
 }
@@ -337,35 +348,21 @@ export async function registerWithCredentials(
     return session;
   }
 
-  const data = await fetchBackendJson<{
-    auth_token?: string;
-    subscription_token?: string;
-    token?: string;
-    username?: string;
-    tier?: string;
-    expires_at?: string | null;
-  }>('/api/v1/auth/register', {
+  const data = await fetchBackendJson<RawAuthApiResponse>('/api/v1/auth/register', {
     method: 'POST',
     body: JSON.stringify({
       username,
       password,
-      device_id: getOrCreateWebDeviceId(),
+      device_identifier: getOrCreateWebDeviceId(),
       device_name: navigator.userAgent.slice(0, 48),
-      platform: 'desktop-web',
+      os: 'web',
     }),
   });
 
-  const subToken = data.subscription_token || data.token || data.auth_token;
-  if (!subToken) {
+  const session = parseAuthSessionResponse(data, username);
+  if (!session) {
     throw new Error('پاسخ ثبت‌نام از سرور فاقد توکن معتبر است.');
   }
-  const session: PersistedSession = {
-    auth_token: data.auth_token || subToken,
-    subscription_token: subToken,
-    username: data.username || username,
-    tier: data.tier || '',
-    expires_at: data.expires_at ?? null,
-  };
   saveLocalSession(session);
   return session;
 }
@@ -395,34 +392,20 @@ export async function loginWithOtpCode(code: string): Promise<PersistedSession> 
     return session;
   }
 
-  const data = await fetchBackendJson<{
-    auth_token?: string;
-    subscription_token?: string;
-    token?: string;
-    username?: string;
-    tier?: string;
-    expires_at?: string | null;
-  }>('/api/v1/auth/verify-code', {
+  const data = await fetchBackendJson<RawAuthApiResponse>('/api/v1/auth/code-login', {
     method: 'POST',
     body: JSON.stringify({
       code,
-      device_id: getOrCreateWebDeviceId(),
+      device_identifier: getOrCreateWebDeviceId(),
       device_name: navigator.userAgent.slice(0, 48),
-      platform: 'desktop-web',
+      os: 'web',
     }),
   });
 
-  const subToken = data.subscription_token || data.token || data.auth_token;
-  if (!subToken) {
+  const session = parseAuthSessionResponse(data);
+  if (!session) {
     throw new Error('کد واردشده معتبر نیست یا منقضی شده است.');
   }
-  const session: PersistedSession = {
-    auth_token: data.auth_token || subToken,
-    subscription_token: subToken,
-    username: data.username || '',
-    tier: data.tier || '',
-    expires_at: data.expires_at ?? null,
-  };
   saveLocalSession(session);
   return session;
 }
@@ -638,7 +621,7 @@ export async function requestTelegramLinkCode(token: string): Promise<string> {
     return invokeTauri<string>('get_telegram_link_code');
   }
   const data = await fetchBackendJson<{ code?: string; link_code?: string }>(
-    `/api/v1/auth/link-telegram?token=${encodeURIComponent(token)}`,
+    `/api/v1/auth/link-token?token=${encodeURIComponent(token)}`,
     {
       method: 'POST',
       headers: { 'X-Subscription-Token': token },
@@ -693,14 +676,19 @@ export async function subscribeNativeTelemetry(
   const listen = getTauriBridge().__TAURI__?.event?.listen;
   if (!listen) return () => {};
   try {
-    const unlisten1 = await listen<{
+    type RawTelemetryPayload = {
       download_speed_bps?: number;
       upload_speed_bps?: number;
       total_download_bytes?: number;
       total_upload_bytes?: number;
       ping_ms?: number | null;
       uptime_seconds?: number;
-    }>('vpn-telemetry', (ev) => {
+    };
+    type RawLogPayload =
+      | string
+      | { timestamp?: string; level?: string; message?: string };
+
+    const handleTelemetry = (ev: { payload: RawTelemetryPayload }) => {
       const p = ev.payload || {};
       onTelemetry({
         download_speed_bps: p.download_speed_bps || 0,
@@ -710,15 +698,27 @@ export async function subscribeNativeTelemetry(
         ping_ms: p.ping_ms && p.ping_ms > 0 ? p.ping_ms : null,
         uptime_seconds: p.uptime_seconds || 0,
       });
-    });
+    };
 
-    const unlisten2 = await listen<string>('vpn-log', (ev) => {
-      if (typeof ev.payload === 'string') onLog(ev.payload);
-    });
+    const handleLog = (ev: { payload: RawLogPayload }) => {
+      if (typeof ev.payload === 'string') {
+        onLog(ev.payload);
+      } else if (ev.payload && typeof ev.payload.message === 'string') {
+        const prefix = ev.payload.level ? `[${ev.payload.level}] ` : '';
+        onLog(`${prefix}${ev.payload.message}`);
+      }
+    };
+
+    const unlisten1 = await listen<RawTelemetryPayload>('vpn-telemetry', handleTelemetry);
+    const unlisten2 = await listen<RawTelemetryPayload>('telemetry-speed', handleTelemetry);
+    const unlisten3 = await listen<RawLogPayload>('vpn-log', handleLog);
+    const unlisten4 = await listen<RawLogPayload>('telemetry-log', handleLog);
 
     return () => {
       unlisten1();
       unlisten2();
+      unlisten3();
+      unlisten4();
     };
   } catch {
     return () => {};

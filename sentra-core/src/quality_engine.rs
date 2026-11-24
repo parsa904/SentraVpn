@@ -143,8 +143,8 @@ impl QualityEngine {
                     return (false, Some("Shadowsocks cipher must use AEAD or 2022 encryption".to_string()));
                 }
             }
-            "trojan" | "hysteria2" | "tuic" => {
-                // Native mandatory TLS/QUIC protocols
+            "trojan" | "hysteria2" | "tuic" | "wireguard" => {
+                // Native mandatory TLS/QUIC/Noise encryption protocols
             }
             "http" | "socks" => {
                 let has_tls = config_json_val

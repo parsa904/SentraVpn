@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   parseProxyInput,
+  parseAuthSessionResponse,
   formatBytes,
   formatSpeed,
   formatDuration,
@@ -97,14 +98,44 @@ test('formats bytes, speeds, durations, pings, and percentages deterministically
   assert.equal(countryCodeToFlag('XX'), '🌐');
 });
 
-test('validates credentials and 8-digit OTP strictly', () => {
-  assert.ok(validateCredentialsForm('', '123456', false));
-  assert.ok(validateCredentialsForm('ab', '123456', true));
-  assert.ok(validateCredentialsForm('valid_user', '123', true));
+test('validates credentials (8-char register rule) and 8-digit OTP strictly', () => {
+  assert.ok(validateCredentialsForm('', '12345678', false));
+  assert.ok(validateCredentialsForm('ab', '12345678', true));
+  assert.ok(validateCredentialsForm('valid_user', '1234567', true));
+  assert.ok(validateCredentialsForm('bad-user.name', 'secret123', true));
   assert.equal(validateCredentialsForm('valid_user', 'secret123', true), null);
+  assert.equal(validateCredentialsForm('legacy.user', '1234', false), null);
 
   assert.ok(validateOtpCode(''));
   assert.ok(validateOtpCode('12345'));
   assert.ok(validateOtpCode('1234abcd'));
   assert.equal(validateOtpCode('12345678'), null);
+});
+
+test('parses nested Sentra Core auth responses and flat session payloads', () => {
+  const nested = parseAuthSessionResponse({
+    access_token: 'jwt_sentra_abc123',
+    user: { username: 'ali_dev', first_name: 'Ali' },
+    subscription: {
+      token: 'sentra_sub_token_001',
+      tier: 'Sentra Pro',
+      expires_at: '2026-12-31T00:00:00Z',
+    },
+  });
+  assert.deepEqual(nested, {
+    auth_token: 'jwt_sentra_abc123',
+    subscription_token: 'sentra_sub_token_001',
+    username: 'ali_dev',
+    tier: 'Sentra Pro',
+    expires_at: '2026-12-31T00:00:00Z',
+  });
+
+  const flat = parseAuthSessionResponse(
+    { subscription_token: 'sentra_flat', tier: 'Sentra Lite' },
+    'fallback_u'
+  );
+  assert.equal(flat?.subscription_token, 'sentra_flat');
+  assert.equal(flat?.username, 'fallback_u');
+
+  assert.equal(parseAuthSessionResponse({}), null);
 });

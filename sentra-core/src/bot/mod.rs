@@ -258,6 +258,16 @@ pub async fn run_telegram_bot(
                                                 .await
                                                 {
                                                     error!("Error handling admin outbound text input: {:?}", e);
+                                                    let _ = bot
+                                                        .send_message(
+                                                            msg.chat.id,
+                                                            format!("❌ خطا در ثبت اوتباند:\n<code>{}</code>", e),
+                                                        )
+                                                        .parse_mode(teloxide::types::ParseMode::Html)
+                                                        .reply_markup(keyboards::cancel_and_back_inline_keyboard(
+                                                            "adm_action_official_outbounds",
+                                                        ))
+                                                        .await;
                                                 }
                                                 return respond(());
                                             }
@@ -361,6 +371,8 @@ pub async fn run_telegram_bot(
                                 || text.starts_with("hysteria2://")
                                 || text.starts_with("tuic://")
                                 || text.starts_with("ss://")
+                                || text.starts_with("wireguard://")
+                                || text.starts_with("wg://")
                                 || (text.starts_with('{') && text.contains("\"server\""))
                             {
                                 if let Err(e) = user_handlers::handle_donation_submission(&bot, &msg, &pool, text).await {

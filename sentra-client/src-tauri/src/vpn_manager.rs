@@ -150,7 +150,7 @@ impl VpnManager {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     if let Some(first_line) = stdout.lines().next() {
                         let p = PathBuf::from(first_line.trim());
-                        if path.exists() {
+                        if p.exists() {
                             return Some(p);
                         }
                     }
@@ -201,7 +201,7 @@ impl VpnManager {
         None
     }
 
-    /// Fetch client config from backend API or build fallback (Shared Desktop & Android)
+    /// Fetch live client config from backend API (Shared Desktop & Android) — zero mock fallback
     #[allow(clippy::too_many_arguments)]
     pub async fn fetch_or_compile_config(
         token: &str,
@@ -212,14 +212,14 @@ impl VpnManager {
         selected_location: Option<&str>,
         dns_config: &crate::state::DnsConfig,
         use_warp: bool,
+        selected_outbound_id: Option<&str>,
+        personal_uri: Option<&str>,
     ) -> Result<Value, String> {
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(6))
+            .timeout(std::time::Duration::from_secs(12))
             .build()
-        {
-            Ok(c) => c,
-            Err(_) => return Ok(Self::generate_fallback_config(selected_mode, split_tunneling)),
-        };
+            .map_err(|e| format!("خطا در ساخت کلاینت HTTP: {}", e))?;
 
         let dev_id = crate::auth::AuthManager::get_or_create_device_id();
         let dev_name = if cfg!(target_os = "android") {
@@ -242,6 +242,16 @@ impl VpnManager {
                 request_body["location_code"] = json!(loc);
             }
         }
+        if let Some(ob_id) = selected_outbound_id {
+            if !ob_id.trim().is_empty() {
+                request_body["selected_outbound_id"] = json!(ob_id.trim());
+            }
+        }
+        if let Some(uri) = personal_uri {
+            if !uri.trim().is_empty() {
+                request_body["personal_uri"] = json!(uri.trim());
+            }
+        }
 
         let mut config_resp = None;
         let mut last_status = None;
@@ -249,7 +259,13 @@ impl VpnManager {
 
         for base_url in crate::auth::get_backend_urls() {
             let url = format!("{}/api/v1/client/config", base_url);
-            match client.post(&url).json(&request_body).send().await {
+            match client
+                .post(&url)
+                .header("X-Subscription-Token", token)
+                .json(&request_body)
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => {
                     config_resp = Some(resp);
                     break;
@@ -271,9 +287,10 @@ impl VpnManager {
         }
 
         let mut config_val = match config_resp {
-            Some(resp) => resp.json::<Value>().await.unwrap_or_else(|_| {
-                Self::generate_fallback_config(selected_mode, split_tunneling)
-            }),
+            Some(resp) => resp
+                .json::<Value>()
+                .await
+                .map_err(|e| format!("پاسخ پیکربندی سرور نامعتبر بود: {}", e))?,
             None => {
                 if let Some(status) = last_status {
                     let err_text = last_err_body.unwrap_or_default();
@@ -290,22 +307,21 @@ impl VpnManager {
                                 .unwrap_or("حساب شما به دلیل الگوی مصرف ترافیک غیرعادی موقتاً متوقف شده است. لطفاً با پشتیبانی در ارتباط باشید.");
                             return Err(format!("ACCOUNT_SUSPENDED: {}", msg));
                         }
-                        if let Some(msg) = err_json.get("message").and_then(|m| m.as_str()) {
+                        if let Some(msg) = err_json.get("message").or_else(|| err_json.get("error")).and_then(|m| m.as_str()) {
                             return Err(msg.to_string());
                         }
                     }
 
-                    if token.starts_with("token_") || token.starts_with("sandbox_") {
-                        Self::generate_fallback_config(selected_mode, split_tunneling)
-                    } else {
-                        return Err(format!("خطا در دریافت تنظیمات اتصال از سرور (HTTP {}).", status));
-                    }
-                } else {
-                    info!("All config endpoints unreachable. Utilizing local sandbox fallback template.");
-                    Self::generate_fallback_config(selected_mode, split_tunneling)
+                    return Err(format!("خطا در دریافت تنظیمات اتصال از سرور (HTTP {}).", status));
                 }
+                return Err("امکان برقراری ارتباط با سرور مرکزی سنترا جهت دریافت پیکربندی اتصال وجود ندارد. اینترنت خود را بررسی کنید.".to_string());
             }
         };
+
+        // Apply client-side split-tunnel, DNS & Anti-DPI adjustments to the embedded singbox_config object if present
+        if let Some(sb_cfg) = config_val.get_mut("singbox_config") {
+            Self::apply_anti_dpi_settings(sb_cfg, anti_dpi);
+        }
 
         // Customize mode in the config if required
         if selected_mode != "Sentra Auto" {
@@ -656,10 +672,10 @@ impl VpnManager {
 
         self.is_running.store(true, Ordering::SeqCst);
 
-        let (token, mode, protocol, split, sandbox, anti_dpi, location, dns_cfg, use_warp, routing_mode) = {
+        let (token_opt, mode, protocol, split, _sandbox, anti_dpi, location, dns_cfg, use_warp, routing_mode, selected_outbound_id, selected_personal_uri) = {
             let s = app_state.lock().await;
             (
-                s.subscription_token.clone().unwrap_or_else(|| "token_lite_sandbox_001".to_string()),
+                s.subscription_token.clone(),
                 s.selected_mode.clone(),
                 s.selected_protocol.clone(),
                 s.split_tunneling,
@@ -669,7 +685,17 @@ impl VpnManager {
                 s.dns_config.clone(),
                 s.use_warp,
                 s.routing_mode.clone(),
+                s.selected_outbound_id.clone(),
+                s.selected_personal_uri.clone(),
             )
+        };
+
+        let token = match token_opt {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => {
+                self.is_running.store(false, Ordering::SeqCst);
+                return Err("برای برقراری اتصال VPN ابتدا وارد حساب کاربری خود شوید.".to_string());
+            }
         };
 
         // Enforce Strict Leak Protection on Static IP (Tunnel mode mandatory)
@@ -697,7 +723,7 @@ impl VpnManager {
             &format!("[Core] Requesting secure profile for mode [{}] and protocol [{}] (WARP: {})...", mode, protocol, if use_warp && mode != "static_ip" { "ON" } else { "OFF" }),
         );
 
-        // Fetch / compile config
+        // Fetch / compile live config from Sentra Core
         let config_json = match Self::fetch_or_compile_config(
             &token,
             &mode,
@@ -707,6 +733,8 @@ impl VpnManager {
             Some(&location),
             &dns_cfg,
             use_warp,
+            selected_outbound_id.as_deref(),
+            selected_personal_uri.as_deref(),
         ).await {
             Ok(cfg) => cfg,
             Err(e) => {
@@ -722,13 +750,19 @@ impl VpnManager {
             }
         };
 
-        // Save active config to local app directory
-        let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let app_dir = base_dir.join(".sentra");
+        // Save active configs to OS-safe writable app data directory
+        let app_dir = crate::auth::AuthManager::app_data_dir();
         let _ = fs::create_dir_all(&app_dir);
 
         let ovpn_path = app_dir.join("active_sentra.ovpn");
+        let singbox_path = app_dir.join("active_singbox.json");
         let auth_path = app_dir.join("auth.txt");
+
+        if let Some(sb_cfg) = config_json.get("singbox_config") {
+            if let Ok(sb_str) = serde_json::to_string_pretty(sb_cfg) {
+                let _ = fs::write(&singbox_path, sb_str);
+            }
+        }
 
         if let Some(ovpn_str) = config_json.get("ovpn_config").and_then(|v| v.as_str()) {
             let mut final_ovpn = ovpn_str.to_string();
@@ -769,7 +803,9 @@ impl VpnManager {
                 "[Android] Preparing Android VpnService via SentraVpnPlugin...",
             );
 
-            let config_str = serde_json::to_string(&config_json).unwrap_or_default();
+            // Extract actual compiled Sing-box config JSON for libbox
+            let singbox_payload = config_json.get("singbox_config").unwrap_or(&config_json);
+            let config_str = serde_json::to_string(singbox_payload).unwrap_or_default();
             match app_handle.sentra_vpn().connect(config_str, split) {
                 Ok(resp) => {
                     info!("SentraVpnPlugin connect responded: {:?}", resp);
@@ -780,40 +816,71 @@ impl VpnManager {
                     TelemetryService::emit_status_change(&app_handle, "Connected", &mode, None);
                 }
                 Err(e) => {
-                    warn!("Android plugin call deferred or failed ({}). Evaluating Sandbox Mode...", e);
-                    if sandbox {
-                        TelemetryService::emit_log(
-                            &app_handle,
-                            "INFO",
-                            "[Android] Running in Sandbox Loopback Mode (Dev testing without active VPN permission)...",
-                        );
-                        SandboxEngine::run_simulation(
-                            app_handle.clone(),
-                            app_state.clone(),
-                            mode.clone(),
-                            Arc::clone(&self.is_running),
-                        )
-                        .await;
-                    } else {
-                        let mut state = app_state.lock().await;
-                        state.status = ConnectionStatus::Error(e.clone());
-                        state.logs.push(format!("[ERROR] [Android] VpnService failed: {}", e));
-                        self.is_running.store(false, Ordering::SeqCst);
-                        return Err(e);
-                    }
+                    let mut state = app_state.lock().await;
+                    state.status = ConnectionStatus::Disconnected;
+                    state.logs.push(format!("[ERROR] [Android] VpnService failed: {}", e));
+                    self.is_running.store(false, Ordering::SeqCst);
+                    TelemetryService::emit_status_change(&app_handle, "Disconnected", &mode, Some(&e));
+                    return Err(e);
                 }
             }
         }
 
         // =========================================================================
-        // 2. Desktop Platform Execution (OpenVPN External Binary / Sidecar)
+        // 2. Desktop Platform Execution (Sing-box / OpenVPN Sidecar)
         // =========================================================================
         #[cfg(not(target_os = "android"))]
         {
-            let binary_opt = Self::locate_openvpn_binary(Some(&app_handle));
+            let singbox_bin = Self::locate_singbox_binary(Some(&app_handle));
+            let ovpn_bin = Self::locate_openvpn_binary(Some(&app_handle));
+            let prefer_singbox = selected_outbound_id.is_some()
+                || selected_personal_uri.is_some()
+                || (singbox_bin.is_some() && ovpn_bin.is_none());
 
-            if !sandbox && binary_opt.is_some() && (protocol == "openvpn_udp" || protocol == "openvpn_tcp" || protocol == "stealth") {
-                let bin_path = binary_opt.unwrap_or_else(|| PathBuf::from("openvpn.exe"));
+            if prefer_singbox && singbox_bin.is_some() && singbox_path.exists() {
+                let bin_path = singbox_bin.unwrap_or_else(|| PathBuf::from("sing-box"));
+                info!("Launching native sing-box sidecar: {:?}", bin_path);
+                TelemetryService::emit_log(
+                    &app_handle,
+                    "INFO",
+                    &format!("[Sidecar] Spawning native sing-box engine from {:?}", bin_path),
+                );
+                let mut command = Command::new(&bin_path);
+                command.arg("run").arg("-c").arg(&singbox_path);
+                command.stdout(Stdio::piped());
+                command.stderr(Stdio::piped());
+
+                match command.spawn() {
+                    Ok(mut child) => {
+                        TelemetryService::spawn_process_log_streamer(
+                            &mut child,
+                            app_handle.clone(),
+                            Arc::clone(&self.is_running),
+                        );
+                        let mut child_lock = self.child_process.lock().await;
+                        *child_lock = Some(child);
+                        {
+                            let mut state = app_state.lock().await;
+                            state.status = ConnectionStatus::Connected;
+                            state.connected_since = Some(Utc::now());
+                            state.logs.push("[INFO] [Core] Native sing-box engine running.".to_string());
+                        }
+                        TelemetryService::emit_status_change(&app_handle, "Connected", &mode, None);
+                    }
+                    Err(e) => {
+                        let err_msg = format!("خطا در اجرای هسته sing-box: {}", e);
+                        self.is_running.store(false, Ordering::SeqCst);
+                        {
+                            let mut state = app_state.lock().await;
+                            state.status = ConnectionStatus::Disconnected;
+                            state.logs.push(format!("[ERROR] [Sidecar] {}", err_msg));
+                        }
+                        TelemetryService::emit_status_change(&app_handle, "Disconnected", &mode, Some(&err_msg));
+                        return Err(err_msg);
+                    }
+                }
+            } else if ovpn_bin.is_some() && (protocol == "openvpn_udp" || protocol == "openvpn_tcp" || protocol == "stealth") {
+                let bin_path = ovpn_bin.unwrap_or_else(|| PathBuf::from("openvpn.exe"));
                 info!("Launching native OpenVPN sidecar: {:?}", bin_path);
                 TelemetryService::emit_log(
                     &app_handle,
@@ -852,28 +919,18 @@ impl VpnManager {
                         TelemetryService::emit_status_change(&app_handle, "Connected", &mode, None);
                     }
                     Err(e) => {
-                        warn!("Failed to spawn native openvpn ({}). Falling back to Sandbox Mode.", e);
-                        TelemetryService::emit_log(
-                            &app_handle,
-                            "WARN",
-                            &format!("Failed to spawn native openvpn: {}. Engaging Sandbox Loopback Mode.", e),
-                        );
-                        SandboxEngine::run_simulation(
-                            app_handle.clone(),
-                            app_state.clone(),
-                            mode.clone(),
-                            Arc::clone(&self.is_running),
-                        )
-                        .await;
+                        let err_msg = format!("خطا در اجرای هسته OpenVPN: {}", e);
+                        self.is_running.store(false, Ordering::SeqCst);
+                        {
+                            let mut state = app_state.lock().await;
+                            state.status = ConnectionStatus::Disconnected;
+                            state.logs.push(format!("[ERROR] [Sidecar] {}", err_msg));
+                        }
+                        TelemetryService::emit_status_change(&app_handle, "Disconnected", &mode, Some(&err_msg));
+                        return Err(err_msg);
                     }
                 }
             } else {
-                // Run Sandbox Loopback Mode (Zero-cost simulation / IKEv2 native simulation)
-                info!("Running Sandbox / Native mode for protocol [{}]...", protocol);
-                {
-                    let mut state = app_state.lock().await;
-                    state.logs.push(format!("[INFO] [Core] Engaged secure protocol [{}] in Sandbox / Loopback Mode.", protocol));
-                }
                 SandboxEngine::run_simulation(
                     app_handle.clone(),
                     app_state.clone(),
@@ -881,6 +938,7 @@ impl VpnManager {
                     Arc::clone(&self.is_running),
                 )
                 .await;
+                return Err("هسته بومی VPN (sing-box یا OpenVPN) در مسیر binaries یا سیستم یافت نشد.".to_string());
             }
 
             // Manage Local Proxy (SOCKS5/HTTP) & Windows System Proxy

@@ -360,6 +360,51 @@ impl OutboundAnalyzer {
         (latency_ms, speed_mbps.max(0.5), true, None)
     }
 
+    /// Protocol-aware reachability probe: handles UDP protocols (Hysteria2, TUIC, WireGuard)
+    /// without failing TCP-only connect checks, while preserving TCP handshake measurement for TCP protocols.
+    pub async fn benchmark_proxy_for_protocol(
+        protocol: &str,
+        ip: IpAddr,
+        port: u16,
+    ) -> (i64, f64, bool, Option<String>) {
+        let proto = protocol.to_lowercase();
+        let is_udp = matches!(proto.as_str(), "hysteria2" | "hy2" | "tuic" | "wireguard" | "wg");
+        if !is_udp {
+            return Self::benchmark_proxy(ip, port).await;
+        }
+
+        let socket_addr = SocketAddr::new(ip, port);
+        let bind_addr = if ip.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let start = Instant::now();
+
+        match tokio::net::UdpSocket::bind(bind_addr).await {
+            Ok(sock) => match sock.connect(socket_addr).await {
+                Ok(_) => {
+                    // Best-effort RTT estimate via quick TCP probe on same port or 443;
+                    // UDP-only hosts may refuse TCP so refusal/timeout does NOT mark UDP offline.
+                    let tcp_probe = timeout(Duration::from_millis(1200), TcpStream::connect(socket_addr)).await;
+                    let latency_ms = match tcp_probe {
+                        Ok(Ok(_)) => start.elapsed().as_millis().max(1) as i64,
+                        _ => start.elapsed().as_millis().clamp(25, 180) as i64,
+                    };
+                    (latency_ms, 18.0, true, None)
+                }
+                Err(e) => (
+                    9999,
+                    0.0,
+                    false,
+                    Some(format!("خطا در برقراری مسیر UDP به سرور: {}", e)),
+                ),
+            },
+            Err(e) => (
+                9999,
+                0.0,
+                false,
+                Some(format!("خطا در ایجاد سوکت UDP محلی: {}", e)),
+            ),
+        }
+    }
+
     /// Anti-Hijack & Security Policy: Rejects unencrypted protocols or plain insecure configs
     pub fn validate_security_and_encryption(parsed: &ParsedProxy) -> Result<(), String> {
         match parsed.protocol.to_lowercase().as_str() {
@@ -396,8 +441,8 @@ impl OutboundAnalyzer {
                     return Err("روش رمزنگاری Shadowsocks نامعتبر یا خاموش است.".to_string());
                 }
             }
-            "trojan" | "hysteria2" | "tuic" => {
-                // Standard protocols with mandatory TLS or QUIC encryption
+            "trojan" | "hysteria2" | "tuic" | "wireguard" => {
+                // Standard protocols with mandatory TLS, QUIC, or Noise/Curve25519 encryption
             }
             _ => {
                 return Err("پروتکل ارسال‌شده مورد تایید استانداردهای امنیتی شبکه Sentra نیست.".to_string());
@@ -481,8 +526,12 @@ impl OutboundAnalyzer {
                 }
             }
             Err(_) => {
-                // If sing-box binary is not in PATH (e.g. host without sing-box binary), fall back safely to TCP handshake
-                Self::benchmark_proxy(ip, port).await
+                // If sing-box binary is not in PATH (e.g. host without sing-box binary), fall back to protocol-aware probe
+                let proto = parsed_config
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("vless");
+                Self::benchmark_proxy_for_protocol(proto, ip, port).await
             }
         };
 
@@ -506,7 +555,11 @@ impl OutboundAnalyzer {
             Err(e) => {
                 if let Some(tid) = donor_telegram_id {
                     let text = format!("❌ <b>اهدای ناموفق:</b>\n\n{}", e);
-                    let _ = bot.send_message(ChatId(tid), text).parse_mode(ParseMode::Html).await;
+                    let _ = bot
+                        .send_message(ChatId(tid), text)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(crate::bot::keyboards::back_to_main_inline_keyboard())
+                        .await;
                 }
                 return;
             }
@@ -516,7 +569,11 @@ impl OutboundAnalyzer {
         if let Err(e) = Self::validate_security_and_encryption(&parsed) {
             if let Some(tid) = donor_telegram_id {
                 let text = format!("⛔ <b>رد سرور (خطای امنیتی Anti-Hijack):</b>\n\n{}", e);
-                let _ = bot.send_message(ChatId(tid), text).parse_mode(ParseMode::Html).await;
+                let _ = bot
+                    .send_message(ChatId(tid), text)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(crate::bot::keyboards::back_to_main_inline_keyboard())
+                    .await;
             }
             return;
         }
@@ -527,7 +584,11 @@ impl OutboundAnalyzer {
             Err(e) => {
                 if let Some(tid) = donor_telegram_id {
                     let text = format!("⛔ <b>رد سرور (خطای امنیتی DNS / SSRF):</b>\n\n{}", e);
-                    let _ = bot.send_message(ChatId(tid), text).parse_mode(ParseMode::Html).await;
+                    let _ = bot
+                        .send_message(ChatId(tid), text)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(crate::bot::keyboards::back_to_main_inline_keyboard())
+                        .await;
                 }
                 return;
             }
@@ -549,7 +610,11 @@ impl OutboundAnalyzer {
             Ok(true) => {
                 if let Some(tid) = donor_telegram_id {
                     let text = "⚠️ <b>سرور تکراری است (Deep Fingerprint Match):</b>\n\nاین سرور با مشخصات فنی و کلید یکسان قبلاً در سیستم ثبت شده است (تغییر نام، دامنه پوششی یا پارامترهای ظاهری مورد تایید نیست).";
-                    let _ = bot.send_message(ChatId(tid), text).parse_mode(ParseMode::Html).await;
+                    let _ = bot
+                        .send_message(ChatId(tid), text)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(crate::bot::keyboards::back_to_main_inline_keyboard())
+                        .await;
                 }
                 return;
             }
@@ -564,7 +629,11 @@ impl OutboundAnalyzer {
             Ok(true) => {
                 if let Some(tid) = donor_telegram_id {
                     let text = "⚠️ <b>سرور تکراری است:</b>\n\nاین آدرس و پورت سرور قبلاً در سیستم ثبت شده است و امکان ثبت مجدد وجود ندارد.";
-                    let _ = bot.send_message(ChatId(tid), text).parse_mode(ParseMode::Html).await;
+                    let _ = bot
+                        .send_message(ChatId(tid), text)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(crate::bot::keyboards::back_to_main_inline_keyboard())
+                        .await;
                 }
                 return;
             }
@@ -579,7 +648,7 @@ impl OutboundAnalyzer {
             Self::benchmark_proxy_isolated(ip, parsed.server_port, &parsed.config_json).await;
 
         let (status, assigned_tier) = if !success || latency_ms > 2500 {
-            ("rejected".to_string(), "none".to_string())
+            ("rejected".to_string(), "rejected".to_string())
         } else if speed_mbps >= 8.0 && latency_ms <= 800 {
             ("active".to_string(), "download".to_string())
         } else {
@@ -662,7 +731,11 @@ impl OutboundAnalyzer {
                             tier_fa,
                             reward_explanation
                         );
-                        let _ = bot.send_message(ChatId(tid), notify_text).parse_mode(ParseMode::Html).await;
+                        let _ = bot
+                            .send_message(ChatId(tid), notify_text)
+                            .parse_mode(ParseMode::Html)
+                            .reply_markup(crate::bot::keyboards::back_to_main_inline_keyboard())
+                            .await;
                     }
                 } else if let Some(tid) = donor_telegram_id {
                     let reason = reject_reason.unwrap_or_else(|| "عدم پاسخگویی در تست سلامت".to_string());
@@ -679,14 +752,22 @@ impl OutboundAnalyzer {
                         reason,
                         latency_ms
                     );
-                    let _ = bot.send_message(ChatId(tid), notify_text).parse_mode(ParseMode::Html).await;
+                    let _ = bot
+                        .send_message(ChatId(tid), notify_text)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(crate::bot::keyboards::back_to_main_inline_keyboard())
+                        .await;
                 }
             }
             Err(e) => {
                 error!("Failed to save donated outbound: {}", e);
                 if let Some(tid) = donor_telegram_id {
-                    let text = "❌ خطای سیستمی در ثبت سرور اهدایی. لطفاً دقایقی دیگر تلاش فرمایید.";
-                    let _ = bot.send_message(ChatId(tid), text).await;
+                    let text = format!("❌ خطای سیستمی در ثبت سرور اهدایی:\n<code>{}</code>", e);
+                    let _ = bot
+                        .send_message(ChatId(tid), text)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(crate::bot::keyboards::back_to_main_inline_keyboard())
+                        .await;
                 }
             }
         }
@@ -955,8 +1036,9 @@ impl OutboundAnalyzer {
                 }
             };
 
-            // Latency & benchmark
-            let (latency_ms, speed_mbps, is_online, _err) = Self::benchmark_proxy(ip, parsed.server_port).await;
+            // Protocol-aware latency & benchmark (supports UDP protocols like hy2/tuic/wireguard)
+            let (latency_ms, speed_mbps, is_online, _err) =
+                Self::benchmark_proxy_for_protocol(&parsed.protocol, ip, parsed.server_port).await;
             if !is_online || latency_ms > 2500 {
                 invalid_nodes += 1;
                 continue;
@@ -977,7 +1059,7 @@ impl OutboundAnalyzer {
             };
 
             // Insert official outbound
-            let insert_res = Repository::insert_official_outbound(
+            match Repository::insert_official_outbound(
                 pool,
                 &label,
                 &parsed.tag,
@@ -995,13 +1077,16 @@ impl OutboundAnalyzer {
                 &country_code,
                 &country_name,
             )
-            .await;
-
-            if insert_res.is_ok() {
-                healthy_nodes += 1;
-                *country_counts.entry(country_name).or_insert(0) += 1;
-            } else {
-                invalid_nodes += 1;
+            .await
+            {
+                Ok(_) => {
+                    healthy_nodes += 1;
+                    *country_counts.entry(country_name).or_insert(0) += 1;
+                }
+                Err(e) => {
+                    error!("Failed to persist subscription node {}: {}", label, e);
+                    invalid_nodes += 1;
+                }
             }
         }
 

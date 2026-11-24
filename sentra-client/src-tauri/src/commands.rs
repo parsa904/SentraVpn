@@ -370,8 +370,13 @@ pub async fn logout(
     state: State<'_, AppState>,
     vpn: State<'_, Arc<VpnManager>>,
 ) -> Result<ClientState, String> {
-    let _ = vpn.stop_vpn(app, state.inner().clone()).await;
+    let _ = vpn.stop_vpn(app.clone(), state.inner().clone()).await;
     AuthManager::clear_session();
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_sentra_vpn::SentraVpnPluginExt;
+        let _ = app.sentra_vpn().clear_session();
+    }
 
     let mut app_state = state.lock().await;
     app_state.is_authenticated = false;
@@ -840,4 +845,107 @@ pub async fn set_selected_outbound(
         outbound_id.as_deref().unwrap_or("auto")
     ));
     Ok(s.clone())
+}
+
+#[tauri::command]
+pub async fn save_persisted_session(
+    app: AppHandle,
+    session_json: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    if let Ok(parsed) = serde_json::from_str::<crate::auth::SessionData>(&session_json) {
+        let _ = AuthManager::save_session(&parsed);
+        let mut s = state.lock().await;
+        s.is_authenticated = true;
+        s.auth_token = Some(parsed.auth_token);
+        s.subscription_token = Some(parsed.subscription_token);
+        s.tier = parsed.tier;
+        s.username = parsed.username;
+        s.remaining_bytes = parsed.remaining_bytes;
+        s.expires_at = parsed.expires_at;
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_sentra_vpn::SentraVpnPluginExt;
+        app.sentra_vpn().save_session(session_json)?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+    }
+
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn load_persisted_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_sentra_vpn::SentraVpnPluginExt;
+        if let Ok(res) = app.sentra_vpn().load_session() {
+            if res.found && !res.payload.trim().is_empty() {
+                if let Ok(parsed) = serde_json::from_str::<crate::auth::SessionData>(&res.payload) {
+                    let mut s = state.lock().await;
+                    s.is_authenticated = true;
+                    s.auth_token = Some(parsed.auth_token);
+                    s.subscription_token = Some(parsed.subscription_token);
+                    s.tier = parsed.tier;
+                    s.username = parsed.username;
+                    s.remaining_bytes = parsed.remaining_bytes;
+                    s.expires_at = parsed.expires_at;
+                }
+                return Ok(Some(res.payload));
+            }
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+    }
+
+    if let Some(sess) = AuthManager::load_saved_session() {
+        let mut s = state.lock().await;
+        s.is_authenticated = true;
+        s.auth_token = Some(sess.auth_token.clone());
+        s.subscription_token = Some(sess.subscription_token.clone());
+        s.tier = sess.tier.clone();
+        s.username = sess.username.clone();
+        s.remaining_bytes = sess.remaining_bytes;
+        s.expires_at = sess.expires_at.clone();
+        if let Ok(json_str) = serde_json::to_string(&sess) {
+            return Ok(Some(json_str));
+        }
+    }
+
+    Ok(None)
+}
+
+#[tauri::command]
+pub async fn clear_persisted_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    AuthManager::clear_session();
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_sentra_vpn::SentraVpnPluginExt;
+        let _ = app.sentra_vpn().clear_session();
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+    }
+
+    let mut s = state.lock().await;
+    s.is_authenticated = false;
+    s.auth_token = None;
+    s.subscription_token = None;
+    s.username = String::new();
+    s.tier = String::new();
+    s.expires_at = None;
+    Ok(true)
 }

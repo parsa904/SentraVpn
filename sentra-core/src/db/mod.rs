@@ -17,10 +17,33 @@ use rand::Rng;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite};
 use std::str::FromStr;
-use tracing::info;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub type DbPool = Pool<Sqlite>;
+
+/// Safely adds a column to an existing SQLite table only if it does not already exist,
+/// using `PRAGMA table_info` so existing user data is never wiped or dropped.
+async fn ensure_column(
+    pool: &DbPool,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), sqlx::Error> {
+    let pragma_sql = format!("PRAGMA table_info({})", table);
+    let rows = sqlx::query(&pragma_sql).fetch_all(pool).await?;
+    let exists = rows.iter().any(|r| {
+        r.try_get::<String, _>("name")
+            .map(|n| n.eq_ignore_ascii_case(column))
+            .unwrap_or(false)
+    });
+    if !exists {
+        let alter_sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition);
+        sqlx::query(&alter_sql).execute(pool).await?;
+        info!("Added missing column '{}.{}' safely via ALTER TABLE", table, column);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct SystemHealthStats {
@@ -342,6 +365,9 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
             bytes_served            BIGINT NOT NULL DEFAULT 0,
             first_used_at           DATETIME,
             monthly_reward_granted  INTEGER NOT NULL DEFAULT 0,
+            fingerprint_sha256      TEXT,
+            offline_since           DATETIME,
+            clawback_executed       INTEGER NOT NULL DEFAULT 0,
             is_official             INTEGER NOT NULL DEFAULT 0,
             label                   TEXT,
             country_code            TEXT NOT NULL DEFAULT 'XX',
@@ -357,63 +383,18 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
             speed_score             INTEGER NOT NULL DEFAULT 50,
             jitter_ms               INTEGER NOT NULL DEFAULT 0,
             last_online_at          DATETIME,
-            allocation_mode         TEXT NOT NULL DEFAULT 'auto'
+            allocation_mode         TEXT NOT NULL DEFAULT 'auto',
+            reward_days             INTEGER NOT NULL DEFAULT 0,
+            user_note               TEXT,
+            approved_at             DATETIME
         );
-        CREATE INDEX IF NOT EXISTS idx_donated_status ON donated_outbounds(status);
-        CREATE INDEX IF NOT EXISTS idx_donated_assigned_tier ON donated_outbounds(assigned_tier);
-        CREATE INDEX IF NOT EXISTS idx_donated_server ON donated_outbounds(server_address, server_port);
-        CREATE INDEX IF NOT EXISTS idx_donated_is_official ON donated_outbounds(is_official);
-        CREATE INDEX IF NOT EXISTS idx_donated_speed_score ON donated_outbounds(speed_score);
-        CREATE INDEX IF NOT EXISTS idx_donated_allow_static ON donated_outbounds(allow_static_ip);
-        CREATE INDEX IF NOT EXISTS idx_donated_allow_web ON donated_outbounds(allow_web);
-        CREATE INDEX IF NOT EXISTS idx_donated_allow_dl ON donated_outbounds(allow_download);
         "#,
     )
     .execute(pool)
     .await?;
 
-    // Safe column migrations for users
-    let _ = sqlx::query("ALTER TABLE users ADD COLUMN outbound_reward_banned INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-
-    // Safe column migrations for existing donated_outbounds schema
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN declared_or_detected_gb BIGINT NOT NULL DEFAULT 0").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN bytes_served BIGINT NOT NULL DEFAULT 0").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN first_used_at DATETIME").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN monthly_reward_granted INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN fingerprint_sha256 TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN offline_since DATETIME").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN clawback_executed INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN is_official INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN label TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN country_code TEXT NOT NULL DEFAULT 'XX'").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN country_name TEXT NOT NULL DEFAULT 'Unknown'").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE outbounds ADD COLUMN country_name TEXT NOT NULL DEFAULT 'Unknown'").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN allow_web INTEGER NOT NULL DEFAULT 1").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN allow_download INTEGER NOT NULL DEFAULT 1").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN allow_static_ip INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN gemini_ok INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN trading_safe INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN speed_score INTEGER NOT NULL DEFAULT 50").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN jitter_ms INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN last_online_at DATETIME").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN allocation_mode TEXT NOT NULL DEFAULT 'auto'").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN reward_days INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN user_note TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donated_outbounds ADD COLUMN approved_at DATETIME").execute(pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_speed_score ON donated_outbounds(speed_score)").execute(pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_allow_static ON donated_outbounds(allow_static_ip)").execute(pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_allow_web ON donated_outbounds(allow_web)").execute(pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_allow_dl ON donated_outbounds(allow_download)").execute(pool).await;
-    let _ = sqlx::query("UPDATE donated_outbounds SET last_online_at = updated_at WHERE last_online_at IS NULL AND status = 'active'").execute(pool).await;
-    let _ = sqlx::query("UPDATE donated_outbounds SET allow_static_ip = 1 WHERE assigned_tier = 'static_ip'").execute(pool).await;
-    let _ = sqlx::query("UPDATE donated_outbounds SET allow_web = 1 WHERE assigned_tier IN ('web_browsing', 'static_ip')").execute(pool).await;
-    let _ = sqlx::query("UPDATE donated_outbounds SET allow_download = 1 WHERE assigned_tier IN ('download', 'static_ip')").execute(pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_is_official ON donated_outbounds(is_official)").execute(pool).await;
-    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donated_country_code ON donated_outbounds(country_code)").execute(pool).await;
-    let _ = sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_donated_fingerprint ON donated_outbounds(fingerprint_sha256)").execute(pool).await;
-
     // Subscription sources table (Admin Sub URLs with periodic re-sync)
-    let _ = sqlx::query(
+    sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS subscription_sources (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -425,11 +406,13 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
             last_synced_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        "#
-    ).execute(pool).await;
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
     // Cloudflare WARP Accounts table
-    let _ = sqlx::query(
+    sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS warp_accounts (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -446,21 +429,52 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
             created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_warp_accounts_is_active ON warp_accounts(is_active);
-        "#
-    ).execute(pool).await;
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
-    // Add use_warp column to device_sessions
-    let _ = sqlx::query("ALTER TABLE device_sessions ADD COLUMN use_warp INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-
-    // Check if existing donated_outbounds table includes static_ip in CHECK constraint
-    let table_sql: Option<String> = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='donated_outbounds'")
-        .fetch_optional(pool)
-        .await
-        .unwrap_or(None);
+    // Check if an older donated_outbounds table lacks 'static_ip' in its CHECK constraint
+    // Run this BEFORE column verification so ensure_column guarantees every column exists afterwards
+    let table_sql: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='donated_outbounds'",
+    )
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
     if let Some(sql) = table_sql {
         if !sql.contains("static_ip") {
-            info!("Migrating donated_outbounds schema to support 'static_ip' for official outbounds...");
-            let _ = sqlx::query(
+            info!("Migrating legacy donated_outbounds schema to support 'static_ip' without data loss...");
+            // Ensure legacy table has columns referenced in SELECT before copying
+            for (col, def) in [
+                ("declared_or_detected_gb", "BIGINT NOT NULL DEFAULT 0"),
+                ("bytes_served", "BIGINT NOT NULL DEFAULT 0"),
+                ("first_used_at", "DATETIME"),
+                ("monthly_reward_granted", "INTEGER NOT NULL DEFAULT 0"),
+                ("fingerprint_sha256", "TEXT"),
+                ("offline_since", "DATETIME"),
+                ("clawback_executed", "INTEGER NOT NULL DEFAULT 0"),
+                ("is_official", "INTEGER NOT NULL DEFAULT 0"),
+                ("label", "TEXT"),
+                ("country_code", "TEXT NOT NULL DEFAULT 'XX'"),
+                ("country_name", "TEXT NOT NULL DEFAULT 'Unknown'"),
+                ("allow_web", "INTEGER NOT NULL DEFAULT 1"),
+                ("allow_download", "INTEGER NOT NULL DEFAULT 1"),
+                ("allow_static_ip", "INTEGER NOT NULL DEFAULT 0"),
+                ("gemini_ok", "INTEGER NOT NULL DEFAULT 0"),
+                ("trading_safe", "INTEGER NOT NULL DEFAULT 0"),
+                ("speed_score", "INTEGER NOT NULL DEFAULT 50"),
+                ("jitter_ms", "INTEGER NOT NULL DEFAULT 0"),
+                ("last_online_at", "DATETIME"),
+                ("allocation_mode", "TEXT NOT NULL DEFAULT 'auto'"),
+                ("reward_days", "INTEGER NOT NULL DEFAULT 0"),
+                ("user_note", "TEXT"),
+                ("approved_at", "DATETIME"),
+            ] {
+                let _ = ensure_column(pool, "donated_outbounds", col, def).await;
+            }
+
+            if let Err(e) = sqlx::query(
                 r#"
                 PRAGMA foreign_keys=OFF;
                 CREATE TABLE IF NOT EXISTS donated_outbounds_mig (
@@ -502,35 +516,101 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
                     speed_score             INTEGER NOT NULL DEFAULT 50,
                     jitter_ms               INTEGER NOT NULL DEFAULT 0,
                     last_online_at          DATETIME,
-                    allocation_mode         TEXT NOT NULL DEFAULT 'auto'
+                    allocation_mode         TEXT NOT NULL DEFAULT 'auto',
+                    reward_days             INTEGER NOT NULL DEFAULT 0,
+                    user_note               TEXT,
+                    approved_at             DATETIME
                 );
                 INSERT INTO donated_outbounds_mig (
                     id, donor_user_id, tag, protocol, server_address, server_port, config_json, latency_ms, speed_mbps,
                     assigned_tier, health_score, status, fail_count, reward_granted, raw_link, rejection_reason,
                     declared_or_detected_gb, bytes_served, first_used_at, monthly_reward_granted, fingerprint_sha256,
-                    offline_since, clawback_executed, is_official, label, country_code, country_name, last_checked_at, created_at, updated_at
+                    offline_since, clawback_executed, is_official, label, country_code, country_name,
+                    last_checked_at, created_at, updated_at,
+                    allow_web, allow_download, allow_static_ip, gemini_ok, trading_safe,
+                    speed_score, jitter_ms, last_online_at, allocation_mode, reward_days, user_note, approved_at
                 )
-                SELECT 
+                SELECT
                     id, donor_user_id, tag, protocol, server_address, server_port, config_json, latency_ms, speed_mbps,
                     assigned_tier, health_score, status, fail_count, reward_granted, raw_link, rejection_reason,
-                    declared_or_detected_gb, bytes_served, first_used_at, monthly_reward_granted, fingerprint_sha256,
-                    offline_since, clawback_executed, COALESCE(is_official, 0), label,
-                    COALESCE(country_code, 'XX'), COALESCE(country_name, 'Unknown'), last_checked_at, created_at, updated_at
+                    COALESCE(declared_or_detected_gb, 0), COALESCE(bytes_served, 0), first_used_at,
+                    COALESCE(monthly_reward_granted, 0), fingerprint_sha256, offline_since,
+                    COALESCE(clawback_executed, 0), COALESCE(is_official, 0), label,
+                    COALESCE(country_code, 'XX'), COALESCE(country_name, 'Unknown'),
+                    last_checked_at, created_at, updated_at,
+                    COALESCE(allow_web, 1), COALESCE(allow_download, 1), COALESCE(allow_static_ip, 0),
+                    COALESCE(gemini_ok, 0), COALESCE(trading_safe, 0), COALESCE(speed_score, 50),
+                    COALESCE(jitter_ms, 0), last_online_at, COALESCE(allocation_mode, 'auto'),
+                    COALESCE(reward_days, 0), user_note, approved_at
                 FROM donated_outbounds;
                 DROP TABLE donated_outbounds;
                 ALTER TABLE donated_outbounds_mig RENAME TO donated_outbounds;
-                CREATE INDEX IF NOT EXISTS idx_donated_status ON donated_outbounds(status);
-                CREATE INDEX IF NOT EXISTS idx_donated_assigned_tier ON donated_outbounds(assigned_tier);
-                CREATE INDEX IF NOT EXISTS idx_donated_server ON donated_outbounds(server_address, server_port);
-                CREATE INDEX IF NOT EXISTS idx_donated_is_official ON donated_outbounds(is_official);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_donated_fingerprint ON donated_outbounds(fingerprint_sha256);
                 PRAGMA foreign_keys=ON;
-                "#
+                "#,
             )
             .execute(pool)
-            .await;
+            .await
+            {
+                warn!("Legacy donated_outbounds static_ip migration returned warning: {}", e);
+            }
         }
     }
+
+    // Safe idempotent column migrations via PRAGMA table_info (never drops existing user data)
+    ensure_column(pool, "users", "outbound_reward_banned", "INTEGER NOT NULL DEFAULT 0").await?;
+    ensure_column(pool, "outbounds", "country_name", "TEXT NOT NULL DEFAULT 'Unknown'").await?;
+    ensure_column(pool, "device_sessions", "use_warp", "INTEGER NOT NULL DEFAULT 0").await?;
+
+    for (col, def) in [
+        ("declared_or_detected_gb", "BIGINT NOT NULL DEFAULT 0"),
+        ("bytes_served", "BIGINT NOT NULL DEFAULT 0"),
+        ("first_used_at", "DATETIME"),
+        ("monthly_reward_granted", "INTEGER NOT NULL DEFAULT 0"),
+        ("fingerprint_sha256", "TEXT"),
+        ("offline_since", "DATETIME"),
+        ("clawback_executed", "INTEGER NOT NULL DEFAULT 0"),
+        ("is_official", "INTEGER NOT NULL DEFAULT 0"),
+        ("label", "TEXT"),
+        ("country_code", "TEXT NOT NULL DEFAULT 'XX'"),
+        ("country_name", "TEXT NOT NULL DEFAULT 'Unknown'"),
+        ("allow_web", "INTEGER NOT NULL DEFAULT 1"),
+        ("allow_download", "INTEGER NOT NULL DEFAULT 1"),
+        ("allow_static_ip", "INTEGER NOT NULL DEFAULT 0"),
+        ("gemini_ok", "INTEGER NOT NULL DEFAULT 0"),
+        ("trading_safe", "INTEGER NOT NULL DEFAULT 0"),
+        ("speed_score", "INTEGER NOT NULL DEFAULT 50"),
+        ("jitter_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_online_at", "DATETIME"),
+        ("allocation_mode", "TEXT NOT NULL DEFAULT 'auto'"),
+        ("reward_days", "INTEGER NOT NULL DEFAULT 0"),
+        ("user_note", "TEXT"),
+        ("approved_at", "DATETIME"),
+    ] {
+        ensure_column(pool, "donated_outbounds", col, def).await?;
+    }
+
+    // Ensure all indexes exist (including UNIQUE index on fingerprint_sha256 required by ON CONFLICT)
+    for idx_sql in [
+        "CREATE INDEX IF NOT EXISTS idx_donated_status ON donated_outbounds(status)",
+        "CREATE INDEX IF NOT EXISTS idx_donated_assigned_tier ON donated_outbounds(assigned_tier)",
+        "CREATE INDEX IF NOT EXISTS idx_donated_server ON donated_outbounds(server_address, server_port)",
+        "CREATE INDEX IF NOT EXISTS idx_donated_is_official ON donated_outbounds(is_official)",
+        "CREATE INDEX IF NOT EXISTS idx_donated_country_code ON donated_outbounds(country_code)",
+        "CREATE INDEX IF NOT EXISTS idx_donated_speed_score ON donated_outbounds(speed_score)",
+        "CREATE INDEX IF NOT EXISTS idx_donated_allow_static ON donated_outbounds(allow_static_ip)",
+        "CREATE INDEX IF NOT EXISTS idx_donated_allow_web ON donated_outbounds(allow_web)",
+        "CREATE INDEX IF NOT EXISTS idx_donated_allow_dl ON donated_outbounds(allow_download)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_donated_fingerprint ON donated_outbounds(fingerprint_sha256)",
+    ] {
+        if let Err(e) = sqlx::query(idx_sql).execute(pool).await {
+            warn!("Index creation warning ({}): {}", idx_sql, e);
+        }
+    }
+
+    let _ = sqlx::query("UPDATE donated_outbounds SET last_online_at = updated_at WHERE last_online_at IS NULL AND status = 'active'").execute(pool).await;
+    let _ = sqlx::query("UPDATE donated_outbounds SET allow_static_ip = 1 WHERE assigned_tier = 'static_ip'").execute(pool).await;
+    let _ = sqlx::query("UPDATE donated_outbounds SET allow_web = 1 WHERE assigned_tier IN ('web_browsing', 'static_ip')").execute(pool).await;
+    let _ = sqlx::query("UPDATE donated_outbounds SET allow_download = 1 WHERE assigned_tier IN ('download', 'static_ip')").execute(pool).await;
 
     // 8. DONATIONS table (Financial Support & Reward Tracking)
     sqlx::query(
@@ -556,8 +636,8 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("ALTER TABLE donations ADD COLUMN file_unique_id TEXT").execute(pool).await;
-    let _ = sqlx::query("ALTER TABLE donations ADD COLUMN image_sha256 TEXT").execute(pool).await;
+    ensure_column(pool, "donations", "file_unique_id", "TEXT").await?;
+    ensure_column(pool, "donations", "image_sha256", "TEXT").await?;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donations_file_unique_id ON donations(file_unique_id)").execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_donations_image_sha256 ON donations(image_sha256)").execute(pool).await;
 
@@ -2886,6 +2966,9 @@ impl Repository {
                 assigned_tier = excluded.assigned_tier,
                 health_score = excluded.health_score,
                 status = excluded.status,
+                fail_count = 0,
+                offline_since = NULL,
+                rejection_reason = NULL,
                 raw_link = excluded.raw_link,
                 is_official = 1,
                 country_code = excluded.country_code,
@@ -2921,14 +3004,22 @@ impl Repository {
         .bind(speed_score)
         .bind(alloc_mode)
         .execute(pool)
-        .await?;
+        .await
+        .map_err(|e| {
+            error!("SQL error in insert_official_outbound (INSERT): {}", e);
+            CoreError::from(e)
+        })?;
 
         let row = sqlx::query_as::<_, DonatedOutbound>(
             "SELECT * FROM donated_outbounds WHERE fingerprint_sha256 = ?"
         )
         .bind(fingerprint_sha256)
         .fetch_one(pool)
-        .await?;
+        .await
+        .map_err(|e| {
+            error!("SQL error in insert_official_outbound (SELECT): {}", e);
+            CoreError::from(e)
+        })?;
 
         Ok(row)
     }
@@ -3402,7 +3493,10 @@ impl Repository {
         )
         .fetch_all(pool)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            error!("SQL error querying active donated_outbounds: {}", e);
+            CoreError::from(e)
+        })?;
 
         for row in donated_rows {
             let code = if row.country_code.trim().is_empty() {
@@ -3464,7 +3558,10 @@ impl Repository {
         )
         .fetch_all(pool)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            error!("SQL error querying active outbounds: {}", e);
+            CoreError::from(e)
+        })?;
 
         for ob in base_rows {
             let duplicate = results
@@ -3623,6 +3720,10 @@ impl Repository {
             r#"
             UPDATE donated_outbounds
             SET status = 'active',
+                fail_count = 0,
+                health_score = 100,
+                offline_since = NULL,
+                rejection_reason = NULL,
                 reward_days = ?,
                 reward_granted = 1,
                 allow_web = 1,
@@ -3646,41 +3747,43 @@ impl Repository {
         if let Some(uid) = ob.donor_user_id {
             donor_user = Self::get_user_by_id(pool, uid).await.unwrap_or(None);
 
-            // Extend or upgrade donor's subscription by reward_days
-            if let Some(sub) = Self::get_subscription_by_user_id(pool, uid).await? {
-                let now = Utc::now();
-                let base_expiry = if sub.expires_at > now { sub.expires_at } else { now };
-                let new_expiry = base_expiry + Duration::days(reward_days);
-                let new_tier = if sub.tier == "Sentra Flow+" {
-                    "Sentra Flow+"
-                } else {
-                    "Sentra Pro"
-                };
-                let new_traffic_limit = sub.traffic_limit_bytes.max(161_061_273_600); // at least 150 GB
-                let new_max_devices = sub.max_concurrent_devices.max(3);
+            // Ensure donor has a subscription row before extending/upgrading by reward_days
+            let sub = match Self::get_subscription_by_user_id(pool, uid).await? {
+                Some(existing) => existing,
+                None => Self::create_or_ensure_lite_subscription(pool, uid).await?,
+            };
+            let now = Utc::now();
+            let base_expiry = if sub.expires_at > now { sub.expires_at } else { now };
+            let new_expiry = base_expiry + Duration::days(reward_days);
+            let new_tier = if sub.tier == "Sentra Flow+" {
+                "Sentra Flow+"
+            } else {
+                "Sentra Pro"
+            };
+            let new_traffic_limit = sub.traffic_limit_bytes.max(161_061_273_600); // at least 150 GB
+            let new_max_devices = sub.max_concurrent_devices.max(3);
 
-                let sub_after = sqlx::query_as::<_, Subscription>(
-                    r#"
-                    UPDATE subscriptions
-                    SET tier = ?,
-                        status = 'active',
-                        traffic_limit_bytes = ?,
-                        max_concurrent_devices = ?,
-                        expires_at = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    RETURNING *
-                    "#,
-                )
-                .bind(new_tier)
-                .bind(new_traffic_limit)
-                .bind(new_max_devices)
-                .bind(new_expiry)
-                .bind(sub.id)
-                .fetch_one(pool)
-                .await?;
-                updated_sub = Some(sub_after);
-            }
+            let sub_after = sqlx::query_as::<_, Subscription>(
+                r#"
+                UPDATE subscriptions
+                SET tier = ?,
+                    status = 'active',
+                    traffic_limit_bytes = ?,
+                    max_concurrent_devices = ?,
+                    expires_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                RETURNING *
+                "#,
+            )
+            .bind(new_tier)
+            .bind(new_traffic_limit)
+            .bind(new_max_devices)
+            .bind(new_expiry)
+            .bind(sub.id)
+            .fetch_one(pool)
+            .await?;
+            updated_sub = Some(sub_after);
         }
 
         Ok((ob, donor_user, updated_sub))
@@ -3866,21 +3969,16 @@ pub struct AdminRealtimeStats {
 }
 
 impl Repository {
-    pub async fn check_duplicate_fingerprint(pool: &sqlx::SqlitePool, fingerprint: &str) -> sqlx::Result<bool> {
-        if let Ok(cnt) = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbounds WHERE fingerprint = ?")
-            .bind(fingerprint)
-            .fetch_one(pool)
-            .await
-        {
-            if cnt > 0 { return Ok(true); }
-        }
-        if let Ok(cnt) = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM donated_outbounds WHERE fingerprint = ?")
-            .bind(fingerprint)
-            .fetch_one(pool)
-            .await
-        {
-            if cnt > 0 { return Ok(true); }
-        }
-        Ok(false)
+    pub async fn check_duplicate_fingerprint(
+        pool: &sqlx::SqlitePool,
+        fingerprint: &str,
+    ) -> sqlx::Result<bool> {
+        let cnt = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM donated_outbounds WHERE fingerprint_sha256 = ? AND status != 'rejected'",
+        )
+        .bind(fingerprint)
+        .fetch_one(pool)
+        .await?;
+        Ok(cnt > 0)
     }
 }

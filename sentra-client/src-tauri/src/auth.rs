@@ -54,12 +54,18 @@ impl AuthManager {
             .map_err(|e| format!("خطا در ساخت کلاینت ارتباطی HTTP: {}", e))
     }
 
-    /// Return OS-safe persistent application data directory (%APPDATA%/com.sentra.connect on Windows)
+    /// Return OS-safe persistent application data directory (%APPDATA%/com.sentra.connect on Windows, writable fallback on Android/Linux)
     pub fn app_data_dir() -> PathBuf {
         let base = if cfg!(target_os = "windows") {
             std::env::var_os("APPDATA")
                 .or_else(|| std::env::var_os("LOCALAPPDATA"))
                 .map(PathBuf::from)
+        } else if cfg!(target_os = "android") {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+                .or_else(|| std::env::var_os("TMPDIR").map(PathBuf::from))
+                .or_else(|| Some(std::env::temp_dir()))
         } else {
             std::env::var_os("XDG_DATA_HOME")
                 .map(PathBuf::from)
@@ -69,7 +75,7 @@ impl AuthManager {
         };
 
         let app_dir = base
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .unwrap_or_else(std::env::temp_dir)
             .join("com.sentra.connect");
         let _ = fs::create_dir_all(&app_dir);
         app_dir
@@ -581,13 +587,14 @@ impl AuthManager {
                         .map_err(|e| format!("خطا در پردازش پاسخ سرور: {}", e));
                 }
                 Ok(resp) => {
+                    let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                         if let Some(m) = v.get("message").or_else(|| v.get("error")).and_then(|x| x.as_str()) {
                             return Err(m.to_string());
                         }
                     }
-                    return Err(format!("خطا در ثبت اوتباند اهدایی (HTTP {}).", resp.status()));
+                    return Err(format!("خطا در ثبت اوتباند اهدایی (HTTP {}).", status));
                 }
                 Err(e) => {
                     last_err = e.to_string();

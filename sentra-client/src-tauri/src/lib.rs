@@ -94,7 +94,10 @@ pub fn run() {
             commands::get_my_donated_outbounds,
             commands::save_personal_configs,
             commands::load_personal_configs,
-            commands::set_selected_outbound
+            commands::set_selected_outbound,
+            commands::save_persisted_session,
+            commands::load_persisted_session,
+            commands::clear_persisted_session
         ])
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

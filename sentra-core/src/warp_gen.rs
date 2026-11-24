@@ -61,39 +61,26 @@ pub async fn register_warp_account(license: Option<&str>) -> Result<WarpAccountD
         "locale": "en_US"
     });
 
-    let resp = match client.post(reg_url).headers(headers.clone()).json(&body).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Cloudflare WARP registration API unreachable ({}), utilizing template profile...", e);
-            return Ok(WarpAccountData {
-                private_key: priv_b64,
-                public_key: pub_b64,
-                address_v4: "172.16.0.2".to_string(),
-                address_v6: "2606:4700:110:8::2".to_string(),
-                reserved: [0, 0, 0],
-                account_id: Some("fallback_id".to_string()),
-                token: Some("fallback_token".to_string()),
-                license_key: license.map(|s| s.to_string()),
-                account_type: if license.is_some() { "plus".to_string() } else { "free".to_string() },
-            });
-        }
-    };
+    let resp = client
+        .post(reg_url)
+        .headers(headers.clone())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            warn!("Cloudflare WARP registration API unreachable: {}", e);
+            format!("خطا در اتصال به سرور ثبت‌نام Cloudflare WARP: {}", e)
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let err_txt = resp.text().await.unwrap_or_default();
-        warn!("Cloudflare WARP registration returned {}: {}, generating template profile.", status, err_txt);
-        return Ok(WarpAccountData {
-            private_key: priv_b64,
-            public_key: pub_b64,
-            address_v4: "172.16.0.2".to_string(),
-            address_v6: "2606:4700:110:8::2".to_string(),
-            reserved: [0, 0, 0],
-            account_id: Some("fallback_id".to_string()),
-            token: Some("fallback_token".to_string()),
-            license_key: license.map(|s| s.to_string()),
-            account_type: if license.is_some() { "plus".to_string() } else { "free".to_string() },
-        });
+        warn!("Cloudflare WARP registration returned {}: {}", status, err_txt);
+        return Err(format!(
+            "سرور کلادفلر درخواست ثبت اکانت WARP را رد کرد (HTTP {}): {}",
+            status,
+            err_txt.chars().take(200).collect::<String>()
+        ));
     }
 
     let json_val: serde_json::Value = resp.json().await.map_err(|e| format!("خطا در پارس پاسخ کلادفلر: {}", e))?;

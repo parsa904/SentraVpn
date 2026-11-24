@@ -1823,6 +1823,8 @@ pub async fn handle_admin_outbound_text_input(
             || rest.starts_with("hysteria2://")
             || rest.starts_with("tuic://")
             || rest.starts_with("ss://")
+            || rest.starts_with("wireguard://")
+            || rest.starts_with("wg://")
             || (rest.starts_with('{') && rest.contains("\"server\"")))
             && !first_word.starts_with("vless://")
             && !first_word.starts_with("vmess://")
@@ -1831,6 +1833,8 @@ pub async fn handle_admin_outbound_text_input(
             && !first_word.starts_with("hysteria2://")
             && !first_word.starts_with("tuic://")
             && !first_word.starts_with("ss://")
+            && !first_word.starts_with("wireguard://")
+            && !first_word.starts_with("wg://")
             && !first_word.starts_with('{')
         {
             (first_word.to_string(), rest)
@@ -1877,20 +1881,30 @@ pub async fn handle_admin_outbound_text_input(
         }
     };
 
-    // 3. Latency check & initial benchmark
-    let (latency_ms, speed_mbps, is_online, _err_opt) = OutboundAnalyzer::benchmark_proxy(ip, parsed.server_port).await;
-    let status = if is_online { "active" } else { "inactive" };
-    let health_score = if is_online { 100 } else { 20 };
+    // 3. Protocol-aware reachability check (handles UDP protocols like hy2/tuic/wireguard properly)
+    let (latency_ms, speed_mbps, is_online, probe_err) =
+        OutboundAnalyzer::benchmark_proxy_for_protocol(&parsed.protocol, ip, parsed.server_port).await;
+    // Admin-added official outbounds MUST be saved immediately as 'active' so Windows & Android clients see them live
+    let status = "active";
+    let health_score = if is_online { 100 } else { 75 };
 
     // 4. Compute fingerprint and detect country
     let mut hasher = Sha256::new();
-    hasher.update(format!("{}:{}:{}", parsed.protocol, parsed.server_address, parsed.server_port).as_bytes());
+    hasher.update(
+        format!(
+            "{}:{}:{}",
+            parsed.protocol.to_lowercase(),
+            parsed.server_address.to_lowercase(),
+            parsed.server_port
+        )
+        .as_bytes(),
+    );
     let fingerprint = format!("{:x}", hasher.finalize());
 
     let (country_code, country_name) = OutboundAnalyzer::detect_country(ip, &parsed.tag).await;
 
-    // 5. Insert or replace in database
-    Repository::insert_official_outbound(
+    // 5. Insert or replace in database — NEVER swallow DB errors; report exact SQLite cause to Admin
+    let saved_outbound = match Repository::insert_official_outbound(
         pool,
         &final_label,
         &parsed.tag,
@@ -1908,10 +1922,27 @@ pub async fn handle_admin_outbound_text_input(
         &country_code,
         &country_name,
     )
-    .await?;
+    .await
+    {
+        Ok(ob) => ob,
+        Err(e) => {
+            tracing::error!("Failed to save admin official outbound in SQLite: {}", e);
+            let err_msg = format!(
+                "❌ <b>خطای دیتابیس هنگام ذخیره نود در هسته:</b>\n<code>{}</code>\n\nلطفاً لاگ سرور را بررسی کرده یا دوباره تلاش فرمایید.",
+                e
+            );
+            bot.send_message(msg.chat.id, err_msg)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
+                .await?;
+            return Ok(());
+        }
+    };
 
     // Auto-sync server sing-box bridge configuration
-    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
+    if let Err(e) = crate::bridge_sync::sync_server_bridge_config(pool).await {
+        warn!("Bridge sync warning after admin outbound insert #{}: {}", saved_outbound.id, e);
+    }
 
     // Clear active admin state
     clear_admin_outbound_state(telegram_user_id).await;
@@ -1925,15 +1956,20 @@ pub async fn handle_admin_outbound_text_input(
         _ => category,
     };
     let status_badge = if is_online {
-        "🟢 آنلاین و آماده سرویس‌دهی"
+        "🟢 فعال و آنلاین (قابل مشاهده در کلاینت‌های ویندوز و اندروید)"
     } else {
-        "🔴 غیرفعال (عدم برقراری اتصال اولیه در پورت مورد نظر)"
+        "🟡 فعال در دیتابیس (هشدار: تست اتصال اولیه از سرور پاسخ نداد؛ در کلاینت‌ها نمایش داده می‌شود)"
+    };
+    let probe_note = if let Some(err_str) = probe_err {
+        format!("\n⚠️ <i>یادداشت تست اولیه: {}</i>", err_str)
+    } else {
+        String::new()
     };
 
     let reply = format!(
-        r#"🎉 <b>اوتباند اختصاصی با موفقیت ثبت شد!</b>
+        r#"🎉 <b>اوتباند اختصاصی با موفقیت در دیتابیس ثبت و فعال شد!</b>
 
-📌 <b>مشخصات نود:</b>
+📌 <b>مشخصات نود (#{}):</b>
 • نام نود (Label): <b>{}</b>
 • لوکیشن کشور: <b>{} ({})</b>
 • بخش اختصاصی: <b>{}</b>
@@ -1941,11 +1977,11 @@ pub async fn handle_admin_outbound_text_input(
 • آدرس و پورت: <code>{}:{}</code>
 • پینگ تست اولیه: <b>{} میلی‌ثانیه</b>
 • تخمین سرعت: <b>{:.1} مگابیت بر ثانیه</b>
-• وضعیت: <b>{}</b>
+• وضعیت: <b>{}</b>{}
 
-✨ این نود هم‌اکنون به صورت اولویت‌دار در مدار اتصال و تولید کانفیگ کلاینت‌ها قرار دارد."#,
-        final_label, country_name, country_code, cat_fa, parsed.protocol, parsed.server_address, parsed.server_port,
-        latency_ms, speed_mbps, status_badge
+✨ این نود هم‌اکنون به صورت زنده در API کلاینت‌های ویندوز و اندروید در دسترس است."#,
+        saved_outbound.id, final_label, country_name, country_code, cat_fa, parsed.protocol,
+        parsed.server_address, parsed.server_port, latency_ms, speed_mbps, status_badge, probe_note
     );
 
     bot.send_message(msg.chat.id, reply)
@@ -1979,7 +2015,24 @@ pub async fn handle_list_official_outbounds(
         _ => category,
     };
 
-    let nodes = Repository::get_official_outbounds_by_category(pool, category).await.unwrap_or_default();
+    let nodes = match Repository::get_official_outbounds_by_category(pool, category).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::error!("Failed to list official outbounds for '{}': {}", category, e);
+            if let Some(msg) = &q.message {
+                let _ = bot
+                    .send_message(
+                        msg.chat().id,
+                        format!("❌ <b>خطای دیتابیس در خواندن لیست نودها:</b>\n<code>{}</code>", e),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
+                    .await;
+            }
+            bot.answer_callback_query(q.id.clone()).await?;
+            return Ok(());
+        }
+    };
 
     if nodes.is_empty() {
         let empty_text = format!(
@@ -2010,6 +2063,7 @@ pub async fn handle_list_official_outbounds(
     if let Some(msg) = &q.message {
         bot.send_message(msg.chat().id, header_text)
             .parse_mode(ParseMode::Html)
+            .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
             .await?;
 
         for ob in &nodes {
@@ -2308,7 +2362,9 @@ pub async fn handle_test_gemini_outbound_callback(
     let ip = match OutboundAnalyzer::check_anti_ssrf(&ob.server_address).await {
         Ok(ip) => ip,
         Err(_) => {
-            bot.send_message(q.from.id, "❌ خطای DNS سرور").await?;
+            bot.send_message(q.from.id, "❌ خطای DNS سرور")
+                .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
+                .await?;
             return Ok(());
         }
     };

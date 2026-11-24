@@ -344,12 +344,15 @@ export function validateCredentialsForm(
   const u = username.trim();
   if (!u) return 'نام کاربری نمی‌تواند خالی باشد.';
   if (u.length < 3 || u.length > 32) return 'نام کاربری باید بین ۳ تا ۳۲ کاراکتر باشد.';
-  if (!/^[a-zA-Z0-9_.-]+$/.test(u)) {
-    return 'نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و _ . - باشد.';
+  const pattern = isRegister ? /^[a-zA-Z0-9_]+$/ : /^[a-zA-Z0-9_.-]+$/;
+  if (!pattern.test(u)) {
+    return isRegister
+      ? 'نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و زیرخط (_) باشد.'
+      : 'نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و _ . - باشد.';
   }
   if (!password) return 'رمز عبور را وارد کنید.';
-  if (isRegister && password.length < 6) {
-    return 'رمز عبور برای ثبت‌نام باید حداقل ۶ کاراکتر باشد.';
+  if (isRegister && password.length < 8) {
+    return 'رمز عبور برای ثبت‌نام باید حداقل ۸ کاراکتر باشد.';
   }
   return null;
 }
@@ -367,4 +370,66 @@ export function computeUsagePercent(usedBytes: number, limitBytes: number): numb
   if (!Number.isFinite(limitBytes) || limitBytes <= 0) return 0;
   if (!Number.isFinite(usedBytes) || usedBytes <= 0) return 0;
   return Math.min(100, Math.round((usedBytes / limitBytes) * 100));
+}
+
+export interface RawAuthApiResponse {
+  access_token?: string;
+  auth_token?: string;
+  subscription_token?: string;
+  token?: string;
+  username?: string;
+  tier?: string;
+  expires_at?: string | null;
+  user?: {
+    username?: string | null;
+    first_name?: string | null;
+  };
+  subscription?: {
+    token?: string;
+    tier?: string;
+    expires_at?: string | null;
+  };
+}
+
+/**
+ * Pure parser normalizing both nested Sentra Core auth responses
+ * ({ access_token, user, subscription }) and flat session payloads.
+ */
+export function parseAuthSessionResponse(
+  data: RawAuthApiResponse,
+  fallbackUsername = ''
+): {
+  auth_token: string;
+  subscription_token: string;
+  username: string;
+  tier: string;
+  expires_at: string | null;
+} | null {
+  const subToken =
+    data.subscription?.token ||
+    data.subscription_token ||
+    data.token ||
+    data.access_token ||
+    data.auth_token;
+
+  if (!subToken || typeof subToken !== 'string' || !subToken.trim()) {
+    return null;
+  }
+
+  const authToken = data.access_token || data.auth_token || subToken;
+  const username =
+    data.user?.username ||
+    data.user?.first_name ||
+    data.username ||
+    fallbackUsername;
+  const tier = data.subscription?.tier || data.tier || '';
+  const expiresAt = data.subscription?.expires_at ?? data.expires_at ?? null;
+
+  return {
+    auth_token: authToken,
+    subscription_token: subToken,
+    username,
+    tier,
+    expires_at: expiresAt,
+  };
 }

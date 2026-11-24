@@ -181,6 +181,8 @@ pub struct ConfigRequest {
     pub protocol: Option<String>,
     pub location_code: Option<String>,
     pub use_warp: Option<bool>,
+    pub selected_outbound_id: Option<String>,
+    pub personal_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -635,7 +637,10 @@ async fn get_client_locations(
     let locations = Repository::get_active_locations_for_free_modes(&state.pool).await?;
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+        ],
         Json(json!({
             "success": true,
             "default": "auto",
@@ -824,7 +829,92 @@ async fn client_config(
     } else {
         requested_location
     };
-    let _assigned_outbounds = Repository::get_active_outbounds_for_mode_and_location(&state.pool, requested_mode, Some(chosen_location_code)).await.unwrap_or_default();
+    let mut active_donated_outbounds = Repository::get_active_outbounds_for_mode_and_location(
+        &state.pool,
+        requested_mode,
+        Some(chosen_location_code),
+    )
+    .await?;
+
+    // If user selected a specific outbound from the live catalog, place it first in Sing-box config
+    if let Some(ref sel_id) = payload.selected_outbound_id {
+        if let Some(raw_num) = sel_id.strip_prefix("node-") {
+            if let Ok(db_id) = raw_num.parse::<i64>() {
+                if let Some(specific) = Repository::get_donated_outbound_by_id(&state.pool, db_id).await? {
+                    if specific.status == "active" {
+                        active_donated_outbounds.retain(|o| o.id != specific.id);
+                        active_donated_outbounds.insert(0, specific);
+                    }
+                }
+            }
+        }
+    }
+
+    // If user requested a personal URI, parse it and compile it directly into the Sing-box outbounds list
+    if let Some(ref personal_uri) = payload.personal_uri {
+        let trimmed = personal_uri.trim();
+        if !trimmed.is_empty() {
+            if let Ok(parsed) = crate::outbound_analyzer::OutboundAnalyzer::parse_input(trimmed) {
+                let personal_row = crate::models::DonatedOutbound {
+                    id: 0,
+                    donor_user_id: Some(sub.user_id),
+                    tag: if parsed.tag.is_empty() { "Personal-Node".to_string() } else { parsed.tag.clone() },
+                    protocol: parsed.protocol.clone(),
+                    server_address: parsed.server_address.clone(),
+                    server_port: parsed.server_port as i64,
+                    config_json: parsed.config_json.to_string(),
+                    latency_ms: 0,
+                    speed_mbps: 0.0,
+                    assigned_tier: "web_browsing".to_string(),
+                    health_score: 100,
+                    status: "active".to_string(),
+                    fail_count: 0,
+                    reward_granted: 0,
+                    raw_link: Some(trimmed.to_string()),
+                    rejection_reason: None,
+                    declared_or_detected_gb: 0,
+                    bytes_served: 0,
+                    first_used_at: None,
+                    monthly_reward_granted: 0,
+                    fingerprint_sha256: None,
+                    offline_since: None,
+                    clawback_executed: 0,
+                    is_official: 0,
+                    label: Some(parsed.tag),
+                    country_code: "XX".to_string(),
+                    country_name: "Personal".to_string(),
+                    last_checked_at: Utc::now(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    allow_web: 1,
+                    allow_download: 1,
+                    allow_static_ip: 0,
+                    gemini_ok: 0,
+                    trading_safe: 0,
+                    speed_score: 100,
+                    jitter_ms: 0,
+                    last_online_at: Some(Utc::now()),
+                    allocation_mode: "manual".to_string(),
+                    reward_days: 0,
+                    user_note: None,
+                    approved_at: None,
+                };
+                active_donated_outbounds.insert(0, personal_row);
+            }
+        }
+    }
+
+    let live_outbounds = Repository::get_all_live_client_outbounds(&state.pool).await?;
+    let base_outbounds = Repository::get_allowed_outbounds(&state.pool, &sub.tier)
+        .await
+        .unwrap_or_default();
+    let singbox_config = compiler::compile_singbox_config_with_donated(
+        &sub,
+        &base_outbounds,
+        &active_donated_outbounds,
+        Some(requested_mode),
+    );
+
     let chosen_location_name = match chosen_location_code.to_uppercase().as_str() {
         "US" => "آمریکا 🇺🇸",
         "DE" => "آلمان 🇩🇪",
@@ -852,7 +942,10 @@ async fn client_config(
 
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+        ],
         Json(json!({
             "success": true,
             "protocol": requested_protocol,
@@ -866,6 +959,8 @@ async fn client_config(
             "auth_username": sub.token,
             "auth_password": sub.token,
             "ovpn_config": ovpn_config,
+            "singbox_config": singbox_config,
+            "outbounds": live_outbounds,
             "stunnel": stunnel_data,
             "ikev2": ikev2_data
         })),
@@ -1670,9 +1765,7 @@ async fn get_client_bootstrap(
     let devices = Repository::get_user_devices(&state.pool, user.id)
         .await
         .unwrap_or_default();
-    let outbounds = Repository::get_all_live_client_outbounds(&state.pool)
-        .await
-        .unwrap_or_default();
+    let outbounds = Repository::get_all_live_client_outbounds(&state.pool).await?;
     let mut modes = Repository::build_modes_info(&sub);
     modes.retain(|m| m.id != "gaming");
 
@@ -1688,7 +1781,10 @@ async fn get_client_bootstrap(
 
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+        ],
         Json(json!({
             "success": true,
             "server_time": now.to_rfc3339(),
@@ -1733,9 +1829,10 @@ async fn get_client_bootstrap(
 async fn donate_client_outbound(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ModesQuery>,
     Json(payload): Json<DonateOutboundRequest>,
 ) -> Result<Response, CoreError> {
-    let token = extract_auth_token(&headers, None)
+    let token = extract_auth_token(&headers, query.token.as_deref())
         .ok_or_else(|| CoreError::AuthFailed("برای اهدای اوتباند ابتدا وارد حساب کاربری خود شوید.".to_string()))?;
 
     let sub = Repository::get_subscription_by_token(&state.pool, &token).await?;
@@ -1782,9 +1879,14 @@ async fn donate_client_outbound(
         ));
     }
 
-    // Measure live TCP latency & detect country
+    // Measure protocol-aware reachability & latency (supports UDP protocols hy2/tuic/wireguard)
     let (latency_ms, _speed_mbps, is_online, err_opt) =
-        crate::outbound_analyzer::OutboundAnalyzer::benchmark_proxy(resolved_ip, parsed.server_port).await;
+        crate::outbound_analyzer::OutboundAnalyzer::benchmark_proxy_for_protocol(
+            &parsed.protocol,
+            resolved_ip,
+            parsed.server_port,
+        )
+        .await;
     if !is_online {
         let reason = err_opt.unwrap_or_else(|| "سرور در دسترس نیست یا پاسخگو نبود.".to_string());
         return Err(CoreError::BadRequest(format!(
@@ -1914,7 +2016,10 @@ async fn get_my_donated_outbounds(
 
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+        ],
         Json(json!({
             "success": true,
             "donations": donations

@@ -5,8 +5,10 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.net.VpnService
 import android.util.Log
+import androidx.activity.result.ActivityResult
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
@@ -27,14 +29,13 @@ class SessionSaveArgs {
 }
 
 /**
- * SentraVpnPlugin: Native Android Tauri Plugin
+ * SentraVpnPlugin: Native Android Tauri v2 Plugin
  * Bridges the TypeScript/Rust frontend with Android VpnService, libbox,
  * and AES-256 EncryptedSharedPreferences for one-time persistent authentication.
  */
 @TauriPlugin
 class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
 
-    private var pendingInvoke: Invoke? = null
     private var pendingConfigJson: String? = null
     private var pendingSplitTunnel: Boolean = true
     private var pendingMode: String = "Sentra Auto"
@@ -43,21 +44,31 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         instance = this
     }
 
+    private fun createEncryptedPrefs(): SharedPreferences {
+        val masterKey = MasterKey.Builder(activity.applicationContext)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        return EncryptedSharedPreferences.create(
+            activity.applicationContext,
+            PREFS_NAME,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
+
     private fun getSecurePrefs(): SharedPreferences {
         return try {
-            val masterKey = MasterKey.Builder(activity.applicationContext)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            EncryptedSharedPreferences.create(
-                activity.applicationContext,
-                PREFS_NAME,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
+            createEncryptedPrefs()
         } catch (e: Exception) {
-            Log.w(TAG, "EncryptedSharedPreferences fallback to MODE_PRIVATE: ${e.message}")
-            activity.applicationContext.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+            Log.w(TAG, "EncryptedSharedPreferences corrupted or keystore reset (${e.message}); recreating...")
+            try {
+                activity.applicationContext.deleteSharedPreferences(PREFS_NAME)
+                createEncryptedPrefs()
+            } catch (retryErr: Exception) {
+                Log.e(TAG, "EncryptedSharedPreferences fallback to MODE_PRIVATE: ${retryErr.message}")
+                activity.applicationContext.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+            }
         }
     }
 
@@ -65,7 +76,6 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         private const val TAG = "SentraVpnPlugin"
         private const val PREFS_NAME = "sentra_secure_auth_prefs"
         private const val KEY_SESSION_JSON = "sentra_session_json"
-        private const val VPN_PERMISSION_REQUEST_CODE = 20262
 
         @Volatile
         private var instance: SentraVpnPlugin? = null
@@ -78,6 +88,7 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
                     put("message", message)
                 }
                 plugin.trigger("telemetry-log", payload)
+                plugin.trigger("vpn-log", payload)
             }
         }
 
@@ -92,6 +103,7 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
                     put("uptime_seconds", uptime)
                 }
                 plugin.trigger("telemetry-speed", payload)
+                plugin.trigger("vpn-telemetry", payload)
             }
         }
 
@@ -155,9 +167,9 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun startVpn(invoke: Invoke) {
         val args = try {
             invoke.parseArgs(ConnectArgs::class.java)
-        } catch (e: Exception) {
-            val configRaw = invoke.getString("config_json") ?: invoke.getString("configJson") ?: ""
-            val splitRaw = invoke.getBoolean("split_tunnel_ir") ?: invoke.getBoolean("splitTunnelIr") ?: true
+        } catch (_: Exception) {
+            val configRaw = invoke.getString("configJson") ?: invoke.getString("config_json") ?: ""
+            val splitRaw = invoke.getBoolean("splitTunnelIr") ?: invoke.getBoolean("split_tunnel_ir") ?: true
             val modeRaw = invoke.getString("mode") ?: "Sentra Auto"
             ConnectArgs().apply {
                 configJson = configRaw
@@ -167,7 +179,7 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         if (args.configJson.isBlank()) {
-            invoke.reject("پیکربندی Sing-box (config_json) خالی است.")
+            invoke.reject("پیکربندی Sing-box (configJson) خالی است.")
             return
         }
 
@@ -175,12 +187,11 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         pendingSplitTunnel = args.splitTunnelIr
         pendingMode = args.mode
 
-        // Check Android system VPN permission
+        // Check Android system VPN permission via Tauri v2 Activity Result API
         val prepareIntent = VpnService.prepare(activity)
         if (prepareIntent != null) {
-            Log.i(TAG, "Requesting Android system VPN permission via startActivityForResult...")
-            pendingInvoke = invoke
-            activity.startActivityForResult(prepareIntent, VPN_PERMISSION_REQUEST_CODE)
+            Log.i(TAG, "Requesting Android system VPN permission via Tauri ActivityCallback...")
+            startActivityForResult(invoke, prepareIntent, "onVpnPermissionResult")
         } else {
             Log.i(TAG, "VPN permission already granted. Launching SentraVpnService directly...")
             launchVpnService(args.configJson, args.mode, args.splitTunnelIr)
@@ -190,6 +201,27 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
                 put("mode", args.mode)
             }
             invoke.resolve(res)
+        }
+    }
+
+    @ActivityCallback
+    fun onVpnPermissionResult(invoke: Invoke, result: ActivityResult) {
+        if (result.resultCode == Activity.RESULT_OK) {
+            Log.i(TAG, "User granted Android VPN permission!")
+            val config = pendingConfigJson ?: ""
+            val split = pendingSplitTunnel
+            val mode = pendingMode
+            launchVpnService(config, mode, split)
+
+            val res = JSObject().apply {
+                put("success", true)
+                put("status", "Connected")
+                put("mode", mode)
+            }
+            invoke.resolve(res)
+        } else {
+            Log.w(TAG, "User denied Android VPN permission.")
+            invoke.reject("مجوز اتصال VPN توسط کاربر تایید نشد.")
         }
     }
 
@@ -226,32 +258,6 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
             put("uptime_seconds", SentraVpnService.uptimeSeconds)
         }
         invoke.resolve(res)
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == VPN_PERMISSION_REQUEST_CODE) {
-            val invoke = pendingInvoke
-            pendingInvoke = null
-
-            if (resultCode == Activity.RESULT_OK) {
-                Log.i(TAG, "User granted Android VPN permission!")
-                val config = pendingConfigJson ?: ""
-                val split = pendingSplitTunnel
-                val mode = pendingMode
-                launchVpnService(config, mode, split)
-
-                val res = JSObject().apply {
-                    put("success", true)
-                    put("status", "Connected")
-                    put("mode", mode)
-                }
-                invoke?.resolve(res)
-            } else {
-                Log.w(TAG, "User denied Android VPN permission.")
-                invoke?.reject("مجوز اتصال VPN توسط کاربر تایید نشد.")
-            }
-        }
     }
 
     private fun launchVpnService(configJson: String, mode: String, split: Boolean) {
