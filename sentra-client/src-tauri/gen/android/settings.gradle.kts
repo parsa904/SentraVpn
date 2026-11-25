@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "Sentra Connect"
 include(":app")
+apply(from = "tauri.settings.gradle")

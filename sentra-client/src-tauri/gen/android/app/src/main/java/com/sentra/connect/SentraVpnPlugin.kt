@@ -140,7 +140,7 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         val raw = try {
             invoke.parseArgs(SessionSaveArgs::class.java).payload
         } catch (_: Exception) {
-            invoke.getString("payload") ?: ""
+            invoke.parseArgs(JSObject::class.java).getString("payload") ?: ""
         }
         if (raw.isBlank()) {
             invoke.reject("داده نشست برای ذخیره خالی است.")
@@ -182,11 +182,12 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         val args = try {
             invoke.parseArgs(ConnectArgs::class.java)
         } catch (_: Exception) {
-            val configRaw = invoke.getString("configJson") ?: invoke.getString("config_json") ?: ""
-            val splitRaw = invoke.getBoolean("splitTunnelIr") ?: invoke.getBoolean("split_tunnel_ir") ?: true
-            val modeRaw = invoke.getString("mode") ?: "Auto"
-            val serverRaw = invoke.getString("serverName") ?: invoke.getString("server_name") ?: modeRaw
-            val autoReconnectRaw = invoke.getBoolean("autoReconnect") ?: invoke.getBoolean("auto_reconnect") ?: true
+            val rawObj = invoke.parseArgs(JSObject::class.java)
+            val configRaw = rawObj.optString("configJson", rawObj.optString("config_json", ""))
+            val splitRaw = if (rawObj.has("splitTunnelIr")) rawObj.getBoolean("splitTunnelIr") else rawObj.optBoolean("split_tunnel_ir", true)
+            val modeRaw = rawObj.optString("mode", "Auto")
+            val serverRaw = rawObj.optString("serverName", rawObj.optString("server_name", modeRaw))
+            val autoReconnectRaw = if (rawObj.has("autoReconnect")) rawObj.getBoolean("autoReconnect") else rawObj.optBoolean("auto_reconnect", true)
             ConnectArgs().apply {
                 configJson = configRaw
                 splitTunnelIr = splitRaw
@@ -262,7 +263,7 @@ class SentraVpnPlugin(private val activity: Activity) : Plugin(activity) {
         val enabled = try {
             invoke.parseArgs(AutoReconnectArgs::class.java).enabled
         } catch (_: Exception) {
-            invoke.getBoolean("enabled") ?: true
+            invoke.parseArgs(JSObject::class.java).optBoolean("enabled", true)
         }
         SentraVpnService.autoReconnectEnabled = enabled
         if (SentraVpnService.isVpnActive) {

@@ -1,0 +1,124 @@
+> Task :buildSrc:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :buildSrc:compileKotlin UP-TO-DATE
+> Task :buildSrc:compileJava NO-SOURCE
+> Task :buildSrc:compileGroovy NO-SOURCE
+> Task :buildSrc:pluginDescriptors UP-TO-DATE
+> Task :buildSrc:processResources UP-TO-DATE
+> Task :buildSrc:classes UP-TO-DATE
+> Task :buildSrc:jar UP-TO-DATE
+
+> Configure project :app
+WARNING: The option setting 'android.proguard.failOnMissingFiles=false' is deprecated.
+The current default is 'true'.
+It will be removed in version 10.0 of the Android Gradle plugin.
+Add android.sync.suppressAgpWarnings=UNSUPPORTED_PROJECT_OPTION_USE to the gradle.properties file to suppress this warning.
+WARNING: The option setting 'android.builtInKotlin=false' is deprecated.
+The current default is 'true'.
+It will be removed in version 10.0 of the Android Gradle plugin.
+Add android.sync.suppressAgpWarnings=UNSUPPORTED_PROJECT_OPTION_USE to the gradle.properties file to suppress this warning.
+WARNING: The option setting 'android.newDsl=false' is deprecated.
+The current default is 'true'.
+It will be removed in version 10.0 of the Android Gradle plugin.
+Add android.sync.suppressAgpWarnings=UNSUPPORTED_PROJECT_OPTION_USE to the gradle.properties file to suppress this warning.
+WARNING: API 'applicationVariants' is obsolete and has been replaced with 'AndroidComponentsExtension'.
+It will be removed in version 10.0 of the Android Gradle plugin.
+The legacy variant API is disabled by default in AGP 9.0, but can be re-enabled by adding 
+    android.newDsl=false
+to this project's gradle.properties file.
+For more information, see http://developer.android.com/build/r/new-dsl.
+
+To determine what is calling applicationVariants, use -Pandroid.debug.obsoleteApi=true on the command line to display more information.
+Add android.sync.suppressAgpWarnings=DEPRECATED_DSL to the gradle.properties file to suppress this warning.
+WARNING: API 'testVariants' is obsolete and has been replaced with 'AndroidComponentsExtension'.
+It will be removed in version 10.0 of the Android Gradle plugin.
+The legacy variant API is disabled by default in AGP 9.0, but can be re-enabled by adding 
+    android.newDsl=false
+to this project's gradle.properties file.
+For more information, see http://developer.android.com/build/r/new-dsl.
+
+To determine what is calling testVariants, use -Pandroid.debug.obsoleteApi=true on the command line to display more information.
+Add android.sync.suppressAgpWarnings=DEPRECATED_DSL to the gradle.properties file to suppress this warning.
+WARNING: API 'unitTestVariants' is obsolete and has been replaced with 'AndroidComponentsExtension'.
+It will be removed in version 10.0 of the Android Gradle plugin.
+The legacy variant API is disabled by default in AGP 9.0, but can be re-enabled by adding 
+    android.newDsl=false
+to this project's gradle.properties file.
+For more information, see http://developer.android.com/build/r/new-dsl.
+
+To determine what is calling unitTestVariants, use -Pandroid.debug.obsoleteApi=true on the command line to display more information.
+Add android.sync.suppressAgpWarnings=DEPRECATED_DSL to the gradle.properties file to suppress this warning.
+
+> Configure project :tauri-android
+WARNING: API 'libraryVariants' is obsolete and has been replaced with 'AndroidComponentsExtension'.
+It will be removed in version 10.0 of the Android Gradle plugin.
+The legacy variant API is disabled by default in AGP 9.0, but can be re-enabled by adding 
+    android.newDsl=false
+to this project's gradle.properties file.
+For more information, see http://developer.android.com/build/r/new-dsl.
+
+To determine what is calling libraryVariants, use -Pandroid.debug.obsoleteApi=true on the command line to display more information.
+Add android.sync.suppressAgpWarnings=DEPRECATED_DSL to the gradle.properties file to suppress this warning.
+
+> Task :app:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :app:preBuild UP-TO-DATE
+> Task :app:preUniversalReleaseBuild UP-TO-DATE
+> Task :app:generateUniversalReleaseBuildConfig UP-TO-DATE
+> Task :app:generateUniversalReleaseResources UP-TO-DATE
+> Task :app:packageUniversalReleaseResources UP-TO-DATE
+> Task :tauri-android:preBuild UP-TO-DATE
+> Task :tauri-android:preReleaseBuild UP-TO-DATE
+> Task :tauri-android:processReleaseNavigationResources UP-TO-DATE
+> Task :tauri-plugin-sentra-vpn:preBuild UP-TO-DATE
+> Task :tauri-plugin-sentra-vpn:preReleaseBuild UP-TO-DATE
+> Task :tauri-plugin-sentra-vpn:processReleaseNavigationResources UP-TO-DATE
+> Task :app:processUniversalReleaseNavigationResources UP-TO-DATE
+> Task :app:parseUniversalReleaseLocalResources UP-TO-DATE
+> Task :app:generateUniversalReleaseRFile UP-TO-DATE
+> Task :tauri-android:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :tauri-android:generateReleaseBuildConfig UP-TO-DATE
+> Task :tauri-android:generateReleaseResources UP-TO-DATE
+> Task :tauri-android:packageReleaseResources UP-TO-DATE
+> Task :tauri-android:parseReleaseLocalResources UP-TO-DATE
+> Task :tauri-android:generateReleaseRFile UP-TO-DATE
+> Task :tauri-android:compileReleaseKotlin UP-TO-DATE
+> Task :tauri-android:javaPreCompileRelease UP-TO-DATE
+> Task :tauri-android:compileReleaseJavaWithJavac UP-TO-DATE
+> Task :tauri-android:bundleLibCompileToJarRelease UP-TO-DATE
+> Task :tauri-plugin-sentra-vpn:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :tauri-plugin-sentra-vpn:generateReleaseResources UP-TO-DATE
+> Task :tauri-plugin-sentra-vpn:packageReleaseResources UP-TO-DATE
+> Task :tauri-plugin-sentra-vpn:parseReleaseLocalResources UP-TO-DATE
+> Task :tauri-plugin-sentra-vpn:generateReleaseRFile UP-TO-DATE
+> Task :tauri-plugin-sentra-vpn:compileReleaseKotlin NO-SOURCE
+> Task :tauri-plugin-sentra-vpn:javaPreCompileRelease UP-TO-DATE
+> Task :tauri-plugin-sentra-vpn:compileReleaseJavaWithJavac NO-SOURCE
+> Task :tauri-plugin-sentra-vpn:bundleLibCompileToJarRelease UP-TO-DATE
+
+> Task :app:compileUniversalReleaseKotlin FAILED
+e: file:///C:/SentraVpn/sentra-client/src-tauri/gen/android/app/src/main/java/com/sentra/connect/SentraVpnPlugin.kt:143:20 Unresolved reference 'getString'.
+e: file:///C:/SentraVpn/sentra-client/src-tauri/gen/android/app/src/main/java/com/sentra/connect/SentraVpnPlugin.kt:185:36 Unresolved reference 'getString'.
+e: file:///C:/SentraVpn/sentra-client/src-tauri/gen/android/app/src/main/java/com/sentra/connect/SentraVpnPlugin.kt:185:70 Unresolved reference 'getString'.
+e: file:///C:/SentraVpn/sentra-client/src-tauri/gen/android/app/src/main/java/com/sentra/connect/SentraVpnPlugin.kt:186:35 Unresolved reference 'getBoolean'.
+e: file:///C:/SentraVpn/sentra-client/src-tauri/gen/android/app/src/main/java/com/sentra/connect/SentraVpnPlugin.kt:186:73 Unresolved reference 'getBoolean'.
+e: file:///C:/SentraVpn/sentra-client/src-tauri/gen/android/app/src/main/java/com/sentra/connect/SentraVpnPlugin.kt:187:34 Unresolved reference 'getString'.
+e: file:///C:/SentraVpn/sentra-client/src-tauri/gen/android/app/src/main/java/com/sentra/connect/SentraVpnPlugin.kt:188:36 Unresolved reference 'getString'.
+e: file:///C:/SentraVpn/sentra-client/src-tauri/gen/android/app/src/main/java/com/sentra/connect/SentraVpnPlugin.kt:188:70 Unresolved reference 'getString'.
+e: file:///C:/SentraVpn/sentra-client/src-tauri/gen/android/app/src/main/java/com/sentra/connect/SentraVpnPlugin.kt:189:43 Unresolved reference 'getBoolean'.
+e: file:///C:/SentraVpn/sentra-client/src-tauri/gen/android/app/src/main/java/com/sentra/connect/SentraVpnPlugin.kt:189:81 Unresolved reference 'getBoolean'.
+e: file:///C:/SentraVpn/sentra-client/src-tauri/gen/android/app/src/main/java/com/sentra/connect/SentraVpnPlugin.kt:265:20 Unresolved reference 'getBoolean'.
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':app:compileUniversalReleaseKotlin' (registered by plugin 'org.jetbrains.kotlin.android').
+> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction
+   > Compilation error. See log for more details
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+> Run with --info or --debug option to get more log output.
+> Run with --scan to get full insights from a Build Scan (powered by Develocity).
+> Get more help at https://help.gradle.org.
+
+BUILD FAILED in 3s
+28 actionable tasks: 1 executed, 27 up-to-date

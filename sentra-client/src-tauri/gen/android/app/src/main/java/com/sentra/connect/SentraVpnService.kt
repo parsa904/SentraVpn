@@ -514,7 +514,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
                         scheduleAutoReconnect("network_switch")
                     } else {
                         try {
-                            boxService?.resetNetwork()
+                            scheduleAutoReconnect("network_switch_refresh")
                             writeLog("[Network] Underlying network switched. Libbox sockets refreshed.")
                         } catch (e: Exception) {
                             Log.w(TAG, "Error refreshing network in boxService: ${e.message}")
