@@ -18,6 +18,7 @@ pub struct User {
     pub auth_code_expires_at: Option<DateTime<Utc>>,
     pub link_code: Option<String>,
     pub link_code_expires_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
     pub outbound_reward_banned: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

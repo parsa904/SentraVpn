@@ -2,12 +2,13 @@ use crate::compiler;
 use crate::db::{DbPool, Repository};
 use crate::error::CoreError;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
+use std::net::SocketAddr;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use chrono::Utc;
@@ -97,6 +98,10 @@ impl LoginRateLimiter {
 }
 
 fn extract_client_ip(headers: &HeaderMap) -> String {
+    extract_client_ip_with_peer(headers, None)
+}
+
+fn extract_client_ip_with_peer(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
     if let Some(xff) = headers.get("x-forwarded-for") {
         if let Ok(s) = xff.to_str() {
             if let Some(first) = s.split(',').next() {
@@ -115,7 +120,8 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
             }
         }
     }
-    "127.0.0.1".to_string()
+    peer.map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
 #[derive(Clone)]
@@ -237,6 +243,12 @@ pub struct DonateOutboundRequest {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SyncClientStateRequest {
+    pub personal_configs: Option<serde_json::Value>,
+    pub preferences: Option<serde_json::Value>,
+}
+
 pub fn create_router(
     pool: DbPool,
     anomaly_detector: crate::anomaly_detector::AnomalyDetector,
@@ -275,8 +287,9 @@ pub fn create_router(
         .route("/api/v1/auth/code-login", post(auth_code_login))
         .route("/api/v1/auth/exchange-code", post(auth_code_login))
         .route("/api/v1/auth/link-token", post(auth_link_token))
-        // 2. Client Bootstrap, Connection Modes & Live Outbounds catalog
+        // 2. Client Bootstrap, Connection Modes, Cross-Device Sync State & Live Outbounds catalog
         .route("/api/v1/client/bootstrap", get(get_client_bootstrap))
+        .route("/api/v1/client/sync-state", get(get_client_sync_state).put(put_client_sync_state))
         .route("/api/v1/client/modes", get(get_client_modes))
         .route("/api/v1/client/locations", get(get_client_locations))
         // 2b. Community Outbound Donation endpoints
@@ -316,14 +329,15 @@ pub fn create_router(
 /// Registers a new account directly with username and password, provisions Lite subscription, and registers device
 async fn auth_register(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<RegisterRequest>,
 ) -> Result<Response, CoreError> {
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = extract_client_ip_with_peer(&headers, Some(peer_addr));
     state.rate_limiter.check_ip(&client_ip).await?;
 
     let username = payload.username.trim().to_lowercase();
-    let password = payload.password.trim();
+    let password = payload.password.as_str();
 
     if username.len() < 3 || username.len() > 32 || !username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         state.rate_limiter.record_failure(&client_ip).await;
@@ -346,11 +360,12 @@ async fn auth_register(
         ));
     }
 
-    // Rate limit: Max 2 registrations per 24 hours per IP
-    Repository::check_and_record_ip_registration(&state.pool, &client_ip).await?;
+    // Check IP registration limit without consuming a slot until registration succeeds
+    Repository::check_ip_registration_limit(&state.pool, &client_ip).await?;
 
     let (user, sub) = match Repository::register_user_with_credentials(&state.pool, &username, password, None).await {
         Ok(res) => {
+            Repository::record_ip_registration(&state.pool, &client_ip).await;
             state.rate_limiter.record_success(&client_ip).await;
             res
         }
@@ -413,14 +428,15 @@ async fn auth_register(
 /// Validates username & password credentials, verifies device slot (Max 3 Devices), and returns session JWT
 async fn auth_login(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response, CoreError> {
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = extract_client_ip_with_peer(&headers, Some(peer_addr));
     state.rate_limiter.check_ip(&client_ip).await?;
 
     let username = payload.username.trim().to_lowercase();
-    let password = payload.password.trim();
+    let password = payload.password.as_str();
 
     let (user, sub) = match Repository::login_user_with_credentials(&state.pool, &username, password).await {
         Ok(res) => {
@@ -520,10 +536,11 @@ async fn auth_link_token(
 /// Validates 8-digit OTP code, registers user device (Max 3 Devices), and returns session JWT
 async fn auth_code_login(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<CodeLoginRequest>,
 ) -> Result<Response, CoreError> {
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = extract_client_ip_with_peer(&headers, Some(peer_addr));
     state.rate_limiter.check_ip(&client_ip).await?;
 
     let code = payload.code.trim();
@@ -1256,6 +1273,25 @@ async fn client_telemetry(
         .await;
     }
 
+    // Persist reported traffic usage delta into subscriptions & traffic_logs so all devices + Telegram bot see live consumption
+    if payload.bytes_delta > 0 {
+        let _ = sqlx::query(
+            "UPDATE subscriptions SET download_bytes = download_bytes + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+        )
+        .bind(payload.bytes_delta)
+        .bind(sub.id)
+        .execute(&state.pool)
+        .await;
+
+        let _ = sqlx::query(
+            "INSERT INTO traffic_logs (subscription_id, bytes_sent, bytes_received) VALUES (?, 0, ?)"
+        )
+        .bind(sub.id)
+        .bind(payload.bytes_delta)
+        .execute(&state.pool)
+        .await;
+    }
+
     // Check sliding window anomaly: >5GB in 15m or >20GB in 1h
     let is_anomaly = state
         .anomaly_detector
@@ -1762,12 +1798,29 @@ async fn get_client_bootstrap(
         return Err(CoreError::UserBanned("حساب کاربری شما مسدود شده است.".to_string()));
     }
 
+    if let Some(dev_id) = headers
+        .get("X-Device-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let _ = sqlx::query(
+            "UPDATE user_devices SET last_active_at = CURRENT_TIMESTAMP WHERE user_id = ? AND device_id = ?"
+        )
+        .bind(user.id)
+        .bind(dev_id)
+        .execute(&state.pool)
+        .await;
+    }
+
     let devices = Repository::get_user_devices(&state.pool, user.id)
         .await
         .unwrap_or_default();
     let outbounds = Repository::get_all_live_client_outbounds(&state.pool).await?;
     let mut modes = Repository::build_modes_info(&sub);
     modes.retain(|m| m.id != "gaming");
+
+    let client_state = read_user_client_state_json(&state.pool, user.id).await;
 
     let used_bytes = (sub.upload_bytes + sub.download_bytes).max(0);
     let remaining_bytes = (sub.traffic_limit_bytes - used_bytes).max(0);
@@ -1817,7 +1870,150 @@ async fn get_client_bootstrap(
             },
             "devices": devices,
             "modes": modes,
-            "outbounds": outbounds
+            "outbounds": outbounds,
+            "client_state": client_state
+        })),
+    )
+        .into_response())
+}
+
+async fn read_user_client_state_json(pool: &DbPool, user_id: i64) -> serde_json::Value {
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT personal_configs_json, preferences_json, updated_at FROM user_client_state WHERE user_id = ? LIMIT 1"
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+
+    match row {
+        Some((configs_str, prefs_str, updated_at)) => {
+            let personal_configs = serde_json::from_str::<serde_json::Value>(&configs_str)
+                .ok()
+                .filter(|v| v.is_array())
+                .unwrap_or_else(|| json!([]));
+            let preferences = serde_json::from_str::<serde_json::Value>(&prefs_str)
+                .ok()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| json!({}));
+            json!({
+                "personal_configs": personal_configs,
+                "preferences": preferences,
+                "updated_at": updated_at
+            })
+        }
+        None => json!({
+            "personal_configs": [],
+            "preferences": {},
+            "updated_at": ""
+        }),
+    }
+}
+
+/// GET /api/v1/client/sync-state
+async fn get_client_sync_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ModesQuery>,
+) -> Result<Response, CoreError> {
+    let token = extract_auth_token(&headers, query.token.as_deref())
+        .ok_or_else(|| CoreError::AuthFailed("توکن احراز هویت ارسال نشده است.".to_string()))?;
+    let sub = Repository::get_subscription_by_token(&state.pool, &token).await?;
+    let client_state = read_user_client_state_json(&state.pool, sub.user_id).await;
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+        ],
+        Json(json!({
+            "success": true,
+            "client_state": client_state
+        })),
+    )
+        .into_response())
+}
+
+/// PUT /api/v1/client/sync-state
+async fn put_client_sync_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ModesQuery>,
+    Json(payload): Json<SyncClientStateRequest>,
+) -> Result<Response, CoreError> {
+    let token = extract_auth_token(&headers, query.token.as_deref())
+        .ok_or_else(|| CoreError::AuthFailed("توکن احراز هویت ارسال نشده است.".to_string()))?;
+    let sub = Repository::get_subscription_by_token(&state.pool, &token).await?;
+
+    let existing = read_user_client_state_json(&state.pool, sub.user_id).await;
+
+    let next_configs = match payload.personal_configs {
+        Some(v) if v.is_array() => {
+            let mut arr = v.as_array().cloned().unwrap_or_default();
+            arr.truncate(100);
+            serde_json::Value::Array(arr)
+        }
+        _ => existing.get("personal_configs").cloned().unwrap_or_else(|| json!([])),
+    };
+
+    let next_prefs = match payload.preferences {
+        Some(v) if v.is_object() => {
+            let mut merged = existing
+                .get("preferences")
+                .and_then(|o| o.as_object())
+                .cloned()
+                .unwrap_or_default();
+            if let Some(incoming) = v.as_object() {
+                for (k, val) in incoming {
+                    if k == "selected_mode" && val.as_str() == Some("gaming") {
+                        continue;
+                    }
+                    merged.insert(k.clone(), val.clone());
+                }
+            }
+            serde_json::Value::Object(merged)
+        }
+        _ => existing.get("preferences").cloned().unwrap_or_else(|| json!({})),
+    };
+
+    let configs_str = serde_json::to_string(&next_configs)
+        .map_err(|e| CoreError::BadRequest(format!("ساختار کانفیگ‌های شخصی نامعتبر است: {}", e)))?;
+    let prefs_str = serde_json::to_string(&next_prefs)
+        .map_err(|e| CoreError::BadRequest(format!("ساختار تنظیمات نامعتبر است: {}", e)))?;
+
+    if configs_str.len() > 262_144 || prefs_str.len() > 16_384 {
+        return Err(CoreError::BadRequest("حجم داده‌های همگام‌سازی بیش از حد مجاز است.".to_string()));
+    }
+
+    let now_iso = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO user_client_state (user_id, personal_configs_json, preferences_json, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            personal_configs_json = excluded.personal_configs_json,
+            preferences_json = excluded.preferences_json,
+            updated_at = excluded.updated_at
+        "#
+    )
+    .bind(sub.user_id)
+    .bind(&configs_str)
+    .bind(&prefs_str)
+    .bind(&now_iso)
+    .execute(&state.pool)
+    .await?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        Json(json!({
+            "success": true,
+            "client_state": {
+                "personal_configs": next_configs,
+                "preferences": next_prefs,
+                "updated_at": now_iso
+            }
         })),
     )
         .into_response())

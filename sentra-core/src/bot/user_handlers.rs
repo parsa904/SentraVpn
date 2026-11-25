@@ -92,18 +92,25 @@ pub async fn handle_start(
 
     let sub = Repository::create_or_ensure_lite_subscription(pool, user.id).await?;
     let is_admin_user = admin_chat_id != 0 && (telegram_user.id.0 as i64 == admin_chat_id);
+    let total_used_bytes = (sub.upload_bytes + sub.download_bytes).max(0);
+    let remaining_gb = (sub.traffic_limit_bytes - total_used_bytes).max(0) as f64 / (1024.0 * 1024.0 * 1024.0);
+    let total_limit_gb = sub.traffic_limit_bytes.max(0) as f64 / (1024.0 * 1024.0 * 1024.0);
+    let linked_line = match &user.username {
+        Some(uname) if !uname.trim().is_empty() => format!("• حساب همگام‌شده اپلیکیشن: <code>@{}</code>\n", uname),
+        _ => String::new(),
+    };
 
     let mut text = format!(
         r#"👋 درود <b>{}</b> گرامی، به پلتفرم هوشمند ضدسانسور <b>سنترا (Sentra)</b> خوش آمدید!
 
-🛡 <b>مشخصات سرویس فعال شما:</b>
-• سطح اشتراک: <code>{}</code>
-• سقف حجم ماهیانه: <code>10 گیگابایت</code>
+🛡 <b>مشخصات سرویس فعال شما (همگام با ویندوز و اندروید):</b>
+{}• سطح اشتراک: <code>{}</code>
+• حجم باقیمانده: <b>{:.2} GB</b> از <code>{:.0} GB</code>
 • پروتکل پیش‌فرض: <code>Sing-box v1.10+ (TUN Mode)</code>
 • وضعیت شبکه: <b>🟢 پایدار و فعال</b>
 
 ⚡ برای اتصال، دکمه <b>«🔑 دریافت کانفیگ و کد اتصال»</b> را بزنید یا جهت استفاده تخصصی از <b>Google Flow و Gemini</b> پلن خود را ارتقا دهید."#,
-        user.first_name, sub.tier
+        user.first_name, linked_line, sub.tier, remaining_gb, total_limit_gb
     );
 
     if is_admin_user {
@@ -320,7 +327,24 @@ pub async fn handle_subscription_status(
     let _ = Repository::check_and_reset_daily_quota(pool, &mut sub).await;
     let devices = Repository::get_user_devices(pool, user.id).await?;
 
+    let synced_configs_count: usize = sqlx::query_scalar::<_, String>(
+        "SELECT personal_configs_json FROM user_client_state WHERE user_id = ? LIMIT 1"
+    )
+    .bind(user.id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    .and_then(|v| v.as_array().map(|a| a.len()))
+    .unwrap_or(0);
+
     let is_pro = sub.tier != "Sentra Lite";
+    let total_used_bytes = (sub.upload_bytes + sub.download_bytes).max(0);
+    let total_used_gb = total_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let total_limit_gb = sub.traffic_limit_bytes.max(0) as f64 / (1024.0 * 1024.0 * 1024.0);
+    let total_rem_gb = (sub.traffic_limit_bytes - total_used_bytes).max(0) as f64 / (1024.0 * 1024.0 * 1024.0);
+
     let static_limit_gb = 30.0;
     let static_used_gb = sub.static_ip_used_mb as f64 / 1024.0;
     let static_rem_gb = (static_limit_gb - static_used_gb).max(0.0);
@@ -343,20 +367,48 @@ pub async fn handle_subscription_status(
         )
     };
 
-    let text = format!(
-        r#"📊 <b>گزارش مصرف و وضعیت ترافیک حساب:</b>
+    let platforms_summary = if devices.is_empty() {
+        "بدون دستگاه ثبت‌شده".to_string()
+    } else {
+        devices
+            .iter()
+            .map(|d| format!("{} ({})", d.device_name, d.platform))
+            .collect::<Vec<_>>()
+            .join("، ")
+    };
 
+    let account_label = user
+        .username
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|u| format!("@{}", u))
+        .unwrap_or_else(|| user.first_name.clone());
+
+    let text = format!(
+        r#"📊 <b>گزارش مصرف و وضعیت همگام‌شده حساب (ویندوز / اندروید / تلگرام):</b>
+
+• حساب کاربری: <code>{}</code>
 • سطح اشتراک: <b>{}</b>
 • وضعیت سرویس: <code>{}</code>
-• دستگاه‌های متصل: <b>{} از ۳ دستگاه مجاز</b>
+• مصرف کل بسته: <b>{:.2} GB</b> مصرف‌شده / <b>{:.2} GB</b> باقیمانده (از {:.0} GB)
+• دستگاه‌های متصل: <b>{} از {} دستگاه مجاز</b>
+• پلتفرم‌های فعال: <i>{}</i>
+• کانفیگ‌های شخصی همگام‌شده: <code>{}</code> مورد
 • تاریخ اعتبار: <code>{}</code>
 
 {}
 
-💬 <i>جهت مدیریت دستگاه‌های متصل، ثبت تیکت پشتیبانی یا ارتقا، از گزینه‌های زیر استفاده نمایید:</i>"#,
+💬 <i>تمام تغییرات اشتراک، مصرف و دستگاه‌ها به صورت لحظه‌ای با برنامه‌های ویندوز و اندروید همگام است.</i>"#,
+        account_label,
         sub.tier,
         sub.status,
+        total_used_gb,
+        total_rem_gb,
+        total_limit_gb,
         devices.len(),
+        sub.max_concurrent_devices.max(3),
+        platforms_summary,
+        synced_configs_count,
         sub.expires_at.format("%Y-%m-%d %H:%M UTC"),
         quota_details
     );

@@ -336,6 +336,15 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_user_devices_user ON user_devices(user_id);
         CREATE INDEX IF NOT EXISTS idx_user_devices_sub ON user_devices(subscription_id);
+
+        -- 7b. USER_CLIENT_STATE table (Cross-device synced personal configs & preferences)
+        CREATE TABLE IF NOT EXISTS user_client_state (
+            user_id                 INTEGER PRIMARY KEY,
+            personal_configs_json   TEXT NOT NULL DEFAULT '[]',
+            preferences_json        TEXT NOT NULL DEFAULT '{}',
+            updated_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
         "#,
     )
     .execute(pool)
@@ -2013,8 +2022,8 @@ impl Repository {
         }
     }
 
-    /// Check IP registration rate limit: max 2 accounts per 24 hours per IP
-    pub async fn check_and_record_ip_registration(pool: &DbPool, ip: &str) -> Result<(), CoreError> {
+    /// Check IP registration rate limit without recording yet: max 2 accounts per 24 hours per IP
+    pub async fn check_ip_registration_limit(pool: &DbPool, ip: &str) -> Result<(), CoreError> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM ip_registrations WHERE ip = ? AND created_at > datetime('now', '-24 hours')"
         )
@@ -2029,11 +2038,21 @@ impl Repository {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Record a successful IP registration event
+    pub async fn record_ip_registration(pool: &DbPool, ip: &str) {
         let _ = sqlx::query("INSERT INTO ip_registrations (ip) VALUES (?)")
             .bind(ip)
             .execute(pool)
             .await;
+    }
 
+    /// Check IP registration rate limit and record immediately
+    pub async fn check_and_record_ip_registration(pool: &DbPool, ip: &str) -> Result<(), CoreError> {
+        Self::check_ip_registration_limit(pool, ip).await?;
+        Self::record_ip_registration(pool, ip).await;
         Ok(())
     }
 
@@ -2093,17 +2112,24 @@ impl Repository {
         Ok((user, sub))
     }
 
-    /// Authenticate standalone user with username and password
+    /// Authenticate standalone user with username or email and password
     pub async fn login_user_with_credentials(
         pool: &DbPool,
         username: &str,
         password: &str,
     ) -> Result<(User, Subscription), CoreError> {
-        let clean_username = username.trim().to_lowercase();
+        let trimmed_ident = username.trim().to_lowercase();
+        let clean_ident = if trimmed_ident.starts_with('@') && !trimmed_ident[1..].contains('@') {
+            trimmed_ident[1..].to_string()
+        } else {
+            trimmed_ident
+        };
+
         let user_opt = sqlx::query_as::<_, User>(
-            "SELECT * FROM users WHERE LOWER(username) = LOWER(?) LIMIT 1"
+            "SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?) LIMIT 1"
         )
-        .bind(&clean_username)
+        .bind(&clean_ident)
+        .bind(&clean_ident)
         .fetch_optional(pool)
         .await?;
 
@@ -2117,7 +2143,9 @@ impl Repository {
             _ => return Err(CoreError::AuthFailed("برای این حساب کاربری رمز عبور ثبت نشده است. لطفاً از طریق ربات تلگرام یا کد یک‌بار مصرف وارد شوید.".to_string())),
         };
 
-        let valid = Self::verify_password_hash(password, hash);
+        let trimmed_password = password.trim();
+        let valid = Self::verify_password_hash(password, hash)
+            || (trimmed_password != password && Self::verify_password_hash(trimmed_password, hash));
 
         if !valid {
             return Err(CoreError::AuthFailed("نام کاربری یا رمز عبور اشتباه است.".to_string()));
@@ -2220,6 +2248,7 @@ impl Repository {
                 // Anti-fraud: Quotas MUST NOT be summed! Take MAX(old_used, target_used)
                 let max_web_mb = os.web_browsing_used_mb.max(ts.web_browsing_used_mb);
                 let max_dl_mb = os.download_used_mb.max(ts.download_used_mb);
+                let max_static_mb = os.static_ip_used_mb.max(ts.static_ip_used_mb);
                 let max_up_bytes = os.upload_bytes.max(ts.upload_bytes);
                 let max_down_bytes = os.download_bytes.max(ts.download_bytes);
 
@@ -2233,6 +2262,7 @@ impl Repository {
                         expires_at = ?,
                         web_browsing_used_mb = ?,
                         download_used_mb = ?,
+                        static_ip_used_mb = ?,
                         upload_bytes = ?,
                         download_bytes = ?,
                         updated_at = CURRENT_TIMESTAMP
@@ -2245,6 +2275,7 @@ impl Repository {
                 .bind(later_expires)
                 .bind(max_web_mb)
                 .bind(max_dl_mb)
+                .bind(max_static_mb)
                 .bind(max_up_bytes)
                 .bind(max_down_bytes)
                 .bind(ts.id)
@@ -2283,6 +2314,22 @@ impl Repository {
                             .await;
                     }
                 }
+            }
+
+            // Preserve synced client state if old_u had state and target_user did not
+            let target_has_state: Option<i64> = sqlx::query_scalar(
+                "SELECT user_id FROM user_client_state WHERE user_id = ? LIMIT 1"
+            )
+            .bind(target_user.id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+            if target_has_state.is_none() {
+                let _ = sqlx::query("UPDATE user_client_state SET user_id = ? WHERE user_id = ?")
+                    .bind(target_user.id)
+                    .bind(old_u.id)
+                    .execute(pool)
+                    .await;
             }
 
             // Transfer donations and outbounds to the unified user

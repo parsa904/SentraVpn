@@ -30,6 +30,11 @@ import {
   pruneLatencyHistory,
 } from './utils/latencyHistory';
 import {
+  type TrafficPoint,
+  appendTrafficSample,
+  pruneTrafficHistory,
+} from './utils/trafficHistory';
+import {
   EMPTY_SESSION_TIMER,
   type PersistedSessionTimer,
   clearPersistedSessionTimer,
@@ -56,6 +61,24 @@ import {
   shouldTriggerAutoReconnect,
 } from './utils/reconnectPolicy';
 import {
+  PING_OPT_INTERVAL_MS,
+  didOutboundOrderChange,
+  getInitialPingOptimizationEnabled,
+  persistPingOptimizationEnabled,
+  resolveOutboundLatency,
+  shouldRunPeriodicPingOptimization,
+  sortOutboundsByLatency,
+} from './utils/pingOptimization';
+import {
+  BOOTSTRAP_POLL_INTERVAL_MS,
+  STATE_PUSH_DEBOUNCE_MS,
+  buildSyncStatePayload,
+  mergePersonalConfigs,
+  normalizeRemoteClientState,
+  parseIsoTimestampMs,
+  shouldApplyRemoteState,
+} from './utils/clientSync';
+import {
   type GithubReleaseUpdate,
   checkGithubLatestRelease,
   connectVpnNative,
@@ -69,6 +92,7 @@ import {
   logoutSession,
   openBatteryOptimizationSettingsNative,
   pingServerNode,
+  pushClientSyncState,
   reconnectVpnNative,
   removeUserDevice,
   requestTelegramLinkCode,
@@ -197,6 +221,11 @@ export const App: React.FC = () => {
   const [autoMode, setAutoMode] = useState(true);
   const [autoResolving, setAutoResolving] = useState(false);
   const [testingAll, setTestingAll] = useState(false);
+  const [pingOptimizationEnabled, setPingOptimizationEnabled] = useState<boolean>(
+    getInitialPingOptimizationEnabled
+  );
+  const [pingOptimizing, setPingOptimizing] = useState(false);
+  const [lastPingOptimizedAt, setLastPingOptimizedAt] = useState<number | null>(null);
   const [livePings, setLivePings] = useState<Record<string, number | null>>({});
   const [pingingIds, setPingingIds] = useState<Record<string, boolean>>({});
 
@@ -210,6 +239,8 @@ export const App: React.FC = () => {
   const [sessionNowMs, setSessionNowMs] = useState<number>(() => Date.now());
   const [latencyHistory, setLatencyHistory] = useState<LatencyPoint[]>([]);
   const [latencyNowMs, setLatencyNowMs] = useState<number>(() => Date.now());
+  const [trafficHistory, setTrafficHistory] = useState<TrafficPoint[]>([]);
+  const [trafficNowMs, setTrafficNowMs] = useState<number>(() => Date.now());
   const [logs, setLogs] = useState<LogEntry[]>([]);
 
   const [addConfigOpen, setAddConfigOpen] = useState(false);
@@ -228,8 +259,65 @@ export const App: React.FC = () => {
   const lastNativePingAtRef = useRef<number>(0);
   const userWantsConnectedRef = useRef<boolean>(false);
   const isReconnectingRef = useRef<boolean>(false);
+  const pingOptimizationEnabledRef = useRef<boolean>(pingOptimizationEnabled);
+  pingOptimizationEnabledRef.current = pingOptimizationEnabled;
+  const pingOptimizingRef = useRef<boolean>(pingOptimizing);
+  pingOptimizingRef.current = pingOptimizing;
+  const testingAllRef = useRef<boolean>(testingAll);
+  testingAllRef.current = testingAll;
+  const autoResolvingRef = useRef<boolean>(autoResolving);
+  autoResolvingRef.current = autoResolving;
+  const autoModeRef = useRef<boolean>(autoMode);
+  autoModeRef.current = autoMode;
+  const connectionStatusRef = useRef<ConnectionStatus>(connectionStatus);
+  connectionStatusRef.current = connectionStatus;
+  const lastPingOptimizedAtRef = useRef<number | null>(lastPingOptimizedAt);
+  lastPingOptimizedAtRef.current = lastPingOptimizedAt;
+  const livePingsRef = useRef<Record<string, number | null>>(livePings);
+  livePingsRef.current = livePings;
+  const outboundsRef = useRef<LiveOutboundNode[]>(bootstrap?.outbounds || []);
+  outboundsRef.current = bootstrap?.outbounds || [];
+  const lastOptimizedOrderIdsRef = useRef<string[]>([]);
   const reconnectAttemptsRef = useRef<number>(0);
   const reconnectDebounceRef = useRef<number | null>(null);
+  const syncingInFlightRef = useRef<boolean>(false);
+  const lastSyncCompletedAtRef = useRef<number>(0);
+  const hydratingFromServerRef = useRef<boolean>(false);
+  const hasHydratedCloudStateRef = useRef<boolean>(false);
+  const lastRemoteStateUpdatedAtMsRef = useRef<number>(0);
+  const syncStatePushTimerRef = useRef<number | null>(null);
+  const personalConfigsRef = useRef<PersonalConfigItem[]>(personalConfigs);
+  personalConfigsRef.current = personalConfigs;
+  const activeTabRef = useRef<NavTab>(activeTab);
+  activeTabRef.current = activeTab;
+  const syncedPrefsRef = useRef({
+    selected_mode: selectedMode,
+    routing_mode: routingMode,
+    split_tunneling: splitTunneling,
+    kill_switch: killSwitch,
+    auto_reconnect: autoReconnect,
+    ping_optimization_enabled: pingOptimizationEnabled,
+    use_warp: useWarp,
+    custom_dns: customDns,
+    selected_outbound_id: activeServer?.id ?? null,
+    auto_mode: autoMode,
+    lang,
+    theme,
+  });
+  syncedPrefsRef.current = {
+    selected_mode: selectedMode,
+    routing_mode: routingMode,
+    split_tunneling: splitTunneling,
+    kill_switch: killSwitch,
+    auto_reconnect: autoReconnect,
+    ping_optimization_enabled: pingOptimizationEnabled,
+    use_warp: useWarp,
+    custom_dns: customDns,
+    selected_outbound_id: activeServer?.id ?? null,
+    auto_mode: autoMode,
+    lang,
+    theme,
+  };
 
   const pushLog = useCallback((level: LogEntry['level'], message: string) => {
     setLogs((prev) => [...prev.slice(-199), makeLogEntry(level, message)]);
@@ -280,19 +368,165 @@ export const App: React.FC = () => {
   }, []);
 
   const syncWithServer = useCallback(
-    async (activeSession: PersistedSession) => {
-      setSyncing(true);
-      setSyncError(null);
-      pushLog('SYNC', 'Requesting live subscription and outbounds from core...');
+    async (activeSession: PersistedSession, options?: { silent?: boolean }) => {
+      const silent = Boolean(options?.silent);
+      if (syncingInFlightRef.current && silent) return;
+      syncingInFlightRef.current = true;
+      if (!silent) {
+        setSyncing(true);
+        setSyncError(null);
+        pushLog('SYNC', 'Requesting live subscription and outbounds from core...');
+      }
       try {
         const data = await fetchBootstrap(activeSession.subscription_token);
+        lastSyncCompletedAtRef.current = Date.now();
         setBootstrap(data);
-        pushLog(
-          'SYNC',
-          `Synced ${data.outbounds.length} active outbounds (${data.subscription.tier}).`
-        );
+        setSyncError(null);
+
+        // Reflect live account/subscription updates (e.g. Telegram upgrades or account linking)
+        setSession((prev) => {
+          if (!prev || prev.subscription_token !== activeSession.subscription_token) return prev;
+          const nextUsername = data.user?.username || data.user?.first_name || prev.username;
+          const nextTier = data.subscription?.tier || prev.tier;
+          const nextExpires = data.subscription?.expires_at ?? prev.expires_at;
+          if (
+            nextUsername === prev.username &&
+            nextTier === prev.tier &&
+            nextExpires === prev.expires_at
+          ) {
+            return prev;
+          }
+          return {
+            ...prev,
+            username: nextUsername,
+            tier: nextTier,
+            expires_at: nextExpires,
+          };
+        });
+
+        // Hydrate cross-device synced personal configs & preferences from database
+        const remoteState = normalizeRemoteClientState(data.client_state);
+        let syncedSelectedServer: ActiveServerSelection | null = null;
+        if (remoteState) {
+          const isFirstHydration = !hasHydratedCloudStateRef.current;
+          if (
+            remoteState.updated_at &&
+            shouldApplyRemoteState(lastRemoteStateUpdatedAtMsRef.current, remoteState.updated_at)
+          ) {
+            hydratingFromServerRef.current = true;
+            lastRemoteStateUpdatedAtMsRef.current = parseIsoTimestampMs(remoteState.updated_at);
+
+            const mergedConfigs = mergePersonalConfigs(
+              personalConfigsRef.current,
+              remoteState.personal_configs,
+              !isFirstHydration || remoteState.personal_configs.length > 0
+            );
+            personalConfigsRef.current = mergedConfigs;
+            setPersonalConfigs(mergedConfigs);
+            void savePersonalConfigs(mergedConfigs);
+
+            const p = remoteState.preferences;
+            if (p.selected_mode) {
+              setSelectedMode(p.selected_mode);
+              void setConnectionModeNative(p.selected_mode).catch(() => {});
+            }
+            if (p.routing_mode) {
+              setRoutingMode(p.routing_mode);
+              void setRoutingModeNative(p.routing_mode).catch(() => {});
+            }
+            if (typeof p.split_tunneling === 'boolean') {
+              setSplitTunneling(p.split_tunneling);
+              void setSplitTunnelingNative(p.split_tunneling).catch(() => {});
+            }
+            if (typeof p.kill_switch === 'boolean') {
+              setKillSwitch(p.kill_switch);
+              void setKillSwitchNative(p.kill_switch).catch(() => {});
+            }
+            if (typeof p.auto_reconnect === 'boolean') {
+              setAutoReconnect(p.auto_reconnect);
+            }
+            if (typeof p.ping_optimization_enabled === 'boolean') {
+              setPingOptimizationEnabled(p.ping_optimization_enabled);
+            }
+            if (typeof p.use_warp === 'boolean') {
+              const effectiveWarp = p.selected_mode === 'static_ip' ? false : p.use_warp;
+              setUseWarp(effectiveWarp);
+              void setUseWarpNative(effectiveWarp).catch(() => {});
+            }
+            if (p.custom_dns) {
+              setCustomDns(p.custom_dns);
+            }
+            if (typeof p.auto_mode === 'boolean') {
+              setAutoMode(p.auto_mode);
+            }
+            if (p.lang) {
+              setLang(p.lang);
+            }
+            if (p.theme) {
+              setTheme(p.theme);
+            }
+            if (p.selected_outbound_id) {
+              const matchedServer = data.outbounds.find((o) => o.id === p.selected_outbound_id);
+              if (matchedServer) {
+                syncedSelectedServer = outboundToSelection(matchedServer, undefined);
+                void setActiveOutboundNative(matchedServer.id, null);
+              } else {
+                const matchedPersonal = mergedConfigs.find((c) => c.id === p.selected_outbound_id);
+                if (matchedPersonal) {
+                  syncedSelectedServer = {
+                    kind: 'personal',
+                    id: matchedPersonal.id,
+                    name: matchedPersonal.name,
+                    protocol: matchedPersonal.protocol,
+                    country_code: matchedPersonal.country_code,
+                    country_name:
+                      matchedPersonal.country_code === 'XX'
+                        ? t(langRef.current, 'personalCountry')
+                        : matchedPersonal.country_code,
+                    flag: matchedPersonal.flag,
+                    server_address: matchedPersonal.server_address,
+                    server_port: matchedPersonal.server_port,
+                    latency_ms: matchedPersonal.latency_ms,
+                    uri: matchedPersonal.uri,
+                  };
+                  void setActiveOutboundNative(null, matchedPersonal.uri);
+                }
+              }
+            }
+
+            window.setTimeout(() => {
+              hydratingFromServerRef.current = false;
+            }, 60);
+          } else if (
+            isFirstHydration &&
+            !remoteState.updated_at &&
+            personalConfigsRef.current.length > 0
+          ) {
+            const payload = buildSyncStatePayload(
+              personalConfigsRef.current,
+              syncedPrefsRef.current
+            );
+            void pushClientSyncState(activeSession.subscription_token, payload)
+              .then((saved) => {
+                const savedMs = parseIsoTimestampMs(saved.updated_at);
+                if (savedMs > 0) lastRemoteStateUpdatedAtMsRef.current = savedMs;
+              })
+              .catch(() => {});
+          }
+          hasHydratedCloudStateRef.current = true;
+        }
+
+        if (!silent) {
+          pushLog(
+            'SYNC',
+            `Synced ${data.outbounds.length} active outbounds (${data.subscription.tier}).`
+          );
+        }
 
         setActiveServer((current) => {
+          if (syncedSelectedServer) {
+            return syncedSelectedServer;
+          }
           if (current) {
             if (current.kind === 'server') {
               const refreshed = data.outbounds.find((o) => o.id === current.id);
@@ -317,16 +551,21 @@ export const App: React.FC = () => {
           const clean = msg.replace('AUTH_EXPIRED:', '').trim();
           pushLog('ERROR', `Session expired: ${clean}`);
           userWantsConnectedRef.current = false;
+          hasHydratedCloudStateRef.current = false;
+          lastRemoteStateUpdatedAtMsRef.current = 0;
           await logoutSession();
           setSession(null);
           setBootstrap(null);
           setAuthNotice(clean || t(langRef.current, 'sessionExpiredNotice'));
-        } else {
+        } else if (!silent) {
           setSyncError(msg);
           pushLog('WARN', `Live sync unavailable: ${msg}`);
         }
       } finally {
-        setSyncing(false);
+        syncingInFlightRef.current = false;
+        if (!silent) {
+          setSyncing(false);
+        }
       }
     },
     [pushLog]
@@ -389,6 +628,113 @@ export const App: React.FC = () => {
       cancelled = true;
     };
   }, [syncWithServer, loadDonations]);
+
+  // Continuous background database sync (30s interval + focus / visibility / online events)
+  const sessionToken = session?.subscription_token ?? null;
+  useEffect(() => {
+    if (!sessionToken) return;
+
+    const triggerSilentSync = (force = false) => {
+      const current = sessionRef.current;
+      if (!current || !navigator.onLine) return;
+      if (!force && Date.now() - lastSyncCompletedAtRef.current < 5_000) return;
+      void syncWithServer(current, { silent: true });
+      if (activeTabRef.current === 'donate') {
+        void loadDonations(current);
+      }
+    };
+
+    const pollTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        triggerSilentSync(true);
+      }
+    }, BOOTSTRAP_POLL_INTERVAL_MS);
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        triggerSilentSync(false);
+      }
+    };
+    const onFocus = () => triggerSilentSync(false);
+    const onOnline = () => triggerSilentSync(true);
+
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('online', onOnline);
+
+    return () => {
+      window.clearInterval(pollTimer);
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('online', onOnline);
+    };
+  }, [sessionToken, syncWithServer, loadDonations]);
+
+  // Debounced cloud sync whenever personal configs or preferences change
+  const activeServerIdForSync = activeServer?.id ?? null;
+  useEffect(() => {
+    if (!sessionToken || !hasHydratedCloudStateRef.current || hydratingFromServerRef.current) {
+      return;
+    }
+
+    if (syncStatePushTimerRef.current) {
+      window.clearTimeout(syncStatePushTimerRef.current);
+    }
+
+    syncStatePushTimerRef.current = window.setTimeout(() => {
+      syncStatePushTimerRef.current = null;
+      const current = sessionRef.current;
+      if (!current || hydratingFromServerRef.current) return;
+
+      const payload = buildSyncStatePayload(personalConfigs, {
+        selected_mode: selectedMode,
+        routing_mode: routingMode,
+        split_tunneling: splitTunneling,
+        kill_switch: killSwitch,
+        auto_reconnect: autoReconnect,
+        ping_optimization_enabled: pingOptimizationEnabled,
+        use_warp: useWarp,
+        custom_dns: customDns,
+        selected_outbound_id: activeServerIdForSync,
+        auto_mode: autoMode,
+        lang,
+        theme,
+      });
+
+      void pushClientSyncState(current.subscription_token, payload)
+        .then((saved) => {
+          const savedMs = parseIsoTimestampMs(saved.updated_at);
+          if (savedMs > 0) {
+            lastRemoteStateUpdatedAtMsRef.current = savedMs;
+          }
+        })
+        .catch(() => {
+          // Will retry on next change or next sync cycle
+        });
+    }, STATE_PUSH_DEBOUNCE_MS);
+
+    return () => {
+      if (syncStatePushTimerRef.current) {
+        window.clearTimeout(syncStatePushTimerRef.current);
+        syncStatePushTimerRef.current = null;
+      }
+    };
+  }, [
+    sessionToken,
+    personalConfigs,
+    selectedMode,
+    routingMode,
+    splitTunneling,
+    killSwitch,
+    autoReconnect,
+    pingOptimizationEnabled,
+    useWarp,
+    customDns,
+    activeServerIdForSync,
+    autoMode,
+    lang,
+    theme,
+  ]);
 
   // Persist & synchronize Auto-Reconnect preference with native Rust/Android engines
   useEffect(() => {
@@ -592,6 +938,10 @@ export const App: React.FC = () => {
           setLatencyNowMs(now);
           setLatencyHistory((prev) => appendLatencySample(prev, snap.ping_ms, now));
         }
+        setTrafficNowMs(now);
+        setTrafficHistory((prev) =>
+          appendTrafficSample(prev, snap.download_speed_bps, snap.upload_speed_bps, now)
+        );
       },
       (line) => pushLog('INFO', line),
       (status, errorMsg) => {
@@ -615,6 +965,11 @@ export const App: React.FC = () => {
         } else if (status === 'connected' || status === 'disconnected') {
           setConnectionError(null);
         }
+      },
+      () => {
+        if (sessionRef.current) {
+          void syncWithServer(sessionRef.current, { silent: true });
+        }
       }
     ).then((unsub) => {
       cleanup = unsub;
@@ -622,7 +977,7 @@ export const App: React.FC = () => {
     return () => {
       if (cleanup) cleanup();
     };
-  }, [pushLog]);
+  }, [pushLog, syncWithServer]);
 
   // Persist Session Time state to localStorage on every transition
   useEffect(() => {
@@ -641,7 +996,7 @@ export const App: React.FC = () => {
     return () => window.clearInterval(timer);
   }, [isSessionTimerRunning]);
 
-  // Smoothly advance and prune the 60-second rolling latency window every second
+  // Smoothly advance and prune the 60-second rolling latency & traffic windows every second
   const hasLatencyHistory = latencyHistory.length > 0;
   useEffect(() => {
     if (connectionStatus !== 'connected' && !hasLatencyHistory) return;
@@ -653,7 +1008,18 @@ export const App: React.FC = () => {
     return () => window.clearInterval(timer);
   }, [connectionStatus, hasLatencyHistory]);
 
-  // Reset latency chart history when switching to a different server so histories never mix
+  const hasTrafficHistory = trafficHistory.length > 0;
+  useEffect(() => {
+    if (connectionStatus !== 'connected' && !hasTrafficHistory) return;
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      setTrafficNowMs(now);
+      setTrafficHistory((prev) => pruneTrafficHistory(prev, now));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [connectionStatus, hasTrafficHistory]);
+
+  // Reset latency & traffic chart histories when switching to a different server so histories never mix
   const activeServerId = activeServer?.id ?? null;
   const activeServerAddress = activeServer?.server_address ?? '';
   const activeServerPort = activeServer?.server_port ?? 0;
@@ -661,6 +1027,7 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (prevServerIdRef.current && prevServerIdRef.current !== activeServerId) {
       setLatencyHistory([]);
+      setTrafficHistory([]);
     }
     prevServerIdRef.current = activeServerId;
   }, [activeServerId]);
@@ -695,6 +1062,12 @@ export const App: React.FC = () => {
 
   const handleAuthenticated = async (newSession: PersistedSession) => {
     setAuthNotice(null);
+    hasHydratedCloudStateRef.current = false;
+    lastRemoteStateUpdatedAtMsRef.current = 0;
+    if (syncStatePushTimerRef.current) {
+      window.clearTimeout(syncStatePushTimerRef.current);
+      syncStatePushTimerRef.current = null;
+    }
     setSession(newSession);
     pushLog('INFO', `Signed in as ${newSession.username || 'user'}. Session persisted.`);
     await syncWithServer(newSession);
@@ -704,6 +1077,12 @@ export const App: React.FC = () => {
   const handleLogout = async () => {
     userWantsConnectedRef.current = false;
     reconnectAttemptsRef.current = 0;
+    hasHydratedCloudStateRef.current = false;
+    lastRemoteStateUpdatedAtMsRef.current = 0;
+    if (syncStatePushTimerRef.current) {
+      window.clearTimeout(syncStatePushTimerRef.current);
+      syncStatePushTimerRef.current = null;
+    }
     if (reconnectDebounceRef.current) {
       window.clearTimeout(reconnectDebounceRef.current);
       reconnectDebounceRef.current = null;
@@ -726,6 +1105,10 @@ export const App: React.FC = () => {
     setSessionTimer(EMPTY_SESSION_TIMER);
     clearPersistedSessionTimer();
     setLatencyHistory([]);
+    setTrafficHistory([]);
+    setLastPingOptimizedAt(null);
+    setPingOptimizing(false);
+    lastOptimizedOrderIdsRef.current = [];
     setActiveTab('home');
     pushLog('INFO', 'Signed out and cleared local session.');
   };
@@ -787,8 +1170,152 @@ export const App: React.FC = () => {
       ]);
     } finally {
       setTestingAll(false);
+      if (serverList.length > 0 && pingOptimizationEnabledRef.current) {
+        const now = Date.now();
+        lastPingOptimizedAtRef.current = now;
+        setLastPingOptimizedAt(now);
+      }
     }
   }, [bootstrap, personalConfigs, handlePingNode, pushLog]);
+
+  // Persist Ping Optimization toggle across sessions
+  useEffect(() => {
+    persistPingOptimizationEnabled(pingOptimizationEnabled);
+  }, [pingOptimizationEnabled]);
+
+  const runPingOptimizationPass = useCallback(async () => {
+    const nodes = outboundsRef.current;
+    if (nodes.length === 0 || pingOptimizingRef.current) return;
+
+    pingOptimizingRef.current = true;
+    setPingOptimizing(true);
+    try {
+      const probeTargets = nodes.filter((node) => node.is_online !== false);
+      const results = await Promise.all(
+        probeTargets.map(async (node) => {
+          try {
+            const ms = await pingServerNode(node.server_address, node.server_port);
+            return [node.id, ms] as const;
+          } catch {
+            return [node.id, null] as const;
+          }
+        })
+      );
+
+      // Abort committing if user signed out mid-sweep
+      if (!sessionRef.current) return;
+
+      const mergedPings: Record<string, number | null> = { ...livePingsRef.current };
+      for (const [id, ms] of results) {
+        mergedPings[id] = ms;
+      }
+
+      livePingsRef.current = mergedPings;
+      setLivePings(mergedPings);
+
+      const currentActive = activeServerRef.current;
+      if (currentActive && currentActive.id in mergedPings) {
+        const latestMs = mergedPings[currentActive.id];
+        setActiveServer((curr) =>
+          curr && curr.id === currentActive.id ? { ...curr, latency_ms: latestMs } : curr
+        );
+      }
+
+      const now = Date.now();
+      lastPingOptimizedAtRef.current = now;
+      setLastPingOptimizedAt(now);
+
+      if (pingOptimizationEnabledRef.current) {
+        const currentOutbounds = outboundsRef.current;
+        const previousOrder =
+          lastOptimizedOrderIdsRef.current.length > 0
+            ? lastOptimizedOrderIdsRef.current.map((id) => ({ id }))
+            : currentOutbounds;
+        const sorted = sortOutboundsByLatency(currentOutbounds, mergedPings);
+        const nextIds = sorted.map((n) => n.id);
+        const changed = didOutboundOrderChange(previousOrder, sorted);
+        lastOptimizedOrderIdsRef.current = nextIds;
+
+        // If Auto Select is active and tunnel is idle, keep its target synced to the fastest healthy node
+        if (autoModeRef.current && connectionStatusRef.current === 'disconnected') {
+          const fastest = selectFastestHealthyServer(currentOutbounds, mergedPings);
+          if (fastest) {
+            const nextSelection = outboundToSelection(fastest.node, fastest.latencyMs);
+            setActiveServer(nextSelection);
+            void setActiveOutboundNative(fastest.node.id, null);
+          }
+        }
+
+        if (changed) {
+          const topNode = sorted[0];
+          const topLatency = topNode ? resolveOutboundLatency(topNode, mergedPings).latencyMs : null;
+          pushLog(
+            'INFO',
+            topNode && topLatency !== null
+              ? `Ping Optimization re-sorted ${sorted.length} outbounds (fastest: ${topNode.name} · ${topLatency} ms).`
+              : `Ping Optimization re-sorted ${sorted.length} outbounds.`
+          );
+        }
+      }
+    } finally {
+      pingOptimizingRef.current = false;
+      setPingOptimizing(false);
+    }
+  }, [pushLog]);
+
+  const outboundsCount = bootstrap?.outbounds.length ?? 0;
+
+  // Periodic automated Ping Optimization loop (probes + re-sorts every 30s while visible)
+  useEffect(() => {
+    if (!session || !pingOptimizationEnabled || outboundsCount === 0) return;
+
+    const evaluateAndRun = () => {
+      const isVisible =
+        typeof document === 'undefined' ? true : document.visibilityState !== 'hidden';
+      if (
+        shouldRunPeriodicPingOptimization({
+          enabled: pingOptimizationEnabledRef.current,
+          outboundsCount: outboundsRef.current.length,
+          isTestingAll: testingAllRef.current,
+          isAutoResolving: autoResolvingRef.current,
+          isOptimizing: pingOptimizingRef.current,
+          isDocumentVisible: isVisible,
+          lastRunAtMs: lastPingOptimizedAtRef.current,
+          nowMs: Date.now(),
+          intervalMs: PING_OPT_INTERVAL_MS,
+        })
+      ) {
+        void runPingOptimizationPass();
+      }
+    };
+
+    // Run immediately on opening Profiles or initial enablement when stale/never run
+    if (activeTab === 'profiles' || lastPingOptimizedAtRef.current === null) {
+      evaluateAndRun();
+    }
+
+    const scheduler = window.setInterval(evaluateAndRun, 5000);
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        evaluateAndRun();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      window.clearInterval(scheduler);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [session, pingOptimizationEnabled, outboundsCount, activeTab, runPingOptimizationPass]);
+
+  const handleTogglePingOptimization = useCallback(
+    (enabled: boolean) => {
+      setPingOptimizationEnabled(enabled);
+      pingOptimizationEnabledRef.current = enabled;
+      pushLog('INFO', `Automated Ping Optimization ${enabled ? 'enabled' : 'paused'}.`);
+    },
+    [pushLog]
+  );
 
   const handleSelectAutoFastest = useCallback(async (): Promise<ActiveServerSelection | null> => {
     const list = (bootstrap?.outbounds || []).filter((o) => o.is_online !== false);
@@ -1076,6 +1603,8 @@ export const App: React.FC = () => {
               isSessionTimerRunning={isSessionTimerRunning}
               latencyHistory={latencyHistory}
               latencyNowMs={latencyNowMs}
+              trafficHistory={trafficHistory}
+              trafficNowMs={trafficNowMs}
               pingingActive={Boolean(activeServer && pingingIds[activeServer.id])}
               activeServerTested={Boolean(activeServer && activeServer.id in livePings)}
               onToggleConnect={() => void handleToggleConnect()}
@@ -1119,6 +1648,10 @@ export const App: React.FC = () => {
               onPingAllOutbounds={() => void handlePingAllOutbounds()}
               onDeletePersonalConfig={handleDeletePersonalConfig}
               onOpenDonateModal={(cfg) => setDonateModalConfig(cfg)}
+              pingOptimizationEnabled={pingOptimizationEnabled}
+              pingOptimizing={pingOptimizing}
+              lastPingOptimizedAt={lastPingOptimizedAt}
+              onTogglePingOptimization={handleTogglePingOptimization}
             />
           )}
 

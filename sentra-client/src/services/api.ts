@@ -2,9 +2,12 @@ import type {
   BootstrapResponse,
   ConnectionModeId,
   DonatedOutboundRecord,
+  HeartbeatVerdictResponse,
   PersistedSession,
   PersonalConfigItem,
   RoutingMode,
+  SyncedClientPreferences,
+  SyncedClientState,
   TelemetrySnapshot,
 } from '../types/sentra';
 import {
@@ -19,11 +22,19 @@ const SESSION_STORAGE_KEY = 'sentra_session_v2';
 const PERSONAL_CONFIGS_KEY = 'sentra_personal_configs_v2';
 const DEVICE_ID_KEY = 'sentra_device_id_v2';
 
-const DEFAULT_BACKEND_URLS = [
+const REMOTE_BACKEND_URLS = [
   import.meta.env.VITE_API_BASE_URL as string | undefined,
   'http://116.203.188.124:8080',
   'https://head.cyberservice.sbs:8443',
 ].filter((u): u is string => Boolean(u && u.trim()));
+
+function getActiveBackendUrls(): string[] {
+  if (!isTauriRuntime() && typeof window !== 'undefined' && window.location?.origin) {
+    const configured = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
+    return configured ? [configured, ''] : [''];
+  }
+  return REMOTE_BACKEND_URLS;
+}
 
 interface TauriGlobalBridge {
   __TAURI_INTERNALS__?: {
@@ -170,9 +181,14 @@ async function fetchBackendJson<T>(
 ): Promise<T> {
   let lastError = 'امکان برقراری ارتباط با سرور مرکزی سنترا وجود ندارد.';
   const timeoutMs = options?.timeoutMs ?? 10000;
+  const isCredentialAuthPath =
+    path.startsWith('/api/v1/auth/login') ||
+    path.startsWith('/api/v1/auth/register') ||
+    path.startsWith('/api/v1/auth/code-login') ||
+    path.startsWith('/api/v1/auth/exchange-code');
 
-  for (const baseUrl of DEFAULT_BACKEND_URLS) {
-    const url = `${baseUrl.replace(/\/$/, '')}${path}`;
+  for (const baseUrl of getActiveBackendUrls()) {
+    const url = baseUrl ? `${baseUrl.replace(/\/$/, '')}${path}` : path;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -187,7 +203,9 @@ async function fetchBackendJson<T>(
       clearTimeout(timer);
 
       if (response.status === 401 || response.status === 403) {
-        let detail = 'نشست کاربری منقضی یا لغو شده است. لطفاً دوباره وارد شوید.';
+        let detail = isCredentialAuthPath
+          ? 'نام کاربری یا رمز عبور اشتباه است.'
+          : 'نشست کاربری منقضی یا لغو شده است. لطفاً دوباره وارد شوید.';
         try {
           const errJson = (await response.json()) as { error?: string; message?: string };
           if (errJson.error || errJson.message) {
@@ -196,7 +214,7 @@ async function fetchBackendJson<T>(
         } catch {
           // keep default message
         }
-        throw new Error(`AUTH_EXPIRED:${detail}`);
+        throw new Error(isCredentialAuthPath ? detail : `AUTH_EXPIRED:${detail}`);
       }
 
       const text = await response.text();
@@ -427,6 +445,7 @@ export async function logoutSession(): Promise<void> {
 
 export async function fetchBootstrap(token: string): Promise<BootstrapResponse> {
   let raw: BootstrapResponse;
+  const webDeviceId = getOrCreateWebDeviceId();
 
   if (isTauriRuntime()) {
     try {
@@ -442,7 +461,10 @@ export async function fetchBootstrap(token: string): Promise<BootstrapResponse> 
       raw = await fetchBackendJson<BootstrapResponse>(
         `/api/v1/client/bootstrap?token=${encodeURIComponent(token)}`,
         {
-          headers: { 'X-Subscription-Token': token },
+          headers: {
+            'X-Subscription-Token': token,
+            'X-Device-Id': webDeviceId,
+          },
         }
       );
     }
@@ -450,9 +472,31 @@ export async function fetchBootstrap(token: string): Promise<BootstrapResponse> 
     raw = await fetchBackendJson<BootstrapResponse>(
       `/api/v1/client/bootstrap?token=${encodeURIComponent(token)}`,
       {
-        headers: { 'X-Subscription-Token': token },
+        headers: {
+          'X-Subscription-Token': token,
+          'X-Device-Id': webDeviceId,
+        },
       }
     );
+  }
+
+  // Keep persisted local/Android session in sync with live subscription tier/expiry/username (e.g. Telegram upgrades)
+  const existing = loadLocalSession();
+  if (existing && existing.subscription_token === token && raw.subscription) {
+    const refreshed: PersistedSession = {
+      ...existing,
+      username: raw.user?.username || raw.user?.first_name || existing.username,
+      tier: raw.subscription.tier || existing.tier,
+      expires_at: raw.subscription.expires_at ?? existing.expires_at,
+    };
+    if (
+      refreshed.username !== existing.username ||
+      refreshed.tier !== existing.tier ||
+      refreshed.expires_at !== existing.expires_at
+    ) {
+      saveLocalSession(refreshed);
+      void saveAndroidEncryptedSession(refreshed);
+    }
   }
 
   // Strictly guarantee gaming mode stays hidden in UI
@@ -462,6 +506,121 @@ export async function fetchBootstrap(token: string): Promise<BootstrapResponse> 
     outbounds: raw.outbounds || [],
     devices: raw.devices || [],
   };
+}
+
+export async function fetchClientSyncState(token: string): Promise<SyncedClientState> {
+  if (isTauriRuntime()) {
+    try {
+      const res = await invokeTauri<SyncedClientState>('fetch_client_state_from_server');
+      return {
+        personal_configs: Array.isArray(res?.personal_configs) ? res.personal_configs : [],
+        preferences: res?.preferences || {},
+        updated_at: res?.updated_at ?? null,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith('AUTH_EXPIRED:')) throw new Error(msg);
+      // fall through to HTTP
+    }
+  }
+
+  const res = await fetchBackendJson<SyncedClientState>(
+    `/api/v1/client/sync-state?token=${encodeURIComponent(token)}`,
+    {
+      headers: {
+        'X-Subscription-Token': token,
+        'X-Device-Id': getOrCreateWebDeviceId(),
+      },
+    }
+  );
+  return {
+    personal_configs: Array.isArray(res?.personal_configs) ? res.personal_configs : [],
+    preferences: res?.preferences || {},
+    updated_at: res?.updated_at ?? null,
+  };
+}
+
+export async function pushClientSyncState(
+  token: string,
+  payload: {
+    personal_configs?: PersonalConfigItem[];
+    preferences?: SyncedClientPreferences;
+  }
+): Promise<SyncedClientState> {
+  if (isTauriRuntime()) {
+    try {
+      const res = await invokeTauri<SyncedClientState>('sync_client_state_to_server', {
+        payload,
+      });
+      return {
+        personal_configs: Array.isArray(res?.personal_configs) ? res.personal_configs : [],
+        preferences: res?.preferences || {},
+        updated_at: res?.updated_at ?? null,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith('AUTH_EXPIRED:')) throw new Error(msg);
+      // fall through to HTTP
+    }
+  }
+
+  const res = await fetchBackendJson<SyncedClientState>(
+    `/api/v1/client/sync-state?token=${encodeURIComponent(token)}`,
+    {
+      method: 'PUT',
+      headers: {
+        'X-Subscription-Token': token,
+        'X-Device-Id': getOrCreateWebDeviceId(),
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+  return {
+    personal_configs: Array.isArray(res?.personal_configs) ? res.personal_configs : [],
+    preferences: res?.preferences || {},
+    updated_at: res?.updated_at ?? null,
+  };
+}
+
+export async function sendUsageHeartbeat(
+  token: string,
+  payload: {
+    mode?: ConnectionModeId;
+    delta_upload_bytes: number;
+    delta_download_bytes: number;
+  }
+): Promise<HeartbeatVerdictResponse> {
+  if (isTauriRuntime()) {
+    try {
+      return await invokeTauri<HeartbeatVerdictResponse>('report_usage_heartbeat', {
+        mode: payload.mode ?? null,
+        deltaUploadBytes: Math.max(0, Math.round(payload.delta_upload_bytes)),
+        deltaDownloadBytes: Math.max(0, Math.round(payload.delta_download_bytes)),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith('AUTH_EXPIRED:')) throw new Error(msg);
+      // fall through to HTTP
+    }
+  }
+
+  const deviceId = getOrCreateWebDeviceId();
+  return fetchBackendJson<HeartbeatVerdictResponse>(
+    `/api/v1/client/heartbeat?token=${encodeURIComponent(token)}`,
+    {
+      method: 'POST',
+      headers: {
+        'X-Subscription-Token': token,
+        'X-Device-Id': deviceId,
+      },
+      body: JSON.stringify({
+        device_id: deviceId,
+        mode: payload.mode || 'web_browsing',
+        delta_upload_bytes: Math.max(0, Math.round(payload.delta_upload_bytes)),
+        delta_download_bytes: Math.max(0, Math.round(payload.delta_download_bytes)),
+      }),
+    }
+  );
 }
 
 export async function donateOutboundToServer(
@@ -749,7 +908,8 @@ export async function savePersonalConfigs(items: PersonalConfigItem[]): Promise<
 export async function subscribeNativeTelemetry(
   onTelemetry: (snap: TelemetrySnapshot) => void,
   onLog: (line: string) => void,
-  onStatus?: (status: 'connected' | 'connecting' | 'disconnected' | 'error', error?: string) => void
+  onStatus?: (status: 'connected' | 'connecting' | 'disconnected' | 'error', error?: string) => void,
+  onSubscriptionSynced?: () => void
 ): Promise<() => void> {
   if (!isTauriRuntime()) return () => {};
   const listen = getTauriBridge().__TAURI__?.event?.listen;
@@ -801,11 +961,18 @@ export async function subscribeNativeTelemetry(
       else if (raw === 'disconnected') onStatus('disconnected', ev.payload?.error || undefined);
     };
 
+    const handleSubscriptionSynced = () => {
+      if (onSubscriptionSynced) {
+        onSubscriptionSynced();
+      }
+    };
+
     const unlisten1 = await listen<RawTelemetryPayload>('vpn-telemetry', handleTelemetry);
     const unlisten2 = await listen<RawTelemetryPayload>('telemetry-speed', handleTelemetry);
     const unlisten3 = await listen<RawLogPayload>('vpn-log', handleLog);
     const unlisten4 = await listen<RawLogPayload>('telemetry-log', handleLog);
     const unlisten5 = await listen<RawStatusPayload>('connection-status-changed', handleStatus);
+    const unlisten6 = await listen<unknown>('subscription-synced', handleSubscriptionSynced);
 
     return () => {
       unlisten1();
@@ -813,6 +980,7 @@ export async function subscribeNativeTelemetry(
       unlisten3();
       unlisten4();
       unlisten5();
+      unlisten6();
     };
   } catch {
     return () => {};

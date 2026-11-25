@@ -30,7 +30,10 @@ import {
 import { SentraLogo } from './SentraLogo';
 import { WorldMapBackdrop } from './WorldMapBackdrop';
 import { LatencyHistoryChart } from './LatencyHistoryChart';
+import { TrafficHistoryChart } from './TrafficHistoryChart';
+import { QuickConnectWidget } from './QuickConnectWidget';
 import type { LatencyPoint } from '../utils/latencyHistory';
+import type { TrafficPoint } from '../utils/trafficHistory';
 
 interface HomeViewProps {
   lang: Language;
@@ -46,6 +49,8 @@ interface HomeViewProps {
   isSessionTimerRunning: boolean;
   latencyHistory: LatencyPoint[];
   latencyNowMs: number;
+  trafficHistory: TrafficPoint[];
+  trafficNowMs: number;
   pingingActive: boolean;
   activeServerTested: boolean;
   onToggleConnect: () => void;
@@ -78,6 +83,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
   isSessionTimerRunning,
   latencyHistory,
   latencyNowMs,
+  trafficHistory,
+  trafficNowMs,
   pingingActive,
   activeServerTested,
   onToggleConnect,
@@ -120,44 +127,57 @@ export const HomeView: React.FC<HomeViewProps> = ({
         isConnected={isConnected}
       />
 
-      {/* Top Mode Selector (strictly 3 modes: Web, Download, Static IP — Gaming hidden) */}
-      <div className="relative z-10 mx-auto w-full max-w-md shrink-0">
-        <div
-          role="radiogroup"
-          aria-label={t(lang, 'connectionModeAria')}
-          className="grid grid-cols-3 gap-1.5 rounded-2xl border border-slate-200/80 dark:border-slate-800/90 bg-white/80 dark:bg-slate-900/75 p-1.5 backdrop-blur-md"
-        >
-          {MODE_DEFINITIONS.map((m) => {
-            const Icon = m.icon;
-            const serverInfo = modeById.get(m.id);
-            const isLocked = serverInfo?.status === 'locked';
-            const isSelected = selectedMode === m.id;
-            return (
-              <button
-                key={m.id}
-                type="button"
-                role="radio"
-                aria-checked={isSelected}
-                disabled={isLocked}
-                onClick={() => onSelectMode(m.id)}
-                className={`flex items-center justify-center gap-1.5 rounded-xl px-2.5 py-2 text-xs font-semibold whitespace-nowrap transition duration-150 active:scale-[0.97] ${
-                  isSelected
-                    ? 'bg-emerald-600 text-white shadow-sm shadow-emerald-600/25'
-                    : isLocked
-                    ? 'cursor-not-allowed text-slate-400 dark:text-slate-600'
-                    : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800/80'
-                }`}
-              >
-                {isLocked ? <Lock size={13} className="shrink-0" /> : <Icon size={13} className="shrink-0" />}
-                <span className="truncate">{t(lang, m.labelKey)}</span>
-              </button>
-            );
-          })}
+      {/* Top Control Bar: Quick Connect Widget + Mode Selector (strictly 3 modes: Web, Download, Static IP — Gaming hidden) */}
+      <div className="relative z-10 mx-auto w-full max-w-2xl shrink-0">
+        <div className="flex flex-col sm:flex-row sm:items-stretch gap-2.5">
+          <div className="sm:flex-1 min-w-0">
+            <QuickConnectWidget
+              lang={lang}
+              connectionStatus={connectionStatus}
+              autoResolving={autoResolving}
+              activeServer={activeServer}
+              autoMode={autoMode}
+              onToggleConnect={onToggleConnect}
+            />
+          </div>
+
+          <div
+            role="radiogroup"
+            aria-label={t(lang, 'connectionModeAria')}
+            className="grid grid-cols-3 gap-1.5 rounded-2xl border border-slate-200/80 dark:border-slate-800/90 bg-white/80 dark:bg-slate-900/75 p-1.5 backdrop-blur-md sm:shrink-0"
+          >
+            {MODE_DEFINITIONS.map((m) => {
+              const Icon = m.icon;
+              const serverInfo = modeById.get(m.id);
+              const isLocked = serverInfo?.status === 'locked';
+              const isSelected = selectedMode === m.id;
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={isSelected}
+                  disabled={isLocked}
+                  onClick={() => onSelectMode(m.id)}
+                  className={`flex items-center justify-center gap-1.5 rounded-xl px-2.5 py-2 text-xs font-semibold whitespace-nowrap transition duration-150 active:scale-[0.97] ${
+                    isSelected
+                      ? 'bg-emerald-600 text-white shadow-sm shadow-emerald-600/25'
+                      : isLocked
+                      ? 'cursor-not-allowed text-slate-400 dark:text-slate-600'
+                      : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800/80'
+                  }`}
+                >
+                  {isLocked ? <Lock size={13} className="shrink-0" /> : <Icon size={13} className="shrink-0" />}
+                  <span className="truncate">{t(lang, m.labelKey)}</span>
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
 
       {/* Center Hero Connect Orb featuring official Sentra Bridge-S emblem */}
-      <div className="relative z-10 my-auto flex flex-col items-center justify-center py-4">
+      <div className="relative z-10 my-auto flex flex-col items-center justify-center py-2.5 sm:py-4">
         <div className="relative flex items-center justify-center">
           {(isConnecting || isConnected) && (
             <>
@@ -473,6 +493,14 @@ export const HomeView: React.FC<HomeViewProps> = ({
               </span>
             </div>
           </div>
+
+          {/* Real-Time 60s Upload/Download Traffic Line Chart directly below speed counters */}
+          <TrafficHistoryChart
+            lang={lang}
+            history={trafficHistory}
+            nowMs={trafficNowMs}
+            isConnected={isConnected}
+          />
         </div>
       </div>
     </section>

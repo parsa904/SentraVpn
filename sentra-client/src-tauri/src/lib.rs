@@ -213,7 +213,10 @@ pub fn run() {
             commands::set_selected_outbound,
             commands::save_persisted_session,
             commands::load_persisted_session,
-            commands::clear_persisted_session
+            commands::clear_persisted_session,
+            commands::fetch_client_state_from_server,
+            commands::sync_client_state_to_server,
+            commands::report_usage_heartbeat
         ])
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -1162,6 +1162,7 @@ impl VpnManager {
                                         let mut s = hb_app_state.lock().await;
                                         s.remaining_bytes = remaining;
                                     }
+                                    let _ = hb_app_handle.emit("subscription-synced", &verdict);
                                 }
                             }
                             break;
@@ -1266,6 +1267,10 @@ impl VpnManager {
                 "INFO",
                 "[Core] Tunnel closed cleanly. Network routing restored.",
             );
+
+            // Flush any pending unsynced usage immediately so Windows/Android/Telegram stay in sync
+            Self::sync_pending_traffic().await;
+            let _ = app_handle.emit("subscription-synced", json!({ "source": "disconnect" }));
         }
 
         Ok(())

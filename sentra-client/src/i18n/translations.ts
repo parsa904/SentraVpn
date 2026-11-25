@@ -120,6 +120,15 @@ export const translations = {
     latencySecondsAgo: '{sec}s ago',
     sessionTimeLabel: 'Session Time',
     sessionTimeAria: 'Current connection session accumulated time',
+    quickConnectTitle: 'Quick Connect',
+    quickConnectToggleAria: 'Toggle VPN quick connection',
+    trafficChartTitle: 'Traffic · 60s',
+    trafficChartAria: 'Real-time upload and download traffic over the last 60 seconds',
+    trafficDownloadLegend: 'Download',
+    trafficUploadLegend: 'Upload',
+    trafficPeakLabel: 'Peak',
+    trafficEmptyConnected: 'Waiting for live traffic data...',
+    trafficEmptyDisconnected: 'Connect to monitor 60s traffic throughput',
 
     // Servers & Profiles
     serversTitle: 'Servers',
@@ -147,6 +156,14 @@ export const translations = {
     deleteConfigAria: 'Delete {name}',
     pingNodeAria: 'Test latency for {name}',
     personalCountry: 'Custom',
+    pingOptTitle: 'Ping Optimization',
+    pingOptToggleAria: 'Toggle automated Ping Optimization',
+    pingOptActiveDesc: 'Auto-sorts lowest latency first every {sec}s',
+    pingOptRunningDesc: 'Probing nodes & optimizing order...',
+    pingOptPausedDesc: 'Paused · Default server order',
+    pingOptJustNow: 'Updated just now',
+    pingOptUpdatedAgo: 'Updated {sec}s ago',
+    pingOptFastestTag: 'Fastest',
 
     // Donate Outbound
     donateTitle: 'Donate Outbound',
@@ -370,6 +387,15 @@ export const translations = {
     latencySecondsAgo: '{sec} ثانیه پیش',
     sessionTimeLabel: 'زمان نشست',
     sessionTimeAria: 'مدت زمان تجمعی نشست اتصال فعلی',
+    quickConnectTitle: 'اتصال سریع',
+    quickConnectToggleAria: 'تغییر وضعیت اتصال سریع VPN',
+    trafficChartTitle: 'ترافیک · ۶۰ ثانیه',
+    trafficChartAria: 'نمودار زنده سرعت دانلود و آپلود در ۶۰ ثانیه اخیر',
+    trafficDownloadLegend: 'دانلود',
+    trafficUploadLegend: 'آپلود',
+    trafficPeakLabel: 'بیشینه',
+    trafficEmptyConnected: 'در انتظار داده‌های زنده ترافیک...',
+    trafficEmptyDisconnected: 'برای مشاهده نمودار ترافیک ۶۰ ثانیه‌ای متصل شوید',
 
     // Servers & Profiles
     serversTitle: 'سرورها',
@@ -397,6 +423,14 @@ export const translations = {
     deleteConfigAria: 'حذف {name}',
     pingNodeAria: 'تست پینگ {name}',
     personalCountry: 'شخصی',
+    pingOptTitle: 'بهینه‌سازی خودکار پینگ',
+    pingOptToggleAria: 'تغییر وضعیت بهینه‌سازی خودکار پینگ',
+    pingOptActiveDesc: 'مرتب‌سازی خودکار کم‌تاخیرترین سرورها هر {sec} ثانیه',
+    pingOptRunningDesc: 'در حال تست پینگ و مرتب‌سازی سرورها...',
+    pingOptPausedDesc: 'متوقف · ترتیب پیش‌فرض سرورها',
+    pingOptJustNow: 'هم‌اکنون به‌روز شد',
+    pingOptUpdatedAgo: '{sec} ثانیه پیش به‌روز شد',
+    pingOptFastestTag: 'سریع‌ترین',
 
     // Donate Outbound
     donateTitle: 'اهدای اوتباند',

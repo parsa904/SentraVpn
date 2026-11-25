@@ -170,13 +170,15 @@ test('compares semver versions and validates GitHub Release URLs safely', () => 
   assert.equal(isSafeReleaseUrl('http://github.com/parsa904/SentraVpn/releases'), false);
 });
 
-test('validates credentials (8-char register rule) and 8-digit OTP in both EN and FA', () => {
+test('validates credentials (8-char register rule, email & @username sign-in) and 8-digit OTP in both EN and FA', () => {
   assert.ok(validateCredentialsForm('', '12345678', false, 'en'));
   assert.ok(validateCredentialsForm('ab', '12345678', true, 'fa'));
   assert.ok(validateCredentialsForm('valid_user', '1234567', true, 'en'));
   assert.ok(validateCredentialsForm('bad-user.name', 'secret123', true, 'en'));
   assert.equal(validateCredentialsForm('valid_user', 'secret123', true, 'en'), null);
   assert.equal(validateCredentialsForm('legacy.user', '1234', false, 'fa'), null);
+  assert.equal(validateCredentialsForm('@existing_user', 'secret123', false, 'fa'), null);
+  assert.equal(validateCredentialsForm('user.name+1@example.com', 'secret123', false, 'en'), null);
 
   assert.ok(validateOtpCode('', 'en'));
   assert.ok(validateOtpCode('12345', 'fa'));

@@ -147,10 +147,69 @@ impl AuthManager {
         }
     }
 
+    fn parse_session_payload(data: &serde_json::Value, fallback_username: &str) -> Result<SessionData, String> {
+        let sub_token = data
+            .get("subscription")
+            .and_then(|s| s.get("token"))
+            .and_then(|t| t.as_str())
+            .or_else(|| data.get("subscription_token").and_then(|t| t.as_str()))
+            .or_else(|| data.get("token").and_then(|t| t.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "پاسخ احراز هویت سرور فاقد توکن معتبر است.".to_string())?
+            .to_string();
+
+        let auth_token = data
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .or_else(|| data.get("auth_token").and_then(|v| v.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("jwt_sentra_{}", sub_token));
+
+        let tier = data
+            .get("subscription")
+            .and_then(|s| s.get("tier"))
+            .and_then(|t| t.as_str())
+            .or_else(|| data.get("tier").and_then(|t| t.as_str()))
+            .unwrap_or("Sentra Lite")
+            .to_string();
+
+        let uname = data
+            .get("user")
+            .and_then(|u| u.get("username"))
+            .and_then(|n| n.as_str())
+            .or_else(|| data.get("user").and_then(|u| u.get("first_name")).and_then(|n| n.as_str()))
+            .or_else(|| data.get("username").and_then(|n| n.as_str()))
+            .unwrap_or(fallback_username)
+            .to_string();
+
+        let remaining_bytes = data
+            .get("subscription")
+            .and_then(|s| s.get("remaining_bytes"))
+            .and_then(|b| b.as_i64())
+            .unwrap_or(10_737_418_240);
+
+        let expires_at = data
+            .get("subscription")
+            .and_then(|s| s.get("expires_at"))
+            .and_then(|e| e.as_str())
+            .map(|s| s.to_string());
+
+        Ok(SessionData {
+            auth_token,
+            subscription_token: sub_token,
+            tier,
+            username: uname,
+            remaining_bytes,
+            expires_at,
+        })
+    }
+
     /// Register a new account with username and password directly in the app
     pub async fn register_with_credentials(username: &str, password: &str) -> Result<SessionData, String> {
         let clean_username = username.trim().to_lowercase();
-        let clean_password = password.trim();
 
         if clean_username.len() < 3 || clean_username.len() > 32 {
             return Err("نام کاربری باید بین ۳ تا ۳۲ کاراکتر باشد.".to_string());
@@ -158,7 +217,7 @@ impl AuthManager {
         if !clean_username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err("نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و زیرخط (_) باشد.".to_string());
         }
-        if clean_password.len() < 8 {
+        if password.len() < 8 {
             return Err("رمز عبور باید حداقل ۸ کاراکتر باشد.".to_string());
         }
 
@@ -173,7 +232,7 @@ impl AuthManager {
 
         let request_payload = json!({
             "username": clean_username,
-            "password": clean_password,
+            "password": password,
             "device_identifier": dev_id,
             "device_name": dev_name,
             "os": if cfg!(target_os = "android") { "android" } else { "windows" },
@@ -210,22 +269,7 @@ impl AuthManager {
                     .await
                     .map_err(|e| format!("خطا در پردازش پاسخ سرور: {}", e))?;
 
-                let auth_token = data.get("access_token").and_then(|v| v.as_str()).unwrap_or("token_jwt_local").to_string();
-                let sub_token = data.get("subscription").and_then(|s| s.get("token")).and_then(|t| t.as_str()).unwrap_or("sub_token_default").to_string();
-                let tier = data.get("subscription").and_then(|s| s.get("tier")).and_then(|t| t.as_str()).unwrap_or("Sentra Lite").to_string();
-                let uname = data.get("user").and_then(|u| u.get("username")).and_then(|n| n.as_str()).unwrap_or(&clean_username).to_string();
-                let remaining_bytes = data.get("subscription").and_then(|s| s.get("remaining_bytes")).and_then(|b| b.as_i64()).unwrap_or(10_737_418_240);
-                let expires_at = data.get("subscription").and_then(|s| s.get("expires_at")).and_then(|e| e.as_str()).map(|s| s.to_string());
-
-                let session = SessionData {
-                    auth_token,
-                    subscription_token: sub_token,
-                    tier,
-                    username: uname,
-                    remaining_bytes,
-                    expires_at,
-                };
-
+                let session = Self::parse_session_payload(&data, &clean_username)?;
                 let _ = Self::save_session(&session);
                 Ok(session)
             }
@@ -249,12 +293,16 @@ impl AuthManager {
         }
     }
 
-    /// Login directly with username and password
+    /// Login directly with username or email and password
     pub async fn login_with_credentials(username: &str, password: &str) -> Result<SessionData, String> {
-        let clean_username = username.trim().to_lowercase();
-        let clean_password = password.trim();
+        let trimmed = username.trim().to_lowercase();
+        let clean_username = if trimmed.starts_with('@') && !trimmed[1..].contains('@') {
+            trimmed[1..].to_string()
+        } else {
+            trimmed
+        };
 
-        if clean_username.is_empty() || clean_password.is_empty() {
+        if clean_username.is_empty() || password.is_empty() {
             return Err("لطفاً نام کاربری و رمز عبور خود را وارد نمایید.".to_string());
         }
 
@@ -269,7 +317,7 @@ impl AuthManager {
 
         let request_payload = json!({
             "username": clean_username,
-            "password": clean_password,
+            "password": password,
             "device_identifier": dev_id,
             "device_name": dev_name,
             "os": if cfg!(target_os = "android") { "android" } else { "windows" },
@@ -306,22 +354,7 @@ impl AuthManager {
                     .await
                     .map_err(|e| format!("خطا در پردازش پاسخ سرور: {}", e))?;
 
-                let auth_token = data.get("access_token").and_then(|v| v.as_str()).unwrap_or("token_jwt_local").to_string();
-                let sub_token = data.get("subscription").and_then(|s| s.get("token")).and_then(|t| t.as_str()).unwrap_or("sub_token_default").to_string();
-                let tier = data.get("subscription").and_then(|s| s.get("tier")).and_then(|t| t.as_str()).unwrap_or("Sentra Lite").to_string();
-                let uname = data.get("user").and_then(|u| u.get("username")).and_then(|n| n.as_str()).unwrap_or(&clean_username).to_string();
-                let remaining_bytes = data.get("subscription").and_then(|s| s.get("remaining_bytes")).and_then(|b| b.as_i64()).unwrap_or(10_737_418_240);
-                let expires_at = data.get("subscription").and_then(|s| s.get("expires_at")).and_then(|e| e.as_str()).map(|s| s.to_string());
-
-                let session = SessionData {
-                    auth_token,
-                    subscription_token: sub_token,
-                    tier,
-                    username: uname,
-                    remaining_bytes,
-                    expires_at,
-                };
-
+                let session = Self::parse_session_payload(&data, &clean_username)?;
                 let _ = Self::save_session(&session);
                 Ok(session)
             }
@@ -437,54 +470,7 @@ impl AuthManager {
                     .await
                     .map_err(|e| format!("خطا در پردازش پاسخ سرور: {}", e))?;
 
-                let auth_token = data
-                    .get("access_token")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("token_jwt_local")
-                    .to_string();
-
-                let sub_token = data
-                    .get("subscription")
-                    .and_then(|s| s.get("token"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("sub_token_default")
-                    .to_string();
-
-                let tier = data
-                    .get("subscription")
-                    .and_then(|s| s.get("tier"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("Sentra Lite")
-                    .to_string();
-
-                let username = data
-                    .get("user")
-                    .and_then(|u| u.get("first_name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("کاربر")
-                    .to_string();
-
-                let remaining_bytes = data
-                    .get("subscription")
-                    .and_then(|s| s.get("remaining_bytes"))
-                    .and_then(|b| b.as_i64())
-                    .unwrap_or(10_737_418_240);
-
-                let expires_at = data
-                    .get("subscription")
-                    .and_then(|s| s.get("expires_at"))
-                    .and_then(|e| e.as_str())
-                    .map(|s| s.to_string());
-
-                let session = SessionData {
-                    auth_token,
-                    subscription_token: sub_token,
-                    tier,
-                    username,
-                    remaining_bytes,
-                    expires_at,
-                };
-
+                let session = Self::parse_session_payload(&data, "کاربر")?;
                 let _ = Self::save_session(&session);
                 Ok(session)
             }
@@ -519,9 +505,10 @@ impl AuthManager {
         }
     }
 
-    /// Fetch live user profile, subscription, devices, and ALL active outbounds from /api/v1/client/bootstrap
+    /// Fetch live user profile, subscription, devices, synced client state, and ALL active outbounds from /api/v1/client/bootstrap
     pub async fn fetch_bootstrap(subscription_token: &str) -> Result<serde_json::Value, String> {
         let client = Self::build_http_client()?;
+        let device_id = Self::get_or_create_device_id();
         let mut last_err = String::new();
 
         for base_url in get_backend_urls() {
@@ -529,6 +516,7 @@ impl AuthManager {
             match client
                 .get(&url)
                 .header("X-Subscription-Token", subscription_token)
+                .header("X-Device-Id", &device_id)
                 .send()
                 .await
             {
@@ -554,6 +542,136 @@ impl AuthManager {
         }
 
         Err(format!("خطا در همگام‌سازی اطلاعات از سرور: {}", last_err))
+    }
+
+    /// Fetch synced personal configs and client preferences from /api/v1/client/sync-state
+    pub async fn fetch_client_sync_state(subscription_token: &str) -> Result<serde_json::Value, String> {
+        let client = Self::build_http_client()?;
+        let device_id = Self::get_or_create_device_id();
+        let mut last_err = String::new();
+
+        for base_url in get_backend_urls() {
+            let url = format!("{}/api/v1/client/sync-state", base_url);
+            match client
+                .get(&url)
+                .header("X-Subscription-Token", subscription_token)
+                .header("X-Device-Id", &device_id)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    return resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .map_err(|e| format!("خطا در پردازش پاسخ همگام‌سازی: {}", e));
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if status.as_u16() == 401 || status.as_u16() == 403 {
+                        return Err(format!("AUTH_EXPIRED: {}", body));
+                    }
+                    last_err = format!("HTTP {} از {}", status, base_url);
+                }
+                Err(e) => {
+                    last_err = format!("{} ({})", base_url, e);
+                }
+            }
+        }
+
+        Err(format!("خطا در دریافت وضعیت همگام‌شده: {}", last_err))
+    }
+
+    /// Push personal configs and client preferences to /api/v1/client/sync-state
+    pub async fn push_client_sync_state(
+        subscription_token: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let client = Self::build_http_client()?;
+        let device_id = Self::get_or_create_device_id();
+        let mut last_err = String::new();
+
+        for base_url in get_backend_urls() {
+            let url = format!("{}/api/v1/client/sync-state", base_url);
+            match client
+                .put(&url)
+                .header("X-Subscription-Token", subscription_token)
+                .header("X-Device-Id", &device_id)
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    return resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .map_err(|e| format!("خطا در پردازش پاسخ همگام‌سازی: {}", e));
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if status.as_u16() == 401 || status.as_u16() == 403 {
+                        return Err(format!("AUTH_EXPIRED: {}", body));
+                    }
+                    last_err = format!("HTTP {} از {}", status, base_url);
+                }
+                Err(e) => {
+                    last_err = format!("{} ({})", base_url, e);
+                }
+            }
+        }
+
+        Err(format!("خطا در ذخیره وضعیت همگام‌شده: {}", last_err))
+    }
+
+    /// Send a real-time usage/device heartbeat to /api/v1/client/heartbeat
+    pub async fn send_usage_heartbeat(
+        subscription_token: &str,
+        device_id: &str,
+        mode: &str,
+        delta_upload_bytes: i64,
+        delta_download_bytes: i64,
+    ) -> Result<serde_json::Value, String> {
+        let client = Self::build_http_client()?;
+        let payload = json!({
+            "device_id": device_id,
+            "mode": mode,
+            "delta_upload_bytes": delta_upload_bytes.max(0),
+            "delta_download_bytes": delta_download_bytes.max(0),
+        });
+        let mut last_err = String::new();
+
+        for base_url in get_backend_urls() {
+            let url = format!("{}/api/v1/client/heartbeat", base_url);
+            match client
+                .post(&url)
+                .header("X-Subscription-Token", subscription_token)
+                .header("X-Device-Id", device_id)
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    return resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .map_err(|e| format!("خطا در پردازش پاسخ مصرف: {}", e));
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    if status.as_u16() == 401 || status.as_u16() == 403 {
+                        return Err(format!("AUTH_EXPIRED: {}", body));
+                    }
+                    last_err = format!("HTTP {} از {}", status, base_url);
+                }
+                Err(e) => {
+                    last_err = format!("{} ({})", base_url, e);
+                }
+            }
+        }
+
+        Err(format!("خطا در ارسال گزارش مصرف به سرور: {}", last_err))
     }
 
     /// Submit a personal proxy URI as a community-donated outbound for Admin Telegram review

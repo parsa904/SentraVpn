@@ -809,6 +809,18 @@ pub async fn fetch_client_bootstrap(
                     s.username = uname.to_string();
                 }
             }
+            let refreshed_session = crate::auth::SessionData {
+                auth_token: s
+                    .auth_token
+                    .clone()
+                    .unwrap_or_else(|| format!("jwt_sentra_{}", token)),
+                subscription_token: token.clone(),
+                tier: s.tier.clone(),
+                username: s.username.clone(),
+                remaining_bytes: s.remaining_bytes,
+                expires_at: s.expires_at.clone(),
+            };
+            let _ = AuthManager::save_session(&refreshed_session);
             let out_count = data
                 .get("outbounds")
                 .and_then(|v| v.as_array())
@@ -1002,4 +1014,63 @@ pub async fn clear_persisted_session(
     s.tier = String::new();
     s.expires_at = None;
     Ok(true)
+}
+
+#[tauri::command]
+pub async fn fetch_client_state_from_server(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let token = {
+        let s = state.lock().await;
+        s.subscription_token.clone()
+    }
+    .ok_or("نشست فعالی یافت نشد. لطفاً وارد حساب خود شوید.".to_string())?;
+
+    AuthManager::fetch_client_sync_state(&token).await
+}
+
+#[tauri::command]
+pub async fn sync_client_state_to_server(
+    payload: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let token = {
+        let s = state.lock().await;
+        s.subscription_token.clone()
+    }
+    .ok_or("نشست فعالی یافت نشد. لطفاً وارد حساب خود شوید.".to_string())?;
+
+    AuthManager::push_client_sync_state(&token, payload).await
+}
+
+#[tauri::command]
+pub async fn report_usage_heartbeat(
+    mode: Option<String>,
+    delta_upload_bytes: i64,
+    delta_download_bytes: i64,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let (token, active_mode) = {
+        let s = state.lock().await;
+        (s.subscription_token.clone(), s.selected_mode.clone())
+    };
+    let token = token.ok_or("نشست فعالی یافت نشد. لطفاً وارد حساب خود شوید.".to_string())?;
+    let device_id = AuthManager::get_or_create_device_id();
+    let mode_to_send = mode.unwrap_or(active_mode);
+
+    let verdict = AuthManager::send_usage_heartbeat(
+        &token,
+        &device_id,
+        &mode_to_send,
+        delta_upload_bytes,
+        delta_download_bytes,
+    )
+    .await?;
+
+    if let Some(remaining) = verdict.get("remaining_bytes").and_then(|b| b.as_i64()) {
+        let mut s = state.lock().await;
+        s.remaining_bytes = remaining;
+    }
+
+    Ok(verdict)
 }

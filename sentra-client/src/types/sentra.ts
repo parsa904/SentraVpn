@@ -82,6 +82,39 @@ export interface LiveOutboundNode {
   uri?: string | null;
 }
 
+export interface SyncedClientPreferences {
+  selected_mode?: ConnectionModeId;
+  routing_mode?: RoutingMode;
+  split_tunneling?: boolean;
+  kill_switch?: boolean;
+  auto_reconnect?: boolean;
+  ping_optimization_enabled?: boolean;
+  use_warp?: boolean;
+  custom_dns?: string;
+  selected_outbound_id?: string | null;
+  auto_mode?: boolean;
+  lang?: 'fa' | 'en';
+  theme?: ThemeMode;
+}
+
+export interface SyncedClientState {
+  personal_configs: PersonalConfigItem[];
+  preferences: SyncedClientPreferences;
+  updated_at: string | null;
+}
+
+export interface HeartbeatVerdictResponse {
+  action: 'continue' | 'disconnect' | string;
+  code?: string;
+  message?: string;
+  remaining_bytes?: number;
+  used_bytes?: number;
+  tier?: string;
+  web_browsing_used_mb?: number;
+  download_used_mb?: number;
+  static_ip_used_mb?: number;
+}
+
 export interface BootstrapResponse {
   success: boolean;
   server_time: string;
@@ -91,6 +124,7 @@ export interface BootstrapResponse {
   devices: UserDeviceItem[];
   modes: ConnectionModeItem[];
   outbounds: LiveOutboundNode[];
+  client_state?: SyncedClientState;
 }
 
 export interface PersonalConfigItem {

@@ -1,6 +1,7 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
+  ArrowUpDown,
   Check,
   Gift,
   Plus,
@@ -17,6 +18,12 @@ import type {
 } from '../types/sentra';
 import { type Language, t } from '../i18n/translations';
 import { formatPing, getLatencyTier, type LatencyTier } from '../utils/proxyParser';
+import {
+  PING_OPT_INTERVAL_MS,
+  getElapsedSecondsSinceOptimization,
+  resolveOutboundLatency,
+  sortOutboundsByLatency,
+} from '../utils/pingOptimization';
 
 interface ProfilesViewProps {
   lang: Language;
@@ -39,6 +46,10 @@ interface ProfilesViewProps {
   onPingAllOutbounds: () => void;
   onDeletePersonalConfig: (id: string) => void;
   onOpenDonateModal: (cfg: PersonalConfigItem) => void;
+  pingOptimizationEnabled: boolean;
+  pingOptimizing: boolean;
+  lastPingOptimizedAt: number | null;
+  onTogglePingOptimization: (enabled: boolean) => void;
 }
 
 function latencyBadgeClasses(tier: LatencyTier): string {
@@ -76,9 +87,23 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
   onPingAllOutbounds,
   onDeletePersonalConfig,
   onOpenDonateModal,
+  pingOptimizationEnabled,
+  pingOptimizing,
+  lastPingOptimizedAt,
+  onTogglePingOptimization,
 }) => {
   const [search, setSearch] = useState('');
   const [protocolFilter, setProtocolFilter] = useState<string>('ALL');
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    if (!pingOptimizationEnabled || lastPingOptimizedAt === null) return;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [pingOptimizationEnabled, lastPingOptimizedAt]);
 
   const availableProtocols = useMemo(() => {
     const set = new Set<string>();
@@ -88,7 +113,7 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
 
   const filteredOutbounds = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return outbounds.filter((node) => {
+    const matched = outbounds.filter((node) => {
       if (protocolFilter !== 'ALL' && node.protocol.toUpperCase() !== protocolFilter) {
         return false;
       }
@@ -101,7 +126,11 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
         node.server_address.toLowerCase().includes(q)
       );
     });
-  }, [outbounds, search, protocolFilter]);
+    return pingOptimizationEnabled ? sortOutboundsByLatency(matched, livePings) : matched;
+  }, [outbounds, search, protocolFilter, pingOptimizationEnabled, livePings]);
+
+  const elapsedSeconds = getElapsedSecondsSinceOptimization(lastPingOptimizedAt, nowMs);
+  const intervalSeconds = Math.round(PING_OPT_INTERVAL_MS / 1000);
 
   const totalTestable = outbounds.length + personalConfigs.filter((c) => !c.is_subscription).length;
 
@@ -223,6 +252,81 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
             )}
           </div>
 
+          {/* Automated Ping Optimization Control Bar */}
+          {outbounds.length > 0 && (
+            <div
+              data-testid="ping-optimization-bar"
+              className="flex items-center justify-between gap-3 rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900/80 px-3.5 py-2.5"
+            >
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span
+                  className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors duration-150 ${
+                    pingOptimizationEnabled
+                      ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400'
+                  }`}
+                >
+                  <ArrowUpDown
+                    size={15}
+                    className={pingOptimizing ? 'animate-spin' : ''}
+                    aria-hidden="true"
+                  />
+                </span>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                    <span className="text-xs font-semibold text-slate-900 dark:text-white whitespace-nowrap">
+                      {t(lang, 'pingOptTitle')}
+                    </span>
+                    {pingOptimizationEnabled && elapsedSeconds !== null && !pingOptimizing && (
+                      <>
+                        <span aria-hidden="true" className="text-slate-300 dark:text-slate-600">
+                          ·
+                        </span>
+                        <span className="font-mono text-[11px] tabular-nums text-emerald-600 dark:text-emerald-400 whitespace-nowrap">
+                          {elapsedSeconds < 2
+                            ? t(lang, 'pingOptJustNow')
+                            : t(lang, 'pingOptUpdatedAgo', { sec: elapsedSeconds })}
+                        </span>
+                      </>
+                    )}
+                  </div>
+                  <p
+                    data-testid="ping-optimization-status"
+                    className="truncate text-[11px] text-slate-500 dark:text-slate-400"
+                  >
+                    {!pingOptimizationEnabled
+                      ? t(lang, 'pingOptPausedDesc')
+                      : pingOptimizing || testingAll
+                      ? t(lang, 'pingOptRunningDesc')
+                      : t(lang, 'pingOptActiveDesc', { sec: intervalSeconds })}
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                role="switch"
+                dir="ltr"
+                data-testid="ping-optimization-toggle"
+                aria-checked={pingOptimizationEnabled}
+                aria-label={t(lang, 'pingOptToggleAria')}
+                onClick={() => onTogglePingOptimization(!pingOptimizationEnabled)}
+                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-slate-950 ${
+                  pingOptimizationEnabled
+                    ? 'bg-emerald-600 dark:bg-emerald-500'
+                    : 'bg-slate-300 dark:bg-slate-700'
+                }`}
+              >
+                <span
+                  aria-hidden="true"
+                  className={`inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-150 ${
+                    pingOptimizationEnabled ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+          )}
+
           {/* Outbounds List */}
           {filteredOutbounds.length === 0 ? (
             <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-slate-300 dark:border-slate-800 bg-white/60 dark:bg-slate-900/40 px-6 py-12 text-center">
@@ -250,22 +354,30 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
               )}
             </div>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {filteredOutbounds.map((node) => {
+            <div
+              data-testid="outbounds-list"
+              className="grid grid-cols-1 md:grid-cols-2 gap-3"
+            >
+              {filteredOutbounds.map((node, index) => {
                 const isSelected =
                   !autoMode && activeServer?.kind === 'server' && activeServer.id === node.id;
                 const tested = node.id in livePings;
-                const ping = tested
-                  ? livePings[node.id]
-                  : node.latency_ms > 0
-                  ? node.latency_ms
-                  : null;
+                const resolved = resolveOutboundLatency(node, livePings);
+                const ping = resolved.latencyMs;
                 const isPinging = Boolean(pingingIds[node.id]);
                 const tier = getLatencyTier(ping, tested);
+                const isTopFastest =
+                  pingOptimizationEnabled &&
+                  index === 0 &&
+                  node.is_online !== false &&
+                  ping !== null &&
+                  filteredOutbounds.length > 1;
 
                 return (
                   <div
                     key={node.id}
+                    data-testid="outbound-card"
+                    data-outbound-id={node.id}
                     className={`flex items-center justify-between gap-3 rounded-2xl border p-4 transition duration-150 ${
                       isSelected
                         ? 'border-emerald-500 bg-emerald-500/[0.06] dark:bg-emerald-500/[0.08]'
@@ -301,6 +413,17 @@ export const ProfilesView: React.FC<ProfilesViewProps> = ({
                               ? t(lang, 'officialServer')
                               : t(lang, 'communityServer')}
                           </span>
+                          {isTopFastest && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span
+                                data-testid="outbound-fastest-label"
+                                className="font-semibold text-emerald-600 dark:text-emerald-400"
+                              >
+                                {t(lang, 'pingOptFastestTag')}
+                              </span>
+                            </>
+                          )}
                         </div>
                       </div>
                     </button>

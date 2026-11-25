@@ -151,7 +151,10 @@ async fn main() -> anyhow::Result<()> {
     info!("👉 V2Ray/Sing-box Sub:    GET  http://{}/api/v1/sub/{{token}}", addr);
     info!("👉 System Health:         GET  http://{}/health", addr);
 
-    axum::serve(listener, app)
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

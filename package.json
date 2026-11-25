@@ -7,7 +7,8 @@
     "sentra-client"
   ],
   "scripts": {
-    "dev": "npm run dev --workspace=sentra-connect",
+    "dev": "tsx server.ts",
+    "start": "NODE_ENV=production node server.ts",
     "build": "npm run build --workspace=sentra-connect",
     "lint": "npm run lint --workspace=sentra-connect",
     "preview": "npm run preview --workspace=sentra-connect"
@@ -15,14 +16,17 @@
   "dependencies": {
     "@tailwindcss/vite": "^4.3.5",
     "@types/d3": "^7.4.3",
+    "@types/express": "^5.0.6",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^4.3.4",
     "d3": "^7.9.2",
+    "express": "^5.3.0",
     "lucide-react": "^1.78.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "tailwindcss": "^4.3.5",
+    "tsx": "^4.23.15",
     "vite": "^5.4.21"
   }
 }

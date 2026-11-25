@@ -377,20 +377,29 @@ export function validateCredentialsForm(
   if (!u) {
     return lang === 'fa' ? 'نام کاربری نمی‌تواند خالی باشد.' : 'Username is required.';
   }
-  if (u.length < 3 || u.length > 32) {
-    return lang === 'fa'
-      ? 'نام کاربری باید بین ۳ تا ۳۲ کاراکتر باشد.'
-      : 'Username must be between 3 and 32 characters.';
-  }
-  const pattern = isRegister ? /^[a-zA-Z0-9_]+$/ : /^[a-zA-Z0-9_.-]+$/;
-  if (!pattern.test(u)) {
-    return isRegister
-      ? lang === 'fa'
+  if (isRegister) {
+    if (u.length < 3 || u.length > 32) {
+      return lang === 'fa'
+        ? 'نام کاربری باید بین ۳ تا ۳۲ کاراکتر باشد.'
+        : 'Username must be between 3 and 32 characters.';
+    }
+    if (!/^[a-zA-Z0-9_]+$/.test(u)) {
+      return lang === 'fa'
         ? 'نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و زیرخط (_) باشد.'
-        : 'Username can only contain letters, numbers, and underscores (_).'
-      : lang === 'fa'
-      ? 'نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و _ . - باشد.'
-      : 'Username can only contain letters, numbers, and _ . - characters.';
+        : 'Username can only contain letters, numbers, and underscores (_).';
+    }
+  } else {
+    const cleanSignIn = u.startsWith('@') && !u.slice(1).includes('@') ? u.slice(1) : u;
+    if (cleanSignIn.length < 2 || cleanSignIn.length > 254) {
+      return lang === 'fa'
+        ? 'نام کاربری یا ایمیل واردشده معتبر نیست.'
+        : 'Enter a valid username or email address.';
+    }
+    if (!/^[a-zA-Z0-9_.@+-]+$/.test(cleanSignIn)) {
+      return lang === 'fa'
+        ? 'نام کاربری یا ایمیل فقط می‌تواند شامل حروف انگلیسی، اعداد و کاراکترهای مجاز باشد.'
+        : 'Username or email contains unsupported characters.';
+    }
   }
   if (!password) {
     return lang === 'fa' ? 'رمز عبور را وارد کنید.' : 'Password is required.';
