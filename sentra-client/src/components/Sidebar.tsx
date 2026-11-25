@@ -12,6 +12,7 @@ import {
 import type { NavTab, ThemeMode } from '../types/sentra';
 import { type Language, type TranslationKey, t } from '../i18n/translations';
 import { SentraLogo } from './SentraLogo';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface SidebarProps {
   lang: Language;
@@ -111,6 +112,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         {/* Bottom Utility Actions */}
         <div className="border-t border-slate-200/70 dark:border-slate-800/80 p-3 space-y-1">
+          <PWAInstallButton lang={lang} variant="sidebar" />
           <button
             type="button"
             onClick={onToggleTheme}

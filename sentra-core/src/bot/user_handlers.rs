@@ -1,14 +1,17 @@
 use crate::bot::keyboards::{
-    back_to_main_inline_keyboard, cancel_and_back_inline_keyboard, download_app_inline_keyboard,
-    ios_modes_inline_keyboard, ios_protocol_choice_keyboard, subscription_status_inline_keyboard,
-    upgrade_plans_inline_keyboard, user_devices_inline_keyboard, user_main_keyboard_with_admin,
+    auth_choice_inline_keyboard, auth_retry_inline_keyboard, back_to_main_inline_keyboard,
+    cancel_and_back_inline_keyboard, download_app_inline_keyboard, ios_modes_inline_keyboard,
+    ios_protocol_choice_keyboard, subscription_status_inline_keyboard,
+    upgrade_plans_inline_keyboard, user_account_inline_keyboard, user_devices_inline_keyboard,
+    user_main_keyboard_for_user,
 };
 use crate::compiler;
 use crate::db::{DbPool, Repository};
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use teloxide::prelude::*;
-use teloxide::types::{InputFile, ParseMode};
+use teloxide::types::{InputFile, KeyboardMarkup, ParseMode};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,12 +19,51 @@ pub enum UserState {
     AwaitingDonationLink,
     AwaitingReceiptPhoto,
     AwaitingLinkCode,
+    AwaitingAppLoginUsername,
+    AwaitingAppLoginPassword { username: String },
 }
 
 static USER_STATES: OnceLock<RwLock<HashMap<i64, UserState>>> = OnceLock::new();
+static LOGIN_FAILURE_TRACKER: OnceLock<RwLock<HashMap<i64, Vec<Instant>>>> = OnceLock::new();
+
+const LOGIN_MAX_FAILED_ATTEMPTS: usize = 5;
+const LOGIN_LOCKOUT_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 fn user_states_map() -> &'static RwLock<HashMap<i64, UserState>> {
     USER_STATES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn login_failure_map() -> &'static RwLock<HashMap<i64, Vec<Instant>>> {
+    LOGIN_FAILURE_TRACKER.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+async fn is_login_rate_limited(telegram_id: i64) -> bool {
+    let now = Instant::now();
+    let mut map = login_failure_map().write().await;
+    let entries = map.entry(telegram_id).or_default();
+    entries.retain(|t| now.duration_since(*t) < LOGIN_LOCKOUT_WINDOW);
+    entries.len() >= LOGIN_MAX_FAILED_ATTEMPTS
+}
+
+async fn record_failed_login(telegram_id: i64) {
+    let now = Instant::now();
+    let mut map = login_failure_map().write().await;
+    let entries = map.entry(telegram_id).or_default();
+    entries.retain(|t| now.duration_since(*t) < LOGIN_LOCKOUT_WINDOW);
+    entries.push(now);
+}
+
+async fn clear_failed_logins(telegram_id: i64) {
+    let mut map = login_failure_map().write().await;
+    map.remove(&telegram_id);
 }
 
 pub async fn set_user_state(telegram_id: i64, state: UserState) {
@@ -39,17 +81,48 @@ pub async fn clear_user_state(telegram_id: i64) {
     map.remove(&telegram_id);
 }
 
+/// Resolve the right main keyboard ("📝 ثبت نام" vs "👤 حساب کاربری") for any Telegram user
+pub async fn resolve_user_main_keyboard(
+    pool: &DbPool,
+    telegram_id: i64,
+    admin_chat_id: i64,
+) -> KeyboardMarkup {
+    let is_registered = Repository::get_user_by_telegram_id(pool, telegram_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let is_admin = crate::bot::admin_handlers::is_authorized_admin(telegram_id, admin_chat_id);
+    user_main_keyboard_for_user(is_registered, is_admin)
+}
+
+/// Prompt an unregistered user to register or sign in with their app account before using account-bound features
+async fn prompt_registration_required(bot: &Bot, chat_id: ChatId) -> anyhow::Result<()> {
+    let text = r#"📝 <b>ابتدا ثبت‌نام یا ورود به حساب را انجام دهید</b>
+
+برای دسترسی به این بخش، لطفاً یکی از دو گزینه زیر را انتخاب نمایید:
+• <b>🆕 ثبت نام:</b> ایجاد فوری حساب و دریافت کد شناسایی اختصاصی
+• <b>🔐 ورود با حساب برنامه:</b> ورود با نام کاربری و رمز عبور اپلیکیشن ویندوز یا اندروید"#;
+
+    bot.send_message(chat_id, text)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(auth_choice_inline_keyboard())
+        .await?;
+    Ok(())
+}
+
 /// Global Back handler: clears any pending UserState or Admin*State and returns to main menu
 pub async fn handle_user_back_to_main_callback(
     bot: &Bot,
     q: &CallbackQuery,
+    pool: &DbPool,
     admin_chat_id: i64,
 ) -> anyhow::Result<()> {
     let tid = q.from.id.0 as i64;
     clear_user_state(tid).await;
     crate::bot::admin_handlers::clear_all_admin_states(tid).await;
 
-    let is_admin = crate::bot::admin_handlers::is_authorized_admin(tid, admin_chat_id);
+    let keyboard = resolve_user_main_keyboard(pool, tid, admin_chat_id).await;
 
     let _ = bot
         .answer_callback_query(q.id.clone())
@@ -63,7 +136,7 @@ pub async fn handle_user_back_to_main_callback(
                 "🏠 <b>منوی اصلی ربات سنترا (Sentra)</b>\n\nعملیات قبلی بسته شد. لطفاً یکی از گزینه‌های زیر را انتخاب نمایید:",
             )
             .parse_mode(ParseMode::Html)
-            .reply_markup(user_main_keyboard_with_admin(is_admin))
+            .reply_markup(keyboard)
             .await;
     }
 
@@ -81,36 +154,59 @@ pub async fn handle_start(
         None => return Ok(()),
     };
 
-    let user = Repository::get_or_create_user(
-        pool,
-        telegram_user.id.0 as i64,
-        telegram_user.username.as_deref(),
-        &telegram_user.first_name,
-        telegram_user.last_name.as_deref(),
-    )
-    .await?;
+    let tid = telegram_user.id.0 as i64;
+    let is_admin_user = admin_chat_id != 0 && (tid == admin_chat_id);
+    let safe_first_name = escape_html(&telegram_user.first_name);
 
-    let sub = Repository::create_or_ensure_lite_subscription(pool, user.id).await?;
-    let is_admin_user = admin_chat_id != 0 && (telegram_user.id.0 as i64 == admin_chat_id);
+    // Do NOT auto-register first-time users on /start; let them choose Register or Login with App Account
+    let existing_user = Repository::get_user_by_telegram_id(pool, tid).await?;
+
+    let Some(user) = existing_user else {
+        let mut welcome = format!(
+            r#"👋 درود <b>{}</b> گرامی، به پلتفرم هوشمند ضدسانسور <b>سنترا (Sentra)</b> خوش آمدید!
+
+برای شروع استفاده از سرویس و همگام‌سازی اشتراک بین ربات تلگرام، ویندوز و اندروید، روی دکمه <b>«📝 ثبت نام»</b> در بالای منو بزنید:
+• <b>🆕 ثبت نام:</b> ساخت فوری حساب و دریافت کد شناسایی اختصاصی
+• <b>🔐 ورود با حساب برنامه:</b> اتصال اکانت موجود شما در اپلیکیشن با نام کاربری و رمز عبور"#,
+            safe_first_name
+        );
+
+        if is_admin_user {
+            welcome.push_str("\n\n👑 <i>دسترسی مدیر کل فعال است. برای ورود به پنل ادمین دستور /admin را ارسال کنید.</i>");
+        }
+
+        bot.send_message(msg.chat.id, welcome)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(user_main_keyboard_for_user(false, is_admin_user))
+            .await?;
+
+        return Ok(());
+    };
+
+    let mut sub = Repository::create_or_ensure_lite_subscription(pool, user.id).await?;
+    let _ = Repository::check_and_reset_daily_quota(pool, &mut sub).await;
     let total_used_bytes = (sub.upload_bytes + sub.download_bytes).max(0);
     let remaining_gb = (sub.traffic_limit_bytes - total_used_bytes).max(0) as f64 / (1024.0 * 1024.0 * 1024.0);
     let total_limit_gb = sub.traffic_limit_bytes.max(0) as f64 / (1024.0 * 1024.0 * 1024.0);
     let linked_line = match &user.username {
-        Some(uname) if !uname.trim().is_empty() => format!("• حساب همگام‌شده اپلیکیشن: <code>@{}</code>\n", uname),
+        Some(uname) if !uname.trim().is_empty() => format!("• نام کاربری: <code>@{}</code>\n", escape_html(uname)),
         _ => String::new(),
     };
 
     let mut text = format!(
-        r#"👋 درود <b>{}</b> گرامی، به پلتفرم هوشمند ضدسانسور <b>سنترا (Sentra)</b> خوش آمدید!
+        r#"👋 خوش آمدید <b>{}</b> گرامی!
 
-🛡 <b>مشخصات سرویس فعال شما (همگام با ویندوز و اندروید):</b>
-{}• سطح اشتراک: <code>{}</code>
+👤 <b>وضعیت حساب کاربری شما (همگام با ویندوز و اندروید):</b>
+{}• نوع اشتراک: <b>{}</b>
 • حجم باقیمانده: <b>{:.2} GB</b> از <code>{:.0} GB</code>
-• پروتکل پیش‌فرض: <code>Sing-box v1.10+ (TUN Mode)</code>
 • وضعیت شبکه: <b>🟢 پایدار و فعال</b>
 
-⚡ برای اتصال، دکمه <b>«🔑 دریافت کانفیگ و کد اتصال»</b> را بزنید یا جهت استفاده تخصصی از <b>Google Flow و Gemini</b> پلن خود را ارتقا دهید."#,
-        user.first_name, linked_line, sub.tier, remaining_gb, total_limit_gb
+برای مشاهده جزئیات مصرف و اشتراک، روی دکمه <b>«👤 حساب کاربری»</b> در بالای منو بزنید."#,
+        escape_html(&user.first_name),
+        linked_line,
+        escape_html(&sub.tier),
+        remaining_gb,
+        total_limit_gb
     );
 
     if is_admin_user {
@@ -119,49 +215,175 @@ pub async fn handle_start(
 
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
-        .reply_markup(user_main_keyboard_with_admin(is_admin_user))
+        .reply_markup(user_main_keyboard_for_user(true, is_admin_user))
         .await?;
 
     Ok(())
 }
 
-pub async fn handle_free_account(bot: &Bot, msg: &Message, pool: &DbPool) -> anyhow::Result<()> {
+/// Handle tapping the big "📝 ثبت نام" button: shows two options (Register / Login with App Account)
+pub async fn handle_register_menu(
+    bot: &Bot,
+    msg: &Message,
+    pool: &DbPool,
+    admin_chat_id: i64,
+) -> anyhow::Result<()> {
     let telegram_user = match msg.from.as_ref() {
         Some(u) => u,
         None => return Ok(()),
     };
+    let tid = telegram_user.id.0 as i64;
+
+    // If user is already registered, refresh keyboard to "👤 حساب کاربری" and open their Account card
+    if Repository::get_user_by_telegram_id(pool, tid).await?.is_some() {
+        let is_admin = crate::bot::admin_handlers::is_authorized_admin(tid, admin_chat_id);
+        let _ = bot
+            .send_message(msg.chat.id, "✅ حساب کاربری شما از قبل ثبت شده است.")
+            .reply_markup(user_main_keyboard_for_user(true, is_admin))
+            .await;
+        return handle_user_account_info(bot, msg, pool, admin_chat_id).await;
+    }
+
+    let text = r#"📝 <b>ثبت‌نام و ورود به حساب سنترا (Sentra)</b>
+
+لطفاً یکی از دو گزینه زیر را انتخاب نمایید:
+
+• <b>🆕 ثبت نام:</b> اگر هنوز حسابی ندارید، با یک کلیک ثبت‌نام کنید تا کد شناسایی شما صادر شود.
+• <b>🔐 ورود با حساب برنامه:</b> اگر قبلاً در اپلیکیشن ویندوز یا اندروید حساب ساخته‌اید، با نام کاربری و رمز عبور خود وارد شوید تا تمام اطلاعات شما همگام شود."#;
+
+    bot.send_message(msg.chat.id, text)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(auth_choice_inline_keyboard())
+        .await?;
+
+    Ok(())
+}
+
+/// Handle inline callback "auth_register_new": registers user and reveals ONLY their identification code, then switches menu to "👤 حساب کاربری"
+pub async fn handle_register_new_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+    admin_chat_id: i64,
+) -> anyhow::Result<()> {
+    let telegram_user = &q.from;
+    let tid = telegram_user.id.0 as i64;
+    let is_admin = crate::bot::admin_handlers::is_authorized_admin(tid, admin_chat_id);
+
+    clear_user_state(tid).await;
 
     let user = Repository::get_or_create_user(
         pool,
-        telegram_user.id.0 as i64,
+        tid,
         telegram_user.username.as_deref(),
         &telegram_user.first_name,
         telegram_user.last_name.as_deref(),
     )
     .await?;
 
-    let sub = Repository::create_or_ensure_lite_subscription(pool, user.id).await?;
-    let code = Repository::generate_auth_code(pool, user.id).await?;
+    let _sub = Repository::create_or_ensure_lite_subscription(pool, user.id).await?;
 
-    let remaining_gb = ((sub.traffic_limit_bytes - (sub.upload_bytes + sub.download_bytes)).max(0)) as f64
-        / (1024.0 * 1024.0 * 1024.0);
+    let _ = bot
+        .answer_callback_query(q.id.clone())
+        .text("✅ ثبت‌نام شما با موفقیت انجام شد.")
+        .await;
 
     let text = format!(
-        r#"🎁 <b>اشتراک رایگان Sentra Lite شما صادر شد:</b>
+        r#"✅ <b>ثبت‌نام شما با موفقیت انجام شد!</b>
 
-• شناسه کاربر: <code>{}</code>
-• توکن اتصال: <code>{}</code>
-• حجم باقیمانده: <b>{:.2} گیگابایت</b>
-• سقف سرعت: <code>10 Mbps</code>
-• کد ۸ رقمی اپلیکیشن: <b><code>{}</code></b>
-• تاریخ انقضا: <code>{}</code>
+🆔 <b>کد شناسایی شما:</b> <code>{}</code>
 
-💡 <i>کد بالا را داخل نرم‌افزار Sentra Connect وارد کنید تا تانل ایمن فوراً فعال شود.</i>"#,
-        user.id,
-        sub.token,
-        remaining_gb,
-        code,
-        sub.expires_at.format("%Y-%m-%d %H:%M UTC")
+از این پس می‌توانید حجم مصرفی و نوع اشتراک خود را از دکمه <b>«👤 حساب کاربری»</b> مشاهده نمایید."#,
+        user.id
+    );
+
+    if let Some(msg) = &q.message {
+        bot.send_message(msg.chat().id, text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(user_main_keyboard_for_user(true, is_admin))
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// Handle inline callback "auth_login_app": begins username + password sign-in for existing app accounts
+pub async fn handle_app_login_start_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+) -> anyhow::Result<()> {
+    let tid = q.from.id.0 as i64;
+
+    if is_login_rate_limited(tid).await {
+        let _ = bot
+            .answer_callback_query(q.id.clone())
+            .text("⛔ به دلیل تلاش‌های ناموفق متعدد، لطفاً ۱۵ دقیقه دیگر دوباره تلاش کنید.")
+            .show_alert(true)
+            .await;
+        return Ok(());
+    }
+
+    set_user_state(tid, UserState::AwaitingAppLoginUsername).await;
+    let _ = bot.answer_callback_query(q.id.clone()).await;
+
+    let text = r#"🔐 <b>ورود با حساب اپلیکیشن Sentra</b>
+
+لطفاً <b>نام کاربری (Username)</b> یا <b>ایمیل</b> حساب خود در برنامه ویندوز/اندروید را ارسال نمایید:"#;
+
+    if let Some(msg) = &q.message {
+        bot.send_message(msg.chat().id, text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(back_to_main_inline_keyboard())
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// Step 1 of app credential login inside Telegram: capture username and ask for password
+pub async fn handle_app_login_username_input(
+    bot: &Bot,
+    msg: &Message,
+    raw_username: &str,
+) -> anyhow::Result<()> {
+    let telegram_user = match msg.from.as_ref() {
+        Some(u) => u,
+        None => return Ok(()),
+    };
+    let tid = telegram_user.id.0 as i64;
+
+    let trimmed = raw_username.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 || trimmed.contains('\n') {
+        bot.send_message(
+            msg.chat.id,
+            "⚠️ نام کاربری واردشده معتبر نیست. لطفاً نام کاربری یا ایمیل حساب برنامه خود را ارسال کنید:",
+        )
+        .reply_markup(back_to_main_inline_keyboard())
+        .await?;
+        return Ok(());
+    }
+
+    let clean_username = if trimmed.starts_with('@') && !trimmed[1..].contains('@') {
+        trimmed[1..].to_string()
+    } else {
+        trimmed.to_string()
+    };
+
+    set_user_state(
+        tid,
+        UserState::AwaitingAppLoginPassword {
+            username: clean_username.clone(),
+        },
+    )
+    .await;
+
+    let text = format!(
+        r#"🔑 <b>ورود به حساب <code>{}</code></b>
+
+لطفاً <b>رمز عبور (Password)</b> حساب خود را ارسال نمایید:
+
+🛡 <i>پیام حاوی رمز عبور جهت حفظ امنیت بلافاصله پس از بررسی از چت حذف خواهد شد.</i>"#,
+        escape_html(&clean_username)
     );
 
     bot.send_message(msg.chat.id, text)
@@ -169,6 +391,272 @@ pub async fn handle_free_account(bot: &Bot, msg: &Message, pool: &DbPool) -> any
         .reply_markup(back_to_main_inline_keyboard())
         .await?;
 
+    Ok(())
+}
+
+/// Step 2 of app credential login inside Telegram: delete password message, verify via Argon2, and link account
+pub async fn handle_app_login_password_input(
+    bot: &Bot,
+    msg: &Message,
+    pool: &DbPool,
+    admin_chat_id: i64,
+    username: &str,
+    raw_password: &str,
+) -> anyhow::Result<()> {
+    // Immediately delete the user's message containing plaintext password from Telegram chat
+    let _ = bot.delete_message(msg.chat.id, msg.id).await;
+
+    let telegram_user = match msg.from.as_ref() {
+        Some(u) => u,
+        None => return Ok(()),
+    };
+    let tid = telegram_user.id.0 as i64;
+    let is_admin = crate::bot::admin_handlers::is_authorized_admin(tid, admin_chat_id);
+
+    clear_user_state(tid).await;
+
+    if is_login_rate_limited(tid).await {
+        bot.send_message(
+            msg.chat.id,
+            "⛔ به دلیل تلاش‌های ناموفق متعدد، امکان ورود موقتاً به مدت ۱۵ دقیقه محدود شده است.",
+        )
+        .reply_markup(back_to_main_inline_keyboard())
+        .await?;
+        return Ok(());
+    }
+
+    if raw_password.trim().is_empty() || raw_password.len() > 256 {
+        record_failed_login(tid).await;
+        bot.send_message(
+            msg.chat.id,
+            "❌ نام کاربری یا رمز عبور اشتباه است.",
+        )
+        .reply_markup(auth_retry_inline_keyboard())
+        .await?;
+        return Ok(());
+    }
+
+    match Repository::login_and_link_telegram_account(
+        pool,
+        tid,
+        username,
+        raw_password,
+        &telegram_user.first_name,
+    )
+    .await
+    {
+        Ok((user, sub)) => {
+            clear_failed_logins(tid).await;
+            let total_used_bytes = (sub.upload_bytes + sub.download_bytes).max(0);
+            let used_gb = total_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            let limit_gb = sub.traffic_limit_bytes.max(0) as f64 / (1024.0 * 1024.0 * 1024.0);
+            let rem_gb = (sub.traffic_limit_bytes - total_used_bytes).max(0) as f64 / (1024.0 * 1024.0 * 1024.0);
+            let display_uname = user
+                .username
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(username);
+
+            let text = format!(
+                r#"✅ <b>ورود با حساب برنامه با موفقیت انجام شد!</b>
+
+👤 <b>نام کاربری:</b> <code>@{}</code>
+🆔 <b>کد شناسایی:</b> <code>{}</code>
+💎 <b>نوع اشتراک:</b> <b>{}</b>
+📊 <b>حجم مصرفی:</b> <b>{:.2} GB</b> مصرف‌شده / <b>{:.2} GB</b> باقیمانده (از {:.0} GB)
+
+از این پس حساب شما در ربات تلگرام، ویندوز و اندروید کاملاً همگام است و می‌توانید از دکمه <b>«👤 حساب کاربری»</b> استفاده نمایید."#,
+                escape_html(display_uname),
+                user.id,
+                escape_html(&sub.tier),
+                used_gb,
+                rem_gb,
+                limit_gb
+            );
+
+            bot.send_message(msg.chat.id, text)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(user_main_keyboard_for_user(true, is_admin))
+                .await?;
+        }
+        Err(e) => {
+            record_failed_login(tid).await;
+            let err_msg = match e {
+                crate::error::CoreError::AuthFailed(m) | crate::error::CoreError::AccountSuspended(m) => m,
+                _ => "نام کاربری یا رمز عبور اشتباه است.".to_string(),
+            };
+            bot.send_message(
+                msg.chat.id,
+                format!("❌ <b>ورود ناموفق:</b>\n\n{}", escape_html(&err_msg)),
+            )
+            .parse_mode(ParseMode::Html)
+            .reply_markup(auth_retry_inline_keyboard())
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle tapping the big "👤 حساب کاربری" button for registered users (shows consumed traffic & subscription type)
+pub async fn handle_user_account_info(
+    bot: &Bot,
+    msg: &Message,
+    pool: &DbPool,
+    admin_chat_id: i64,
+) -> anyhow::Result<()> {
+    let telegram_user = match msg.from.as_ref() {
+        Some(u) => u,
+        None => return Ok(()),
+    };
+    let tid = telegram_user.id.0 as i64;
+    let is_admin = crate::bot::admin_handlers::is_authorized_admin(tid, admin_chat_id);
+
+    let Some(user) = Repository::get_user_by_telegram_id(pool, tid).await? else {
+        return handle_register_menu(bot, msg, pool, admin_chat_id).await;
+    };
+
+    let mut sub = Repository::create_or_ensure_lite_subscription(pool, user.id).await?;
+    let _ = Repository::check_and_reset_daily_quota(pool, &mut sub).await;
+    let devices = Repository::get_user_devices(pool, user.id).await?;
+
+    let is_pro = sub.tier != "Sentra Lite";
+    let total_used_bytes = (sub.upload_bytes + sub.download_bytes).max(0);
+    let total_used_gb = total_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let total_limit_gb = sub.traffic_limit_bytes.max(0) as f64 / (1024.0 * 1024.0 * 1024.0);
+    let total_rem_gb = (sub.traffic_limit_bytes - total_used_bytes).max(0) as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    let usage_percent = if sub.traffic_limit_bytes > 0 {
+        ((total_used_bytes as f64 / sub.traffic_limit_bytes as f64) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+
+    let mode_usage_block = if is_pro {
+        let static_used_gb = sub.static_ip_used_mb as f64 / 1024.0;
+        let static_rem_gb = (30.0 - static_used_gb).max(0.0);
+        format!(
+            "🌐 <b>وب‌گردی:</b> نامحدود\n📥 <b>دانلود:</b> نامحدود\n🔒 <b>آی‌پی ثابت:</b> {:.2} GB مصرف‌شده / {:.2} GB باقیمانده",
+            static_used_gb, static_rem_gb
+        )
+    } else {
+        let wb_used = sub.web_browsing_used_mb as f64 / 1024.0;
+        let dl_used = sub.download_used_mb as f64 / 1024.0;
+        format!(
+            "🌐 <b>مصرف امروز وب‌گردی:</b> {:.2} GB از ۲.۰۰ GB\n📥 <b>مصرف امروز دانلود:</b> {:.2} GB از ۳.۰۰ GB",
+            wb_used, dl_used
+        )
+    };
+
+    let account_name = user
+        .username
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|u| format!("@{}", escape_html(u)))
+        .unwrap_or_else(|| escape_html(&user.first_name));
+
+    let text = format!(
+        r#"👤 <b>حساب کاربری سنترا (Sentra)</b>
+
+🆔 <b>کد شناسایی:</b> <code>{}</code>
+👤 <b>نام کاربری:</b> <code>{}</code>
+💎 <b>نوع اشتراک:</b> <b>{}</b> (<code>{}</code>)
+📅 <b>اعتبار اشتراک:</b> <code>{}</code>
+
+📊 <b>میزان مصرف حجم:</b>
+• مصرف‌شده: <b>{:.2} GB</b> ({:.1}%)
+• باقیمانده: <b>{:.2} GB</b> از <code>{:.0} GB</code>
+
+{}
+
+📱 <b>دستگاه‌های متصل:</b> <b>{} از {} دستگاه مجاز</b>"#,
+        user.id,
+        account_name,
+        escape_html(&sub.tier),
+        escape_html(&sub.status),
+        sub.expires_at.format("%Y-%m-%d %H:%M UTC"),
+        total_used_gb,
+        usage_percent,
+        total_rem_gb,
+        total_limit_gb,
+        mode_usage_block,
+        devices.len(),
+        sub.max_concurrent_devices.max(3)
+    );
+
+    bot.send_message(msg.chat.id, text)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(user_account_inline_keyboard(devices.len()))
+        .await?;
+
+    // Keep persistent keyboard synced as registered
+    let _ = is_admin;
+    Ok(())
+}
+
+/// Inline callback from Account card: generate fresh 8-digit app login code
+pub async fn handle_account_get_code_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+) -> anyhow::Result<()> {
+    let tid = q.from.id.0 as i64;
+    let Some(user) = Repository::get_user_by_telegram_id(pool, tid).await? else {
+        let _ = bot
+            .answer_callback_query(q.id.clone())
+            .text("⚠️ لطفاً ابتدا ثبت‌نام یا ورود به حساب را انجام دهید.")
+            .show_alert(true)
+            .await;
+        return Ok(());
+    };
+
+    let code = Repository::generate_auth_code(pool, user.id).await?;
+    let _ = bot.answer_callback_query(q.id.clone()).text("✅ کد ورود صادر شد.").await;
+
+    if let Some(msg) = &q.message {
+        let text = format!(
+            r#"🔑 <b>کد ۸ رقمی ورود به اپلیکیشن Sentra Connect:</b>
+
+👉 <b><code>{}</code></b> 👈
+
+🆔 <b>کد شناسایی شما:</b> <code>{}</code>"#,
+            code, user.id
+        );
+        bot.send_message(msg.chat().id, text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(back_to_main_inline_keyboard())
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// Inline callback from Account card: open upgrade plans view
+pub async fn handle_account_upgrade_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+) -> anyhow::Result<()> {
+    let _ = bot.answer_callback_query(q.id.clone()).await;
+    if let Some(msg) = &q.message {
+        let text = r#"⚡ <b>تعرفه‌ها و پلن‌های ضدسانسور سنترا:</b>
+
+۱. <b>Sentra Lite (رایگان):</b>
+• ۱۰ گیگابایت ماهیانه | ۱ دستگاه همزمان | سرعت ۱۰ مگابیت
+
+۲. <b>Sentra Pro (حرفه‌ای):</b>
+• ۱۵۰ گیگابایت ماهیانه | ۳ دستگاه همزمان | سرعت ۱۰۰ مگابیت+
+• دسترسی به نودهای Shadow و Pulse
+
+۳. <b>Sentra Flow+ (اختصاصی هوش مصنوعی):</b>
+• حجم نامحدود (سقف منصفانه ۱ ترابایت) | ۱۰ دستگاه همزمان | سرعت گیگابیتی
+• <b>مجهز به IP مسکونی ثابت آمریکا (US Residential IP)</b>
+• ۱۰۰٪ تضمین‌شده برای کار بدون خطای ریجن با <b>Google Flow</b>، <b>Gemini</b> و <b>Claude</b>"#;
+
+        bot.send_message(msg.chat().id, text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(upgrade_plans_inline_keyboard())
+            .await?;
+    }
     Ok(())
 }
 
@@ -256,14 +744,9 @@ pub async fn handle_get_config_and_links(
         None => return Ok(()),
     };
 
-    let user = Repository::get_or_create_user(
-        pool,
-        telegram_user.id.0 as i64,
-        telegram_user.username.as_deref(),
-        &telegram_user.first_name,
-        telegram_user.last_name.as_deref(),
-    )
-    .await?;
+    let Some(user) = Repository::get_user_by_telegram_id(pool, telegram_user.id.0 as i64).await? else {
+        return prompt_registration_required(bot, msg.chat.id).await;
+    };
 
     let sub = Repository::create_or_ensure_lite_subscription(pool, user.id).await?;
     let code = Repository::generate_auth_code(pool, user.id).await?;
@@ -314,14 +797,9 @@ pub async fn handle_subscription_status(
         None => return Ok(()),
     };
 
-    let user = Repository::get_or_create_user(
-        pool,
-        telegram_user.id.0 as i64,
-        telegram_user.username.as_deref(),
-        &telegram_user.first_name,
-        telegram_user.last_name.as_deref(),
-    )
-    .await?;
+    let Some(user) = Repository::get_user_by_telegram_id(pool, telegram_user.id.0 as i64).await? else {
+        return prompt_registration_required(bot, msg.chat.id).await;
+    };
 
     let mut sub = Repository::create_or_ensure_lite_subscription(pool, user.id).await?;
     let _ = Repository::check_and_reset_daily_quota(pool, &mut sub).await;
@@ -478,7 +956,49 @@ pub async fn handle_ticket_callback(
     Ok(())
 }
 
-/// Prompt iOS user to pick one of the 4 connection modes for OpenVPN
+/// Builds smart entitlement-aware description text for the iOS config menu.
+fn build_ios_menu_text(tier: &str, gaming_enabled: bool) -> String {
+    let has_gaming = compiler::tier_has_gaming(tier);
+    let has_static = compiler::tier_has_static_ip(tier);
+
+    let mut lines = vec![
+        "🍏 <b>دریافت کانفیگ اختصاصی iOS و مک</b>".to_string(),
+        String::new(),
+        format!("سطح اشتراک فعلی شما: <b>{}</b>", tier),
+        String::new(),
+        "کانفیگ‌های قابل مشاهده برای حساب شما:".to_string(),
+        "🌐 <b>وب‌گردی روزمره (رایگان):</b> ۲ گیگابایت سهمیه روزانه (IKEv2 / OpenVPN)".to_string(),
+        "⚡ <b>دانلود پرسرعت (رایگان):</b> ۳ گیگابایت سهمیه روزانه (IKEv2 / OpenVPN)".to_string(),
+    ];
+
+    if !gaming_enabled {
+        lines.push(
+            "🎮 <b>گیمینگ کم‌پینگ (به‌زودی):</b> این بخش به‌زودی با سرورهای کم‌پینگ و پروتکل <b>WireGuard</b> اضافه می‌شود.".to_string(),
+        );
+    } else if has_gaming {
+        lines.push(
+            "🎮 <b>گیمینگ کم‌پینگ (فعال):</b> تحویل مستقیم با پروتکل <b>WireGuard</b> برای کمترین پینگ و بدون جیتر".to_string(),
+        );
+    }
+    if has_static {
+        lines.push(
+            "💎 <b>آی‌پی ثابت اختصاصی (فعال):</b> آی‌پی تمیز مسکونی آمریکا مناسب ترید و سرویس‌های بانکی/AI".to_string(),
+        );
+    }
+
+    if !has_static && (!gaming_enabled || !has_gaming) {
+        lines.push(String::new());
+        lines.push(
+            "💡 <i>کاربران رایگان به کانفیگ‌های رایگان دسترسی دارند. در صورت خرید اشتراک ویژه، گزینه‌های مربوطه به‌صورت هوشمند در همین منو فعال می‌شوند.</i>".to_string(),
+        );
+    }
+
+    lines.push(String::new());
+    lines.push("👇 <b>لطفاً کانفیگ مورد نظر خود را انتخاب نمایید:</b>".to_string());
+    lines.join("\n")
+}
+
+/// Prompt iOS user with smart entitlement-aware config options
 pub async fn handle_ios_subscription_prompt(
     bot: &Bot,
     msg: &Message,
@@ -489,50 +1009,36 @@ pub async fn handle_ios_subscription_prompt(
         None => return Ok(()),
     };
 
-    let user = Repository::get_or_create_user(
-        pool,
-        telegram_user.id.0 as i64,
-        telegram_user.username.as_deref(),
-        &telegram_user.first_name,
-        telegram_user.last_name.as_deref(),
-    )
-    .await?;
+    let Some(user) = Repository::get_user_by_telegram_id(pool, telegram_user.id.0 as i64).await? else {
+        return prompt_registration_required(bot, msg.chat.id).await;
+    };
 
     let sub = match Repository::get_subscription_by_user_id(pool, user.id).await? {
         Some(s) => s,
         None => Repository::create_or_ensure_lite_subscription(pool, user.id).await?,
     };
 
-    let text = format!(
-        r#"🍏 <b>اشتراک اختصاصی iOS و مک (پروتکل OpenVPN)</b>
-
-سطح اشتراک فعلی شما: <b>{}</b>
-
-برای دریافت فایل کانفیگ سازگار با اپلیکیشن <b>OpenVPN Connect</b> روی آیفون، آیپد یا سیستم‌عامل مک، یکی از حالت‌های اتصال زیر را انتخاب کنید:
-
-🌐 <b>۱. وب‌گردی (Web Browsing):</b> ۲ گیگابایت سهمیه روزانه رایگان، مناسب گشت‌وگذار روزمره
-⚡ <b>۲. دانلود (Download):</b> ۳ گیگابایت سهمیه روزانه رایگان، بهینه‌سازی سرعت بالا
-🔒 <b>۳. آی‌پی ثابت ترید/جمنای (Static IP):</b> آی‌پی ثابت تمیز مسکونی آمریکا (ویژه کاربران Pro و Flow+)
-
-👇 <b>لطفاً حالت اتصال مورد نظر خود را انتخاب نمایید:</b>"#,
-        sub.tier
-    );
+    let gaming_enabled = Repository::has_active_gaming_outbounds(pool).await;
+    let text = build_ios_menu_text(&sub.tier, gaming_enabled);
 
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
-        .reply_markup(ios_modes_inline_keyboard(&sub.tier))
+        .reply_markup(ios_modes_inline_keyboard(&sub.tier, gaming_enabled))
         .await?;
 
     Ok(())
 }
 
-/// Handle selection of an iOS connection mode callback - shows protocol choices (IKEv2 vs OpenVPN)
+/// Handle selection of an iOS connection mode callback:
+/// - Gaming shows "Coming Soon" until at least one active Gaming outbound exists in DB;
+///   once enabled, it immediately issues an iOS WireGuard (.conf) profile for entitled users.
+/// - Web Browsing / Download / Static IP show IKEv2 & OpenVPN protocol choices
 pub async fn handle_ios_mode_selection(
     bot: &Bot,
     q: &CallbackQuery,
     pool: &DbPool,
     mode: &str,
-    _base_url: &str,
+    base_url: &str,
 ) -> anyhow::Result<()> {
     let telegram_user = &q.from;
     let user = Repository::get_or_create_user(
@@ -549,19 +1055,29 @@ pub async fn handle_ios_mode_selection(
         None => Repository::create_or_ensure_lite_subscription(pool, user.id).await?,
     };
 
-    // 1. Gaming is coming soon
+    // 1. Gaming mode: show Coming Soon alert until admin adds an active Gaming outbound
     if mode == "gaming" {
-        bot.answer_callback_query(q.id.clone())
-            .text("🎮 حالت گیمینگ (کاهش پینگ و جیتر) در حال حاضر غیرفعال است و به‌زودی اضافه می‌شود.")
-            .show_alert(true)
-            .await?;
-        return Ok(());
+        if !Repository::has_active_gaming_outbounds(pool).await {
+            bot.answer_callback_query(q.id.clone())
+                .text("🎮 بخش گیمینگ به زودی اضافه می‌شود! به محض فعال‌سازی سرورهای گیمینگ، این بخش در کل اکوسیستم در دسترس خواهد بود.")
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+        if !compiler::tier_has_gaming(&sub.tier) {
+            bot.answer_callback_query(q.id.clone())
+                .text("🔒 دسترسی به کانفیگ گیمینگ WireGuard مختص کاربران دارای اشتراک گیمینگ / Pro / Flow+ است.")
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+        return handle_ios_send_wireguard(bot, q, pool, base_url).await;
     }
 
-    // 2. Static IP is locked for Lite tier
-    if mode == "static_ip" && sub.tier == "Sentra Lite" {
+    // 2. Static IP is strictly enforced by tier entitlement
+    if mode == "static_ip" && !compiler::tier_has_static_ip(&sub.tier) {
         bot.answer_callback_query(q.id.clone())
-            .text("🔒 دسترسی به آی‌پی ثابت تمیز مسکونی آمریکا مختص پلن‌های ویژه (Pro / Flow+) است. لطفاً اشتراک خود را ارتقا دهید.")
+            .text("🔒 دسترسی به آی‌پی ثابت تمیز مسکونی آمریکا مختص کاربران دارای اشتراک آی‌پی ثابت / Pro / Flow+ است.")
             .show_alert(true)
             .await?;
         return Ok(());
@@ -593,7 +1109,7 @@ pub async fn handle_ios_mode_selection(
 
     let mode_fa = match mode {
         "download" => "⚡ دانلود (پایداری و سرعت بالا)",
-        "static_ip" => "🔒 آی‌پی ثابت مسکونی آمریکا (ترید و جمنای)",
+        "static_ip" => "💎 آی‌پی ثابت مسکونی آمریکا (ترید و جمنای)",
         _ => "🌐 وب‌گردی روزمره (سهمیه ۲ گیگ)",
     };
 
@@ -615,6 +1131,97 @@ pub async fn handle_ios_mode_selection(
             .parse_mode(ParseMode::Html)
             .reply_markup(ios_protocol_choice_keyboard(mode))
             .await;
+    }
+
+    Ok(())
+}
+
+/// Sends an ultra-low-latency WireGuard (.conf) gaming profile directly for iOS WireGuard app
+pub async fn handle_ios_send_wireguard(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+    base_url: &str,
+) -> anyhow::Result<()> {
+    let telegram_user = &q.from;
+    let user = Repository::get_or_create_user(
+        pool,
+        telegram_user.id.0 as i64,
+        telegram_user.username.as_deref(),
+        &telegram_user.first_name,
+        telegram_user.last_name.as_deref(),
+    )
+    .await?;
+
+    let sub = match Repository::get_subscription_by_user_id(pool, user.id).await? {
+        Some(s) => s,
+        None => Repository::create_or_ensure_lite_subscription(pool, user.id).await?,
+    };
+
+    if user.status == "suspended" || user.status == "banned" || sub.status == "suspended" || sub.status == "disabled" {
+        bot.answer_callback_query(q.id.clone())
+            .text("⛔ حساب کاربری شما در حال حاضر غیرفعال است.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+
+    if !Repository::has_active_gaming_outbounds(pool).await {
+        bot.answer_callback_query(q.id.clone())
+            .text("🎮 بخش گیمینگ به زودی اضافه می‌شود! به محض فعال‌سازی سرورهای گیمینگ، این بخش در کل اکوسیستم در دسترس خواهد بود.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+
+    if !compiler::tier_has_gaming(&sub.tier) {
+        bot.answer_callback_query(q.id.clone())
+            .text("🔒 دسترسی به کانفیگ گیمینگ WireGuard نیازمند اشتراک گیمینگ، Pro یا Flow+ است.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+
+    bot.answer_callback_query(q.id.clone())
+        .text("🎮 در حال صدور کانفیگ اختصاصی WireGuard گیمینگ برای iOS...")
+        .await?;
+
+    let server_host = url::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let (wg_conf, _client_pub, client_addr) =
+        compiler::generate_wireguard_gaming_profile(&sub, &server_host);
+    let token_prefix: String = sub.token.chars().take(8).collect();
+    let wg_file = InputFile::memory(wg_conf.into_bytes())
+        .file_name(format!("sentra-gaming-wg-{}.conf", token_prefix));
+
+    let caption = format!(
+        r#"🎮 <b>کانفیگ اختصاصی گیمینگ سنترا برای iOS (پروتکل WireGuard)</b>
+
+🔹 <b>پروتکل:</b> WireGuard (بهینه‌سازی شده با MTU 1280 و کمترین پینگ/جیتر)
+🔹 <b>آی‌پی تانل اختصاصی:</b> <code>{}</code>
+🔹 <b>پلن اشتراک:</b> {}
+🔹 <b>اعتبار:</b> {}
+
+📋 <b>راهنمای اتصال سریع در آیفون/آیپد:</b>
+۱. اپلیکیشن رسمی <b>WireGuard</b> را از App Store دانلود و نصب کنید.
+۲. فایل پیوست بالا (<code>sentra-gaming-wg-{}.conf</code>) را لمس کرده و دکمه <b>Share (اشتراک‌گذاری)</b> را بزنید.
+۳. از لیست برنامه‌ها، <b>WireGuard</b> را انتخاب کنید تا تانل به‌صورت خودکار وارد شود.
+۴. سوئیچ اتصال را روشن کنید و از بازی آنلاین بدون لگ و پکت‌لاس لذت ببرید!"#,
+        client_addr,
+        sub.tier,
+        sub.expires_at.format("%Y-%m-%d"),
+        token_prefix
+    );
+
+    if let Some(msg) = &q.message {
+        bot.send_document(msg.chat().id, wg_file)
+            .caption(caption)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(cancel_and_back_inline_keyboard("ios_sub_back_to_modes"))
+            .await?;
     }
 
     Ok(())
@@ -643,6 +1250,17 @@ pub async fn handle_ios_send_ikev2(
         None => Repository::create_or_ensure_lite_subscription(pool, user.id).await?,
     };
 
+    if mode == "static_ip" && !compiler::tier_has_static_ip(&sub.tier) {
+        bot.answer_callback_query(q.id.clone())
+            .text("🔒 دسترسی به آی‌پی ثابت مختص اشتراک‌های دارای آی‌پی ثابت است.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+    if mode == "gaming" {
+        return handle_ios_send_wireguard(bot, q, pool, base_url).await;
+    }
+
     bot.answer_callback_query(q.id.clone())
         .text("✅ در حال صدور پروفایل بومی IKEv2 برای آیفون...")
         .await?;
@@ -662,8 +1280,6 @@ pub async fn handle_ios_send_ikev2(
         _ => "وب‌گردی",
     };
 
-    let direct_url = format!("{}/api/v1/mobileconfig/{}?mode={}", base_url, sub.token, mode);
-
     let caption = format!(
         r#"🍏 <b>پروفایل اختصاصی IKEv2 سنترا (بدون نیاز به برنامه)</b>
 
@@ -681,10 +1297,7 @@ pub async fn handle_ios_send_ikev2(
 • سرور: <code>{}</code>
 • شناسه (Remote ID): <code>{}</code>
 • نام کاربری: <code>{}</code>
-• رمز عبور: <code>{}</code>
-
-🔗 <b>لینک مستقیم نصب در سافاری:</b>
-<code>{}</code>"#,
+• رمز عبور: <code>{}</code>"#,
         mode_fa,
         sub.tier,
         sub.expires_at.format("%Y-%m-%d"),
@@ -692,8 +1305,7 @@ pub async fn handle_ios_send_ikev2(
         server_host,
         server_host,
         sub.token,
-        sub.token,
-        direct_url
+        sub.token
     );
 
     if let Some(msg) = &q.message {
@@ -731,6 +1343,17 @@ pub async fn handle_ios_send_openvpn(
         None => Repository::create_or_ensure_lite_subscription(pool, user.id).await?,
     };
 
+    if mode == "static_ip" && !compiler::tier_has_static_ip(&sub.tier) {
+        bot.answer_callback_query(q.id.clone())
+            .text("🔒 دسترسی به آی‌پی ثابت مختص اشتراک‌های دارای آی‌پی ثابت است.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+    if mode == "gaming" {
+        return handle_ios_send_wireguard(bot, q, pool, base_url).await;
+    }
+
     bot.answer_callback_query(q.id.clone())
         .text(format!("✅ در حال صدور کانفیگ OpenVPN ({})...", protocol))
         .await?;
@@ -743,8 +1366,6 @@ pub async fn handle_ios_send_openvpn(
     let ovpn_content = compiler::generate_ovpn_profile_ext(&sub, Some(mode), protocol, &server_host);
     let ovpn_file = InputFile::memory(ovpn_content.into_bytes())
         .file_name(format!("sentra-{}-{}-{}.ovpn", mode, protocol, &sub.token[..8]));
-
-    let direct_url = format!("{}/api/v1/ovpn/{}?mode={}&protocol={}", base_url, sub.token, mode, protocol);
 
     let (mode_fa, mode_desc) = match mode {
         "download" => ("دانلود فوق‌سریع", "بهینه‌سازی شده برای انتقال حجم و فایل با پایداری حداکثری"),
@@ -771,16 +1392,12 @@ pub async fn handle_ios_send_openvpn(
 ۱. نرم‌افزار رسمی <b>OpenVPN Connect</b> را از App Store دانلود و نصب کنید.
 ۲. فایل پیوست بالا را لمس کرده و دکمه Share (اشتراک‌گذاری) را بزنید.
 ۳. از لیست برنامه‌ها، <b>OpenVPN</b> را انتخاب کنید تا فایل درون آن ایمپورت شود.
-۴. در برنامه OpenVPN، دکمه <b>ADD</b> را زده و سوئیچ اتصال را روشن کنید.
-
-🔗 <b>لینک مستقیم دانلود فایل:</b>
-<code>{}</code>"#,
+۴. در برنامه OpenVPN، دکمه <b>ADD</b> را زده و سوئیچ اتصال را روشن کنید."#,
         proto_title,
         mode_fa,
         mode_desc,
         sub.tier,
-        sub.expires_at.format("%Y-%m-%d"),
-        direct_url
+        sub.expires_at.format("%Y-%m-%d")
     );
 
     if let Some(msg) = &q.message {
@@ -794,7 +1411,7 @@ pub async fn handle_ios_send_openvpn(
     Ok(())
 }
 
-/// Returns iOS user back to the active connection modes selection
+/// Returns iOS user back to the smart entitlement-aware connection modes selection
 pub async fn handle_ios_back_to_modes(
     bot: &Bot,
     q: &CallbackQuery,
@@ -815,26 +1432,23 @@ pub async fn handle_ios_back_to_modes(
         None => Repository::create_or_ensure_lite_subscription(pool, user.id).await?,
     };
 
-    let prompt = r#"🍏 <b>اشتراک اختصاصی iOS و مک (پروتکل‌های ایمن)</b>
-
-به دلیل محدودیت‌های سیستم‌عامل iOS در نصب هسته‌های جانبی، اتصال در آیفون از طریق <b>IKEv2 بومی</b> یا <b>OpenVPN</b> برقرار می‌شود.
-
-📌 لطفاً یکی از حالت‌های اتصال زیر را متناسب با نیاز خود انتخاب فرمایید:"#;
+    let gaming_enabled = Repository::has_active_gaming_outbounds(pool).await;
+    let prompt = build_ios_menu_text(&sub.tier, gaming_enabled);
 
     bot.answer_callback_query(q.id.clone()).await?;
 
     if let Some(msg) = &q.message {
         if bot
-            .edit_message_text(msg.chat().id, msg.id(), prompt)
+            .edit_message_text(msg.chat().id, msg.id(), prompt.clone())
             .parse_mode(ParseMode::Html)
-            .reply_markup(ios_modes_inline_keyboard(&sub.tier))
+            .reply_markup(ios_modes_inline_keyboard(&sub.tier, gaming_enabled))
             .await
             .is_err()
         {
             let _ = bot
                 .send_message(msg.chat().id, prompt)
                 .parse_mode(ParseMode::Html)
-                .reply_markup(ios_modes_inline_keyboard(&sub.tier))
+                .reply_markup(ios_modes_inline_keyboard(&sub.tier, gaming_enabled))
                 .await;
         }
     }
@@ -1393,39 +2007,35 @@ pub async fn handle_ios_download_callback(
     pool: &DbPool,
 ) -> anyhow::Result<()> {
     let telegram_user = &q.from;
-    let user = Repository::get_or_create_user(
-        pool,
-        telegram_user.id.0 as i64,
-        telegram_user.username.as_deref(),
-        &telegram_user.first_name,
-        telegram_user.last_name.as_deref(),
-    )
-    .await?;
+    let user = match Repository::get_user_by_telegram_id(pool, telegram_user.id.0 as i64).await? {
+        Some(u) => u,
+        None => {
+            if let Some(msg) = &q.message {
+                bot.send_message(
+                    msg.chat().id,
+                    "📝 <b>ابتدا ثبت نام یا وارد حساب کاربری شوید</b>\n\nبرای دریافت کانفیگ iOS ابتدا باید ثبت نام کنید یا با حساب برنامه خود وارد شوید:",
+                )
+                .parse_mode(ParseMode::Html)
+                .reply_markup(auth_choice_inline_keyboard())
+                .await?;
+            }
+            bot.answer_callback_query(q.id.clone()).await?;
+            return Ok(());
+        }
+    };
 
     let sub = match Repository::get_subscription_by_user_id(pool, user.id).await? {
         Some(s) => s,
         None => Repository::create_or_ensure_lite_subscription(pool, user.id).await?,
     };
 
-    let text = format!(
-        r#"🍏 <b>اشتراک اختصاصی iOS و مک (پروتکل OpenVPN)</b>
-
-سطح اشتراک فعلی شما: <b>{}</b>
-
-برای دریافت فایل کانفیگ سازگار با اپلیکیشن <b>OpenVPN Connect</b> روی آیفون، آیپد یا سیستم‌عامل مک، یکی از حالت‌های اتصال زیر را انتخاب کنید:
-
-🌐 <b>۱. وب‌گردی (Web Browsing):</b> ۲ گیگابایت سهمیه روزانه رایگان، مناسب گشت‌وگذار روزمره
-⚡ <b>۲. دانلود (Download):</b> ۳ گیگابایت سهمیه روزانه رایگان، بهینه‌سازی سرعت بالا
-🔒 <b>۳. آی‌پی ثابت ترید/جمنای (Static IP):</b> آی‌پی ثابت تمیز مسکونی آمریکا (ویژه کاربران Pro و Flow+)
-
-👇 <b>لطفاً حالت اتصال مورد نظر خود را انتخاب نمایید:</b>"#,
-        sub.tier
-    );
+    let gaming_enabled = Repository::has_active_gaming_outbounds(pool).await;
+    let text = build_ios_menu_text(&sub.tier, gaming_enabled);
 
     if let Some(msg) = &q.message {
         bot.send_message(msg.chat().id, text)
             .parse_mode(ParseMode::Html)
-            .reply_markup(ios_modes_inline_keyboard(&sub.tier))
+            .reply_markup(ios_modes_inline_keyboard(&sub.tier, gaming_enabled))
             .await?;
     }
     bot.answer_callback_query(q.id.clone()).await?;

@@ -7,6 +7,7 @@ import {
   formatBytes,
   formatRemainingDays,
 } from '../utils/proxyParser';
+import { PWAInstallButton } from './PWAInstallButton';
 
 interface TopSubscriptionBarProps {
   lang: Language;
@@ -91,6 +92,7 @@ export const TopSubscriptionBar: React.FC<TopSubscriptionBarProps> = ({
 
       {/* Action Controls */}
       <div className="flex items-center gap-1.5 md:gap-2 shrink-0">
+        <PWAInstallButton lang={lang} variant="compact" />
         <button
           type="button"
           onClick={onSync}

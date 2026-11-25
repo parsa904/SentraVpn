@@ -141,6 +141,11 @@ export function createApiApp(store: SentraStore): express.Express {
   const rateLimiter = new AuthRateLimiter();
 
   app.disable('x-powered-by');
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    next();
+  });
   app.use(express.json({ limit: '512kb' }));
 
   app.get('/health', (_req, res) => {
@@ -338,11 +343,58 @@ export function createApiApp(store: SentraStore): express.Express {
     }
   });
 
+  app.get('/api/v1/client/locations', async (req, res) => {
+    try {
+      if (await tryProxyToUpstream(req, res)) return;
+      const result = store.getClientLocations();
+      res.status(200).json(result);
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  const handleClientConfig = async (req: Request, res: Response) => {
+    try {
+      if (await tryProxyToUpstream(req, res)) return;
+      const body = (req.body || {}) as Record<string, unknown>;
+      const result = store.compileClientConfig(extractRequestToken(req), {
+        mode: typeof body.mode === 'string' ? body.mode : 'web_browsing',
+        protocol: typeof body.protocol === 'string' ? body.protocol : undefined,
+        location_code: typeof body.location_code === 'string' ? body.location_code : undefined,
+        use_warp: typeof body.use_warp === 'boolean' ? body.use_warp : false,
+        selected_outbound_id:
+          typeof body.selected_outbound_id === 'string' ? body.selected_outbound_id : null,
+        personal_uri: typeof body.personal_uri === 'string' ? body.personal_uri : null,
+      });
+      res.status(200).json(result);
+    } catch (err) {
+      handleError(res, err);
+    }
+  };
+
+  app.post('/api/v1/client/config', handleClientConfig);
+  app.post('/api/v1/client/connect', handleClientConfig);
+
   app.post('/api/v1/client/outbounds/donate', async (req, res) => {
     try {
       if (await tryProxyToUpstream(req, res)) return;
       const body = (req.body || {}) as Record<string, unknown>;
       const result = store.donateOutbound(extractRequestToken(req), {
+        uri: String(body.uri ?? ''),
+        name: typeof body.name === 'string' ? body.name : undefined,
+        note: typeof body.note === 'string' ? body.note : undefined,
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  app.post('/api/v1/client/outbounds/add', async (req, res) => {
+    try {
+      if (await tryProxyToUpstream(req, res)) return;
+      const body = (req.body || {}) as Record<string, unknown>;
+      const result = store.addEcosystemOutbound(extractRequestToken(req), {
         uri: String(body.uri ?? ''),
         name: typeof body.name === 'string' ? body.name : undefined,
         note: typeof body.note === 'string' ? body.note : undefined,
@@ -362,6 +414,40 @@ export function createApiApp(store: SentraStore): express.Express {
       handleError(res, err);
     }
   });
+
+  app.get('/api/v1/wireguard/:token', async (req, res) => {
+    try {
+      if (await tryProxyToUpstream(req, res)) return;
+      const hostHeader = (req.header('host') || '127.0.0.1').split(':')[0];
+      const result = store.generateWireguardGamingProfile(req.params.token || '', hostHeader);
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${result.filename}"`);
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      res.status(200).send(result.config);
+    } catch (err) {
+      handleError(res, err);
+    }
+  });
+
+  const handleSubscription = async (req: Request, res: Response) => {
+    try {
+      if (await tryProxyToUpstream(req, res)) return;
+      const format = typeof req.query.format === 'string' ? req.query.format : undefined;
+      const userAgent = req.header('User-Agent') || '';
+      const result = store.getSubscriptionPayload(req.params.token || '', format, userAgent);
+      res.setHeader('Content-Type', result.contentType);
+      res.setHeader('Subscription-Userinfo', result.subUserInfo);
+      if (!result.isSingbox) {
+        res.setHeader('Content-Disposition', 'attachment; filename="sentra-sub.txt"');
+      }
+      res.status(200).send(result.body);
+    } catch (err) {
+      handleError(res, err);
+    }
+  };
+
+  app.get('/api/v1/sub/:token', handleSubscription);
+  app.get('/sub/:token', handleSubscription);
 
   return app;
 }
@@ -385,8 +471,31 @@ async function startServer(): Promise<void> {
     app.use(vite.middlewares);
   } else {
     const distDir = path.join(clientRoot, 'dist');
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
+    app.use(
+      express.static(distDir, {
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('sw.js') || filePath.endsWith('registerSW.js')) {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            res.setHeader('Service-Worker-Allowed', '/');
+          } else if (filePath.endsWith('.webmanifest')) {
+            res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache');
+          }
+        },
+      })
+    );
+    app.use('/api', (_req, res) => {
+      res.status(404).json({
+        success: false,
+        error: 'مسیر درخواستی یافت نشد.',
+        message: 'Route not found',
+      });
+    });
+    app.use((req, res, next) => {
+      if (req.method !== 'GET' || req.path.startsWith('/api/') || req.path.startsWith('/sub/')) {
+        next();
+        return;
+      }
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }

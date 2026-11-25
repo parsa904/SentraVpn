@@ -80,6 +80,7 @@ import {
 } from './utils/clientSync';
 import {
   type GithubReleaseUpdate,
+  addEcosystemOutboundToServer,
   checkGithubLatestRelease,
   connectVpnNative,
   disconnectVpnNative,
@@ -120,6 +121,16 @@ import { SettingsView } from './components/SettingsView';
 import { LogsView } from './components/LogsView';
 import { AddConfigModal } from './components/AddConfigModal';
 import { DonateModal } from './components/DonateModal';
+import { OfflineIndicator } from './components/OfflineIndicator';
+import {
+  loadCachedActiveServer,
+  loadCachedBootstrapFromCacheStorage,
+  loadCachedBootstrapSnapshot,
+  loadCachedDonationsSnapshot,
+  saveCachedActiveServer,
+  saveCachedBootstrapSnapshot,
+  saveCachedDonationsSnapshot,
+} from './utils/offlineCache';
 
 const THEME_STORAGE_KEY = 'sentra_theme_v2';
 
@@ -194,6 +205,7 @@ export const App: React.FC = () => {
   const [authNotice, setAuthNotice] = useState<string | null>(null);
 
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
+  const [lastConfigCachedAt, setLastConfigCachedAt] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
 
@@ -245,7 +257,7 @@ export const App: React.FC = () => {
 
   const [addConfigOpen, setAddConfigOpen] = useState(false);
   const [donateModalConfig, setDonateModalConfig] = useState<PersonalConfigItem | null>(null);
-  const [toast, setToast] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
+  const [toast, setToast] = useState<{ kind: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   const toastTimerRef = useRef<number | null>(null);
   const langRef = useRef<Language>(lang);
@@ -271,6 +283,8 @@ export const App: React.FC = () => {
   autoModeRef.current = autoMode;
   const connectionStatusRef = useRef<ConnectionStatus>(connectionStatus);
   connectionStatusRef.current = connectionStatus;
+  const selectedModeRef = useRef<ConnectionModeId>(selectedMode);
+  selectedModeRef.current = selectedMode;
   const lastPingOptimizedAtRef = useRef<number | null>(lastPingOptimizedAt);
   lastPingOptimizedAtRef.current = lastPingOptimizedAt;
   const livePingsRef = useRef<Record<string, number | null>>(livePings);
@@ -323,7 +337,7 @@ export const App: React.FC = () => {
     setLogs((prev) => [...prev.slice(-199), makeLogEntry(level, message)]);
   }, []);
 
-  const showToast = useCallback((kind: 'success' | 'error', text: string) => {
+  const showToast = useCallback((kind: 'success' | 'error' | 'info', text: string) => {
     setToast({ kind, text });
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
     toastTimerRef.current = window.setTimeout(() => setToast(null), 4200);
@@ -381,6 +395,10 @@ export const App: React.FC = () => {
         const data = await fetchBootstrap(activeSession.subscription_token);
         lastSyncCompletedAtRef.current = Date.now();
         setBootstrap(data);
+        const cachedEnv = saveCachedBootstrapSnapshot(activeSession.subscription_token, data);
+        if (cachedEnv) {
+          setLastConfigCachedAt(cachedEnv.cachedAt);
+        }
         setSyncError(null);
 
         // Reflect live account/subscription updates (e.g. Telegram upgrades or account linking)
@@ -426,9 +444,14 @@ export const App: React.FC = () => {
             void savePersonalConfigs(mergedConfigs);
 
             const p = remoteState.preferences;
+            const gamingModeInfo = data.modes.find((m) => m.id === 'gaming');
             if (p.selected_mode) {
-              setSelectedMode(p.selected_mode);
-              void setConnectionModeNative(p.selected_mode).catch(() => {});
+              const safeMode: ConnectionModeId =
+                p.selected_mode === 'gaming' && gamingModeInfo?.status === 'coming_soon'
+                  ? 'web_browsing'
+                  : p.selected_mode;
+              setSelectedMode(safeMode);
+              void setConnectionModeNative(safeMode).catch(() => {});
             }
             if (p.routing_mode) {
               setRoutingMode(p.routing_mode);
@@ -449,7 +472,10 @@ export const App: React.FC = () => {
               setPingOptimizationEnabled(p.ping_optimization_enabled);
             }
             if (typeof p.use_warp === 'boolean') {
-              const effectiveWarp = p.selected_mode === 'static_ip' ? false : p.use_warp;
+              const effectiveWarp =
+                p.selected_mode === 'static_ip' || p.selected_mode === 'gaming'
+                  ? false
+                  : p.use_warp;
               setUseWarp(effectiveWarp);
               void setUseWarpNative(effectiveWarp).catch(() => {});
             }
@@ -558,8 +584,12 @@ export const App: React.FC = () => {
           setBootstrap(null);
           setAuthNotice(clean || t(langRef.current, 'sessionExpiredNotice'));
         } else if (!silent) {
-          setSyncError(msg);
-          pushLog('WARN', `Live sync unavailable: ${msg}`);
+          if (typeof navigator !== 'undefined' && !navigator.onLine) {
+            pushLog('INFO', 'Offline mode active — running with locally cached configuration.');
+          } else {
+            setSyncError(msg);
+            pushLog('WARN', `Live sync unavailable: ${msg}`);
+          }
         }
       } finally {
         syncingInFlightRef.current = false;
@@ -577,11 +607,14 @@ export const App: React.FC = () => {
       try {
         const list = await fetchMyDonations(activeSession.subscription_token);
         setDonations(list);
+        saveCachedDonationsSnapshot(activeSession.subscription_token, list);
       } catch (err) {
-        pushLog(
-          'WARN',
-          `Failed to load donations: ${err instanceof Error ? err.message : String(err)}`
-        );
+        if (typeof navigator === 'undefined' || navigator.onLine) {
+          pushLog(
+            'WARN',
+            `Failed to load donations: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
       } finally {
         setLoadingDonations(false);
       }
@@ -589,16 +622,30 @@ export const App: React.FC = () => {
     [pushLog]
   );
 
-  // Startup bootstrap: restore persisted auth + personal configs in parallel with splash
+  // Persist active server selection locally so offline startups restore it immediately
+  useEffect(() => {
+    if (session?.subscription_token) {
+      saveCachedActiveServer(session.subscription_token, activeServer);
+    }
+  }, [session?.subscription_token, activeServer]);
+
+  // Log when the Service Worker finishes precaching static assets for offline use
+  useEffect(() => {
+    const onOfflineReady = () => {
+      pushLog('INFO', 'Service Worker ready — static assets cached for instant offline boot.');
+    };
+    window.addEventListener('sentra:sw-offline-ready', onOfflineReady);
+    return () => {
+      window.removeEventListener('sentra:sw-offline-ready', onOfflineReady);
+    };
+  }, [pushLog]);
+
+  // Startup bootstrap: hydrate instantly from last known local config cache (0ms offline boot), then sync in background
   useEffect(() => {
     let cancelled = false;
     const skipSplash = shouldSkipSplash();
 
     const init = async () => {
-      const minSplashDelay = skipSplash
-        ? Promise.resolve()
-        : new Promise<void>((resolve) => window.setTimeout(resolve, 1100));
-
       const [restored, savedPersonal] = await Promise.all([
         restorePersistedSession(),
         loadPersonalConfigs(),
@@ -609,12 +656,114 @@ export const App: React.FC = () => {
 
       if (restored) {
         setSession(restored);
+
+        // 1. Check local cached configuration synchronously first (then CacheStorage fallback)
+        let cachedBootstrap = loadCachedBootstrapSnapshot(restored.subscription_token);
+        if (!cachedBootstrap) {
+          cachedBootstrap = await loadCachedBootstrapFromCacheStorage(restored.subscription_token);
+        }
+        const cachedDonations = loadCachedDonationsSnapshot(restored.subscription_token);
+        const cachedSelection = loadCachedActiveServer(restored.subscription_token);
+
+        if (cancelled) return;
+
+        if (cachedDonations) {
+          setDonations(cachedDonations);
+        }
+
+        if (cachedBootstrap) {
+          const data = cachedBootstrap.data;
+          setBootstrap(data);
+          setLastConfigCachedAt(cachedBootstrap.cachedAt);
+
+          const cachedRemoteState = normalizeRemoteClientState(data.client_state);
+          if (cachedRemoteState) {
+            hydratingFromServerRef.current = true;
+            if (cachedRemoteState.updated_at) {
+              lastRemoteStateUpdatedAtMsRef.current = parseIsoTimestampMs(
+                cachedRemoteState.updated_at
+              );
+            }
+            const merged = mergePersonalConfigs(
+              savedPersonal,
+              cachedRemoteState.personal_configs,
+              cachedRemoteState.personal_configs.length > 0
+            );
+            personalConfigsRef.current = merged;
+            setPersonalConfigs(merged);
+            const p = cachedRemoteState.preferences;
+            const cachedGamingInfo = data.modes.find((m) => m.id === 'gaming');
+            if (p.selected_mode) {
+              const safeMode: ConnectionModeId =
+                p.selected_mode === 'gaming' && cachedGamingInfo?.status === 'coming_soon'
+                  ? 'web_browsing'
+                  : p.selected_mode;
+              setSelectedMode(safeMode);
+            }
+            if (p.routing_mode) setRoutingMode(p.routing_mode);
+            if (typeof p.split_tunneling === 'boolean') setSplitTunneling(p.split_tunneling);
+            if (typeof p.kill_switch === 'boolean') setKillSwitch(p.kill_switch);
+            if (typeof p.auto_reconnect === 'boolean') setAutoReconnect(p.auto_reconnect);
+            if (typeof p.ping_optimization_enabled === 'boolean') {
+              setPingOptimizationEnabled(p.ping_optimization_enabled);
+            }
+            if (typeof p.use_warp === 'boolean') {
+              setUseWarp(
+                p.selected_mode === 'static_ip' || p.selected_mode === 'gaming'
+                  ? false
+                  : p.use_warp
+              );
+            }
+            if (p.custom_dns) setCustomDns(p.custom_dns);
+            if (typeof p.auto_mode === 'boolean') setAutoMode(p.auto_mode);
+            window.setTimeout(() => {
+              hydratingFromServerRef.current = false;
+            }, 60);
+          }
+
+          if (cachedSelection) {
+            setActiveServer(cachedSelection);
+          } else {
+            const fastest = selectFastestHealthyServer(data.outbounds, {});
+            const fallback = fastest?.node || data.outbounds[0];
+            if (fallback) {
+              setActiveServer(outboundToSelection(fallback, undefined));
+            }
+          }
+
+          // Instant initialization! Do not block UI on splash or network latency
+          setSplashDone(true);
+
+          if (typeof navigator !== 'undefined' && navigator.onLine) {
+            pushLog('SYNC', 'Initialized instantly from cached config; refreshing in background...');
+            void syncWithServer(restored, { silent: true });
+            void loadDonations(restored);
+          } else {
+            pushLog('INFO', 'Initialized instantly in offline mode from locally cached configuration.');
+          }
+          return;
+        }
+
+        // First-ever launch (no cached config yet)
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+          pushLog('WARN', 'Started offline with no prior cached configuration.');
+          setSplashDone(true);
+          return;
+        }
+
+        const minSplashDelay = skipSplash
+          ? Promise.resolve()
+          : new Promise<void>((resolve) => window.setTimeout(resolve, 900));
         setSplashStatusKey('splashSyncing');
         await Promise.all([syncWithServer(restored), minSplashDelay]);
         if (!cancelled) {
           void loadDonations(restored);
         }
       } else {
+        const minSplashDelay =
+          skipSplash || (typeof navigator !== 'undefined' && !navigator.onLine)
+            ? Promise.resolve()
+            : new Promise<void>((resolve) => window.setTimeout(resolve, 700));
         await minSplashDelay;
       }
 
@@ -627,7 +776,7 @@ export const App: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [syncWithServer, loadDonations]);
+  }, [syncWithServer, loadDonations, pushLog]);
 
   // Continuous background database sync (30s interval + focus / visibility / online events)
   const sessionToken = session?.subscription_token ?? null;
@@ -1114,10 +1263,19 @@ export const App: React.FC = () => {
   };
 
   const handleSelectMode = async (mode: ConnectionModeId) => {
+    const modeMeta = bootstrap?.modes?.find((m) => m.id === mode);
+    if (modeMeta?.status === 'coming_soon' || (!modeMeta && mode === 'gaming')) {
+      showToast('info', t(lang, 'gamingComingSoonToast'));
+      return;
+    }
+
     setSelectedMode(mode);
     if (mode === 'static_ip') {
       setRoutingMode('tunnel');
       setKillSwitch(true);
+      setUseWarp(false);
+    } else if (mode === 'gaming') {
+      setRoutingMode('tunnel');
       setUseWarp(false);
     }
     try {
@@ -1186,6 +1344,13 @@ export const App: React.FC = () => {
   const runPingOptimizationPass = useCallback(async () => {
     const nodes = outboundsRef.current;
     if (nodes.length === 0 || pingOptimizingRef.current) return;
+    // Never generate background probe traffic while actively connected in Gaming mode (prevents ping spikes/jitter)
+    if (
+      connectionStatusRef.current === 'connected' &&
+      selectedModeRef.current === 'gaming'
+    ) {
+      return;
+    }
 
     pingOptimizingRef.current = true;
     setPingOptimizing(true);
@@ -1458,7 +1623,10 @@ export const App: React.FC = () => {
     showToast('success', t(lang, 'serverSelectedToast', { name: cfg.name }));
   };
 
-  const handleAddPersonalConfig = (item: PersonalConfigItem) => {
+  const handleAddPersonalConfig = (
+    item: PersonalConfigItem,
+    options?: { publishToEcosystem?: boolean }
+  ) => {
     setPersonalConfigs((prev) => {
       const next = [item, ...prev];
       void savePersonalConfigs(next);
@@ -1467,6 +1635,25 @@ export const App: React.FC = () => {
     handleSelectPersonalConfig(item);
     setActiveTab('profiles');
     showToast('success', t(lang, 'configAddedToast', { name: item.name }));
+
+    if (options?.publishToEcosystem !== false && session && !item.is_subscription) {
+      void addEcosystemOutboundToServer(session.subscription_token, {
+        uri: item.uri,
+        name: item.name,
+      })
+        .then((res) => {
+          pushLog('SYNC', `Outbound "${item.name}" activated across the Sentra ecosystem.`);
+          if (res.message) {
+            showToast('success', res.message);
+          }
+          void syncWithServer(session, { silent: true });
+          void loadDonations(session);
+        })
+        .catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          pushLog('WARN', `Ecosystem activation skipped for "${item.name}": ${msg}`);
+        });
+    }
   };
 
   const handleDeletePersonalConfig = (id: string) => {
@@ -1488,9 +1675,10 @@ export const App: React.FC = () => {
   }): Promise<{ message?: string }> => {
     if (!session) throw new Error(t(lang, 'signInRequired'));
     const res = await donateOutboundToServer(session.subscription_token, payload);
-    pushLog('SYNC', `Donated outbound "${payload.name || 'custom'}" submitted for review.`);
+    pushLog('SYNC', `Donated outbound "${payload.name || 'custom'}" activated in ecosystem.`);
     showToast('success', res.message || t(lang, 'donationSubmittedDefault'));
     void loadDonations(session);
+    void syncWithServer(session, { silent: true });
     return res;
   };
 
@@ -1515,15 +1703,18 @@ export const App: React.FC = () => {
 
   if (!session) {
     return (
-      <AuthView
-        lang={lang}
-        onChangeLanguage={setLang}
-        theme={theme}
-        onToggleTheme={toggleTheme}
-        onAuthenticated={handleAuthenticated}
-        initialNotice={authNotice}
-        botUsername={bootstrap?.bot_username}
-      />
+      <>
+        <AuthView
+          lang={lang}
+          onChangeLanguage={setLang}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          onAuthenticated={handleAuthenticated}
+          initialNotice={authNotice}
+          botUsername={bootstrap?.bot_username}
+        />
+        <OfflineIndicator lang={lang} />
+      </>
     );
   }
 
@@ -1739,6 +1930,8 @@ export const App: React.FC = () => {
         onConfirmDonate={handleDonateSubmit}
       />
 
+      <OfflineIndicator lang={lang} cachedAt={lastConfigCachedAt} />
+
       {/* Toast Notification */}
       {toast && (
         <div
@@ -1746,6 +1939,8 @@ export const App: React.FC = () => {
           className={`fixed top-16 md:top-auto md:bottom-6 end-4 md:end-6 z-50 max-w-sm rounded-xl border px-4 py-3 text-xs font-semibold shadow-xl backdrop-blur-md transition-opacity duration-200 ${
             toast.kind === 'error'
               ? 'border-rose-500/40 bg-rose-950/90 text-rose-100'
+              : toast.kind === 'info'
+              ? 'border-amber-500/45 bg-slate-900/95 text-amber-100'
               : 'border-emerald-500/40 bg-slate-900/95 text-emerald-100'
           }`}
         >

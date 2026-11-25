@@ -277,13 +277,220 @@ function getTehranDateKey(date: Date): string {
   }
 }
 
+function isBlockedHost(rawHost: string): boolean {
+  const host = rawHost.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return true;
+  if (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host === '0.0.0.0' ||
+    host === '::' ||
+    host === '::1'
+  ) {
+    return true;
+  }
+
+  // IPv4-mapped IPv6 e.g. ::ffff:127.0.0.1
+  const ipv4Candidate = host.startsWith('::ffff:') ? host.slice(7) : host;
+  const ipv4Match = ipv4Candidate.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4Match) {
+    const a = Number(ipv4Match[1]);
+    const b = Number(ipv4Match[2]);
+    const c = Number(ipv4Match[3]);
+    const d = Number(ipv4Match[4]);
+    if (a > 255 || b > 255 || c > 255 || d > 255) return true;
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true; // link-local / cloud metadata
+    if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
+    if (a === 192 && b === 168) return true; // RFC1918
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    if (a >= 224) return true; // multicast / reserved
+  }
+
+  // IPv6 ULA / link-local
+  if (host.includes(':')) {
+    if (host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe80')) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function buildSingboxOutboundFromUri(
+  rawUri: string,
+  protocol: string,
+  serverAddress: string,
+  serverPort: number,
+  tag: string
+): Record<string, unknown> {
+  const protoLower = protocol.toLowerCase();
+  if (protoLower === 'vmess') {
+    const body = rawUri.replace(/^vmess:\/\//i, '').split('#')[0].trim();
+    const parsed = JSON.parse(Buffer.from(body, 'base64').toString('utf8')) as Record<string, unknown>;
+    const obj: Record<string, unknown> = {
+      type: 'vmess',
+      tag,
+      server: serverAddress,
+      server_port: serverPort,
+      uuid: String(parsed.id || ''),
+      security: String(parsed.scy || 'auto'),
+      alter_id: Number(parsed.aid || 0),
+    };
+    if (String(parsed.tls || '').toLowerCase() === 'tls') {
+      obj.tls = {
+        enabled: true,
+        server_name: String(parsed.sni || parsed.host || serverAddress),
+      };
+    }
+    return obj;
+  }
+
+  const normalizedUrl = new URL(rawUri.replace(/^[a-zA-Z0-9+.-]+:\/\//, 'https://'));
+  const params = normalizedUrl.searchParams;
+  const userInfo = decodeURIComponent(normalizedUrl.username || '');
+  const sni = params.get('sni') || params.get('host') || serverAddress;
+
+  if (protoLower === 'vless') {
+    const obj: Record<string, unknown> = {
+      type: 'vless',
+      tag,
+      server: serverAddress,
+      server_port: serverPort,
+      uuid: userInfo,
+      flow: params.get('flow') || '',
+      packet_encoding: 'xudp',
+    };
+    const security = (params.get('security') || '').toLowerCase();
+    if (security === 'tls' || security === 'reality') {
+      const tls: Record<string, unknown> = {
+        enabled: true,
+        server_name: sni,
+      };
+      if (security === 'reality' && params.get('pbk')) {
+        tls.reality = {
+          enabled: true,
+          public_key: params.get('pbk'),
+          short_id: params.get('sid') || '',
+        };
+      }
+      obj.tls = tls;
+    }
+    return obj;
+  }
+
+  if (protoLower === 'trojan') {
+    return {
+      type: 'trojan',
+      tag,
+      server: serverAddress,
+      server_port: serverPort,
+      password: userInfo,
+      tls: {
+        enabled: true,
+        server_name: sni,
+      },
+    };
+  }
+
+  if (protoLower === 'hysteria2') {
+    return {
+      type: 'hysteria2',
+      tag,
+      server: serverAddress,
+      server_port: serverPort,
+      password: userInfo,
+      tls: {
+        enabled: true,
+        server_name: sni,
+      },
+    };
+  }
+
+  if (protoLower === 'tuic') {
+    return {
+      type: 'tuic',
+      tag,
+      server: serverAddress,
+      server_port: serverPort,
+      uuid: userInfo,
+      password: decodeURIComponent(normalizedUrl.password || ''),
+      congestion_control: params.get('congestion_control') || 'bbr',
+      tls: {
+        enabled: true,
+        server_name: sni,
+      },
+    };
+  }
+
+  if (protoLower === 'shadowsocks') {
+    let method = 'aes-256-gcm';
+    let password = decodeURIComponent(normalizedUrl.password || '');
+    if (!password && userInfo) {
+      try {
+        const decoded = Buffer.from(userInfo, 'base64').toString('utf8');
+        const colonIdx = decoded.indexOf(':');
+        if (colonIdx > 0) {
+          method = decoded.slice(0, colonIdx);
+          password = decoded.slice(colonIdx + 1);
+        }
+      } catch {
+        password = userInfo;
+      }
+    } else if (userInfo) {
+      method = userInfo;
+    }
+    return {
+      type: 'shadowsocks',
+      tag,
+      server: serverAddress,
+      server_port: serverPort,
+      method,
+      password,
+    };
+  }
+
+  if (protoLower === 'socks' || protoLower === 'socks5') {
+    return {
+      type: 'socks',
+      tag,
+      server: serverAddress,
+      server_port: serverPort,
+      version: '5',
+    };
+  }
+
+  if (protoLower === 'http') {
+    return {
+      type: 'http',
+      tag,
+      server: serverAddress,
+      server_port: serverPort,
+    };
+  }
+
+  return {
+    type: protoLower,
+    tag,
+    server: serverAddress,
+    server_port: serverPort,
+  };
+}
+
 function parseDonatedUri(uri: string): {
   protocol: string;
   server_address: string;
   server_port: number;
   name: string;
+  fingerprint_sha256: string;
+  config_json: string;
 } {
   const cleaned = uri.trim();
+  if (!cleaned || cleaned.length > 8192) {
+    throw new StoreError(400, 'فرمت لینک کانفیگ معتبر نیست.');
+  }
   const match = cleaned.match(/^([a-zA-Z0-9+.-]+):\/\/(.+)$/);
   if (!match) {
     throw new StoreError(400, 'فرمت لینک کانفیگ معتبر نیست.');
@@ -300,12 +507,19 @@ function parseDonatedUri(uri: string): {
     tuic: 'TUIC',
     wireguard: 'WIREGUARD',
     wg: 'WIREGUARD',
+    socks: 'SOCKS',
+    socks5: 'SOCKS',
+    http: 'HTTP',
   };
 
   const protocol = schemeMap[rawScheme];
   if (!protocol) {
     throw new StoreError(400, 'پروتکل انتخاب‌شده پشتیبانی نمی‌شود.');
   }
+
+  let serverAddress = '';
+  let serverPort = 443;
+  let name = '';
 
   if (rawScheme === 'vmess') {
     try {
@@ -315,34 +529,106 @@ function parseDonatedUri(uri: string): {
         throw new Error('missing host');
       }
       const port = Number(parsed.port || 443);
-      return {
-        protocol,
-        server_address: parsed.add,
-        server_port: Number.isFinite(port) && port > 0 && port <= 65535 ? port : 443,
-        name: (parsed.ps || `${protocol}-${parsed.add}`).slice(0, 80),
-      };
+      serverAddress = parsed.add.trim();
+      serverPort = Number.isFinite(port) && port > 0 && port <= 65535 ? port : 443;
+      name = (parsed.ps || `${protocol}-${serverAddress}`).slice(0, 80);
     } catch {
       throw new StoreError(400, 'ساختار لینک VMess معتبر نیست.');
     }
+  } else {
+    try {
+      const normalizedUrl = new URL(cleaned.replace(/^[a-zA-Z0-9+.-]+:\/\//, 'https://'));
+      const host = normalizedUrl.hostname;
+      const port = normalizedUrl.port ? Number(normalizedUrl.port) : 443;
+      const fragment = normalizedUrl.hash ? decodeURIComponent(normalizedUrl.hash.slice(1)) : '';
+      if (!host) {
+        throw new Error('missing host');
+      }
+      serverAddress = host.trim();
+      serverPort = Number.isFinite(port) && port > 0 && port <= 65535 ? port : 443;
+      name = (fragment || `${protocol}-${serverAddress}`).slice(0, 80);
+    } catch {
+      throw new StoreError(400, 'ساختار لینک کانفیگ معتبر نیست.');
+    }
   }
 
-  try {
-    const normalizedUrl = new URL(cleaned.replace(/^[a-zA-Z0-9+.-]+:\/\//, 'https://'));
-    const host = normalizedUrl.hostname;
-    const port = normalizedUrl.port ? Number(normalizedUrl.port) : 443;
-    const fragment = normalizedUrl.hash ? decodeURIComponent(normalizedUrl.hash.slice(1)) : '';
-    if (!host) {
-      throw new Error('missing host');
-    }
-    return {
-      protocol,
-      server_address: host,
-      server_port: Number.isFinite(port) && port > 0 && port <= 65535 ? port : 443,
-      name: (fragment || `${protocol}-${host}`).slice(0, 80),
-    };
-  } catch {
-    throw new StoreError(400, 'ساختار لینک کانفیگ معتبر نیست.');
+  if (isBlockedHost(serverAddress)) {
+    throw new StoreError(
+      400,
+      'آدرس سرور واردشده متعلق به شبکه داخلی یا غیرمجاز است و امکان ثبت آن وجود ندارد.'
+    );
   }
+
+  const fingerprint_sha256 = crypto
+    .createHash('sha256')
+    .update(`${protocol.toLowerCase()}:${serverAddress.toLowerCase()}:${serverPort}`)
+    .digest('hex');
+
+  const singboxObj = buildSingboxOutboundFromUri(
+    cleaned,
+    protocol,
+    serverAddress,
+    serverPort,
+    name
+  );
+
+  return {
+    protocol,
+    server_address: serverAddress,
+    server_port: serverPort,
+    name,
+    fingerprint_sha256,
+    config_json: JSON.stringify(singboxObj),
+  };
+}
+
+export function tierHasStaticIp(tier: string): boolean {
+  const lower = (tier || '').trim().toLowerCase();
+  if (!lower || lower === 'sentra lite' || lower === 'lite' || lower === 'free') {
+    return false;
+  }
+  return (
+    lower.includes('static') ||
+    lower.includes('pro') ||
+    lower.includes('flow') ||
+    lower.includes('ultra') ||
+    lower.includes('vip') ||
+    lower.includes('all')
+  );
+}
+
+export function tierHasGaming(tier: string): boolean {
+  const lower = (tier || '').trim().toLowerCase();
+  if (!lower || lower === 'sentra lite' || lower === 'lite' || lower === 'free') {
+    return false;
+  }
+  return (
+    lower.includes('gaming') ||
+    lower.includes('game') ||
+    lower.includes('pro') ||
+    lower.includes('flow') ||
+    lower.includes('ultra') ||
+    lower.includes('vip') ||
+    lower.includes('all')
+  );
+}
+
+function deriveX25519KeypairFromSeed(seed: Buffer): { privateKeyB64: string; publicKeyB64: string } {
+  // PKCS#8 DER prefix for X25519 private key (RFC 8410) + 32-byte raw seed
+  const pkcs8Prefix = Buffer.from('302e020100300506032b656e04220420', 'hex');
+  const rawSeed = Buffer.from(seed.subarray(0, 32));
+  const privKeyObj = crypto.createPrivateKey({
+    key: Buffer.concat([pkcs8Prefix, rawSeed]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  const pubKeyObj = crypto.createPublicKey(privKeyObj);
+  const spkiDer = pubKeyObj.export({ format: 'der', type: 'spki' }) as Buffer;
+  const rawPub = spkiDer.subarray(spkiDer.length - 32);
+  return {
+    privateKeyB64: rawSeed.toString('base64'),
+    publicKeyB64: rawPub.toString('base64'),
+  };
 }
 
 function sanitizeSyncPreferences(raw: unknown): Record<string, unknown> {
@@ -355,6 +641,7 @@ function sanitizeSyncPreferences(raw: unknown): Record<string, unknown> {
   if (
     input.selected_mode === 'web_browsing' ||
     input.selected_mode === 'download' ||
+    input.selected_mode === 'gaming' ||
     input.selected_mode === 'static_ip'
   ) {
     out.selected_mode = input.selected_mode;
@@ -560,6 +847,18 @@ export class SentraStore {
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS outbounds (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tag TEXT NOT NULL UNIQUE,
+        protocol TEXT NOT NULL,
+        server_address TEXT NOT NULL,
+        server_port INTEGER NOT NULL,
+        uuid TEXT,
+        tier_access TEXT NOT NULL DEFAULT 'Sentra Lite',
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+
       CREATE INDEX IF NOT EXISTS idx_users_username_lower ON users (LOWER(username));
       CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users (LOWER(email));
       CREATE INDEX IF NOT EXISTS idx_subscriptions_token ON subscriptions (token);
@@ -577,6 +876,33 @@ export class SentraStore {
       "TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'"
     );
     this.ensureColumn('subscriptions', 'speed_limit_bps', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('donated_outbounds', 'label', 'TEXT');
+    this.ensureColumn('donated_outbounds', 'config_json', "TEXT NOT NULL DEFAULT '{}'");
+    this.ensureColumn('donated_outbounds', 'assigned_tier', "TEXT NOT NULL DEFAULT 'web_browsing'");
+    this.ensureColumn('donated_outbounds', 'allow_web', 'INTEGER NOT NULL DEFAULT 1');
+    this.ensureColumn('donated_outbounds', 'allow_download', 'INTEGER NOT NULL DEFAULT 1');
+    this.ensureColumn('donated_outbounds', 'allow_static_ip', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('donated_outbounds', 'allow_gaming', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('donated_outbounds', 'speed_score', 'INTEGER NOT NULL DEFAULT 80');
+    this.ensureColumn('donated_outbounds', 'last_online_at', 'TEXT');
+    this.ensureColumn('donated_outbounds', 'allocation_mode', "TEXT NOT NULL DEFAULT 'auto'");
+    this.ensureColumn('donated_outbounds', 'fingerprint_sha256', 'TEXT');
+    this.ensureColumn('donated_outbounds', 'fail_count', 'INTEGER NOT NULL DEFAULT 0');
+
+    // Normalize existing active/approved outbounds so they are active across the entire ecosystem
+    this.db.exec(`
+      UPDATE donated_outbounds
+      SET allow_gaming = 1
+      WHERE assigned_tier = 'gaming'
+         OR COALESCE(allocation_mode, 'auto') IN ('gaming_only', 'gaming', 'all');
+
+      UPDATE donated_outbounds
+      SET allow_web = 1,
+          allow_download = 1
+      WHERE status IN ('active', 'approved')
+        AND COALESCE(allocation_mode, 'auto') NOT IN ('static_only', 'gaming_only')
+        AND (allow_web = 0 OR allow_download = 0);
+    `);
   }
 
   private checkAndResetDailyQuota(sub: SubscriptionRow): SubscriptionRow {
@@ -722,8 +1048,45 @@ export class SentraStore {
     };
   }
 
+  /**
+   * Returns true once at least one active outbound has been allocated to Gaming.
+   * Until then, Gaming remains visible as "coming_soon" across the entire ecosystem.
+   */
+  hasActiveGamingOutbounds(): boolean {
+    const donatedRow = this.db
+      .prepare(
+        `SELECT COUNT(*) as cnt FROM donated_outbounds
+         WHERE status IN ('active', 'approved')
+           AND (allow_gaming = 1 OR assigned_tier = 'gaming' OR allocation_mode IN ('gaming_only', 'gaming', 'all'))`
+      )
+      .get() as { cnt: number };
+    if ((donatedRow?.cnt || 0) > 0) {
+      return true;
+    }
+
+    const outboundsCols = this.db
+      .prepare('PRAGMA table_info(outbounds)')
+      .all() as Array<{ name: string }>;
+    if (outboundsCols.some((c) => c.name === 'mode_category')) {
+      const coreRow = this.db
+        .prepare(
+          `SELECT COUNT(*) as cnt FROM outbounds
+           WHERE is_active = 1 AND server_address != '127.0.0.1' AND mode_category = 'gaming'`
+        )
+        .get() as { cnt: number };
+      if ((coreRow?.cnt || 0) > 0) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   private buildModes(sub: SubscriptionRow) {
     const isLite = sub.tier === 'Sentra Lite';
+    const gamingEnabled = this.hasActiveGamingOutbounds();
+    const hasGaming = tierHasGaming(sub.tier);
+    const hasStatic = tierHasStaticIp(sub.tier);
     return [
       {
         id: 'web_browsing',
@@ -750,13 +1113,31 @@ export class SentraStore {
         description: 'High-bandwidth routing for large downloads and streaming.',
       },
       {
+        id: 'gaming',
+        name: 'Gaming',
+        status: !gamingEnabled ? 'coming_soon' : hasGaming ? 'active' : 'locked',
+        badge: !gamingEnabled
+          ? 'Coming Soon'
+          : hasGaming
+          ? 'Low Ping · MTU 1280'
+          : 'Gaming / Pro',
+        daily_limit_mb: gamingEnabled && hasGaming ? 204800 : 0,
+        used_today_mb: 0,
+        remaining_today_mb: gamingEnabled && hasGaming ? 204800 : 0,
+        speed_desc: 'Ultra-Low Ping',
+        security_desc: 'Full-Cone NAT · WireGuard iOS',
+        description: gamingEnabled
+          ? 'Zero-jitter routing for Windows/Android gaming and WireGuard protocol for iOS.'
+          : 'Gaming mode is coming soon and activates automatically once gaming servers are added.',
+      },
+      {
         id: 'static_ip',
         name: 'Static IP',
-        status: isLite ? 'locked' : sub.static_ip_used_mb >= 30720 ? 'depleted' : 'active',
-        badge: isLite ? 'Pro' : null,
-        daily_limit_mb: isLite ? 0 : 30720,
+        status: !hasStatic ? 'locked' : sub.static_ip_used_mb >= 30720 ? 'depleted' : 'active',
+        badge: !hasStatic ? 'Static / Pro' : null,
+        daily_limit_mb: !hasStatic ? 0 : 30720,
         used_today_mb: sub.static_ip_used_mb,
-        remaining_today_mb: Math.max(0, (isLite ? 0 : 30720) - sub.static_ip_used_mb),
+        remaining_today_mb: Math.max(0, (!hasStatic ? 0 : 30720) - sub.static_ip_used_mb),
         speed_desc: 'Dedicated Route',
         security_desc: 'Clean Residential / Trading Safe',
         description: 'Consistent exit IP for banking, exchanges, and sensitive accounts.',
@@ -1297,31 +1678,7 @@ export class SentraStore {
       )
       .all(user.id) as unknown as DeviceRow[];
 
-    const activeOutbounds = this.db
-      .prepare(
-        `SELECT id, COALESCE(NULLIF(name, ''), NULLIF(tag, ''), protocol) as name,
-                COALESCE(NULLIF(tag, ''), name, protocol) as tag,
-                protocol, country_code, country_name, flag, latency_ms, health_score,
-                is_official, server_address, server_port, raw_link
-         FROM donated_outbounds
-         WHERE status IN ('active', 'approved')
-         ORDER BY is_official DESC, latency_ms ASC`
-      )
-      .all() as Array<{
-      id: number;
-      name: string;
-      tag: string;
-      protocol: string;
-      country_code: string;
-      country_name: string;
-      flag: string;
-      latency_ms: number;
-      health_score: number;
-      is_official: number;
-      server_address: string;
-      server_port: number;
-      raw_link: string | null;
-    }>;
+    const activeOutbounds = this.getActiveEcosystemOutboundsList();
 
     const usedBytes = sub.upload_bytes + sub.download_bytes;
     const remainingBytes = Math.max(0, sub.traffic_limit_bytes - usedBytes);
@@ -1362,25 +1719,618 @@ export class SentraStore {
       },
       devices,
       modes: this.buildModes(sub),
-      outbounds: activeOutbounds.map((o) => ({
-        id: `node-${o.id}`,
-        db_id: o.id,
-        name: o.name,
-        tag: o.tag,
-        protocol: o.protocol,
-        category: 'web_browsing',
-        country_code: o.country_code || 'XX',
-        country_name: o.country_name || 'Global',
-        flag: o.flag || '🌐',
-        latency_ms: o.latency_ms || 0,
-        health_score: o.health_score || 100,
-        is_official: o.is_official === 1,
-        is_online: true,
-        server_address: o.server_address,
-        server_port: o.server_port,
-        uri: o.raw_link,
-      })),
+      outbounds: activeOutbounds,
       client_state: this.readClientStateRow(user.id),
+    };
+  }
+
+  private getActiveEcosystemOutboundsList() {
+    const donatedRows = this.db
+      .prepare(
+        `SELECT id,
+                COALESCE(NULLIF(label, ''), NULLIF(name, ''), NULLIF(tag, ''), protocol) as name,
+                COALESCE(NULLIF(tag, ''), NULLIF(label, ''), NULLIF(name, ''), protocol) as tag,
+                protocol, assigned_tier, country_code, country_name, flag, latency_ms, health_score,
+                is_official, server_address, server_port, raw_link, config_json,
+                allow_web, allow_download, allow_static_ip
+         FROM donated_outbounds
+         WHERE status IN ('active', 'approved')
+         ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, id DESC`
+      )
+      .all() as Array<{
+      id: number;
+      name: string;
+      tag: string;
+      protocol: string;
+      assigned_tier: string | null;
+      country_code: string | null;
+      country_name: string | null;
+      flag: string | null;
+      latency_ms: number;
+      health_score: number;
+      is_official: number;
+      server_address: string;
+      server_port: number;
+      raw_link: string | null;
+      config_json: string | null;
+      allow_web: number;
+      allow_download: number;
+      allow_static_ip: number;
+    }>;
+
+    const coreRows = this.db
+      .prepare(
+        `SELECT id, tag, protocol, server_address, server_port, uuid, tier_access
+         FROM outbounds
+         WHERE is_active = 1 AND server_address != '127.0.0.1'
+         ORDER BY id ASC`
+      )
+      .all() as Array<{
+      id: number;
+      tag: string;
+      protocol: string;
+      server_address: string;
+      server_port: number;
+      uuid: string | null;
+      tier_access: string;
+    }>;
+
+    const result = donatedRows.map((o) => ({
+      id: `node-${o.id}`,
+      db_id: o.id,
+      name: o.name,
+      tag: o.tag,
+      protocol: o.protocol,
+      category: o.assigned_tier || 'web_browsing',
+      country_code: o.country_code || 'XX',
+      country_name: o.country_name || 'Global',
+      flag: o.flag || '🌐',
+      latency_ms: o.latency_ms || 0,
+      health_score: o.health_score || 100,
+      is_official: o.is_official === 1,
+      is_online: true,
+      server_address: o.server_address,
+      server_port: o.server_port,
+      uri: o.raw_link,
+    }));
+
+    for (const c of coreRows) {
+      let uri = `${c.protocol.toLowerCase()}://${c.server_address}:${c.server_port}#${encodeURIComponent(c.tag)}`;
+      if (c.protocol.toLowerCase() === 'vless') {
+        uri = `vless://${c.uuid || '00000000-0000-0000-0000-000000000000'}@${c.server_address}:${c.server_port}?security=reality&type=tcp#${encodeURIComponent(c.tag)}`;
+      }
+      result.push({
+        id: `core-${c.id}`,
+        db_id: c.id,
+        name: c.tag,
+        tag: c.tag,
+        protocol: c.protocol.toUpperCase(),
+        category: 'web_browsing',
+        country_code: 'XX',
+        country_name: 'Sentra Core',
+        flag: '🛡️',
+        latency_ms: 0,
+        health_score: 100,
+        is_official: true,
+        is_online: true,
+        server_address: c.server_address,
+        server_port: c.server_port,
+        uri,
+      });
+    }
+
+    return result;
+  }
+
+  getClientLocations() {
+    const outbounds = this.getActiveEcosystemOutboundsList();
+    const byCountry = new Map<
+      string,
+      {
+        country_code: string;
+        country_name: string;
+        flag: string;
+        node_count: number;
+        best_latency_ms: number;
+      }
+    >();
+
+    for (const o of outbounds) {
+      const code = (o.country_code || 'XX').toUpperCase();
+      const existing = byCountry.get(code);
+      if (!existing) {
+        byCountry.set(code, {
+          country_code: code,
+          country_name: o.country_name || 'Global',
+          flag: o.flag || '🌐',
+          node_count: 1,
+          best_latency_ms: o.latency_ms || 0,
+        });
+      } else {
+        existing.node_count += 1;
+        if (o.latency_ms > 0 && (existing.best_latency_ms === 0 || o.latency_ms < existing.best_latency_ms)) {
+          existing.best_latency_ms = o.latency_ms;
+        }
+      }
+    }
+
+    return {
+      success: true,
+      locations: Array.from(byCountry.values()),
+    };
+  }
+
+  compileClientConfig(
+    rawToken: string | undefined | null,
+    payload: {
+      mode?: string;
+      protocol?: string;
+      location_code?: string;
+      use_warp?: boolean;
+      selected_outbound_id?: string | null;
+      personal_uri?: string | null;
+    }
+  ) {
+    const { sub } = this.resolveAuthenticatedUser(rawToken);
+    const requestedMode =
+      payload.mode === 'download' ||
+      payload.mode === 'static_ip' ||
+      payload.mode === 'gaming'
+        ? payload.mode
+        : 'web_browsing';
+
+    if (requestedMode === 'gaming') {
+      if (!this.hasActiveGamingOutbounds()) {
+        throw new StoreError(
+          403,
+          'بخش گیمینگ به زودی اضافه می‌شود.',
+          'MODE_COMING_SOON'
+        );
+      }
+      if (!tierHasGaming(sub.tier)) {
+        throw new StoreError(
+          403,
+          'حالت گیمینگ کم‌پینگ نیازمند اشتراک گیمینگ، Pro یا Flow+ است.',
+          'MODE_LOCKED'
+        );
+      }
+    }
+
+    if (requestedMode === 'static_ip' && !tierHasStaticIp(sub.tier)) {
+      throw new StoreError(
+        403,
+        'حالت آی‌پی ثابت اختصاصی نیازمند اشتراک آی‌پی ثابت، Pro یا Flow+ است.',
+        'MODE_LOCKED'
+      );
+    }
+
+    const singboxOutbounds: Array<Record<string, unknown>> = [];
+    const outboundTags: string[] = [];
+    const usedTags = new Set<string>();
+
+    const makeUniqueTag = (base: string): string => {
+      if (!usedTags.has(base)) {
+        usedTags.add(base);
+        return base;
+      }
+      let idx = 2;
+      while (usedTags.has(`${base} (${idx})`)) idx += 1;
+      const candidate = `${base} (${idx})`;
+      usedTags.add(candidate);
+      return candidate;
+    };
+
+    let hasExplicitSelection = false;
+
+    // 1. Optional personal URI (validated against Anti-SSRF)
+    if (payload.personal_uri && typeof payload.personal_uri === 'string' && payload.personal_uri.trim()) {
+      const parsed = parseDonatedUri(payload.personal_uri);
+      const tag = makeUniqueTag(`Personal ${parsed.name}`);
+      const obj = JSON.parse(parsed.config_json) as Record<string, unknown>;
+      obj.tag = tag;
+      outboundTags.push(tag);
+      singboxOutbounds.push(obj);
+      hasExplicitSelection = true;
+    }
+
+    // 2. Load active ecosystem outbounds (for gaming mode, prioritize gaming-allocated outbounds)
+    const donatedSql =
+      requestedMode === 'gaming'
+        ? `SELECT id,
+                  COALESCE(NULLIF(label, ''), NULLIF(name, ''), NULLIF(tag, ''), protocol) as display_name,
+                  protocol, server_address, server_port, raw_link, config_json, is_official
+           FROM donated_outbounds
+           WHERE status IN ('active', 'approved')
+             AND (allow_gaming = 1 OR assigned_tier = 'gaming' OR allocation_mode IN ('gaming_only', 'gaming', 'all'))
+           ORDER BY is_official DESC, CASE WHEN latency_ms > 0 THEN latency_ms ELSE 9999 END ASC, speed_score DESC, id DESC`
+        : `SELECT id,
+                  COALESCE(NULLIF(label, ''), NULLIF(name, ''), NULLIF(tag, ''), protocol) as display_name,
+                  protocol, server_address, server_port, raw_link, config_json, is_official
+           FROM donated_outbounds
+           WHERE status IN ('active', 'approved')
+           ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, id DESC`;
+    const donatedRows = this.db.prepare(donatedSql).all() as Array<{
+      id: number;
+      display_name: string;
+      protocol: string;
+      server_address: string;
+      server_port: number;
+      raw_link: string | null;
+      config_json: string | null;
+      is_official: number;
+    }>;
+
+    // Prioritize selected_outbound_id if it references node-*
+    const selId = payload.selected_outbound_id || '';
+    if (selId.startsWith('node-')) {
+      const targetId = Number(selId.slice('node-'.length));
+      const idx = donatedRows.findIndex((r) => r.id === targetId);
+      if (idx > 0) {
+        const [picked] = donatedRows.splice(idx, 1);
+        donatedRows.unshift(picked);
+        hasExplicitSelection = true;
+      } else if (idx === 0) {
+        hasExplicitSelection = true;
+      }
+    }
+
+    for (const row of donatedRows) {
+      let obj: Record<string, unknown> | null = null;
+      if (row.config_json && row.config_json.trim().startsWith('{') && row.config_json.trim() !== '{}') {
+        try {
+          obj = JSON.parse(row.config_json) as Record<string, unknown>;
+        } catch {
+          obj = null;
+        }
+      }
+      if (!obj && row.raw_link) {
+        try {
+          const parsed = parseDonatedUri(row.raw_link);
+          obj = JSON.parse(parsed.config_json) as Record<string, unknown>;
+        } catch {
+          obj = null;
+        }
+      }
+      if (!obj) {
+        obj = {
+          type: row.protocol.toLowerCase(),
+          server: row.server_address,
+          server_port: row.server_port,
+        };
+      }
+      const prefix = row.is_official === 1 ? '👑 ' : '🤝 ';
+      const tag = makeUniqueTag(`${prefix}${row.display_name}`);
+      obj.tag = tag;
+      outboundTags.push(tag);
+      singboxOutbounds.push(obj);
+    }
+
+    // 3. Core outbounds table (non-loopback)
+    const coreRows = this.db
+      .prepare(
+        `SELECT id, tag, protocol, server_address, server_port, uuid
+         FROM outbounds
+         WHERE is_active = 1 AND server_address != '127.0.0.1'
+         ORDER BY id ASC`
+      )
+      .all() as Array<{
+      id: number;
+      tag: string;
+      protocol: string;
+      server_address: string;
+      server_port: number;
+      uuid: string | null;
+    }>;
+
+    for (const c of coreRows) {
+      const tag = makeUniqueTag(c.tag);
+      const obj: Record<string, unknown> =
+        c.protocol.toLowerCase() === 'vless'
+          ? {
+              type: 'vless',
+              tag,
+              server: c.server_address,
+              server_port: c.server_port,
+              uuid: c.uuid || '00000000-0000-0000-0000-000000000000',
+              flow: '',
+              packet_encoding: 'xudp',
+            }
+          : {
+              type: c.protocol.toLowerCase(),
+              tag,
+              server: c.server_address,
+              server_port: c.server_port,
+            };
+      if (selId === `core-${c.id}`) {
+        outboundTags.unshift(tag);
+        singboxOutbounds.unshift(obj);
+        hasExplicitSelection = true;
+      } else {
+        outboundTags.push(tag);
+        singboxOutbounds.push(obj);
+      }
+    }
+
+    const selectDefault =
+      hasExplicitSelection && outboundTags.length > 0 ? outboundTags[0] : 'Sentra Auto';
+
+    const isGaming = requestedMode === 'gaming';
+
+    const allOutbounds: Array<Record<string, unknown>> = [
+      {
+        type: 'selector',
+        tag: 'Sentra Select',
+        outbounds: ['Sentra Auto', ...outboundTags, 'direct'],
+        default: selectDefault,
+      },
+      {
+        type: 'urltest',
+        tag: 'Sentra Auto',
+        outbounds: outboundTags.length > 0 ? outboundTags : ['direct'],
+        url: 'https://www.gstatic.com/generate_204',
+        interval: isGaming ? '1m' : '3m',
+        tolerance: isGaming ? 15 : 50,
+      },
+      ...singboxOutbounds,
+      { type: 'direct', tag: 'direct' },
+      { type: 'block', tag: 'block' },
+      { type: 'dns', tag: 'dns-out' },
+    ];
+
+    const singboxConfig = {
+      log: { level: isGaming ? 'warn' : 'info', timestamp: true },
+      dns: isGaming
+        ? {
+            servers: [
+              {
+                tag: 'dns-remote',
+                address: 'udp://1.1.1.1',
+                strategy: 'ipv4_only',
+                detour: 'Sentra Select',
+              },
+              {
+                tag: 'dns-remote-backup',
+                address: 'udp://8.8.8.8',
+                strategy: 'ipv4_only',
+                detour: 'Sentra Select',
+              },
+              { tag: 'dns-direct', address: 'local', detour: 'direct' },
+            ],
+            rules: [
+              { outbound: 'any', server: 'dns-remote' },
+              { domain_suffix: ['.ir'], server: 'dns-direct' },
+            ],
+            final: 'dns-remote',
+            strategy: 'ipv4_only',
+            independent_cache: true,
+          }
+        : {
+            servers: [
+              { tag: 'dns-remote', address: 'https://1.1.1.1/dns-query', detour: 'Sentra Select' },
+              { tag: 'dns-direct', address: 'local', detour: 'direct' },
+              { tag: 'dns-block', address: 'rcode://success' },
+            ],
+            rules: [
+              { outbound: 'any', server: 'dns-direct' },
+              { domain_suffix: ['.ir'], server: 'dns-direct' },
+            ],
+            final: 'dns-remote',
+            strategy: 'prefer_ipv4',
+          },
+      inbounds: [
+        isGaming
+          ? {
+              type: 'tun',
+              tag: 'tun-in',
+              interface_name: 'sentra0',
+              inet4_address: '172.19.0.1/30',
+              mtu: 1280,
+              auto_route: true,
+              strict_route: true,
+              stack: 'system',
+              endpoint_independent_nat: true,
+              udp_timeout: '5m',
+              sniff: false,
+              sniff_override_destination: false,
+            }
+          : {
+              type: 'tun',
+              tag: 'tun-in',
+              interface_name: 'sentra0',
+              inet4_address: '172.19.0.1/30',
+              mtu: 1400,
+              auto_route: true,
+              strict_route: true,
+              stack: 'system',
+              sniff: true,
+            },
+        {
+          type: 'mixed',
+          tag: 'mixed-in',
+          listen: '127.0.0.1',
+          listen_port: 2080,
+          sniff: !isGaming,
+        },
+      ],
+      outbounds: allOutbounds,
+      route: {
+        auto_detect_interface: true,
+        final: 'Sentra Select',
+        rules: [
+          { protocol: 'dns', outbound: 'dns-out' },
+          { domain_suffix: ['.ir', '.local'], outbound: 'direct' },
+          { ip_is_private: true, outbound: 'direct' },
+        ],
+      },
+      experimental: {
+        clash_api: {
+          external_controller: '127.0.0.1:9090',
+          secret: 'sentra_internal_traffic_secret',
+        },
+      },
+    };
+
+    return {
+      success: true,
+      mode: requestedMode,
+      tier: sub.tier,
+      use_warp: isGaming || requestedMode === 'static_ip' ? false : Boolean(payload.use_warp),
+      gaming_optimized: isGaming,
+      active_outbounds_count: outboundTags.length,
+      singbox_config: singboxConfig,
+      outbounds: this.getActiveEcosystemOutboundsList(),
+    };
+  }
+
+  generateWireguardGamingProfile(
+    rawToken: string | undefined | null,
+    serverHost = '127.0.0.1'
+  ): {
+    filename: string;
+    config: string;
+    client_public_key: string;
+    client_address: string;
+    tier: string;
+  } {
+    const { sub } = this.resolveAuthenticatedUser(rawToken);
+    if (!this.hasActiveGamingOutbounds()) {
+      throw new StoreError(
+        403,
+        'بخش گیمینگ به زودی اضافه می‌شود.',
+        'MODE_COMING_SOON'
+      );
+    }
+    if (!tierHasGaming(sub.tier)) {
+      throw new StoreError(
+        403,
+        'کانفیگ گیمینگ WireGuard مختص کاربران دارای اشتراک گیمینگ، Pro یا Flow+ است.',
+        'MODE_LOCKED'
+      );
+    }
+
+    const salt = (process.env.WIREGUARD_KEY_SALT || 'sentra-gaming-wg-v1').trim();
+    const clientSeed = crypto
+      .createHash('sha256')
+      .update(`${salt}:client:${sub.token}`)
+      .digest();
+    const clientPair = deriveX25519KeypairFromSeed(clientSeed);
+
+    const envPub = (process.env.WIREGUARD_SERVER_PUBLIC_KEY || '').trim();
+    const envPriv = (process.env.WIREGUARD_SERVER_PRIVATE_KEY || '').trim();
+    let serverPub = envPub;
+    if (!serverPub && envPriv) {
+      const decoded = Buffer.from(envPriv, 'base64');
+      if (decoded.length === 32) {
+        serverPub = deriveX25519KeypairFromSeed(decoded).publicKeyB64;
+      }
+    }
+    const cleanHost =
+      !serverHost || serverHost === '0.0.0.0' ? '127.0.0.1' : serverHost.trim();
+    if (!serverPub) {
+      const fallbackSeed = crypto
+        .createHash('sha256')
+        .update(`sentra-wg-server-pub:${cleanHost}`)
+        .digest();
+      serverPub = deriveX25519KeypairFromSeed(fallbackSeed).publicKeyB64;
+    }
+
+    const ipDigest = crypto
+      .createHash('sha256')
+      .update(`sentra-wg-ip:${sub.token}`)
+      .digest();
+    const clientAddress = `10.66.${ipDigest[0]}.${(ipDigest[1] % 250) + 2}/32`;
+    const wgPort = Number(process.env.WIREGUARD_PORT) > 0 ? Number(process.env.WIREGUARD_PORT) : 51820;
+    const tokenPrefix = sub.token.slice(0, 8);
+
+    const config = [
+      '# ==============================================================================',
+      '# Sentra Gaming - WireGuard Profile (iOS Ultra-Low Latency)',
+      `# Tier: ${sub.tier} | Mode: gaming`,
+      `# Client Public Key: ${clientPair.publicKeyB64}`,
+      `# Generated: ${new Date().toISOString()}`,
+      '# ==============================================================================',
+      '[Interface]',
+      `PrivateKey = ${clientPair.privateKeyB64}`,
+      `Address = ${clientAddress}`,
+      'DNS = 1.1.1.1, 8.8.8.8',
+      'MTU = 1280',
+      '',
+      '[Peer]',
+      `PublicKey = ${serverPub}`,
+      `Endpoint = ${cleanHost}:${wgPort}`,
+      'AllowedIPs = 0.0.0.0/0',
+      'PersistentKeepalive = 25',
+      '',
+    ].join('\n');
+
+    return {
+      filename: `sentra-gaming-wg-${tokenPrefix}.conf`,
+      config,
+      client_public_key: clientPair.publicKeyB64,
+      client_address: clientAddress,
+      tier: sub.tier,
+    };
+  }
+
+  getSubscriptionPayload(
+    token: string,
+    format?: string,
+    userAgent = ''
+  ): {
+    contentType: string;
+    body: string;
+    subUserInfo: string;
+    isSingbox: boolean;
+  } {
+    const { sub } = this.resolveAuthenticatedUser(token);
+    const expireTs = Math.floor(Date.parse(sub.expires_at) / 1000) || 0;
+    const subUserInfo = `upload=${sub.upload_bytes}; download=${sub.download_bytes}; total=${sub.traffic_limit_bytes}; expire=${expireTs}`;
+
+    const lowerFormat = (format || '').toLowerCase();
+    const lowerUa = userAgent.toLowerCase();
+    const wantsSingbox =
+      lowerFormat === 'singbox' ||
+      lowerFormat === 'sing-box' ||
+      lowerUa.includes('sing-box') ||
+      lowerUa.includes('singbox');
+
+    if (wantsSingbox) {
+      const compiled = this.compileClientConfig(token, { mode: 'web_browsing' });
+      return {
+        contentType: 'application/json; charset=utf-8',
+        body: JSON.stringify(compiled.singbox_config, null, 2),
+        subUserInfo,
+        isSingbox: true,
+      };
+    }
+
+    const outbounds = this.getActiveEcosystemOutboundsList();
+    const seen = new Set<string>();
+    const lines: string[] = [];
+
+    for (const o of outbounds) {
+      const prefix = o.is_official ? '👑 ' : '🤝 ';
+      const taggedName = `${prefix}${o.name}`;
+      let uri = (o.uri || '').trim();
+      if (uri) {
+        if (!uri.toLowerCase().startsWith('vmess://')) {
+          const base = uri.split('#')[0];
+          uri = `${base}#${encodeURIComponent(taggedName)}`;
+        }
+      } else {
+        uri = `${o.protocol.toLowerCase()}://${o.server_address}:${o.server_port}#${encodeURIComponent(taggedName)}`;
+      }
+      if (!seen.has(uri)) {
+        seen.add(uri);
+        lines.push(uri);
+      }
+    }
+
+    return {
+      contentType: 'text/plain; charset=utf-8',
+      body: Buffer.from(lines.join('\n'), 'utf8').toString('base64'),
+      subUserInfo,
+      isSingbox: false,
     };
   }
 
@@ -1405,13 +2355,20 @@ export class SentraStore {
   donateOutbound(
     rawToken: string | undefined | null,
     payload: { uri: string; name?: string; note?: string }
-  ): { success: true; id: number; latency_ms: number; message: string } {
+  ): { success: true; id: number; status: string; latency_ms: number; message: string } {
     const { user } = this.resolveAuthenticatedUser(rawToken);
     if (!payload.uri || typeof payload.uri !== 'string' || !payload.uri.trim()) {
       throw new StoreError(400, 'لینک کانفیگ نمی‌تواند خالی باشد.');
     }
 
     const parsed = parseDonatedUri(payload.uri);
+    const dup = this.db
+      .prepare('SELECT id FROM donated_outbounds WHERE fingerprint_sha256 = ? LIMIT 1')
+      .get(parsed.fingerprint_sha256) as { id: number } | undefined;
+    if (dup) {
+      throw new StoreError(400, 'این سرور قبلاً در شبکه سنترا ثبت و فعال شده است.');
+    }
+
     const label = (payload.name?.trim() || parsed.name).slice(0, 80);
     const note = payload.note ? payload.note.trim().slice(0, 240) : null;
     const nowIso = new Date().toISOString();
@@ -1419,36 +2376,203 @@ export class SentraStore {
     const insert = this.db
       .prepare(
         `INSERT INTO donated_outbounds (
-          donor_user_id, name, tag, protocol, server_address, server_port,
-          country_code, country_name, flag, raw_link, latency_ms, status, reward_days,
-          user_note, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'XX', 'Global', '🌐', ?, 0, 'pending', 0, ?, ?)`
+          donor_user_id, name, label, tag, protocol, server_address, server_port,
+          config_json, assigned_tier, country_code, country_name, flag, raw_link,
+          latency_ms, health_score, is_official, status, reward_days,
+          allow_web, allow_download, allow_static_ip, speed_score, last_online_at,
+          allocation_mode, fingerprint_sha256, user_note, created_at, approved_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'web_browsing', 'XX', 'Global', '🌐', ?, 0, 100, 0, 'active', 0, 1, 1, 0, 85, ?, 'auto', ?, ?, ?, ?)`
       )
       .run(
         user.id,
         label,
         label,
+        label,
         parsed.protocol,
         parsed.server_address,
         parsed.server_port,
+        parsed.config_json,
         payload.uri.trim(),
+        nowIso,
+        parsed.fingerprint_sha256,
         note,
+        nowIso,
         nowIso
       );
 
     return {
       success: true,
       id: Number(insert.lastInsertRowid),
+      status: 'active',
       latency_ms: 0,
-      message: 'کانفیگ اهدایی شما با موفقیت ثبت شد و در صف بررسی قرار گرفت.',
+      message: 'اوتباند اهدایی شما با موفقیت ثبت و بلافاصله در کل اکوسیستم سنترا فعال شد.',
     };
+  }
+
+  addEcosystemOutbound(
+    rawToken: string | undefined | null,
+    payload: { uri: string; name?: string; note?: string; category?: string }
+  ): { success: true; id: number; is_official: boolean; status: string; message: string } {
+    const { user } = this.resolveAuthenticatedUser(rawToken);
+    if (!payload.uri || typeof payload.uri !== 'string' || !payload.uri.trim()) {
+      throw new StoreError(400, 'لینک کانفیگ نمی‌تواند خالی باشد.');
+    }
+
+    const parsed = parseDonatedUri(payload.uri);
+    const isOfficial = user.role === 'admin' ? 1 : 0;
+    const requestedCat = isOfficial === 1 ? (payload.category || 'both') : 'auto';
+    const allowWeb = requestedCat === 'static_only' || requestedCat === 'gaming_only' ? 0 : 1;
+    const allowDownload = allowWeb;
+    const allowStatic =
+      isOfficial === 1 && (requestedCat === 'static_only' || requestedCat === 'both' || requestedCat === 'all')
+        ? 1
+        : 0;
+    const allowGaming =
+      isOfficial === 1 && (requestedCat === 'gaming_only' || requestedCat === 'gaming' || requestedCat === 'all')
+        ? 1
+        : 0;
+    const allocationMode = isOfficial === 1 ? requestedCat : 'auto';
+    const assignedTier =
+      allowGaming === 1 && allowWeb === 0
+        ? 'gaming'
+        : allowStatic === 1
+        ? 'static_ip'
+        : 'web_browsing';
+    const label = (payload.name?.trim() || parsed.name).slice(0, 80);
+    const note = payload.note ? payload.note.trim().slice(0, 240) : null;
+    const nowIso = new Date().toISOString();
+
+    const existing = this.db
+      .prepare('SELECT id FROM donated_outbounds WHERE fingerprint_sha256 = ? LIMIT 1')
+      .get(parsed.fingerprint_sha256) as { id: number } | undefined;
+
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE donated_outbounds
+           SET name = ?, label = ?, tag = ?, config_json = ?, raw_link = ?,
+               status = 'active', allow_web = ?, allow_download = ?,
+               allow_static_ip = CASE WHEN ? = 1 THEN 1 ELSE allow_static_ip END,
+               allow_gaming = CASE WHEN ? = 1 THEN 1 ELSE allow_gaming END,
+               allocation_mode = CASE WHEN ? = 1 THEN ? ELSE allocation_mode END,
+               is_official = CASE WHEN ? = 1 THEN 1 ELSE is_official END,
+               last_online_at = ?, approved_at = COALESCE(approved_at, ?)
+           WHERE id = ?`
+        )
+        .run(
+          label,
+          label,
+          label,
+          parsed.config_json,
+          payload.uri.trim(),
+          allowWeb,
+          allowDownload,
+          allowStatic,
+          allowGaming,
+          isOfficial,
+          allocationMode,
+          isOfficial,
+          nowIso,
+          nowIso,
+          existing.id
+        );
+      return {
+        success: true,
+        id: existing.id,
+        is_official: isOfficial === 1,
+        status: 'active',
+        message: 'اوتباند با موفقیت بروزرسانی و در کل اکوسیستم سنترا فعال شد.',
+      };
+    }
+
+    const insert = this.db
+      .prepare(
+        `INSERT INTO donated_outbounds (
+          donor_user_id, name, label, tag, protocol, server_address, server_port,
+          config_json, assigned_tier, country_code, country_name, flag, raw_link,
+          latency_ms, health_score, is_official, status, reward_days,
+          allow_web, allow_download, allow_static_ip, allow_gaming, speed_score, last_online_at,
+          allocation_mode, fingerprint_sha256, user_note, created_at, approved_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'XX', 'Global', '🌐', ?, 0, 100, ?, 'active', 0, ?, ?, ?, ?, 90, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        user.id,
+        label,
+        label,
+        label,
+        parsed.protocol,
+        parsed.server_address,
+        parsed.server_port,
+        parsed.config_json,
+        assignedTier,
+        payload.uri.trim(),
+        isOfficial,
+        allowWeb,
+        allowDownload,
+        allowStatic,
+        allowGaming,
+        nowIso,
+        allocationMode,
+        parsed.fingerprint_sha256,
+        note,
+        nowIso,
+        nowIso
+      );
+
+    return {
+      success: true,
+      id: Number(insert.lastInsertRowid),
+      is_official: isOfficial === 1,
+      status: 'active',
+      message: 'اوتباند شما با موفقیت ثبت و بلافاصله در کل اکوسیستم سنترا فعال شد.',
+    };
+  }
+
+  /** Test helper to simulate Admin adding or removing an official Gaming outbound from Telegram Bot */
+  addOfficialGamingOutboundForTest(uri: string, name = 'Gaming-Frankfurt-01', latencyMs = 38): number {
+    const parsed = parseDonatedUri(uri);
+    const nowIso = new Date().toISOString();
+    const res = this.db
+      .prepare(
+        `INSERT INTO donated_outbounds (
+          donor_user_id, name, label, tag, protocol, server_address, server_port,
+          config_json, assigned_tier, country_code, country_name, flag, raw_link,
+          latency_ms, health_score, is_official, status, reward_days,
+          allow_web, allow_download, allow_static_ip, allow_gaming, speed_score, last_online_at,
+          allocation_mode, fingerprint_sha256, created_at, approved_at
+        ) VALUES (
+          (SELECT id FROM users ORDER BY id ASC LIMIT 1),
+          ?, ?, ?, ?, ?, ?, ?, 'gaming', 'DE', 'Germany', '🇩🇪', ?, ?, 100, 1, 'active', 0,
+          0, 0, 0, 1, 98, ?, 'gaming_only', ?, ?, ?
+        )`
+      )
+      .run(
+        name,
+        name,
+        name,
+        parsed.protocol,
+        parsed.server_address,
+        parsed.server_port,
+        parsed.config_json,
+        uri.trim(),
+        latencyMs,
+        nowIso,
+        parsed.fingerprint_sha256,
+        nowIso,
+        nowIso
+      );
+    return Number(res.lastInsertRowid);
+  }
+
+  setOutboundStatusForTest(id: number, status: 'active' | 'inactive'): void {
+    this.db.prepare('UPDATE donated_outbounds SET status = ? WHERE id = ?').run(status, id);
   }
 
   getMyDonations(rawToken: string | undefined | null): { donations: DonatedRow[] } {
     const { user } = this.resolveAuthenticatedUser(rawToken);
     const donations = this.db
       .prepare(
-        `SELECT id, COALESCE(NULLIF(name, ''), tag) as name, protocol, server_address, server_port,
+        `SELECT id, COALESCE(NULLIF(label, ''), NULLIF(name, ''), tag) as name, protocol, server_address, server_port,
                 country_code, flag, latency_ms, status, reward_days, user_note, rejection_reason,
                 created_at, approved_at
          FROM donated_outbounds WHERE donor_user_id = ? ORDER BY id DESC`
@@ -1456,5 +2580,12 @@ export class SentraStore {
       .all(user.id) as unknown as DonatedRow[];
 
     return { donations };
+  }
+
+  /** Helper for unit tests to simulate subscription tier upgrades */
+  setSubscriptionTierForTest(token: string, tier: string): void {
+    this.db
+      .prepare('UPDATE subscriptions SET tier = ? WHERE token = ?')
+      .run(tier, token);
   }
 }

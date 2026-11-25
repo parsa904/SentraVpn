@@ -3,26 +3,34 @@ use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup,
 };
 
-/// Main persistent reply keyboard for users (with optional Admin panel button)
-pub fn user_main_keyboard_with_admin(is_admin: bool) -> KeyboardMarkup {
+/// Main persistent reply keyboard for users:
+/// - Unregistered first-time users see a large full-width "📝 ثبت نام" button as the very first option.
+/// - Registered users see a large full-width "👤 حساب کاربری" button in that spot.
+pub fn user_main_keyboard_for_user(is_registered: bool, is_admin: bool) -> KeyboardMarkup {
+    let primary_top_button = if is_registered {
+        KeyboardButton::new("👤 حساب کاربری")
+    } else {
+        KeyboardButton::new("📝 ثبت نام")
+    };
+
     let mut rows = vec![
-        vec![
-            KeyboardButton::new("🎁 دریافت اشتراک رایگان (Sentra Lite)"),
-            KeyboardButton::new("⚡ ارتقا به پلن ویژه (Sentra Pro / Flow+)"),
-        ],
+        vec![primary_top_button],
         vec![
             KeyboardButton::new("📥 دانلود اپلیکیشن Sentra Connect"),
         ],
         vec![
+            KeyboardButton::new("⚡ ارتقا به پلن ویژه (Sentra Pro / Flow+)"),
             KeyboardButton::new("🔑 دریافت کانفیگ و کد اتصال"),
-            KeyboardButton::new("🍏 دریافت اشتراک iOS (OpenVPN)"),
         ],
         vec![
+            KeyboardButton::new("🍏 دریافت اشتراک iOS"),
             KeyboardButton::new("🤝 اهدای اوتباند (حمایت از Sentra)"),
-            KeyboardButton::new("🔗 اتصال حساب اپلیکیشن"),
         ],
         vec![
+            KeyboardButton::new("🔗 اتصال حساب اپلیکیشن"),
             KeyboardButton::new("💖 حمایت مالی از توسعه Sentra"),
+        ],
+        vec![
             KeyboardButton::new("📊 وضعیت اشتراک و تیکت پشتیبانی"),
         ],
     ];
@@ -34,9 +42,51 @@ pub fn user_main_keyboard_with_admin(is_admin: bool) -> KeyboardMarkup {
     KeyboardMarkup::new(rows).resize_keyboard()
 }
 
-/// Main persistent reply keyboard for normal users
+/// Main persistent reply keyboard for registered users (with optional Admin panel button)
+pub fn user_main_keyboard_with_admin(is_admin: bool) -> KeyboardMarkup {
+    user_main_keyboard_for_user(true, is_admin)
+}
+
+/// Main persistent reply keyboard for normal registered users
 pub fn user_main_keyboard() -> KeyboardMarkup {
-    user_main_keyboard_with_admin(false)
+    user_main_keyboard_for_user(true, false)
+}
+
+/// Inline keyboard shown when an unregistered user taps "📝 ثبت نام"
+pub fn auth_choice_inline_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("🆕 ثبت نام", "auth_register_new"),
+            InlineKeyboardButton::callback("🔐 ورود با حساب برنامه", "auth_login_app"),
+        ],
+        vec![InlineKeyboardButton::callback("🔙 بازگشت", "user_back_main")],
+    ])
+}
+
+/// Inline keyboard shown after a failed credential login attempt
+pub fn auth_retry_inline_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("🔄 تلاش مجدد ورود", "auth_login_app"),
+            InlineKeyboardButton::callback("🆕 ثبت نام جدید", "auth_register_new"),
+        ],
+        vec![InlineKeyboardButton::callback("🔙 بازگشت", "user_back_main")],
+    ])
+}
+
+/// Inline keyboard for the "👤 حساب کاربری" profile/usage card
+pub fn user_account_inline_keyboard(devices_count: usize) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            format!("📱 مدیریت دستگاه‌های متصل ({}/3)", devices_count),
+            "manage_devices",
+        )],
+        vec![
+            InlineKeyboardButton::callback("🔑 کد ورود اپلیکیشن", "account_get_app_code"),
+            InlineKeyboardButton::callback("⚡ ارتقا اشتراک", "account_upgrade_menu"),
+        ],
+        vec![InlineKeyboardButton::callback("🔙 بازگشت", "user_back_main")],
+    ])
 }
 
 /// Reusable inline Back button returning to the user's main menu and clearing active states
@@ -63,32 +113,65 @@ pub fn cancel_and_back_inline_keyboard(callback_data: &str) -> InlineKeyboardMar
     )]])
 }
 
-/// Inline keyboard for iOS OpenVPN Connection Mode selection (Gaming temporarily hidden)
-pub fn ios_modes_inline_keyboard(tier: &str) -> InlineKeyboardMarkup {
-    let static_label = if tier == "Sentra Lite" {
-        "🔒 ۳. آی‌پی ثابت ترید/جمنای (قفل - نیاز به اشتراک ویژه)"
-    } else {
-        "🌐 ۳. آی‌پی ثابت ترید/جمنای (آمریکا - فعال)"
-    };
+/// Smart entitlement-aware inline keyboard for iOS config selection:
+/// - Free / Lite users see the free configs (Web Browsing + Download).
+/// - When Gaming is NOT yet activated in DB (gaming_enabled == false), a visible
+///   "🎮 گیمینگ کم‌پینگ (به‌زودی)" button is shown; clicking it displays a Coming Soon alert.
+/// - Once an admin adds an active Gaming outbound (gaming_enabled == true), Gaming
+///   activates ecosystem-wide and unlocks WireGuard (.conf) for Gaming / Pro / Flow+ users.
+/// - Users who purchased Static IP (or Pro/Flow+) automatically unlock Static IP configs.
+pub fn ios_modes_inline_keyboard(tier: &str, gaming_enabled: bool) -> InlineKeyboardMarkup {
+    let has_static = crate::compiler::tier_has_static_ip(tier);
+    let has_gaming = crate::compiler::tier_has_gaming(tier);
 
-    InlineKeyboardMarkup::new(vec![
+    let mut rows = vec![
         vec![InlineKeyboardButton::callback(
-            "🌐 ۱. وب‌گردی (سهمیه ۲ گیگابایت روزانه)",
+            "🌐 وب‌گردی روزمره (رایگان)",
             "ios_mode_web_browsing",
         )],
         vec![InlineKeyboardButton::callback(
-            "⚡ ۲. دانلود (سهمیه ۳ گیگابایت روزانه)",
+            "⚡ دانلود پرسرعت (رایگان)",
             "ios_mode_download",
         )],
-        vec![InlineKeyboardButton::callback(
-            static_label,
+    ];
+
+    if !gaming_enabled {
+        rows.push(vec![InlineKeyboardButton::callback(
+            "🎮 گیمینگ کم‌پینگ (به‌زودی)",
+            "ios_mode_gaming",
+        )]);
+    } else if has_gaming {
+        rows.push(vec![InlineKeyboardButton::callback(
+            "🎮 گیمینگ کم‌پینگ (پروتکل WireGuard)",
+            "ios_mode_gaming",
+        )]);
+    }
+
+    if has_static {
+        rows.push(vec![InlineKeyboardButton::callback(
+            "💎 آی‌پی ثابت اختصاصی (ترید و جمنای)",
             "ios_mode_static_ip",
-        )],
-        vec![InlineKeyboardButton::callback(
-            "🔙 بازگشت",
-            "user_back_main",
-        )],
-    ])
+        )]);
+    }
+
+    if !has_static || (gaming_enabled && !has_gaming) {
+        let upgrade_label = if gaming_enabled {
+            "⚡ خرید / ارتقا به گیمینگ یا آی‌پی ثابت"
+        } else {
+            "⚡ خرید / ارتقا به آی‌پی ثابت یا پلن ویژه"
+        };
+        rows.push(vec![InlineKeyboardButton::callback(
+            upgrade_label,
+            "account_upgrade_menu",
+        )]);
+    }
+
+    rows.push(vec![InlineKeyboardButton::callback(
+        "🔙 بازگشت",
+        "user_back_main",
+    )]);
+
+    InlineKeyboardMarkup::new(rows)
 }
 
 /// Inline keyboard for iOS Protocol selection (IKEv2 vs OpenVPN UDP/TCP)
@@ -121,8 +204,12 @@ pub fn upgrade_plans_inline_keyboard() -> InlineKeyboardMarkup {
             "sim_pay_success",
         )],
         vec![
-            InlineKeyboardButton::callback("⚡ پلن Pro (۱۵۰ گیگ)", "plan_info_pro"),
-            InlineKeyboardButton::callback("🚀 پلن Flow+ (IP مسکونی آمریکا)", "plan_info_flow"),
+            InlineKeyboardButton::callback("🎮 پلن گیمینگ (WireGuard iOS + پینگ کم)", "plan_info_gaming"),
+            InlineKeyboardButton::callback("💎 پلن آی‌پی ثابت (ترید و جمنای)", "plan_info_static"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("⚡ پلن Pro (گیمینگ + آی‌پی ثابت)", "plan_info_pro"),
+            InlineKeyboardButton::callback("🚀 پلن Flow+ (کامل + IP مسکونی)", "plan_info_flow"),
         ],
         vec![InlineKeyboardButton::callback("🔙 بازگشت", "user_back_main")],
     ])
@@ -164,6 +251,7 @@ pub fn admin_official_outbounds_hub_keyboard() -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("📥 لیست نودهای دانلود", "adm_ob_list_download"),
         ],
         vec![
+            InlineKeyboardButton::callback("🎮 لیست نودهای گیمینگ", "adm_ob_list_gaming"),
             InlineKeyboardButton::callback("🔒 لیست نودهای آی‌پی ثابت", "adm_ob_list_static_ip"),
         ],
         vec![
@@ -179,10 +267,16 @@ pub fn admin_select_outbound_target_keyboard() -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("🌐 فقط بخش رایگان (وب‌گردی / دانلود)", "adm_ob_alloc_free_only"),
         ],
         vec![
+            InlineKeyboardButton::callback("🎮 فقط بخش گیمینگ (فعال‌سازی گیمینگ در کل سیستم)", "adm_ob_alloc_gaming_only"),
+        ],
+        vec![
             InlineKeyboardButton::callback("💎 فقط بخش آی‌پی ثابت (ترید و جمنای)", "adm_ob_alloc_static_only"),
         ],
         vec![
-            InlineKeyboardButton::callback("⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)", "adm_ob_alloc_both"),
+            InlineKeyboardButton::callback("⚡️ بخش رایگان + آی‌پی ثابت همزمان", "adm_ob_alloc_both"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("🔥 کل اکوسیستم (رایگان + آی‌پی ثابت + گیمینگ)", "adm_ob_alloc_all"),
         ],
         vec![
             InlineKeyboardButton::callback("🤖 تشخیص هوشمند خودکار (بر اساس تست جمنای و سرعت)", "adm_ob_alloc_auto"),
@@ -219,10 +313,16 @@ pub fn admin_outbound_reallocation_keyboard(outbound_id: i64) -> InlineKeyboardM
             InlineKeyboardButton::callback("🌐 فقط بخش رایگان (وب / دانلود)", format!("adm_set_alloc_{}_free_only", outbound_id)),
         ],
         vec![
+            InlineKeyboardButton::callback("🎮 فقط بخش گیمینگ (فعال‌سازی گیمینگ)", format!("adm_set_alloc_{}_gaming_only", outbound_id)),
+        ],
+        vec![
             InlineKeyboardButton::callback("💎 فقط بخش آی‌پی ثابت (ترید و جمنای)", format!("adm_set_alloc_{}_static_only", outbound_id)),
         ],
         vec![
-            InlineKeyboardButton::callback("⚡️ هر دو بخش (رایگان + آی‌پی ثابت)", format!("adm_set_alloc_{}_both", outbound_id)),
+            InlineKeyboardButton::callback("⚡️ بخش رایگان + آی‌پی ثابت", format!("adm_set_alloc_{}_both", outbound_id)),
+        ],
+        vec![
+            InlineKeyboardButton::callback("🔥 کل اکوسیستم (رایگان + آی‌پی ثابت + گیمینگ)", format!("adm_set_alloc_{}_all", outbound_id)),
         ],
         vec![
             InlineKeyboardButton::callback("🤖 تشخیص هوشمند خودکار", format!("adm_set_alloc_{}_auto", outbound_id)),
@@ -260,7 +360,7 @@ pub fn download_app_inline_keyboard() -> InlineKeyboardMarkup {
             "dl_app_android",
         )],
         vec![InlineKeyboardButton::callback(
-            "🍏 راهنمای اتصال آیفون (iOS - OpenVPN)",
+            "🍏 دریافت کانفیگ آیفون (iOS - OpenVPN / WireGuard)",
             "dl_app_ios",
         )],
         vec![InlineKeyboardButton::callback("🔙 بازگشت", "user_back_main")],
@@ -281,6 +381,10 @@ pub fn admin_user_card_inline_keyboard(user_id: i64, is_suspended: bool) -> Inli
             InlineKeyboardButton::callback("➕ ارتقا به Flow+ (۳۰ روزه)", format!("adm_up_flow_{}", user_id)),
         ],
         vec![
+            InlineKeyboardButton::callback("🎮 ارتقا به Gaming (۳۰ روزه)", format!("adm_up_gaming_{}", user_id)),
+            InlineKeyboardButton::callback("💎 ارتقا به Static IP (۳۰ روزه)", format!("adm_up_static_{}", user_id)),
+        ],
+        vec![
             InlineKeyboardButton::callback("🔄 ریست حجم روزانه کاربر", format!("adm_rst_quota_{}", user_id)),
             InlineKeyboardButton::callback("🔄 ریست حجم آی‌پی ثابت (۳۰ گیگ)", format!("adm_rst_static_{}", user_id)),
         ],
@@ -299,10 +403,12 @@ pub fn admin_user_card_inline_keyboard(user_id: i64, is_suspended: bool) -> Inli
 pub fn payment_receipt_inline_keyboard(user_id: i64) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("✅ تایید و فعال‌سازی ۳۰ روزه Pro", format!("rcpt_approve_pro_{}", user_id)),
+            InlineKeyboardButton::callback("✅ تایید ۳۰ روزه Pro", format!("rcpt_approve_pro_{}", user_id)),
+            InlineKeyboardButton::callback("✅ تایید ۳۰ روزه Flow+", format!("rcpt_approve_flow_{}", user_id)),
         ],
         vec![
-            InlineKeyboardButton::callback("✅ تایید و فعال‌سازی ۳۰ روزه Flow+", format!("rcpt_approve_flow_{}", user_id)),
+            InlineKeyboardButton::callback("🎮 تایید ۳۰ روزه Gaming", format!("rcpt_approve_gaming_{}", user_id)),
+            InlineKeyboardButton::callback("💎 تایید ۳۰ روزه Static IP", format!("rcpt_approve_static_{}", user_id)),
         ],
         vec![
             InlineKeyboardButton::callback("❌ رد رسید پرداخت", format!("rcpt_reject_{}", user_id)),
@@ -388,9 +494,13 @@ pub fn support_ticket_inline_keyboard() -> InlineKeyboardMarkup {
 pub fn admin_tier_change_inline_keyboard(target_user_id: i64) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("تغییر به Lite", format!("set_tier_{}_lite", target_user_id)),
-            InlineKeyboardButton::callback("تغییر به Pro", format!("set_tier_{}_pro", target_user_id)),
-            InlineKeyboardButton::callback("تغییر به Flow+", format!("set_tier_{}_flow", target_user_id)),
+            InlineKeyboardButton::callback("Lite", format!("set_tier_{}_lite", target_user_id)),
+            InlineKeyboardButton::callback("Gaming", format!("set_tier_{}_gaming", target_user_id)),
+            InlineKeyboardButton::callback("Static IP", format!("set_tier_{}_static", target_user_id)),
+        ],
+        vec![
+            InlineKeyboardButton::callback("Pro", format!("set_tier_{}_pro", target_user_id)),
+            InlineKeyboardButton::callback("Flow+", format!("set_tier_{}_flow", target_user_id)),
         ],
         vec![InlineKeyboardButton::callback("🔙 بازگشت", "adm_back_main")],
     ])

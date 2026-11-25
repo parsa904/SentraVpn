@@ -11,7 +11,7 @@ export const BOOTSTRAP_POLL_INTERVAL_MS = 30_000;
 export const STATE_PUSH_DEBOUNCE_MS = 1_200;
 export const MAX_SYNCED_PERSONAL_CONFIGS = 100;
 
-const ALLOWED_MODES = new Set<ConnectionModeId>(['web_browsing', 'download', 'static_ip']);
+const ALLOWED_MODES = new Set<ConnectionModeId>(['web_browsing', 'download', 'gaming', 'static_ip']);
 const ALLOWED_ROUTING = new Set<RoutingMode>(['tunnel', 'system_proxy', 'proxy']);
 const ALLOWED_THEMES = new Set<ThemeMode>(['dark', 'light']);
 

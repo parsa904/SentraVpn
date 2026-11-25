@@ -17,6 +17,7 @@ import {
   type RawAuthApiResponse,
 } from '../utils/proxyParser';
 import type { BatteryOptimizationStatus } from '../utils/reconnectPolicy';
+import { clearOfflineConfigCache } from '../utils/offlineCache';
 
 const SESSION_STORAGE_KEY = 'sentra_session_v2';
 const PERSONAL_CONFIGS_KEY = 'sentra_personal_configs_v2';
@@ -30,8 +31,14 @@ const REMOTE_BACKEND_URLS = [
 
 function getActiveBackendUrls(): string[] {
   if (!isTauriRuntime() && typeof window !== 'undefined' && window.location?.origin) {
-    const configured = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
-    return configured ? [configured, ''] : [''];
+    const configured = (import.meta.env.VITE_API_BASE_URL as string | undefined)
+      ?.trim()
+      .replace(/\/+$/, '');
+    const sameOrigin = window.location.origin.replace(/\/+$/, '');
+    if (configured && configured !== sameOrigin) {
+      return ['', configured];
+    }
+    return [''];
   }
   return REMOTE_BACKEND_URLS;
 }
@@ -432,8 +439,10 @@ export async function loginWithOtpCode(code: string): Promise<PersistedSession> 
 }
 
 export async function logoutSession(): Promise<void> {
+  const previous = loadLocalSession();
   saveLocalSession(null);
   await saveAndroidEncryptedSession(null);
+  await clearOfflineConfigCache(previous?.subscription_token ?? null);
   if (isTauriRuntime()) {
     try {
       await invokeTauri('logout');
@@ -458,26 +467,20 @@ export async function fetchBootstrap(token: string): Promise<BootstrapResponse> 
         throw new Error(msg);
       }
       // Fallback to direct HTTP if backend state wasn't hydrated yet (e.g., Android EncryptedSharedPreferences restore)
-      raw = await fetchBackendJson<BootstrapResponse>(
-        `/api/v1/client/bootstrap?token=${encodeURIComponent(token)}`,
-        {
-          headers: {
-            'X-Subscription-Token': token,
-            'X-Device-Id': webDeviceId,
-          },
-        }
-      );
-    }
-  } else {
-    raw = await fetchBackendJson<BootstrapResponse>(
-      `/api/v1/client/bootstrap?token=${encodeURIComponent(token)}`,
-      {
+      raw = await fetchBackendJson<BootstrapResponse>('/api/v1/client/bootstrap', {
         headers: {
           'X-Subscription-Token': token,
           'X-Device-Id': webDeviceId,
         },
-      }
-    );
+      });
+    }
+  } else {
+    raw = await fetchBackendJson<BootstrapResponse>('/api/v1/client/bootstrap', {
+      headers: {
+        'X-Subscription-Token': token,
+        'X-Device-Id': webDeviceId,
+      },
+    });
   }
 
   // Keep persisted local/Android session in sync with live subscription tier/expiry/username (e.g. Telegram upgrades)
@@ -499,10 +502,9 @@ export async function fetchBootstrap(token: string): Promise<BootstrapResponse> 
     }
   }
 
-  // Strictly guarantee gaming mode stays hidden in UI
   return {
     ...raw,
-    modes: (raw.modes || []).filter((m) => m.id !== 'gaming'),
+    modes: raw.modes || [],
     outbounds: raw.outbounds || [],
     devices: raw.devices || [],
   };
@@ -524,15 +526,12 @@ export async function fetchClientSyncState(token: string): Promise<SyncedClientS
     }
   }
 
-  const res = await fetchBackendJson<SyncedClientState>(
-    `/api/v1/client/sync-state?token=${encodeURIComponent(token)}`,
-    {
-      headers: {
-        'X-Subscription-Token': token,
-        'X-Device-Id': getOrCreateWebDeviceId(),
-      },
-    }
-  );
+  const res = await fetchBackendJson<SyncedClientState>('/api/v1/client/sync-state', {
+    headers: {
+      'X-Subscription-Token': token,
+      'X-Device-Id': getOrCreateWebDeviceId(),
+    },
+  });
   return {
     personal_configs: Array.isArray(res?.personal_configs) ? res.personal_configs : [],
     preferences: res?.preferences || {},
@@ -564,17 +563,14 @@ export async function pushClientSyncState(
     }
   }
 
-  const res = await fetchBackendJson<SyncedClientState>(
-    `/api/v1/client/sync-state?token=${encodeURIComponent(token)}`,
-    {
-      method: 'PUT',
-      headers: {
-        'X-Subscription-Token': token,
-        'X-Device-Id': getOrCreateWebDeviceId(),
-      },
-      body: JSON.stringify(payload),
-    }
-  );
+  const res = await fetchBackendJson<SyncedClientState>('/api/v1/client/sync-state', {
+    method: 'PUT',
+    headers: {
+      'X-Subscription-Token': token,
+      'X-Device-Id': getOrCreateWebDeviceId(),
+    },
+    body: JSON.stringify(payload),
+  });
   return {
     personal_configs: Array.isArray(res?.personal_configs) ? res.personal_configs : [],
     preferences: res?.preferences || {},
@@ -605,22 +601,19 @@ export async function sendUsageHeartbeat(
   }
 
   const deviceId = getOrCreateWebDeviceId();
-  return fetchBackendJson<HeartbeatVerdictResponse>(
-    `/api/v1/client/heartbeat?token=${encodeURIComponent(token)}`,
-    {
-      method: 'POST',
-      headers: {
-        'X-Subscription-Token': token,
-        'X-Device-Id': deviceId,
-      },
-      body: JSON.stringify({
-        device_id: deviceId,
-        mode: payload.mode || 'web_browsing',
-        delta_upload_bytes: Math.max(0, Math.round(payload.delta_upload_bytes)),
-        delta_download_bytes: Math.max(0, Math.round(payload.delta_download_bytes)),
-      }),
-    }
-  );
+  return fetchBackendJson<HeartbeatVerdictResponse>('/api/v1/client/heartbeat', {
+    method: 'POST',
+    headers: {
+      'X-Subscription-Token': token,
+      'X-Device-Id': deviceId,
+    },
+    body: JSON.stringify({
+      device_id: deviceId,
+      mode: payload.mode || 'web_browsing',
+      delta_upload_bytes: Math.max(0, Math.round(payload.delta_upload_bytes)),
+      delta_download_bytes: Math.max(0, Math.round(payload.delta_download_bytes)),
+    }),
+  });
 }
 
 export async function donateOutboundToServer(
@@ -646,7 +639,7 @@ export async function donateOutboundToServer(
   }
 
   return fetchBackendJson<{ success: boolean; id?: number; latency_ms?: number; message?: string }>(
-    `/api/v1/client/outbounds/donate?token=${encodeURIComponent(token)}`,
+    '/api/v1/client/outbounds/donate',
     {
       method: 'POST',
       headers: { 'X-Subscription-Token': token },
@@ -658,6 +651,28 @@ export async function donateOutboundToServer(
       timeoutMs: 15000,
     }
   );
+}
+
+export async function addEcosystemOutboundToServer(
+  token: string,
+  payload: { uri: string; name?: string; note?: string }
+): Promise<{ success: boolean; id?: number; is_official?: boolean; status?: string; message?: string }> {
+  return fetchBackendJson<{
+    success: boolean;
+    id?: number;
+    is_official?: boolean;
+    status?: string;
+    message?: string;
+  }>('/api/v1/client/outbounds/add', {
+    method: 'POST',
+    headers: { 'X-Subscription-Token': token },
+    body: JSON.stringify({
+      uri: payload.uri,
+      name: payload.name || undefined,
+      note: payload.note || undefined,
+    }),
+    timeoutMs: 15000,
+  });
 }
 
 export async function fetchMyDonations(token: string): Promise<DonatedOutboundRecord[]> {
@@ -672,7 +687,7 @@ export async function fetchMyDonations(token: string): Promise<DonatedOutboundRe
   }
 
   res = await fetchBackendJson<{ donations?: DonatedOutboundRecord[] }>(
-    `/api/v1/client/outbounds/my-donations?token=${encodeURIComponent(token)}`,
+    '/api/v1/client/outbounds/my-donations',
     {
       headers: { 'X-Subscription-Token': token },
     }
@@ -843,14 +858,11 @@ export async function removeUserDevice(token: string, deviceId: string): Promise
     await invokeTauri('remove_user_device', { deviceId });
     return;
   }
-  await fetchBackendJson(
-    `/api/v1/client/devices/remove?token=${encodeURIComponent(token)}`,
-    {
-      method: 'POST',
-      headers: { 'X-Subscription-Token': token },
-      body: JSON.stringify({ device_id: deviceId }),
-    }
-  );
+  await fetchBackendJson('/api/v1/client/devices/remove', {
+    method: 'POST',
+    headers: { 'X-Subscription-Token': token },
+    body: JSON.stringify({ device_id: deviceId }),
+  });
 }
 
 export async function requestTelegramLinkCode(token: string): Promise<string> {
@@ -858,7 +870,7 @@ export async function requestTelegramLinkCode(token: string): Promise<string> {
     return invokeTauri<string>('get_telegram_link_code');
   }
   const data = await fetchBackendJson<{ code?: string; link_code?: string }>(
-    `/api/v1/auth/link-token?token=${encodeURIComponent(token)}`,
+    '/api/v1/auth/link-token',
     {
       method: 'POST',
       headers: { 'X-Subscription-Token': token },

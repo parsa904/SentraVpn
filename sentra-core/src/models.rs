@@ -59,6 +59,8 @@ pub struct DonatedOutbound {
     pub allow_web: i64,
     pub allow_download: i64,
     pub allow_static_ip: i64,
+    #[sqlx(default)]
+    pub allow_gaming: i64,
     pub gemini_ok: i64,
     pub trading_safe: i64,
     pub speed_score: i64,

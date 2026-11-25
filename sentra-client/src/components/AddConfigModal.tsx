@@ -8,7 +8,7 @@ interface AddConfigModalProps {
   lang: Language;
   open: boolean;
   onClose: () => void;
-  onAddConfig: (item: PersonalConfigItem) => void;
+  onAddConfig: (item: PersonalConfigItem, options?: { publishToEcosystem?: boolean }) => void;
 }
 
 export const AddConfigModal: React.FC<AddConfigModalProps> = ({
@@ -19,6 +19,7 @@ export const AddConfigModal: React.FC<AddConfigModalProps> = ({
 }) => {
   const [rawInput, setRawInput] = useState('');
   const [customName, setCustomName] = useState('');
+  const [publishToEcosystem, setPublishToEcosystem] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const preview = useMemo(() => {
@@ -47,7 +48,7 @@ export const AddConfigModal: React.FC<AddConfigModalProps> = ({
     setError(null);
     try {
       const item = buildPersonalConfigItem(rawInput, customName);
-      onAddConfig(item);
+      onAddConfig(item, { publishToEcosystem });
       setRawInput('');
       setCustomName('');
       onClose();
@@ -140,6 +141,20 @@ export const AddConfigModal: React.FC<AddConfigModalProps> = ({
               className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950/60 px-3.5 py-2.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
             />
           </div>
+
+          <label className="flex cursor-pointer items-start gap-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 px-3.5 py-2.5 text-xs text-slate-700 dark:text-slate-300">
+            <input
+              type="checkbox"
+              checked={publishToEcosystem}
+              onChange={(e) => setPublishToEcosystem(e.target.checked)}
+              className="mt-0.5 h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+            />
+            <span>
+              {lang === 'fa'
+                ? 'فعال‌سازی در کل اکوسیستم سنترا (ویندوز، اندروید، وب و لینک‌های اشتراک)'
+                : 'Activate across entire Sentra ecosystem (Windows, Android, Web & subscriptions)'}
+            </span>
+          </label>
 
           {preview && (
             <div className="flex items-center justify-between gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/[0.07] px-3.5 py-2.5 text-xs">

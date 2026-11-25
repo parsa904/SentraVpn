@@ -1,7 +1,7 @@
 export type NavTab = 'home' | 'profiles' | 'donate' | 'settings' | 'logs';
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type RoutingMode = 'tunnel' | 'system_proxy' | 'proxy';
-export type ConnectionModeId = 'web_browsing' | 'download' | 'static_ip';
+export type ConnectionModeId = 'web_browsing' | 'download' | 'gaming' | 'static_ip';
 export type ThemeMode = 'dark' | 'light';
 
 export interface PersistedSession {

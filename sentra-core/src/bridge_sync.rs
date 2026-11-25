@@ -11,66 +11,208 @@ use tracing::{info, warn};
 pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
     info!("[BridgeSync] Synchronizing server sing-box bridge configuration...");
 
-    // 1. Fetch active outbounds for the 3 modes
-    // Static IP: strictly official only
+    // 1. Fetch active outbounds for all modes (with automatic ecosystem fallback in Repository)
     let static_outbounds = Repository::get_active_official_outbounds_for_mode(pool, "static_ip")
         .await
         .unwrap_or_default();
 
-    // Web Browsing: prioritized official then donated
     let web_outbounds = Repository::get_active_outbounds_for_mode_prioritized(pool, "web_browsing")
         .await
         .unwrap_or_default();
 
-    // Download: prioritized official then donated
     let dl_outbounds = Repository::get_active_outbounds_for_mode_prioritized(pool, "download")
         .await
         .unwrap_or_default();
+
+    let gaming_outbounds = Repository::get_active_outbounds_for_mode_prioritized(pool, "gaming")
+        .await
+        .unwrap_or_default();
+
+    // Also load any non-loopback active rows from the core `outbounds` table so manually added core outbounds are active on the bridge too
+    let core_outbounds: Vec<crate::models::Outbound> = Repository::list_all_outbounds(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|ob| ob.is_active == 1 && ob.server_address != "127.0.0.1")
+        .collect();
 
     let mut singbox_outbounds: Vec<Value> = Vec::new();
     let mut web_outbound_tags: Vec<String> = Vec::new();
     let mut dl_outbound_tags: Vec<String> = Vec::new();
     let mut static_outbound_tags: Vec<String> = Vec::new();
+    let mut gaming_outbound_tags: Vec<String> = Vec::new();
+    let mut inserted_tags: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Default direct outbound fallback
     singbox_outbounds.push(json!({
         "type": "direct",
         "tag": "direct-out"
     }));
+    inserted_tags.insert("direct-out".to_string());
 
-    // Register all active web outbounds with country tags (sorted by speed_score DESC, latency_ms ASC)
+    // Register all active web outbounds with country tags (sorted by is_official DESC, speed_score DESC, latency_ms ASC)
     for dob in &web_outbounds {
         if let Ok(mut parsed) = serde_json::from_str::<Value>(&dob.config_json) {
             let tag = format!("out-web-{}-{}", dob.country_code.to_lowercase(), dob.id);
-            if let Some(obj) = parsed.as_object_mut() {
-                obj.insert("tag".to_string(), json!(tag));
+            if inserted_tags.insert(tag.clone()) {
+                if let Some(obj) = parsed.as_object_mut() {
+                    obj.insert("tag".to_string(), json!(tag));
+                }
+                singbox_outbounds.push(parsed);
             }
-            singbox_outbounds.push(parsed);
-            web_outbound_tags.push(tag);
+            if !web_outbound_tags.contains(&tag) {
+                web_outbound_tags.push(tag);
+            }
         }
     }
 
-    // Register all active download outbounds with country tags (sorted by speed_score DESC, latency_ms ASC)
+    // Register all active download outbounds with country tags
     for dob in &dl_outbounds {
         if let Ok(mut parsed) = serde_json::from_str::<Value>(&dob.config_json) {
             let tag = format!("out-dl-{}-{}", dob.country_code.to_lowercase(), dob.id);
-            if let Some(obj) = parsed.as_object_mut() {
-                obj.insert("tag".to_string(), json!(tag));
+            if inserted_tags.insert(tag.clone()) {
+                if let Some(obj) = parsed.as_object_mut() {
+                    obj.insert("tag".to_string(), json!(tag));
+                }
+                singbox_outbounds.push(parsed);
             }
-            singbox_outbounds.push(parsed);
-            dl_outbound_tags.push(tag);
+            if !dl_outbound_tags.contains(&tag) {
+                dl_outbound_tags.push(tag);
+            }
         }
     }
 
-    // Register static_ip outbounds (sorted by speed_score DESC, latency_ms ASC)
+    // Register static_ip outbounds
     for dob in &static_outbounds {
         if let Ok(mut parsed) = serde_json::from_str::<Value>(&dob.config_json) {
             let tag = format!("out-static-{}-{}", dob.country_code.to_lowercase(), dob.id);
-            if let Some(obj) = parsed.as_object_mut() {
-                obj.insert("tag".to_string(), json!(tag));
+            if inserted_tags.insert(tag.clone()) {
+                if let Some(obj) = parsed.as_object_mut() {
+                    obj.insert("tag".to_string(), json!(tag));
+                }
+                singbox_outbounds.push(parsed);
             }
-            singbox_outbounds.push(parsed);
-            static_outbound_tags.push(tag);
+            if !static_outbound_tags.contains(&tag) {
+                static_outbound_tags.push(tag);
+            }
+        }
+    }
+
+    // Register gaming outbounds (lowest-latency pool for Windows, Android & iOS WireGuard gaming exit)
+    for dob in &gaming_outbounds {
+        if let Ok(mut parsed) = serde_json::from_str::<Value>(&dob.config_json) {
+            let tag = format!("out-game-{}-{}", dob.country_code.to_lowercase(), dob.id);
+            if inserted_tags.insert(tag.clone()) {
+                if let Some(obj) = parsed.as_object_mut() {
+                    obj.insert("tag".to_string(), json!(tag));
+                }
+                singbox_outbounds.push(parsed);
+            }
+            if !gaming_outbound_tags.contains(&tag) {
+                gaming_outbound_tags.push(tag);
+            }
+        }
+    }
+
+    // Register non-loopback active rows from the core `outbounds` table
+    for ob in &core_outbounds {
+        let tag = format!("out-core-{}-{}", ob.country_code.to_lowercase(), ob.id);
+        let node_cfg = match ob.protocol.as_str() {
+            "vless" => {
+                let mut v = json!({
+                    "type": "vless",
+                    "tag": tag,
+                    "server": ob.server_address,
+                    "server_port": ob.server_port,
+                    "uuid": ob.uuid.as_deref().unwrap_or("00000000-0000-0000-0000-000000000000"),
+                    "flow": "",
+                    "packet_encoding": "xudp"
+                });
+                if ob.tls_enabled == 1 {
+                    v["tls"] = json!({
+                        "enabled": true,
+                        "server_name": ob.tls_sni.as_deref().unwrap_or("learn.microsoft.com"),
+                        "utls": { "enabled": true, "fingerprint": "chrome" },
+                        "reality": {
+                            "enabled": true,
+                            "public_key": ob.reality_public_key.as_deref().unwrap_or(""),
+                            "short_id": ob.reality_short_id.as_deref().unwrap_or("")
+                        }
+                    });
+                }
+                v
+            }
+            "trojan" => json!({
+                "type": "trojan",
+                "tag": tag,
+                "server": ob.server_address,
+                "server_port": ob.server_port,
+                "password": ob.password.as_deref().unwrap_or("sentra_pass")
+            }),
+            "hysteria2" => json!({
+                "type": "hysteria2",
+                "tag": tag,
+                "server": ob.server_address,
+                "server_port": ob.server_port,
+                "password": ob.password.as_deref().unwrap_or("sentra_pass")
+            }),
+            "http" => json!({
+                "type": "http",
+                "tag": tag,
+                "server": ob.server_address,
+                "server_port": ob.server_port
+            }),
+            _ => json!({
+                "type": "socks",
+                "tag": tag,
+                "server": ob.server_address,
+                "server_port": ob.server_port,
+                "version": "5"
+            }),
+        };
+
+        if inserted_tags.insert(tag.clone()) {
+            singbox_outbounds.push(node_cfg);
+        }
+        match ob.mode_category.as_str() {
+            "static_ip" => {
+                if !static_outbound_tags.contains(&tag) {
+                    static_outbound_tags.push(tag.clone());
+                }
+                if !web_outbound_tags.contains(&tag) {
+                    web_outbound_tags.push(tag.clone());
+                }
+                if !dl_outbound_tags.contains(&tag) {
+                    dl_outbound_tags.push(tag);
+                }
+            }
+            "gaming" => {
+                if !gaming_outbound_tags.contains(&tag) {
+                    gaming_outbound_tags.push(tag.clone());
+                }
+                if !web_outbound_tags.contains(&tag) {
+                    web_outbound_tags.push(tag);
+                }
+            }
+            "download" => {
+                if !dl_outbound_tags.contains(&tag) {
+                    dl_outbound_tags.push(tag.clone());
+                }
+                if !web_outbound_tags.contains(&tag) {
+                    web_outbound_tags.push(tag);
+                }
+            }
+            _ => {
+                if !web_outbound_tags.contains(&tag) {
+                    web_outbound_tags.push(tag.clone());
+                }
+                if !dl_outbound_tags.contains(&tag) {
+                    dl_outbound_tags.push(tag.clone());
+                }
+                if !gaming_outbound_tags.contains(&tag) {
+                    gaming_outbound_tags.push(tag);
+                }
+            }
         }
     }
 
@@ -88,6 +230,8 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
         } else {
             static_outbound_tags[0].clone()
         }
+    } else if !web_outbound_tags.is_empty() {
+        web_outbound_tags[0].clone()
     } else {
         "direct-out".to_string()
     };
@@ -103,6 +247,8 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
             "tolerance": 50
         }));
         "out-web-auto".to_string()
+    } else if !dl_outbound_tags.is_empty() {
+        dl_outbound_tags[0].clone()
     } else {
         "direct-out".to_string()
     };
@@ -117,11 +263,29 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
             "tolerance": 50
         }));
         "out-dl-auto".to_string()
+    } else if !web_outbound_tags.is_empty() {
+        web_outbound_tags[0].clone()
     } else {
         "direct-out".to_string()
     };
 
-    // 2. Fetch active Cloudflare WARP account for dual-chain routing
+    let gaming_target_tag = if !gaming_outbound_tags.is_empty() {
+        singbox_outbounds.push(json!({
+            "type": "urltest",
+            "tag": "out-gaming-auto",
+            "outbounds": gaming_outbound_tags,
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": "1m",
+            "tolerance": 15
+        }));
+        "out-gaming-auto".to_string()
+    } else if !web_outbound_tags.is_empty() {
+        web_target_tag.clone()
+    } else {
+        "direct-out".to_string()
+    };
+
+    // 2. Fetch active Cloudflare WARP account for dual-chain routing (never applied to gaming/static)
     let warp_opt = Repository::get_active_warp_account(pool).await.unwrap_or(None);
 
     let mut inbounds = vec![
@@ -152,6 +316,18 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
             "strict_route": false,
             "stack": "system"
         }),
+        json!({
+            "type": "tun",
+            "tag": "tun-gaming",
+            "interface_name": "tun-gaming",
+            "inet4_address": "10.10.3.1/30",
+            "mtu": 1280,
+            "endpoint_independent_nat": true,
+            "udp_timeout": "5m",
+            "auto_route": false,
+            "strict_route": false,
+            "stack": "system"
+        }),
     ];
 
     let mut route_rules = vec![
@@ -166,6 +342,10 @@ pub async fn sync_server_bridge_config(pool: &DbPool) -> Result<(), CoreError> {
         json!({
             "inbound": ["tun-static"],
             "outbound": static_target_tag
+        }),
+        json!({
+            "inbound": ["tun-gaming"],
+            "outbound": gaming_target_tag
         }),
     ];
 

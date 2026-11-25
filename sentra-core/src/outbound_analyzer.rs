@@ -30,6 +30,32 @@ pub struct SubscriptionImportResult {
     pub country_counts: std::collections::HashMap<String, usize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewedSubNode {
+    pub label: String,
+    pub tag: String,
+    pub protocol: String,
+    pub server_address: String,
+    pub server_port: u16,
+    pub config_json: String,
+    pub raw_link: String,
+    pub fingerprint: String,
+    pub latency_ms: i64,
+    pub speed_mbps: f64,
+    pub is_online: bool,
+    pub probe_note: Option<String>,
+    pub country_code: String,
+    pub country_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionPreviewResult {
+    pub source_url: String,
+    pub total_raw_lines: usize,
+    pub skipped_invalid: usize,
+    pub nodes: Vec<PreviewedSubNode>,
+}
+
 pub struct OutboundAnalyzer;
 
 impl OutboundAnalyzer {
@@ -643,9 +669,9 @@ impl OutboundAnalyzer {
             Ok(false) => {}
         }
 
-        // 5. Benchmark in isolated container/process
+        // 5. Protocol-aware reachability & speed benchmark (supports TCP + UDP protocols like hy2/tuic/wireguard)
         let (latency_ms, speed_mbps, success, reject_reason) =
-            Self::benchmark_proxy_isolated(ip, parsed.server_port, &parsed.config_json).await;
+            Self::benchmark_proxy_for_protocol(&parsed.protocol, ip, parsed.server_port).await;
 
         let (status, assigned_tier) = if !success || latency_ms > 2500 {
             ("rejected".to_string(), "rejected".to_string())
@@ -694,6 +720,10 @@ impl OutboundAnalyzer {
                 info!("Saved donated outbound #{} with status {} and tier {}", outbound.id, status, assigned_tier);
 
                 if status == "active" {
+                    // Immediately sync server sing-box bridge so OpenVPN / IKEv2 / Stealth / WARP also use this donated node
+                    if let Err(e) = crate::bridge_sync::sync_server_bridge_config(&pool).await {
+                        warn!("Bridge sync warning after donated outbound #{}: {}", outbound.id, e);
+                    }
                     if let Some(tid) = donor_telegram_id {
                         let tier_fa = match assigned_tier.as_str() {
                             "download" => "🚀 حالت دانلود و استریم پرسرعت",
@@ -898,27 +928,35 @@ impl OutboundAnalyzer {
         ("DE".to_string(), "آلمان 🇩🇪".to_string())
     }
 
-    /// Import official outbounds from a Subscription URL with Anti-SSRF, 2MB size limit,
-    /// 10s timeout, max 50 nodes limit, automated ping test, and country persistence.
-    pub async fn import_subscription_url(
-        pool: &DbPool,
-        category: &str,
+    /// Fetch, Anti-SSRF validate, parse, and probe all nodes from a Subscription URL
+    /// WITHOUT dropping nodes whose ping failed or had high latency.
+    /// Used by the Admin Telegram Bot to display an interactive node list where every node
+    /// can be added unconditionally regardless of ping test results.
+    pub async fn preview_subscription_url(
         sub_url: &str,
-    ) -> Result<SubscriptionImportResult, String> {
+    ) -> Result<SubscriptionPreviewResult, String> {
         let trimmed_url = sub_url.trim();
 
-        // 1. Validate URL scheme strictly https
-        let parsed_url = Url::parse(trimmed_url).map_err(|e| format!("آدرس سابسکریپشن نامعتبر است: {}", e))?;
-        if parsed_url.scheme().to_lowercase() != "https" {
-            return Err("امنیت Anti-SSRF: فقط پروتکل امن https:// برای دریافت سابسکریپشن مجاز است.".to_string());
+        // 1. Validate URL scheme (https or http, strictly public IPs via Anti-SSRF)
+        let parsed_url =
+            Url::parse(trimmed_url).map_err(|e| format!("آدرس سابسکریپشن نامعتبر است: {}", e))?;
+        let scheme = parsed_url.scheme().to_lowercase();
+        if scheme != "https" && scheme != "http" {
+            return Err(
+                "امنیت Anti-SSRF: فقط پروتکل‌های https:// یا http:// برای دریافت سابسکریپشن مجاز است."
+                    .to_string(),
+            );
         }
 
-        let host = parsed_url.host_str().ok_or("دامنه در آدرس سابسکریپشن موجود نیست.")?;
+        let host = parsed_url
+            .host_str()
+            .ok_or("دامنه در آدرس سابسکریپشن موجود نیست.")?;
+        let lookup_port = parsed_url.port_or_known_default().unwrap_or(443);
 
         // 2. Anti-SSRF Protection: resolve domain and verify each IP is public
         let addrs: Vec<SocketAddr> = timeout(
             Duration::from_secs(5),
-            tokio::net::lookup_host(format!("{}:443", host))
+            tokio::net::lookup_host(format!("{}:{}", host, lookup_port)),
         )
         .await
         .map_err(|_| "تایم‌اوت در بررسی دامنه سابسکریپشن (DNS Timeout)".to_string())?
@@ -945,26 +983,32 @@ impl OutboundAnalyzer {
             .build()
             .map_err(|e| format!("خطا در ایجاد کلاینت HTTP: {}", e))?;
 
-        let resp = client.get(trimmed_url)
+        let resp = client
+            .get(trimmed_url)
             .send()
             .await
             .map_err(|e| format!("خطا در اتصال به سرور سابسکریپشن: {}", e))?;
 
         if !resp.status().is_success() {
-            return Err(format!("سرور سابسکریپشن خطای HTTP {} را بازگرداند.", resp.status()));
+            return Err(format!(
+                "سرور سابسکریپشن خطای HTTP {} را بازگرداند.",
+                resp.status()
+            ));
         }
 
-        let bytes = resp.bytes().await.map_err(|e| format!("خطا در دریافت دیتای سابسکریپشن: {}", e))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("خطا در دریافت دیتای سابسکریپشن: {}", e))?;
         if bytes.len() > 2 * 1024 * 1024 {
             return Err("امنیت: حجم فایل سابسکریپشن بیش از سقف مجاز ۲ مگابایت است.".to_string());
         }
 
         let raw_text = String::from_utf8_lossy(&bytes).to_string();
 
-        // 4. Extract individual proxy definitions
+        // 4. Extract individual proxy definitions (Base64, Sing-box JSON, or plaintext lines)
         let mut node_strings: Vec<String> = Vec::new();
 
-        // Try decoding as base64 first
         if let Ok(decoded_bytes) = decode_b64(raw_text.trim()) {
             let decoded_str = String::from_utf8_lossy(&decoded_bytes).to_string();
             for line in decoded_str.lines() {
@@ -974,7 +1018,6 @@ impl OutboundAnalyzer {
                 }
             }
         } else if raw_text.trim().starts_with('[') || raw_text.trim().starts_with('{') {
-            // Sing-box JSON array or JSON config
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw_text.trim()) {
                 if let Some(arr) = val.as_array() {
                     for item in arr {
@@ -990,7 +1033,6 @@ impl OutboundAnalyzer {
             }
         }
 
-        // If not base64 or json array, split lines as plaintext
         if node_strings.is_empty() {
             for line in raw_text.lines() {
                 let l = line.trim();
@@ -1000,91 +1042,136 @@ impl OutboundAnalyzer {
             }
         }
 
-        let total_nodes = node_strings.len();
-        if total_nodes == 0 {
+        let total_raw_lines = node_strings.len();
+        if total_raw_lines == 0 {
             return Err("هیچ کانفیگ پروکسی در محتوای سابسکریپشن یافت نشد.".to_string());
         }
 
-        // Enforce maximum 50 nodes per subscription
+        // Enforce maximum 50 nodes per subscription preview
         let limited_nodes: Vec<String> = node_strings.into_iter().take(50).collect();
 
-        let mut healthy_nodes = 0;
-        let mut invalid_nodes = 0;
-        let mut country_counts = std::collections::HashMap::new();
+        let mut skipped_invalid = 0usize;
+        let mut preview_nodes: Vec<PreviewedSubNode> = Vec::new();
 
         for raw_node in &limited_nodes {
             let parsed = match Self::parse_input(raw_node) {
                 Ok(p) => p,
                 Err(_) => {
-                    invalid_nodes += 1;
+                    skipped_invalid += 1;
                     continue;
                 }
             };
 
-            // Security & Anti-Hijack validation
-            if Self::validate_security_and_encryption(&parsed).is_err() {
-                invalid_nodes += 1;
-                continue;
-            }
-
-            // Anti-SSRF check on node server address
+            // Anti-SSRF check on node server address (always strictly enforced)
             let ip = match Self::check_anti_ssrf(&parsed.server_address).await {
                 Ok(ip) => ip,
                 Err(_) => {
-                    invalid_nodes += 1;
+                    skipped_invalid += 1;
                     continue;
                 }
             };
 
-            // Protocol-aware latency & benchmark (supports UDP protocols like hy2/tuic/wireguard)
-            let (latency_ms, speed_mbps, is_online, _err) =
+            // Protocol-aware reachability & latency check: NEVER drop a node on bad/failed ping!
+            let (latency_ms, speed_mbps, is_online, probe_note) =
                 Self::benchmark_proxy_for_protocol(&parsed.protocol, ip, parsed.server_port).await;
-            if !is_online || latency_ms > 2500 {
-                invalid_nodes += 1;
-                continue;
-            }
 
             // Country detection
             let (country_code, country_name) = Self::detect_country(ip, &parsed.tag).await;
 
-            // Generate fingerprint
+            // Compute deterministic fingerprint
             let mut hasher = Sha256::new();
-            hasher.update(format!("{}:{}:{}", parsed.protocol, parsed.server_address, parsed.server_port).as_bytes());
+            hasher.update(
+                format!(
+                    "{}:{}:{}",
+                    parsed.protocol.to_lowercase(),
+                    parsed.server_address.to_lowercase(),
+                    parsed.server_port
+                )
+                .as_bytes(),
+            );
             let fingerprint = format!("{:x}", hasher.finalize());
 
-            let label = if !parsed.tag.is_empty() && parsed.tag != "donated-singbox" && parsed.tag != "donated-node" {
+            let label = if !parsed.tag.is_empty()
+                && parsed.tag != "donated-singbox"
+                && parsed.tag != "donated-node"
+            {
                 parsed.tag.clone()
             } else {
                 format!("{}-{}", country_code, parsed.protocol)
             };
 
-            // Insert official outbound
-            match Repository::insert_official_outbound(
-                pool,
-                &label,
-                &parsed.tag,
-                &parsed.protocol,
-                &parsed.server_address,
-                parsed.server_port as i64,
-                &parsed.config_json.to_string(),
+            preview_nodes.push(PreviewedSubNode {
+                label,
+                tag: parsed.tag,
+                protocol: parsed.protocol,
+                server_address: parsed.server_address,
+                server_port: parsed.server_port,
+                config_json: parsed.config_json.to_string(),
+                raw_link: raw_node.clone(),
+                fingerprint,
                 latency_ms,
                 speed_mbps,
+                is_online,
+                probe_note,
+                country_code,
+                country_name,
+            });
+        }
+
+        if preview_nodes.is_empty() {
+            return Err("هیچ نود قابل پارس و معتبر در این سابسکریپشن یافت نشد.".to_string());
+        }
+
+        Ok(SubscriptionPreviewResult {
+            source_url: trimmed_url.to_string(),
+            total_raw_lines,
+            skipped_invalid,
+            nodes: preview_nodes,
+        })
+    }
+
+    /// Import official outbounds from a Subscription URL with Anti-SSRF, 2MB size limit,
+    /// 10s timeout, max 50 nodes limit, and unconditional persistence regardless of ping test outcome.
+    pub async fn import_subscription_url(
+        pool: &DbPool,
+        category: &str,
+        sub_url: &str,
+    ) -> Result<SubscriptionImportResult, String> {
+        let preview = Self::preview_subscription_url(sub_url).await?;
+        let mut added_nodes = 0usize;
+        let mut invalid_nodes = preview.skipped_invalid;
+        let mut country_counts = std::collections::HashMap::new();
+
+        for node in &preview.nodes {
+            let health_score = if node.is_online { 100 } else { 70 };
+            let stored_latency = if node.is_online { node.latency_ms } else { 0 };
+
+            match Repository::insert_official_outbound(
+                pool,
+                &node.label,
+                &node.tag,
+                &node.protocol,
+                &node.server_address,
+                node.server_port as i64,
+                &node.config_json,
+                stored_latency,
+                node.speed_mbps,
                 category,
-                Some(raw_node),
-                &fingerprint,
+                Some(&node.raw_link),
+                &node.fingerprint,
                 "active",
-                100,
-                &country_code,
-                &country_name,
+                health_score,
+                &node.country_code,
+                &node.country_name,
             )
             .await
             {
                 Ok(_) => {
-                    healthy_nodes += 1;
-                    *country_counts.entry(country_name).or_insert(0) += 1;
+                    added_nodes += 1;
+                    *country_counts.entry(node.country_name.clone()).or_insert(0) += 1;
                 }
                 Err(e) => {
-                    error!("Failed to persist subscription node {}: {}", label, e);
+                    error!("Failed to persist subscription node {}: {}", node.label, e);
                     invalid_nodes += 1;
                 }
             }
@@ -1094,10 +1181,10 @@ impl OutboundAnalyzer {
         let source_id = Repository::save_subscription_source(
             pool,
             category,
-            trimmed_url,
+            &preview.source_url,
             Some(&format!("سابلینک {}", category)),
-            total_nodes as i64,
-            healthy_nodes as i64,
+            preview.total_raw_lines as i64,
+            added_nodes as i64,
         )
         .await
         .map_err(|e| format!("خطا در ذخیره منبع سابسکریپشن: {}", e))?;
@@ -1107,8 +1194,8 @@ impl OutboundAnalyzer {
 
         Ok(SubscriptionImportResult {
             source_id,
-            total_nodes,
-            healthy_nodes,
+            total_nodes: preview.total_raw_lines,
+            healthy_nodes: added_nodes,
             invalid_nodes,
             country_counts,
         })

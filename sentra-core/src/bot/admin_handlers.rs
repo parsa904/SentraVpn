@@ -106,11 +106,85 @@ pub async fn clear_admin_panel_state(admin_id: i64) {
     map.remove(&admin_id);
 }
 
+/// Pending Subscription URL node list preview per admin (for interactive list + force-add regardless of ping)
+#[derive(Debug, Clone)]
+pub struct PendingSubImport {
+    pub category: String,
+    pub source_url: String,
+    pub total_raw_lines: usize,
+    pub skipped_invalid: usize,
+    pub nodes: Vec<crate::outbound_analyzer::PreviewedSubNode>,
+    pub added_indices: std::collections::HashSet<usize>,
+}
+
+static ADMIN_PENDING_SUB_IMPORTS: OnceLock<RwLock<HashMap<i64, PendingSubImport>>> =
+    OnceLock::new();
+
+fn pending_sub_imports_map() -> &'static RwLock<HashMap<i64, PendingSubImport>> {
+    ADMIN_PENDING_SUB_IMPORTS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub async fn set_pending_sub_import(admin_id: i64, pending: PendingSubImport) {
+    let mut map = pending_sub_imports_map().write().await;
+    map.insert(admin_id, pending);
+}
+
+pub async fn get_pending_sub_import(admin_id: i64) -> Option<PendingSubImport> {
+    let map = pending_sub_imports_map().read().await;
+    map.get(&admin_id).cloned()
+}
+
+pub async fn clear_pending_sub_import(admin_id: i64) {
+    let mut map = pending_sub_imports_map().write().await;
+    map.remove(&admin_id);
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn category_label_fa(category: &str) -> &str {
+    match category {
+        "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
+        "gaming_only" | "gaming" => "🎮 فقط بخش گیمینگ (فعال‌سازی گیمینگ در کل اکوسیستم)",
+        "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
+        "both" => "⚡️ بخش رایگان + آی‌پی ثابت همزمان",
+        "all" => "🔥 کل اکوسیستم (رایگان + آی‌پی ثابت + گیمینگ)",
+        "auto" => "🤖 تشخیص هوشمند خودکار (بر اساس تست جمنای و سرعت)",
+        "download" => "📥 دانلود (Download)",
+        _ => category,
+    }
+}
+
+fn category_enables_gaming(category: &str) -> bool {
+    matches!(category, "gaming" | "gaming_only" | "all")
+}
+
+fn allocation_summary_fa(ob: &crate::models::DonatedOutbound) -> &'static str {
+    if ob.allow_gaming == 1 && ob.allow_static_ip == 1 && ob.allow_web == 1 {
+        "🔥 کل اکوسیستم (رایگان + آی‌پی ثابت + گیمینگ)"
+    } else if ob.allow_gaming == 1 && ob.allow_web == 0 && ob.allow_static_ip == 0 {
+        "🎮 فقط بخش گیمینگ"
+    } else if ob.allow_gaming == 1 {
+        "🎮 گیمینگ + سایر بخش‌ها"
+    } else if ob.allow_static_ip == 1 && ob.allow_web == 1 {
+        "⚡️ بخش رایگان + آی‌پی ثابت"
+    } else if ob.allow_static_ip == 1 {
+        "💎 فقط آی‌پی ثابت (ترید و جمنای)"
+    } else {
+        "🌐 فقط بخش رایگان (وب / دانلود)"
+    }
+}
+
 /// Immediately clears all pending admin conversation/input states
 pub async fn clear_all_admin_states(admin_id: i64) {
     clear_admin_outbound_state(admin_id).await;
     clear_admin_upload_state(admin_id).await;
     clear_admin_panel_state(admin_id).await;
+    clear_pending_sub_import(admin_id).await;
 }
 
 pub fn is_authorized_admin(telegram_id: i64, admin_chat_id: i64) -> bool {
@@ -1585,30 +1659,40 @@ pub async fn handle_official_outbounds_hub_callback(
 
     let web_nodes = Repository::get_official_outbounds_by_category(pool, "web_browsing").await.unwrap_or_default();
     let dl_nodes = Repository::get_official_outbounds_by_category(pool, "download").await.unwrap_or_default();
+    let gaming_nodes = Repository::get_official_outbounds_by_category(pool, "gaming").await.unwrap_or_default();
     let static_nodes = Repository::get_official_outbounds_by_category(pool, "static_ip").await.unwrap_or_default();
+    let gaming_live = Repository::has_active_gaming_outbounds(pool).await;
     let warp_account = Repository::get_active_warp_account(pool).await.unwrap_or(None);
     let warp_status = if let Some(ref w) = warp_account {
         format!("فعال ⚡️ ({})", if w.account_type == "plus" { "WARP+ 🌟" } else { "رایگان" })
     } else {
         "تنظیم‌نشده (خاموش)".to_string()
     };
+    let gaming_state_str = if gaming_live {
+        "🟢 فعال در کل اکوسیستم"
+    } else {
+        "⏳ به‌زودی (با ثبت اولین نود گیمینگ خودکار فعال می‌شود)"
+    };
 
     let text = format!(
         r#"🌐 <b>مرکز مدیریت اوتباندهای رسمی و اختصاصی سنترا (Official Outbounds Hub)</b>
 
-در این بخش می‌توانید سرورهای اصلی هر ۳ حالت فعال شبکه را اضافه، پایش و مدیریت فرمایید:
+در این بخش می‌توانید سرورهای اصلی هر ۴ حالت شبکه را اضافه، پایش و مدیریت فرمایید:
 
-📊 <b>آمار نودهای اختصاصی فعال:</b>
+📊 <b>آمار نودهای اختصاصی ثبت‌شده:</b>
 • 🌐 نودهای وب‌گردی (Web Browsing): <b>{} نود</b>
 • 📥 نودهای دانلود پرسرعت (Download): <b>{} نود</b>
+• 🎮 نودهای گیمینگ (Gaming): <b>{} نود</b> — {}
 • 🔒 نودهای آی‌پی ثابت مسکونی (Static IP): <b>{} نود</b>
 • ⚡️ اکانت Cloudflare WARP سرور: <b>{}</b>
 
-<i>نکته: نودهای رسمی ادمین بر خلاف نودهای اهدایی کاربران، هرگز منقضی نشده و در تولید کانفیگ کلاینت‌ها بالاترین اولویت را دارند.</i>
+<i>نکته: نودهای رسمی ادمین هرگز منقضی نمی‌شوند. با ارسال لینک سابسکریپشن، تمامی نودها به صورت فهرستی نمایش داده می‌شوند تا حتی در صورت عدم پاسخ پینگ بتوانید آن‌ها را اضافه کنید.</i>
 
 👇 لطفاً عملیات مورد نظر را انتخاب نمایید:"#,
         web_nodes.len(),
         dl_nodes.len(),
+        gaming_nodes.len(),
+        gaming_state_str,
         static_nodes.len(),
         warp_status,
     );
@@ -1671,23 +1755,16 @@ pub async fn handle_target_category_chosen(
     )
     .await;
 
-    let cat_fa = match category {
-        "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
-        "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
-        "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
-        "auto" => "🤖 تشخیص هوشمند خودکار (بر اساس تست جمنای و سرعت)",
-        "download" => "📥 دانلود (Download)",
-        _ => category,
-    };
+    let cat_fa = category_label_fa(category);
 
     let text = format!(
         r#"➕ <b>ثبت اوتباند جدید برای بخش [{}]</b>
 
 لطفاً <b>نام دلخواه نود (Label)</b> را به همراه <b>لینک اوتباند، بلاک JSON یا آدرس سابسکریپشن (Sub URL)</b> ارسال نمایید.
 
-<i>روش ۱ (لینک سابسکریپشن یکجا):</i>
+<i>روش ۱ (لینک سابسکریپشن یکجا — نمایش فهرستی نودها):</i>
 <code>https://sub.example.com/api/v1/sub?token=...</code>
-<i>(پشتیبانی از Base64، چندخطی و Sing-box JSON با محافظت Anti-SSRF و تست پینگ خودکار)</i>
+<i>(تمامی نودها به صورت فهرستی نمایش داده می‌شوند و حتی اگر تست پینگ مناسب نباشد می‌توانید تکی یا یکجا آن‌ها را اضافه کنید)</i>
 
 <i>روش ۲ (نام + لینک تکی):</i>
 <code>US-Static-01 vless://uuid@server:443?security=reality...#US-Node</code>
@@ -1728,6 +1805,7 @@ pub async fn handle_admin_outbound_text_input(
 
     if text == "/cancel" {
         clear_admin_outbound_state(telegram_user_id).await;
+        clear_pending_sub_import(telegram_user_id).await;
         bot.send_message(msg.chat.id, "❌ فرآیند افزودن اوتباند لغو شد.")
             .reply_markup(admin_official_outbounds_hub_keyboard())
             .await?;
@@ -1736,66 +1814,49 @@ pub async fn handle_admin_outbound_text_input(
 
     let trimmed = text.trim();
 
-    // 0. Check if input is a Subscription URL (https://...)
-    if trimmed.starts_with("https://") || (trimmed.contains("https://") && !trimmed.starts_with("vless://") && !trimmed.starts_with("vmess://") && !trimmed.starts_with("trojan://") && !trimmed.starts_with('{')) {
+    // 0. Check if input is a Subscription URL (https://... or http://...)
+    let is_proxy_scheme = trimmed.starts_with("vless://")
+        || trimmed.starts_with("vmess://")
+        || trimmed.starts_with("trojan://")
+        || trimmed.starts_with("hy2://")
+        || trimmed.starts_with("hysteria2://")
+        || trimmed.starts_with("tuic://")
+        || trimmed.starts_with("ss://")
+        || trimmed.starts_with("wireguard://")
+        || trimmed.starts_with("wg://")
+        || trimmed.starts_with('{');
+
+    if !is_proxy_scheme && (trimmed.contains("https://") || trimmed.contains("http://")) {
         let sub_url = if let Some(idx) = trimmed.find("https://") {
-            &trimmed[idx..]
+            trimmed[idx..].split_whitespace().next().unwrap_or(trimmed)
+        } else if let Some(idx) = trimmed.find("http://") {
+            trimmed[idx..].split_whitespace().next().unwrap_or(trimmed)
         } else {
             trimmed
         };
 
-        bot.send_message(msg.chat.id, "⏳ <b>در حال تحلیل امنیتی و استخراج نودهای سابسکریپشن...</b>\n<i>(بررسی Anti-SSRF، تست پینگ خودکار و تشخیص کشور نودها)</i>")
-            .parse_mode(ParseMode::Html)
-            .await?;
+        bot.send_message(
+            msg.chat.id,
+            "⏳ <b>در حال استخراج فهرست نودهای سابسکریپشن...</b>\n<i>(بررسی امنیتی Anti-SSRF و تست پینگ — هیچ نودی به خاطر پینگ بالا یا عدم پاسخ حذف نمی‌شود)</i>",
+        )
+        .parse_mode(ParseMode::Html)
+        .await?;
 
-        match OutboundAnalyzer::import_subscription_url(pool, category, sub_url).await {
-            Ok(res) => {
+        match OutboundAnalyzer::preview_subscription_url(sub_url).await {
+            Ok(preview) => {
                 clear_admin_outbound_state(telegram_user_id).await;
-
-                let mut country_summary = String::new();
-                for (country, count) in &res.country_counts {
-                    country_summary.push_str(&format!("• {}: <b>{} نود</b>\n", country, count));
-                }
-                if country_summary.is_empty() {
-                    country_summary = "• نامشخص / محلی\n".to_string();
-                }
-
-                let cat_fa = match category {
-                    "web_browsing" => "🌐 وب‌گردی (Web Browsing)",
-                    "download" => "📥 دانلود (Download)",
-                    "static_ip" => "🔒 آی‌پی ثابت مسکونی (Static IP)",
-                    _ => category,
+                let pending = PendingSubImport {
+                    category: category.to_string(),
+                    source_url: preview.source_url,
+                    total_raw_lines: preview.total_raw_lines,
+                    skipped_invalid: preview.skipped_invalid,
+                    nodes: preview.nodes,
+                    added_indices: std::collections::HashSet::new(),
                 };
+                let (list_text, kb) = build_sub_preview_message(&pending, 0);
+                set_pending_sub_import(telegram_user_id, pending).await;
 
-                let success_msg = format!(
-                    r#"✅ <b>همگام‌سازی سابسکریپشن برای [{}] با موفقیت انجام شد</b>
-
-📦 <b>گزارش استخراج نودها:</b>
-• کل کانفیگ‌های بررسی‌شده: <b>{} نود</b>
-• نودهای سالم و فعال ثبت‌شده: <b>{} نود</b>
-• نودهای نامعتبر / تایم‌اوت / ردشده: <b>{} نود</b>
-
-🌍 <b>تفکیک جغرافیایی نودهای سالم:</b>
-{}
-⚡️ پل ارتباطی سرور (Sing-box Bridge) به صورت خودکار بروزرسانی شد."#,
-                    cat_fa,
-                    res.total_nodes,
-                    res.healthy_nodes,
-                    res.invalid_nodes,
-                    country_summary
-                );
-
-                let kb = InlineKeyboardMarkup::new(vec![
-                    vec![
-                        InlineKeyboardButton::callback("🔄 بروزرسانی مجدد این سابلینک", format!("adm_sub_resync_{}", res.source_id)),
-                    ],
-                    vec![
-                        InlineKeyboardButton::callback("📋 مشاهده لیست نودها", format!("adm_ob_list_{}", category)),
-                        InlineKeyboardButton::callback("🔙 بازگشت به منوی اوتباندها", "adm_action_official_outbounds"),
-                    ],
-                ]);
-
-                bot.send_message(msg.chat.id, success_msg)
+                bot.send_message(msg.chat.id, list_text)
                     .parse_mode(ParseMode::Html)
                     .reply_markup(kb)
                     .await?;
@@ -1803,7 +1864,10 @@ pub async fn handle_admin_outbound_text_input(
                 return Ok(());
             }
             Err(e) => {
-                let err_msg = format!("❌ <b>خطا در پردازش سابسکریپشن:</b>\n{}\n\nلطفاً لینک را بررسی فرمایید یا روی «🔙 بازگشت» بزنید.", e);
+                let err_msg = format!(
+                    "❌ <b>خطا در پردازش سابسکریپشن:</b>\n{}\n\nلطفاً لینک را بررسی فرمایید یا روی «🔙 بازگشت» بزنید.",
+                    escape_html(&e)
+                );
                 bot.send_message(msg.chat.id, err_msg)
                     .parse_mode(ParseMode::Html)
                     .reply_markup(cancel_and_back_inline_keyboard("adm_action_official_outbounds"))
@@ -1947,23 +2011,21 @@ pub async fn handle_admin_outbound_text_input(
     // Clear active admin state
     clear_admin_outbound_state(telegram_user_id).await;
 
-    let cat_fa = match category {
-        "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
-        "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
-        "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
-        "auto" => "🤖 تشخیص هوشمند خودکار (بر اساس تست جمنای و سرعت)",
-        "download" => "📥 دانلود (Download)",
-        _ => category,
-    };
+    let cat_fa = category_label_fa(category);
     let status_badge = if is_online {
-        "🟢 فعال و آنلاین (قابل مشاهده در کلاینت‌های ویندوز و اندروید)"
+        "🟢 فعال و آنلاین (قابل مشاهده در کل اکوسیستم)"
     } else {
-        "🟡 فعال در دیتابیس (هشدار: تست اتصال اولیه از سرور پاسخ نداد؛ در کلاینت‌ها نمایش داده می‌شود)"
+        "🟡 فعال در دیتابیس (تست پینگ اولیه پاسخ نداد؛ با این حال بدون محدودیت اضافه و فعال شد)"
     };
     let probe_note = if let Some(err_str) = probe_err {
-        format!("\n⚠️ <i>یادداشت تست اولیه: {}</i>", err_str)
+        format!("\n⚠️ <i>یادداشت تست اولیه: {}</i>", escape_html(&err_str))
     } else {
         String::new()
+    };
+    let gaming_live_notice = if category_enables_gaming(category) {
+        "\n\n🎮 <b>بخش گیمینگ اکنون به صورت خودکار در کل اکوسیستم (ربات تلگرام، ویندوز و اندروید) فعال شد!</b>"
+    } else {
+        ""
     };
 
     let reply = format!(
@@ -1977,11 +2039,11 @@ pub async fn handle_admin_outbound_text_input(
 • آدرس و پورت: <code>{}:{}</code>
 • پینگ تست اولیه: <b>{} میلی‌ثانیه</b>
 • تخمین سرعت: <b>{:.1} مگابیت بر ثانیه</b>
-• وضعیت: <b>{}</b>{}
+• وضعیت: <b>{}</b>{}{}
 
-✨ این نود هم‌اکنون به صورت زنده در API کلاینت‌های ویندوز و اندروید در دسترس است."#,
-        saved_outbound.id, final_label, country_name, country_code, cat_fa, parsed.protocol,
-        parsed.server_address, parsed.server_port, latency_ms, speed_mbps, status_badge, probe_note
+✨ این نود هم‌اکنون به صورت زنده در کل اکوسیستم سنترا در دسترس است."#,
+        saved_outbound.id, escape_html(&final_label), escape_html(&country_name), country_code, cat_fa, parsed.protocol,
+        parsed.server_address, parsed.server_port, latency_ms, speed_mbps, status_badge, probe_note, gaming_live_notice
     );
 
     bot.send_message(msg.chat.id, reply)
@@ -1989,6 +2051,377 @@ pub async fn handle_admin_outbound_text_input(
         .reply_markup(admin_official_outbounds_hub_keyboard())
         .await?;
 
+    Ok(())
+}
+
+/// Build the interactive paginated subscription node list message & inline keyboard
+fn build_sub_preview_message(pending: &PendingSubImport, requested_page: usize) -> (String, InlineKeyboardMarkup) {
+    const PER_PAGE: usize = 8;
+    let total = pending.nodes.len();
+    let total_pages = total.div_ceil(PER_PAGE).max(1);
+    let page = requested_page.min(total_pages - 1);
+    let start = page * PER_PAGE;
+    let end = (start + PER_PAGE).min(total);
+
+    let healthy_count = pending.nodes.iter().filter(|n| n.is_online).count();
+    let weak_or_offline_count = total.saturating_sub(healthy_count);
+    let added_count = pending.added_indices.len();
+
+    let mut lines = vec![
+        format!("📋 <b>فهرست نودهای سابسکریپشن برای [{}]</b>", category_label_fa(&pending.category)),
+        String::new(),
+        format!(
+            "📊 استخراج‌شده: <b>{} نود</b> (🟢 سالم: <b>{}</b> | 🔴 بدون پاسخ/پینگ نامناسب: <b>{}</b> | ✅ اضافه‌شده: <b>{}</b>)",
+            total, healthy_count, weak_or_offline_count, added_count
+        ),
+        "<i>روی هر نود کلیک کنید تا حتی در صورت عدم پاسخ یا پینگ بالا بلافاصله اضافه شود، یا دکمه «افزودن همه» را بزنید:</i>".to_string(),
+        String::new(),
+    ];
+
+    let mut kb_rows: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+
+    for (idx, node) in pending.nodes.iter().enumerate().take(end).skip(start) {
+        let is_added = pending.added_indices.contains(&idx);
+        let ping_badge = if node.is_online && node.latency_ms > 0 && node.latency_ms <= 250 {
+            format!("🟢 {}ms", node.latency_ms)
+        } else if node.is_online && node.latency_ms > 250 {
+            format!("🟡 {}ms", node.latency_ms)
+        } else {
+            "🔴 بدون پاسخ/پینگ نامناسب".to_string()
+        };
+        let prefix = if is_added { "✅" } else { "▫️" };
+        lines.push(format!(
+            "{} <b>#{}</b> {} — <code>{}</code> • {} • {}",
+            prefix,
+            idx + 1,
+            escape_html(&node.label),
+            node.protocol,
+            escape_html(&node.country_name),
+            ping_badge
+        ));
+
+        let short_label: String = node.label.chars().take(22).collect();
+        let short_ping = if node.is_online && node.latency_ms > 0 {
+            format!("{}ms", node.latency_ms)
+        } else {
+            "بدون پینگ".to_string()
+        };
+        let btn_label = if is_added {
+            format!("✅ #{} {} (اضافه‌شد)", idx + 1, short_label)
+        } else {
+            format!("➕ #{} {} ({})", idx + 1, short_label, short_ping)
+        };
+        kb_rows.push(vec![InlineKeyboardButton::callback(
+            btn_label,
+            format!("adm_sub_add_node_{}", idx),
+        )]);
+    }
+
+    if total_pages > 1 {
+        let mut nav_row = Vec::new();
+        if page > 0 {
+            nav_row.push(InlineKeyboardButton::callback(
+                "◀️ صفحه قبل",
+                format!("adm_sub_page_{}", page - 1),
+            ));
+        }
+        nav_row.push(InlineKeyboardButton::callback(
+            format!("صفحه {}/{}", page + 1, total_pages),
+            format!("adm_sub_page_{}", page),
+        ));
+        if page + 1 < total_pages {
+            nav_row.push(InlineKeyboardButton::callback(
+                "صفحه بعد ▶️",
+                format!("adm_sub_page_{}", page + 1),
+            ));
+        }
+        kb_rows.push(nav_row);
+    }
+
+    kb_rows.push(vec![InlineKeyboardButton::callback(
+        format!("✅ افزودن همه {} نود (حتی با پینگ نامناسب)", total),
+        "adm_sub_add_all",
+    )]);
+
+    if healthy_count > 0 && healthy_count < total {
+        kb_rows.push(vec![InlineKeyboardButton::callback(
+            format!("⚡ افزودن فقط {} نود با پینگ سالم", healthy_count),
+            "adm_sub_add_healthy",
+        )]);
+    }
+
+    kb_rows.push(vec![InlineKeyboardButton::callback(
+        "🔙 بازگشت به منوی اوتباندها",
+        "adm_action_official_outbounds",
+    )]);
+
+    (lines.join("\n"), InlineKeyboardMarkup::new(kb_rows))
+}
+
+/// Paginate through the admin's pending subscription preview list
+pub async fn handle_sub_preview_page_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    admin_chat_id: i64,
+    page: usize,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone()).text("⛔ دسترسی غیرمجاز!").show_alert(true).await?;
+        return Ok(());
+    }
+
+    let Some(pending) = get_pending_sub_import(telegram_user_id).await else {
+        bot.answer_callback_query(q.id.clone())
+            .text("⚠️ فهرست سابسکریپشن منقضی شده است. لطفاً لینک را مجدداً ارسال کنید.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    };
+
+    let (text, kb) = build_sub_preview_message(&pending, page);
+    if let Some(msg) = &q.message {
+        let _ = bot
+            .edit_message_text(msg.chat().id, msg.id(), text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(kb)
+            .await;
+    }
+    bot.answer_callback_query(q.id.clone()).await?;
+    Ok(())
+}
+
+/// Force-add a single node from the admin's subscription list regardless of ping test outcome
+pub async fn handle_sub_preview_add_node_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+    admin_chat_id: i64,
+    node_idx: usize,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone()).text("⛔ دسترسی غیرمجاز!").show_alert(true).await?;
+        return Ok(());
+    }
+
+    let Some(mut pending) = get_pending_sub_import(telegram_user_id).await else {
+        bot.answer_callback_query(q.id.clone())
+            .text("⚠️ فهرست سابسکریپشن منقضی شده است. لطفاً لینک را مجدداً ارسال کنید.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    };
+
+    let Some(node) = pending.nodes.get(node_idx).cloned() else {
+        bot.answer_callback_query(q.id.clone()).text("نود مورد نظر یافت نشد.").show_alert(true).await?;
+        return Ok(());
+    };
+
+    let health_score = if node.is_online { 100 } else { 70 };
+    let stored_latency = if node.is_online { node.latency_ms } else { 0 };
+
+    if let Err(e) = Repository::insert_official_outbound(
+        pool,
+        &node.label,
+        &node.tag,
+        &node.protocol,
+        &node.server_address,
+        node.server_port as i64,
+        &node.config_json,
+        stored_latency,
+        node.speed_mbps,
+        &pending.category,
+        Some(&node.raw_link),
+        &node.fingerprint,
+        "active",
+        health_score,
+        &node.country_code,
+        &node.country_name,
+    )
+    .await
+    {
+        bot.answer_callback_query(q.id.clone())
+            .text(format!("❌ خطا در ثبت نود: {}", e))
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    }
+
+    pending.added_indices.insert(node_idx);
+    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
+
+    let page = node_idx / 8;
+    let (text, kb) = build_sub_preview_message(&pending, page);
+    let gaming_activated = category_enables_gaming(&pending.category);
+    set_pending_sub_import(telegram_user_id, pending).await;
+
+    if let Some(msg) = &q.message {
+        let _ = bot
+            .edit_message_text(msg.chat().id, msg.id(), text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(kb)
+            .await;
+    }
+
+    let toast_msg = if gaming_activated {
+        format!("✅ نود «{}» ثبت شد و بخش گیمینگ در کل اکوسیستم فعال شد!", node.label)
+    } else {
+        format!("✅ نود «{}» با موفقیت اضافه و فعال شد.", node.label)
+    };
+    bot.answer_callback_query(q.id.clone())
+        .text(toast_msg)
+        .show_alert(gaming_activated)
+        .await?;
+    Ok(())
+}
+
+/// Bulk-add nodes from the admin's subscription list (either ALL nodes regardless of ping, or healthy-only)
+pub async fn handle_sub_preview_add_bulk_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    pool: &DbPool,
+    admin_chat_id: i64,
+    only_healthy: bool,
+) -> anyhow::Result<()> {
+    let telegram_user_id = q.from.id.0 as i64;
+    if !is_authorized_admin(telegram_user_id, admin_chat_id) {
+        bot.answer_callback_query(q.id.clone()).text("⛔ دسترسی غیرمجاز!").show_alert(true).await?;
+        return Ok(());
+    }
+
+    let Some(pending) = get_pending_sub_import(telegram_user_id).await else {
+        bot.answer_callback_query(q.id.clone())
+            .text("⚠️ فهرست سابسکریپشن منقضی شده است.")
+            .show_alert(true)
+            .await?;
+        return Ok(());
+    };
+
+    let mut added_now = 0usize;
+    let mut failed_db = 0usize;
+    let mut country_counts: HashMap<String, usize> = HashMap::new();
+
+    for (idx, node) in pending.nodes.iter().enumerate() {
+        if only_healthy && !node.is_online {
+            continue;
+        }
+        if pending.added_indices.contains(&idx) {
+            *country_counts.entry(node.country_name.clone()).or_insert(0) += 1;
+            continue;
+        }
+
+        let health_score = if node.is_online { 100 } else { 70 };
+        let stored_latency = if node.is_online { node.latency_ms } else { 0 };
+        match Repository::insert_official_outbound(
+            pool,
+            &node.label,
+            &node.tag,
+            &node.protocol,
+            &node.server_address,
+            node.server_port as i64,
+            &node.config_json,
+            stored_latency,
+            node.speed_mbps,
+            &pending.category,
+            Some(&node.raw_link),
+            &node.fingerprint,
+            "active",
+            health_score,
+            &node.country_code,
+            &node.country_name,
+        )
+        .await
+        {
+            Ok(_) => {
+                added_now += 1;
+                *country_counts.entry(node.country_name.clone()).or_insert(0) += 1;
+            }
+            Err(e) => {
+                warn!("Failed to persist sub node {}: {}", node.label, e);
+                failed_db += 1;
+            }
+        }
+    }
+
+    let total_saved = added_now + pending.added_indices.len();
+    let source_id = Repository::save_subscription_source(
+        pool,
+        &pending.category,
+        &pending.source_url,
+        Some(&format!("سابلینک {}", pending.category)),
+        pending.total_raw_lines as i64,
+        total_saved as i64,
+    )
+    .await
+    .unwrap_or(0);
+
+    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
+    clear_pending_sub_import(telegram_user_id).await;
+
+    let mut country_summary = String::new();
+    for (country, count) in &country_counts {
+        country_summary.push_str(&format!("• {}: <b>{} نود</b>\n", escape_html(country), count));
+    }
+    if country_summary.is_empty() {
+        country_summary = "• نامشخص\n".to_string();
+    }
+
+    let gaming_live_notice = if category_enables_gaming(&pending.category) && total_saved > 0 {
+        "\n\n🎮 <b>بخش گیمینگ اکنون به صورت خودکار در کل اکوسیستم (ربات تلگرام، ویندوز و اندروید) فعال شد!</b>"
+    } else {
+        ""
+    };
+
+    let summary_text = format!(
+        r#"✅ <b>افزودن نودهای سابسکریپشن برای [{}] تکمیل شد</b>
+
+📦 <b>گزارش نهایی:</b>
+• کل نودهای فهرست: <b>{} نود</b>
+• نودهای ثبت و فعال‌شده در سیستم: <b>{} نود</b>
+• خطا در ذخیره‌سازی: <b>{} نود</b>
+
+🌍 <b>تفکیک جغرافیایی:</b>
+{}
+⚡️ پل ارتباطی سرور (Sing-box Bridge) به صورت خودکار بروزرسانی شد.{}"#,
+        category_label_fa(&pending.category),
+        pending.nodes.len(),
+        total_saved,
+        failed_db,
+        country_summary,
+        gaming_live_notice
+    );
+
+    let list_cat = match pending.category.as_str() {
+        "gaming_only" | "gaming" => "gaming",
+        "static_only" | "static_ip" => "static_ip",
+        "download" => "download",
+        _ => "web_browsing",
+    };
+
+    let mut kb_rows = Vec::new();
+    if source_id > 0 {
+        kb_rows.push(vec![InlineKeyboardButton::callback(
+            "🔄 بروزرسانی مجدد این سابلینک",
+            format!("adm_sub_resync_{}", source_id),
+        )]);
+    }
+    kb_rows.push(vec![
+        InlineKeyboardButton::callback("📋 مشاهده لیست نودها", format!("adm_ob_list_{}", list_cat)),
+        InlineKeyboardButton::callback("🔙 بازگشت به منوی اوتباندها", "adm_action_official_outbounds"),
+    ]);
+
+    if let Some(msg) = &q.message {
+        let _ = bot
+            .edit_message_text(msg.chat().id, msg.id(), summary_text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(InlineKeyboardMarkup::new(kb_rows))
+            .await;
+    }
+
+    bot.answer_callback_query(q.id.clone())
+        .text(format!("✅ {} نود با موفقیت ثبت و فعال شد.", total_saved))
+        .await?;
     Ok(())
 }
 
@@ -2006,14 +2439,7 @@ pub async fn handle_list_official_outbounds(
         return Ok(());
     }
 
-    let cat_fa = match category {
-        "free_only" | "web_browsing" => "🌐 فقط بخش رایگان (وب‌گردی / دانلود)",
-        "static_only" | "static_ip" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
-        "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت همزمان)",
-        "auto" => "🤖 تشخیص هوشمند خودکار (بر اساس تست جمنای و سرعت)",
-        "download" => "📥 دانلود (Download)",
-        _ => category,
-    };
+    let cat_fa = category_label_fa(category);
 
     let nodes = match Repository::get_official_outbounds_by_category(pool, category).await {
         Ok(list) => list,
@@ -2039,8 +2465,9 @@ pub async fn handle_list_official_outbounds(
             "📭 هیچ نود رسمی فعالی برای بخش <b>[{}]</b> ثبت نشده است.\n\nجهت افزودن اولین نود، دکمه زیر را لمس فرمایید:",
             cat_fa
         );
+        let target_cat = if category == "gaming" { "gaming_only" } else { category };
         let kb = InlineKeyboardMarkup::new(vec![
-            vec![InlineKeyboardButton::callback("➕ افزودن نود برای این بخش", format!("adm_ob_target_{}", category))],
+            vec![InlineKeyboardButton::callback("➕ افزودن نود برای این بخش", format!("adm_ob_target_{}", target_cat))],
             vec![InlineKeyboardButton::callback("🔙 بازگشت به منوی اوتباندها", "adm_action_official_outbounds")],
         ]);
 
@@ -2068,13 +2495,7 @@ pub async fn handle_list_official_outbounds(
 
         for ob in &nodes {
             let status_icon = if ob.status == "active" { "🟢 فعال / آنلاین" } else { "🔴 غیرفعال / آفلاین" };
-            let alloc_desc = if ob.allow_static_ip == 1 && ob.allow_web == 1 {
-                "⚡️ هر دو بخش (رایگان + آی‌پی ثابت)"
-            } else if ob.allow_static_ip == 1 {
-                "💎 فقط آی‌پی ثابت (ترید و جمنای)"
-            } else {
-                "🌐 فقط بخش رایگان (وب / دانلود)"
-            };
+            let alloc_desc = allocation_summary_fa(ob);
             let gemini_badge = if ob.gemini_ok == 1 { "✅ سازگار و آماده" } else { "❌ ناموفق / تست‌نشده" };
             let trading_badge = if ob.trading_safe == 1 { "✅ پایدار (Jitter < 30ms)" } else { "⚠️ نامناسب" };
             let last_seen = ob.last_online_at
@@ -2155,8 +2576,27 @@ pub async fn handle_ping_official_outbound_callback(
         }
     };
 
-    let (latency_ms, jitter_ms, speed_mbps, speed_score, is_online) =
-        QualityEngine::test_outbound_network_quality(ip, ob.server_port as u16).await;
+    let proto_lower = ob.protocol.to_lowercase();
+    let is_udp_proto = matches!(
+        proto_lower.as_str(),
+        "hysteria2" | "hy2" | "tuic" | "wireguard" | "wg"
+    );
+    let (latency_ms, jitter_ms, speed_mbps, speed_score, is_online) = if is_udp_proto {
+        let (lat, spd, online, _) = OutboundAnalyzer::benchmark_proxy_for_protocol(
+            &ob.protocol,
+            ip,
+            ob.server_port as u16,
+        )
+        .await;
+        let score = if online {
+            (95 - (lat / 10)).clamp(35, 100)
+        } else {
+            0
+        };
+        (lat, if online { 5 } else { 999 }, spd, score, online)
+    } else {
+        QualityEngine::test_outbound_network_quality(ip, ob.server_port as u16).await
+    };
 
     let parsed_config: serde_json::Value = serde_json::from_str(&ob.config_json).unwrap_or_default();
     let (gemini_ok, trading_safe) =
@@ -2193,13 +2633,7 @@ pub async fn handle_ping_official_outbound_callback(
     // Update message card if available
     if let Some(msg) = &q.message {
         let status_icon = if is_online { "🟢 فعال / آنلاین" } else { "🔴 غیرفعال / آفلاین" };
-        let alloc_desc = if ob.allow_static_ip == 1 && ob.allow_web == 1 {
-            "⚡️ هر دو بخش (رایگان + آی‌پی ثابت)"
-        } else if ob.allow_static_ip == 1 {
-            "💎 فقط آی‌پی ثابت (ترید و جمنای)"
-        } else {
-            "🌐 فقط بخش رایگان (وب / دانلود)"
-        };
+        let alloc_desc = allocation_summary_fa(&ob);
         let gemini_badge = if gemini_ok { "✅ سازگار و آماده" } else { "❌ ناموفق" };
         let trading_badge = if trading_safe { "✅ پایدار (Jitter < 30ms)" } else { "⚠️ نامناسب" };
 
@@ -2289,11 +2723,13 @@ pub async fn handle_set_outbound_allocation_callback(
         return Ok(());
     }
 
-    let (allow_web, allow_download, allow_static_ip) = match alloc_mode {
-        "free_only" => (true, true, false),
-        "static_only" => (false, false, true),
-        "both" => (true, true, true),
-        _ => (true, true, false), // auto initially starts with free, updated by engine
+    let (allow_web, allow_download, allow_static_ip, allow_gaming) = match alloc_mode {
+        "free_only" => (true, true, false, false),
+        "gaming_only" | "gaming" => (false, false, false, true),
+        "static_only" => (false, false, true, false),
+        "both" => (true, true, true, false),
+        "all" => (true, true, true, true),
+        _ => (true, true, false, false), // auto initially starts with free, updated by engine
     };
 
     Repository::update_outbound_allocation(
@@ -2302,6 +2738,7 @@ pub async fn handle_set_outbound_allocation_callback(
         allow_web,
         allow_download,
         allow_static_ip,
+        allow_gaming,
         alloc_mode,
     )
     .await?;
@@ -2309,11 +2746,11 @@ pub async fn handle_set_outbound_allocation_callback(
     // Auto-sync server bridge
     let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
 
-    let desc = match alloc_mode {
-        "free_only" => "🌐 فقط بخش رایگان (وب / دانلود)",
-        "static_only" => "💎 فقط بخش آی‌پی ثابت (ترید و جمنای)",
-        "both" => "⚡️ هر دو بخش (رایگان + آی‌پی ثابت)",
-        _ => "🤖 تشخیص هوشمند خودکار",
+    let desc = category_label_fa(alloc_mode);
+    let gaming_live_notice = if allow_gaming {
+        "\n\n🎮 <b>بخش گیمینگ اکنون به صورت خودکار در کل اکوسیستم فعال شد!</b>"
+    } else {
+        ""
     };
 
     bot.answer_callback_query(q.id.clone())
@@ -2325,7 +2762,10 @@ pub async fn handle_set_outbound_allocation_callback(
         let _ = bot.edit_message_text(
             msg.chat().id,
             msg.id(),
-            format!("✅ <b>تخصیص دسترسی نود #{} با موفقیت روی [{}] تنظیم و در پل سرور همگام شد.</b>", outbound_id, desc),
+            format!(
+                "✅ <b>تخصیص دسترسی نود #{} با موفقیت روی [{}] تنظیم و در پل سرور همگام شد.</b>{}",
+                outbound_id, desc, gaming_live_notice
+            ),
         )
         .parse_mode(ParseMode::Html)
         .reply_markup(admin_official_outbounds_hub_keyboard())
@@ -2788,6 +3228,8 @@ pub async fn handle_donated_outbound_reject(
         "توسط مدیر سیستم تایید نشد (عدم احراز شرایط کیفیت یا پایداری).",
     )
     .await?;
+
+    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
 
     if let Some(ref donor) = donor_opt {
         if let Some(tg_id) = donor.telegram_id {

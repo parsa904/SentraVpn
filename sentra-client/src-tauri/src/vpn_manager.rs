@@ -237,7 +237,7 @@ impl VpnManager {
             "os": if cfg!(target_os = "android") { "android" } else { "windows" },
             "mode": selected_mode,
             "protocol": selected_protocol,
-            "use_warp": if selected_mode == "static_ip" { false } else { use_warp }
+            "use_warp": if selected_mode == "static_ip" || selected_mode == "gaming" { false } else { use_warp }
         });
         if let Some(loc) = selected_location {
             if !loc.is_empty() && loc != "auto" {
@@ -320,77 +320,156 @@ impl VpnManager {
             }
         };
 
-        // Apply client-side split-tunnel, DNS & Anti-DPI adjustments to the embedded singbox_config object if present
-        if let Some(sb_cfg) = config_val.get_mut("singbox_config") {
-            Self::apply_anti_dpi_settings(sb_cfg, anti_dpi);
-        }
+        // Apply client-side split-tunnel, DNS, clash_api & Anti-DPI adjustments to the embedded singbox_config object (or root if raw)
+        let custom_dns_for_ovpn = if selected_mode != "static_ip"
+            && !dns_config.selected_dns_address.is_empty()
+            && dns_config.selected_dns_id != "auto"
+        {
+            Some(dns_config.selected_dns_address.clone())
+        } else {
+            None
+        };
 
-        // Customize mode in the config if required
-        if selected_mode != "Sentra Auto" {
-            if let Some(selector) = config_val.get_mut("outbounds").and_then(|o| o.as_array_mut()) {
-                for item in selector {
-                    if item.get("tag").and_then(|t| t.as_str()) == Some("Sentra Select") {
-                        item["default"] = json!(selected_mode);
+        {
+            let target_sb = if config_val.get("singbox_config").is_some() {
+                config_val.get_mut("singbox_config").unwrap()
+            } else {
+                &mut config_val
+            };
+
+            // Only override Sentra Select default if selected_mode matches an actual outbound tag
+            if selected_mode != "Sentra Auto" {
+                if let Some(outbounds_arr) = target_sb.get_mut("outbounds").and_then(|o| o.as_array_mut()) {
+                    let has_matching_tag = outbounds_arr
+                        .iter()
+                        .any(|item| item.get("tag").and_then(|t| t.as_str()) == Some(selected_mode));
+                    if has_matching_tag {
+                        for item in outbounds_arr {
+                            if item.get("tag").and_then(|t| t.as_str()) == Some("Sentra Select") {
+                                item["default"] = json!(selected_mode);
+                            }
+                        }
                     }
                 }
             }
-        }
 
-        // Handle Split Tunneling
-        if !split_tunneling {
-            if let Some(rules) = config_val
-                .get_mut("route")
-                .and_then(|r| r.get_mut("rules"))
-                .and_then(|r| r.as_array_mut())
-            {
-                rules.retain(|rule| {
-                    if let Some(outbound) = rule.get("outbound").and_then(|o| o.as_str()) {
-                        if outbound == "direct" && rule.get("domain_suffix").is_some() {
-                            return false;
+            // Handle Split Tunneling
+            if !split_tunneling {
+                if let Some(rules) = target_sb
+                    .get_mut("route")
+                    .and_then(|r| r.get_mut("rules"))
+                    .and_then(|r| r.as_array_mut())
+                {
+                    rules.retain(|rule| {
+                        if let Some(outbound) = rule.get("outbound").and_then(|o| o.as_str()) {
+                            if outbound == "direct" && rule.get("domain_suffix").is_some() {
+                                return false;
+                            }
+                        }
+                        true
+                    });
+                }
+            }
+
+            // Strict Leak Protection for Static IP (Trade & Crypto Protection)
+            if selected_mode == "static_ip" {
+                info!("Enforcing Strict Leak Protection for Static IP (IPv6 blocked, Remote Clean Global DoH enforced).");
+                if let Some(dns) = target_sb.get_mut("dns") {
+                    dns["servers"] = json!([
+                        {
+                            "tag": "dns-remote",
+                            "address": "https://1.1.1.1/dns-query",
+                            "strategy": "ipv4_only",
+                            "detour": "Sentra Select"
+                        },
+                        {
+                            "tag": "dns-block",
+                            "address": "rcode://success"
+                        }
+                    ]);
+                    dns["rules"] = json!([
+                        { "outbound": "any", "server": "dns-remote" }
+                    ]);
+                }
+                if let Some(rules) = target_sb
+                    .get_mut("route")
+                    .and_then(|r| r.get_mut("rules"))
+                    .and_then(|r| r.as_array_mut())
+                {
+                    rules.insert(0, json!({
+                        "ip_version": 6,
+                        "outbound": "block"
+                    }));
+                }
+            } else if selected_mode == "gaming" {
+                info!("Applying Ultra-Low-Latency Gaming optimizations for Windows/Android (MTU 1280, Full-Cone NAT, Direct UDP DNS, Zero DPI/MUX jitter).");
+                // 1. Optimize TUN inbound for gaming UDP streams
+                if let Some(inbounds) = target_sb.get_mut("inbounds").and_then(|i| i.as_array_mut()) {
+                    for ib in inbounds {
+                        if ib.get("type").and_then(|t| t.as_str()) == Some("tun") {
+                            ib["mtu"] = json!(1280);
+                            ib["stack"] = json!("system");
+                            ib["endpoint_independent_nat"] = json!(true);
+                            ib["udp_timeout"] = json!("5m");
+                            ib["sniff"] = json!(false);
+                            ib["sniff_override_destination"] = json!(false);
+                            ib["strict_route"] = json!(true);
+                            if let Some(obj) = ib.as_object_mut() {
+                                obj.remove("inet6_address");
+                            }
                         }
                     }
-                    true
-                });
-            }
-        }
-
-        // Strict Leak Protection for Static IP (Trade & Crypto Protection)
-        if selected_mode == "static_ip" {
-            info!("Enforcing Strict Leak Protection for Static IP (IPv6 blocked, Remote Clean Global DoH enforced).");
-            if let Some(dns) = config_val.get_mut("dns") {
-                dns["servers"] = json!([
-                    {
-                        "tag": "dns-remote",
-                        "address": "https://1.1.1.1/dns-query",
-                        "strategy": "ipv4_only",
-                        "detour": "Sentra Select"
-                    },
-                    {
-                        "tag": "dns-block",
-                        "address": "rcode://success"
+                }
+                // 2. Tune urltest for tight 15ms jitter tolerance without mid-match flapping
+                if let Some(outbounds) = target_sb.get_mut("outbounds").and_then(|o| o.as_array_mut()) {
+                    for ob in outbounds {
+                        if ob.get("type").and_then(|t| t.as_str()) == Some("urltest") {
+                            ob["interval"] = json!("1m");
+                            ob["tolerance"] = json!(15);
+                        }
                     }
-                ]);
-                dns["rules"] = json!([
-                    { "outbound": "any", "server": "dns-remote" }
-                ]);
-            }
-            if let Some(rules) = config_val.get_mut("route").and_then(|r| r.get_mut("rules")).and_then(|r| r.as_array_mut()) {
-                rules.insert(0, json!({
-                    "ip_version": 6,
-                    "outbound": "block"
-                }));
-            }
-        } else {
-            // Apply Custom / Selected DNS for free modes
-            let target_dns = if !dns_config.selected_dns_address.is_empty() && dns_config.selected_dns_id != "auto" {
-                Some(dns_config.selected_dns_address.as_str())
-            } else {
-                None
-            };
-
-            if let Some(dns_addr) = target_dns {
+                }
+                // 3. Direct IPv4 UDP DNS (no DoH TLS handshake jitter)
+                let gaming_dns_primary = custom_dns_for_ovpn
+                    .as_deref()
+                    .filter(|addr| !addr.starts_with("http"))
+                    .map(|addr| format!("udp://{}", addr))
+                    .unwrap_or_else(|| "udp://1.1.1.1".to_string());
+                if let Some(dns) = target_sb.get_mut("dns") {
+                    dns["servers"] = json!([
+                        {
+                            "tag": "dns-remote",
+                            "address": gaming_dns_primary,
+                            "strategy": "ipv4_only",
+                            "detour": "Sentra Select"
+                        },
+                        {
+                            "tag": "dns-remote-backup",
+                            "address": "udp://8.8.8.8",
+                            "strategy": "ipv4_only",
+                            "detour": "Sentra Select"
+                        },
+                        {
+                            "tag": "dns-direct",
+                            "address": "local",
+                            "detour": "direct"
+                        }
+                    ]);
+                    dns["final"] = json!("dns-remote");
+                    dns["strategy"] = json!("ipv4_only");
+                    dns["independent_cache"] = json!(true);
+                    if let Some(obj) = dns.as_object_mut() {
+                        obj.remove("fakeip");
+                    }
+                }
+                // 4. Minimize log I/O overhead during gaming
+                target_sb["log"] = json!({
+                    "level": "warn",
+                    "timestamp": true
+                });
+            } else if let Some(ref dns_addr) = custom_dns_for_ovpn {
                 info!("Injecting customized DNS into connection profile: {}", dns_addr);
-                if let Some(dns) = config_val.get_mut("dns") {
+                if let Some(dns) = target_sb.get_mut("dns") {
                     if let Some(servers) = dns.get_mut("servers").and_then(|s| s.as_array_mut()) {
                         for s in servers {
                             if s.get("tag").and_then(|t| t.as_str()) == Some("dns-remote") {
@@ -399,28 +478,33 @@ impl VpnManager {
                         }
                     }
                 }
-                if let Some(ovpn_str) = config_val.get_mut("ovpn_config").and_then(|o| o.as_str()) {
-                    let mut new_ovpn = ovpn_str.to_string();
-                    if !dns_addr.starts_with("http") {
-                        new_ovpn.push_str(&format!("\ndhcp-option DNS {}\n", dns_addr));
+            }
+
+            // Ensure experimental.clash_api exists for live kernel traffic sync
+            if target_sb.get("experimental").is_none() {
+                target_sb["experimental"] = json!({
+                    "clash_api": {
+                        "external_controller": "127.0.0.1:9090",
+                        "secret": "sentra_internal_traffic_secret"
                     }
-                    config_val["ovpn_config"] = json!(new_ovpn);
-                }
+                });
+            }
+
+            // Apply Anti-DPI Lab parameters into Sing-box config (bypassed in gaming mode to prevent artificial latency/jitter)
+            if selected_mode != "gaming" {
+                Self::apply_anti_dpi_settings(target_sb, anti_dpi);
             }
         }
 
-        // Ensure experimental.clash_api exists for live kernel traffic sync
-        if config_val.get("experimental").is_none() {
-            config_val["experimental"] = json!({
-                "clash_api": {
-                    "external_controller": "127.0.0.1:9090",
-                    "secret": "sentra_internal_traffic_secret"
+        if let Some(ref dns_addr) = custom_dns_for_ovpn {
+            if let Some(ovpn_str) = config_val.get_mut("ovpn_config").and_then(|o| o.as_str()) {
+                let mut new_ovpn = ovpn_str.to_string();
+                if !dns_addr.starts_with("http") {
+                    new_ovpn.push_str(&format!("\ndhcp-option DNS {}\n", dns_addr));
                 }
-            });
+                config_val["ovpn_config"] = json!(new_ovpn);
+            }
         }
-
-        // Apply Anti-DPI Lab parameters into Sing-box config
-        Self::apply_anti_dpi_settings(&mut config_val, anti_dpi);
 
         Ok(config_val)
     }
@@ -729,6 +813,14 @@ impl VpnManager {
             s.logs.push("[SECURITY] Strict Leak Protection engaged for Static IP (Kill-Switch enforced, Tunnel mode locked, IPv6 blocked).".to_string());
         }
 
+        // Enforce Optimal Gaming TUN settings on Windows & Android (WARP off, Tunnel mode preferred)
+        if mode == "gaming" {
+            let mut s = app_state.lock().await;
+            s.use_warp = false;
+            s.routing_mode = "tunnel".to_string();
+            s.logs.push("[GAMING] Ultra-Low-Latency Gaming engine engaged (MTU 1280, Full-Cone NAT, WARP bypassed, zero DPI/MUX jitter).".to_string());
+        }
+
         // Perform crash-safe synchronization of any pending traffic from previous abnormal exit
         Self::sync_pending_traffic().await;
 
@@ -740,7 +832,7 @@ impl VpnManager {
                 "[INFO] [Core] Initiating connection in mode [{}] with protocol [{}] (WARP: {}, Auto-Reconnect: {})...",
                 mode,
                 protocol,
-                if use_warp && mode != "static_ip" { "ON" } else { "OFF" },
+                if use_warp && mode != "static_ip" && mode != "gaming" { "ON" } else { "OFF" },
                 if auto_reconnect { "ON" } else { "OFF" }
             ));
         }
@@ -753,7 +845,7 @@ impl VpnManager {
                 "[Core] Requesting secure profile for mode [{}] and protocol [{}] (WARP: {}, Auto-Reconnect: {})...",
                 mode,
                 protocol,
-                if use_warp && mode != "static_ip" { "ON" } else { "OFF" },
+                if use_warp && mode != "static_ip" && mode != "gaming" { "ON" } else { "OFF" },
                 if auto_reconnect { "ON" } else { "OFF" }
             ),
         );
@@ -880,7 +972,8 @@ impl VpnManager {
         {
             let singbox_bin = Self::locate_singbox_binary(Some(&app_handle));
             let ovpn_bin = Self::locate_openvpn_binary(Some(&app_handle));
-            let prefer_singbox = selected_outbound_id.is_some()
+            let prefer_singbox = mode == "gaming"
+                || selected_outbound_id.is_some()
                 || selected_personal_uri.is_some()
                 || (singbox_bin.is_some() && ovpn_bin.is_none());
 

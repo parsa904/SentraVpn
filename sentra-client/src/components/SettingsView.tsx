@@ -104,6 +104,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [copied, setCopied] = useState(false);
 
   const isStaticIp = selectedMode === 'static_ip';
+  const isGaming = selectedMode === 'gaming';
+  const isWarpDisabled = isStaticIp || isGaming;
   const cleanBot = botUsername?.replace(/^@/, '').trim();
 
   const handleGenerateLinkCode = async () => {
@@ -423,24 +425,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         {t(lang, 'warpTitle')}
                       </div>
                       <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                        {isStaticIp ? t(lang, 'warpStaticDisabled') : t(lang, 'warpDesc')}
+                        {isStaticIp
+                          ? t(lang, 'warpStaticDisabled')
+                          : isGaming
+                          ? t(lang, 'warpGamingDisabled')
+                          : t(lang, 'warpDesc')}
                       </div>
                     </div>
                     <button
                       type="button"
                       role="switch"
                       dir="ltr"
-                      disabled={isStaticIp}
-                      aria-checked={useWarp && !isStaticIp}
+                      disabled={isWarpDisabled}
+                      aria-checked={useWarp && !isWarpDisabled}
                       aria-label={t(lang, 'warpAria')}
                       onClick={() => onToggleWarp(!useWarp)}
                       className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-40 ${
-                        useWarp && !isStaticIp ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-slate-700'
+                        useWarp && !isWarpDisabled ? 'bg-emerald-600' : 'bg-slate-300 dark:bg-slate-700'
                       }`}
                     >
                       <span
                         className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform duration-150 ${
-                          useWarp && !isStaticIp ? 'translate-x-6' : 'translate-x-1'
+                          useWarp && !isWarpDisabled ? 'translate-x-6' : 'translate-x-1'
                         }`}
                       />
                     </button>

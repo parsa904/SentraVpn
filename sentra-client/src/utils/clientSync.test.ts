@@ -27,8 +27,8 @@ function makeConfig(id: string, uri = `vless://u@1.1.1.1:443#${id}`): PersonalCo
   };
 }
 
-test('sanitizeSyncedPreferences strips gaming mode and invalid enum values', () => {
-  const sanitized = sanitizeSyncedPreferences({
+test('sanitizeSyncedPreferences preserves valid modes including gaming and strips invalid enum values', () => {
+  const withGaming = sanitizeSyncedPreferences({
     selected_mode: 'gaming',
     routing_mode: 'invalid_mode',
     split_tunneling: true,
@@ -43,14 +43,23 @@ test('sanitizeSyncedPreferences strips gaming mode and invalid enum values', () 
     theme: 'dark',
   });
 
-  assert.equal(sanitized.selected_mode, undefined);
-  assert.equal(sanitized.routing_mode, undefined);
-  assert.equal(sanitized.split_tunneling, true);
-  assert.equal(sanitized.kill_switch, false);
-  assert.equal(sanitized.custom_dns, '9.9.9.9');
-  assert.equal(sanitized.selected_outbound_id, 'node-de-1');
-  assert.equal(sanitized.lang, 'fa');
-  assert.equal(sanitized.theme, 'dark');
+  assert.equal(withGaming.selected_mode, 'gaming');
+  assert.equal(withGaming.routing_mode, undefined);
+  assert.equal(withGaming.split_tunneling, true);
+  assert.equal(withGaming.kill_switch, false);
+  assert.equal(withGaming.custom_dns, '9.9.9.9');
+  assert.equal(withGaming.selected_outbound_id, 'node-de-1');
+  assert.equal(withGaming.lang, 'fa');
+  assert.equal(withGaming.theme, 'dark');
+
+  const withInvalidMode = sanitizeSyncedPreferences({
+    selected_mode: 'unsupported_mode',
+    lang: 'de',
+    theme: 'sepia',
+  });
+  assert.equal(withInvalidMode.selected_mode, undefined);
+  assert.equal(withInvalidMode.lang, undefined);
+  assert.equal(withInvalidMode.theme, undefined);
 });
 
 test('sanitizePersonalConfigs deduplicates ids and enforces cap', () => {

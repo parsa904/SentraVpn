@@ -292,8 +292,9 @@ pub fn create_router(
         .route("/api/v1/client/sync-state", get(get_client_sync_state).put(put_client_sync_state))
         .route("/api/v1/client/modes", get(get_client_modes))
         .route("/api/v1/client/locations", get(get_client_locations))
-        // 2b. Community Outbound Donation endpoints
+        // 2b. Community Outbound Donation & Ecosystem Add endpoints
         .route("/api/v1/client/outbounds/donate", post(donate_client_outbound))
+        .route("/api/v1/client/outbounds/add", post(add_ecosystem_outbound))
         .route("/api/v1/client/outbounds/my-donations", get(get_my_donated_outbounds))
         // 3. Client Sing-box dynamic config compiler
         .route("/api/v1/client/config", post(client_config))
@@ -311,9 +312,10 @@ pub fn create_router(
         // 8. V2Ray / Sing-box Subscription endpoints
         .route("/api/v1/sub/:token", get(get_subscription))
         .route("/sub/:token", get(get_subscription))
-        // 9. OpenVPN profile generator & internal daemon hooks
+        // 9. OpenVPN, IKEv2 & WireGuard Gaming profile generators & internal daemon hooks
         .route("/api/v1/ovpn/:token", get(get_openvpn_profile))
         .route("/api/v1/mobileconfig/:token", get(get_mobileconfig_profile))
+        .route("/api/v1/wireguard/:token", get(get_wireguard_gaming_profile))
         .route("/api/internal/openvpn/auth", post(openvpn_internal_auth))
         .route("/api/internal/openvpn/accounting", post(openvpn_internal_accounting))
         .route("/api/internal/ikev2/auth", post(ikev2_internal_auth))
@@ -623,16 +625,17 @@ async fn get_client_modes(
                 .map(|s| s.replace("jwt_sentra_", ""))
         });
 
+    let gaming_enabled = Repository::has_active_gaming_outbounds(&state.pool).await;
     let modes = if let Some(t) = token {
         match Repository::get_subscription_by_token(&state.pool, &t).await {
             Ok(mut sub) => {
                 let _ = Repository::check_and_reset_daily_quota(&state.pool, &mut sub).await;
-                Repository::build_modes_info(&sub)
+                Repository::build_modes_info(&sub, gaming_enabled)
             }
-            Err(_) => Repository::build_default_modes_info(),
+            Err(_) => Repository::build_default_modes_info(gaming_enabled),
         }
     } else {
-        Repository::build_default_modes_info()
+        Repository::build_default_modes_info(gaming_enabled)
     };
 
     Ok((
@@ -733,17 +736,25 @@ async fn client_config(
 
     let requested_mode = payload.mode.as_deref().unwrap_or("web_browsing");
 
-    // Enforce mode rules:
-    // A. Gaming is coming soon
+    // Enforce mode rules (strict server-side entitlement checks):
+    // A. Gaming mode: Coming Soon until at least one active Gaming outbound exists in DB,
+    //    then strictly requires Gaming / Pro / Flow+ tier.
     if requested_mode == "gaming" {
-        return Err(CoreError::ModeComingSoon {
-            mode: "گیمینگ (Gaming)".to_string(),
-        });
+        if !Repository::has_active_gaming_outbounds(&state.pool).await {
+            return Err(CoreError::ModeComingSoon {
+                mode: "گیمینگ (Gaming)".to_string(),
+            });
+        }
+        if !compiler::tier_has_gaming(&sub.tier) {
+            return Err(CoreError::ModeLocked {
+                mode: "گیمینگ (Gaming)".to_string(),
+            });
+        }
     }
 
-    // B. Static IP quota & tier check (30 GB limit for Pro / Flow+)
+    // B. Static IP quota & tier check (30 GB limit for Static IP / Pro / Flow+)
     if requested_mode == "static_ip" {
-        if sub.tier == "Sentra Lite" {
+        if !compiler::tier_has_static_ip(&sub.tier) {
             return Err(CoreError::ModeLocked {
                 mode: "آی‌پی ثابت (Static IP)".to_string(),
             });
@@ -853,83 +864,112 @@ async fn client_config(
     )
     .await?;
 
-    // If user selected a specific outbound from the live catalog, place it first in Sing-box config
+    if active_donated_outbounds.is_empty() {
+        active_donated_outbounds =
+            Repository::get_all_active_ecosystem_outbounds_for_tier(&state.pool, &sub.tier)
+                .await
+                .unwrap_or_default();
+    }
+
+    let mut base_outbounds = Repository::get_allowed_outbounds(&state.pool, &sub.tier)
+        .await
+        .unwrap_or_default();
+
+    let mut has_explicit_selection = false;
+
+    // If user selected a specific outbound from the live catalog (node-* or core-*), place it first
     if let Some(ref sel_id) = payload.selected_outbound_id {
         if let Some(raw_num) = sel_id.strip_prefix("node-") {
             if let Ok(db_id) = raw_num.parse::<i64>() {
                 if let Some(specific) = Repository::get_donated_outbound_by_id(&state.pool, db_id).await? {
-                    if specific.status == "active" {
+                    if specific.status == "active" || specific.status == "approved" {
                         active_donated_outbounds.retain(|o| o.id != specific.id);
                         active_donated_outbounds.insert(0, specific);
+                        has_explicit_selection = true;
+                    }
+                }
+            }
+        } else if let Some(raw_num) = sel_id.strip_prefix("core-") {
+            if let Ok(db_id) = raw_num.parse::<i64>() {
+                if let Some(specific) = Repository::get_outbound_by_id(&state.pool, db_id).await? {
+                    if specific.is_active {
+                        base_outbounds.retain(|o| o.id != specific.id);
+                        base_outbounds.insert(0, specific);
+                        has_explicit_selection = true;
                     }
                 }
             }
         }
     }
 
-    // If user requested a personal URI, parse it and compile it directly into the Sing-box outbounds list
+    // If user requested a personal URI, validate against Anti-SSRF and compile it directly into Sing-box
     if let Some(ref personal_uri) = payload.personal_uri {
         let trimmed = personal_uri.trim();
-        if !trimmed.is_empty() {
+        if !trimmed.is_empty() && trimmed.len() <= 8192 {
             if let Ok(parsed) = crate::outbound_analyzer::OutboundAnalyzer::parse_input(trimmed) {
-                let personal_row = crate::models::DonatedOutbound {
-                    id: 0,
-                    donor_user_id: Some(sub.user_id),
-                    tag: if parsed.tag.is_empty() { "Personal-Node".to_string() } else { parsed.tag.clone() },
-                    protocol: parsed.protocol.clone(),
-                    server_address: parsed.server_address.clone(),
-                    server_port: parsed.server_port as i64,
-                    config_json: parsed.config_json.to_string(),
-                    latency_ms: 0,
-                    speed_mbps: 0.0,
-                    assigned_tier: "web_browsing".to_string(),
-                    health_score: 100,
-                    status: "active".to_string(),
-                    fail_count: 0,
-                    reward_granted: 0,
-                    raw_link: Some(trimmed.to_string()),
-                    rejection_reason: None,
-                    declared_or_detected_gb: 0,
-                    bytes_served: 0,
-                    first_used_at: None,
-                    monthly_reward_granted: 0,
-                    fingerprint_sha256: None,
-                    offline_since: None,
-                    clawback_executed: 0,
-                    is_official: 0,
-                    label: Some(parsed.tag),
-                    country_code: "XX".to_string(),
-                    country_name: "Personal".to_string(),
-                    last_checked_at: Utc::now(),
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    allow_web: 1,
-                    allow_download: 1,
-                    allow_static_ip: 0,
-                    gemini_ok: 0,
-                    trading_safe: 0,
-                    speed_score: 100,
-                    jitter_ms: 0,
-                    last_online_at: Some(Utc::now()),
-                    allocation_mode: "manual".to_string(),
-                    reward_days: 0,
-                    user_note: None,
-                    approved_at: None,
-                };
-                active_donated_outbounds.insert(0, personal_row);
+                if crate::outbound_analyzer::OutboundAnalyzer::check_anti_ssrf(&parsed.server_address)
+                    .await
+                    .is_ok()
+                {
+                    let personal_row = crate::models::DonatedOutbound {
+                        id: 0,
+                        donor_user_id: Some(sub.user_id),
+                        tag: if parsed.tag.is_empty() { "Personal-Node".to_string() } else { parsed.tag.clone() },
+                        protocol: parsed.protocol.clone(),
+                        server_address: parsed.server_address.clone(),
+                        server_port: parsed.server_port as i64,
+                        config_json: parsed.config_json.to_string(),
+                        latency_ms: 0,
+                        speed_mbps: 0.0,
+                        assigned_tier: "web_browsing".to_string(),
+                        health_score: 100,
+                        status: "active".to_string(),
+                        fail_count: 0,
+                        reward_granted: 0,
+                        raw_link: Some(trimmed.to_string()),
+                        rejection_reason: None,
+                        declared_or_detected_gb: 0,
+                        bytes_served: 0,
+                        first_used_at: None,
+                        monthly_reward_granted: 0,
+                        fingerprint_sha256: None,
+                        offline_since: None,
+                        clawback_executed: 0,
+                        is_official: 0,
+                        label: Some(parsed.tag),
+                        country_code: "XX".to_string(),
+                        country_name: "Personal".to_string(),
+                        last_checked_at: Utc::now(),
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        allow_web: 1,
+                        allow_download: 1,
+                        allow_static_ip: 0,
+                        allow_gaming: 0,
+                        gemini_ok: 0,
+                        trading_safe: 0,
+                        speed_score: 100,
+                        jitter_ms: 0,
+                        last_online_at: Some(Utc::now()),
+                        allocation_mode: "manual".to_string(),
+                        reward_days: 0,
+                        user_note: None,
+                        approved_at: None,
+                    };
+                    active_donated_outbounds.insert(0, personal_row);
+                    has_explicit_selection = true;
+                }
             }
         }
     }
 
     let live_outbounds = Repository::get_all_live_client_outbounds(&state.pool).await?;
-    let base_outbounds = Repository::get_allowed_outbounds(&state.pool, &sub.tier)
-        .await
-        .unwrap_or_default();
-    let singbox_config = compiler::compile_singbox_config_with_donated(
+    let singbox_config = compiler::compile_singbox_config_with_donated_and_selection(
         &sub,
         &base_outbounds,
         &active_donated_outbounds,
         Some(requested_mode),
+        has_explicit_selection,
     );
 
     let chosen_location_name = match chosen_location_code.to_uppercase().as_str() {
@@ -943,8 +983,8 @@ async fn client_config(
         _ => "⚡️ انتخاب خودکار سریع‌ترین لوکیشن (Auto)",
     };
 
-    // Cloudflare WARP opt-in: Strictly disabled in static_ip mode, opt-in for web & download
-    let use_warp = if requested_mode == "static_ip" {
+    // Cloudflare WARP opt-in: Strictly disabled in static_ip and gaming modes (avoids extra hop latency/jitter)
+    let use_warp = if requested_mode == "static_ip" || requested_mode == "gaming" {
         false
     } else {
         payload.use_warp.unwrap_or(false)
@@ -1359,6 +1399,10 @@ async fn get_subscription(
         || user_agent.contains("singbox");
 
     let outbounds = Repository::get_allowed_outbounds(&state.pool, &sub.tier).await?;
+    let ecosystem_outbounds =
+        Repository::get_all_active_ecosystem_outbounds_for_tier(&state.pool, &sub.tier)
+            .await
+            .unwrap_or_default();
 
     let sub_userinfo = format!(
         "upload={}; download={}; total={}; expire={}",
@@ -1369,7 +1413,12 @@ async fn get_subscription(
     );
 
     if wants_singbox {
-        let singbox_json = compiler::compile_singbox_config(&sub, &outbounds, None);
+        let singbox_json = compiler::compile_singbox_config_with_donated(
+            &sub,
+            &outbounds,
+            &ecosystem_outbounds,
+            None,
+        );
         Ok((
             StatusCode::OK,
             [
@@ -1383,9 +1432,25 @@ async fn get_subscription(
         )
             .into_response())
     } else {
-        // Base64 V2Ray list
+        // Base64 V2Ray / Clash / Sing-box URI list containing all active official + donated outbounds
         let mut lines = Vec::new();
+        let mut seen_uris: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for dob in &ecosystem_outbounds {
+            if let Some(uri) = build_share_uri_from_donated(dob) {
+                if seen_uris.insert(uri.clone()) {
+                    lines.push(uri);
+                }
+            }
+        }
+
+        let has_real_nodes = !lines.is_empty()
+            || outbounds.iter().any(|ob| ob.server_address != "127.0.0.1");
+
         for ob in outbounds {
+            if has_real_nodes && ob.server_address == "127.0.0.1" {
+                continue;
+            }
             let uri = match ob.protocol.as_str() {
                 "socks" => format!("socks://{}:{}#{}", ob.server_address, ob.server_port, urlencoding_simple(&ob.tag)),
                 "http" => format!("http://{}:{}#{}", ob.server_address, ob.server_port, urlencoding_simple(&ob.tag)),
@@ -1398,7 +1463,9 @@ async fn get_subscription(
                 ),
                 _ => format!("socks://{}:{}#{}", ob.server_address, ob.server_port, urlencoding_simple(&ob.tag)),
             };
-            lines.push(uri);
+            if seen_uris.insert(uri.clone()) {
+                lines.push(uri);
+            }
         }
 
         let raw_payload = lines.join("\n");
@@ -1417,6 +1484,90 @@ async fn get_subscription(
             encoded_payload,
         )
             .into_response())
+    }
+}
+
+fn build_share_uri_from_donated(dob: &crate::models::DonatedOutbound) -> Option<String> {
+    let display_name = dob
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&dob.tag);
+    let prefix = if dob.is_official == 1 { "👑 " } else { "🤝 " };
+    let tagged_name = format!("{}{}", prefix, display_name);
+
+    if let Some(ref raw) = dob.raw_link {
+        let trimmed = raw.trim();
+        let lower = trimmed.to_lowercase();
+        let supported = [
+            "vless://",
+            "vmess://",
+            "trojan://",
+            "ss://",
+            "hy2://",
+            "hysteria2://",
+            "tuic://",
+            "wireguard://",
+            "wg://",
+            "socks://",
+            "socks5://",
+            "http://",
+        ];
+        if supported.iter().any(|s| lower.starts_with(s)) {
+            if lower.starts_with("vmess://") {
+                return Some(trimmed.to_string());
+            }
+            let base = trimmed.split('#').next().unwrap_or(trimmed);
+            return Some(format!("{}#{}", base, urlencoding_simple(&tagged_name)));
+        }
+    }
+
+    let cfg: serde_json::Value = serde_json::from_str(&dob.config_json).unwrap_or_default();
+    match dob.protocol.to_lowercase().as_str() {
+        "vless" => {
+            let uuid = cfg.get("uuid").and_then(|v| v.as_str())?;
+            Some(format!(
+                "vless://{}@{}:{}?encryption=none#{}",
+                uuid,
+                dob.server_address,
+                dob.server_port,
+                urlencoding_simple(&tagged_name)
+            ))
+        }
+        "trojan" => {
+            let password = cfg.get("password").and_then(|v| v.as_str())?;
+            Some(format!(
+                "trojan://{}@{}:{}#{}",
+                password,
+                dob.server_address,
+                dob.server_port,
+                urlencoding_simple(&tagged_name)
+            ))
+        }
+        "hysteria2" | "hy2" => {
+            let password = cfg.get("password").and_then(|v| v.as_str())?;
+            Some(format!(
+                "hysteria2://{}@{}:{}#{}",
+                password,
+                dob.server_address,
+                dob.server_port,
+                urlencoding_simple(&tagged_name)
+            ))
+        }
+        "socks" | "socks5" => Some(format!(
+            "socks://{}:{}#{}",
+            dob.server_address,
+            dob.server_port,
+            urlencoding_simple(&tagged_name)
+        )),
+        "http" => Some(format!(
+            "http://{}:{}#{}",
+            dob.server_address,
+            dob.server_port,
+            urlencoding_simple(&tagged_name)
+        )),
+        _ => None,
     }
 }
 
@@ -1457,14 +1608,21 @@ async fn get_openvpn_profile(
 
     let mode = query.mode.as_deref().unwrap_or("web_browsing");
 
-    // Validate mode
+    // Validate mode availability & entitlement server-side
     if mode == "gaming" {
-        return Err(CoreError::ModeComingSoon {
-            mode: "گیمینگ (Gaming)".to_string(),
-        });
+        if !Repository::has_active_gaming_outbounds(&state.pool).await {
+            return Err(CoreError::ModeComingSoon {
+                mode: "گیمینگ (Gaming)".to_string(),
+            });
+        }
+        if !compiler::tier_has_gaming(&sub.tier) {
+            return Err(CoreError::ModeLocked {
+                mode: "گیمینگ (Gaming)".to_string(),
+            });
+        }
     }
     if mode == "static_ip" {
-        if sub.tier == "Sentra Lite" {
+        if !compiler::tier_has_static_ip(&sub.tier) {
             return Err(CoreError::ModeLocked {
                 mode: "آی‌پی ثابت (Static IP)".to_string(),
             });
@@ -1558,12 +1716,19 @@ async fn get_mobileconfig_profile(
 
     let mode = query.mode.as_deref().unwrap_or("web_browsing");
     if mode == "gaming" {
-        return Err(CoreError::ModeComingSoon {
-            mode: "گیمینگ (Gaming)".to_string(),
-        });
+        if !Repository::has_active_gaming_outbounds(&state.pool).await {
+            return Err(CoreError::ModeComingSoon {
+                mode: "گیمینگ (Gaming)".to_string(),
+            });
+        }
+        if !compiler::tier_has_gaming(&sub.tier) {
+            return Err(CoreError::ModeLocked {
+                mode: "گیمینگ (Gaming)".to_string(),
+            });
+        }
     }
     if mode == "static_ip" {
-        if sub.tier == "Sentra Lite" {
+        if !compiler::tier_has_static_ip(&sub.tier) {
             return Err(CoreError::ModeLocked {
                 mode: "آی‌پی ثابت (Static IP)".to_string(),
             });
@@ -1600,6 +1765,79 @@ async fn get_mobileconfig_profile(
         .into_response())
 }
 
+/// GET /api/v1/wireguard/:token
+/// Issues an ultra-low-latency WireGuard (.conf) gaming profile for iOS WireGuard app.
+/// Strictly enforces server-side Gaming tier entitlement.
+async fn get_wireguard_gaming_profile(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Response, CoreError> {
+    let sub = Repository::get_subscription_by_token(&state.pool, &token).await?;
+
+    let user_opt = Repository::get_user_by_id(&state.pool, sub.user_id).await?;
+    if let Some(user) = user_opt {
+        if user.status == "suspended" || sub.status == "suspended" {
+            return Err(CoreError::AccountSuspended(
+                "حساب شما به دلیل الگوی مصرف ترافیک غیرعادی موقتاً متوقف شده است. لطفاً با پشتیبانی در ارتباط باشید.".to_string(),
+            ));
+        }
+        if user.status == "banned" || sub.status == "disabled" {
+            return Err(CoreError::UserBanned("حساب کاربری شما مسدود شده است.".to_string()));
+        }
+    }
+
+    if sub.expires_at < Utc::now() {
+        return Err(CoreError::SubscriptionExpired(sub.expires_at.to_rfc3339()));
+    }
+
+    if !Repository::has_active_gaming_outbounds(&state.pool).await {
+        return Err(CoreError::ModeComingSoon {
+            mode: "گیمینگ (WireGuard iOS)".to_string(),
+        });
+    }
+
+    if !compiler::tier_has_gaming(&sub.tier) {
+        return Err(CoreError::ModeLocked {
+            mode: "گیمینگ (WireGuard iOS)".to_string(),
+        });
+    }
+
+    let token_prefix: String = sub.token.chars().take(8).collect();
+    let dev_id = format!("ios-wg-{}", token_prefix);
+    let _ = Repository::register_or_update_device(
+        &state.pool,
+        sub.user_id,
+        sub.id,
+        &dev_id,
+        "iPhone WireGuard Gaming",
+        "ios",
+    )
+    .await;
+
+    let server_host = if state.server_host == "0.0.0.0" || state.server_host.is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        state.server_host.clone()
+    };
+
+    let (wg_conf, _client_pub, _client_addr) =
+        compiler::generate_wireguard_gaming_profile(&sub, &server_host);
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"sentra-gaming-wg.conf\"",
+            ),
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+        ],
+        wg_conf,
+    )
+        .into_response())
+}
+
 /// POST /api/internal/openvpn/auth
 /// Internal hook for OpenVPN server to authenticate users and enforce static IP 30GB limits
 async fn openvpn_internal_auth(
@@ -1610,8 +1848,20 @@ async fn openvpn_internal_auth(
     let sub = Repository::get_subscription_by_token(&state.pool, token).await?;
 
     let mode = payload.mode.as_deref().unwrap_or("web_browsing");
+    if mode == "gaming" {
+        if !Repository::has_active_gaming_outbounds(&state.pool).await {
+            return Err(CoreError::ModeComingSoon {
+                mode: "گیمینگ (Gaming)".to_string(),
+            });
+        }
+        if !compiler::tier_has_gaming(&sub.tier) {
+            return Err(CoreError::ModeLocked {
+                mode: "گیمینگ (Gaming)".to_string(),
+            });
+        }
+    }
     if mode == "static_ip" {
-        if sub.tier == "Sentra Lite" {
+        if !compiler::tier_has_static_ip(&sub.tier) {
             return Err(CoreError::ModeLocked {
                 mode: "آی‌پی ثابت (Static IP)".to_string(),
             });
@@ -1817,8 +2067,8 @@ async fn get_client_bootstrap(
         .await
         .unwrap_or_default();
     let outbounds = Repository::get_all_live_client_outbounds(&state.pool).await?;
-    let mut modes = Repository::build_modes_info(&sub);
-    modes.retain(|m| m.id != "gaming");
+    let gaming_enabled = Repository::has_active_gaming_outbounds(&state.pool).await;
+    let modes = Repository::build_modes_info(&sub, gaming_enabled);
 
     let client_state = read_user_client_state_json(&state.pool, user.id).await;
 
@@ -1966,9 +2216,6 @@ async fn put_client_sync_state(
                 .unwrap_or_default();
             if let Some(incoming) = v.as_object() {
                 for (k, val) in incoming {
-                    if k == "selected_mode" && val.as_str() == Some("gaming") {
-                        continue;
-                    }
                     merged.insert(k.clone(), val.clone());
                 }
             }
@@ -2129,7 +2376,10 @@ async fn donate_client_outbound(
     )
     .await?;
 
-    // Immediately notify Admin in Telegram with inline review buttons (+7 / +15 / +30 days / Reject / Back)
+    // Immediately activate across the server Sing-box bridge (OpenVPN/IKEv2/Stealth/WARP)
+    let _ = crate::bridge_sync::sync_server_bridge_config(&state.pool).await;
+
+    // Notify Admin in Telegram with inline review buttons (+7 / +15 / +30 days reward or Reject)
     if let Some(ref bot) = state.bot {
         if state.admin_chat_id != 0 {
             use teloxide::prelude::*;
@@ -2147,14 +2397,14 @@ async fn donate_client_outbound(
                 .unwrap_or_default();
 
             let admin_msg = format!(
-                "🎁 <b>درخواست جدید اهدای اوتباند از اپلیکیشن</b> (#{})\n\n\
+                "🎁 <b>اوتباند اهدایی جدید در کل اکوسیستم فعال شد</b> (#{})\n\n\
                  👤 <b>کاربر اهداکننده:</b> <code>{}</code>\n\
                  🏷 <b>نام سرور:</b> <code>{}</code>\n\
                  🔌 <b>پروتکل:</b> <b>{}</b>\n\
                  🌍 <b>موقعیت:</b> {} {} (<code>{}:{}</code>)\n\
                  ⚡ <b>پینگ تست‌شده:</b> <b>{} ms</b>{}\n\n\
                  🔗 <b>لینک ارسالی:</b>\n<code>{}</code>\n\n\
-                 👇 جهت انتشار برای تمام کاربران و اهدای اشتراک رایگان تصمیم بگیرید:",
+                 ✅ این نود پس از تست سلامت، بلافاصله در کل اکوسیستم فعال شد. جهت اهدای پاداش اشتراک یا رد/غیرفعال‌سازی انتخاب کنید:",
                 outbound_id,
                 donor_label,
                 final_tag,
@@ -2186,12 +2436,121 @@ async fn donate_client_outbound(
         Json(json!({
             "success": true,
             "id": outbound_id,
-            "status": "pending",
+            "status": "active",
             "latency_ms": latency_ms,
             "protocol": parsed.protocol,
             "country_code": country_code,
             "flag": flag,
-            "message": "اوتباند شما با موفقیت تست و برای تایید مدیر ارسال شد. پس از تایید، اشتراک رایگان شما به‌صورت خودکار فعال می‌شود."
+            "message": "اوتباند اهدایی شما با موفقیت تست و بلافاصله در کل اکوسیستم سنترا فعال شد. پس از بررسی مدیر، پاداش اشتراک نیز به حساب شما افزوده می‌شود."
+        })),
+    )
+        .into_response())
+}
+
+/// POST /api/v1/client/outbounds/add
+/// Allows admins (as official) or authenticated users (as active community node) to publish an outbound across the entire ecosystem
+async fn add_ecosystem_outbound(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<DonateOutboundRequest>,
+) -> Result<Response, CoreError> {
+    let token = extract_auth_token(&headers, None)
+        .ok_or_else(|| CoreError::AuthFailed("توکن احراز هویت نامعتبر است.".to_string()))?;
+
+    let sub = Repository::get_subscription_by_token(&state.pool, &token).await?;
+    let user = Repository::get_user_by_id(&state.pool, sub.user_id)
+        .await?
+        .ok_or_else(|| CoreError::AuthFailed("کاربر یافت نشد.".to_string()))?;
+
+    let is_admin = user.role == "admin"
+        || (state.admin_chat_id != 0 && user.telegram_id == Some(state.admin_chat_id));
+
+    if !is_admin {
+        return donate_client_outbound(State(state), headers, Json(payload)).await;
+    }
+
+    let raw_uri = payload.uri.trim();
+    if raw_uri.is_empty() || raw_uri.len() > 8192 {
+        return Err(CoreError::BadRequest("لینک کانفیگ نامعتبر یا خالی است.".to_string()));
+    }
+
+    let parsed = crate::outbound_analyzer::OutboundAnalyzer::parse_input(raw_uri)
+        .map_err(CoreError::BadRequest)?;
+
+    let resolved_ip = crate::outbound_analyzer::OutboundAnalyzer::check_anti_ssrf(&parsed.server_address)
+        .await
+        .map_err(CoreError::BadRequest)?;
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(
+        format!(
+            "{}:{}:{}",
+            parsed.protocol.to_lowercase(),
+            parsed.server_address.to_lowercase(),
+            parsed.server_port
+        )
+        .as_bytes(),
+    );
+    let fingerprint = format!("{:x}", hasher.finalize());
+
+    let (latency_ms, speed_mbps, is_online, _err_opt) =
+        crate::outbound_analyzer::OutboundAnalyzer::benchmark_proxy_for_protocol(
+            &parsed.protocol,
+            resolved_ip,
+            parsed.server_port,
+        )
+        .await;
+
+    let (country_code, country_name) =
+        crate::outbound_analyzer::OutboundAnalyzer::detect_country(resolved_ip, &parsed.tag).await;
+    let flag = crate::outbound_analyzer::OutboundAnalyzer::country_code_to_flag(&country_code);
+
+    let final_tag = payload
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&parsed.tag)
+        .to_string();
+
+    let config_json_str = serde_json::to_string(&parsed.config_json).unwrap_or_else(|_| "{}".to_string());
+
+    let inserted = Repository::insert_official_outbound(
+        &state.pool,
+        &final_tag,
+        &final_tag,
+        &parsed.protocol,
+        &parsed.server_address,
+        parsed.server_port as i64,
+        &config_json_str,
+        if is_online { latency_ms } else { 0 },
+        speed_mbps,
+        "both",
+        Some(raw_uri),
+        &fingerprint,
+        "active",
+        if is_online { 100 } else { 85 },
+        &country_code,
+        &country_name,
+    )
+    .await?;
+
+    let _ = crate::bridge_sync::sync_server_bridge_config(&state.pool).await;
+
+    Ok((
+        StatusCode::CREATED,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        Json(json!({
+            "success": true,
+            "id": inserted.id,
+            "is_official": true,
+            "status": "active",
+            "latency_ms": inserted.latency_ms,
+            "protocol": inserted.protocol,
+            "country_code": country_code,
+            "flag": flag,
+            "message": "اوتباند رسمی شما با موفقیت ثبت و بلافاصله در کل اکوسیستم سنترا فعال شد."
         })),
     )
         .into_response())

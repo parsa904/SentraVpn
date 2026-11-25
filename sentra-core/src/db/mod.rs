@@ -363,7 +363,7 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
             config_json             TEXT NOT NULL,
             latency_ms              INTEGER NOT NULL DEFAULT 9999,
             speed_mbps              REAL NOT NULL DEFAULT 0.0,
-            assigned_tier           TEXT NOT NULL CHECK(assigned_tier IN ('web_browsing', 'download', 'static_ip', 'rejected')),
+            assigned_tier           TEXT NOT NULL CHECK(assigned_tier IN ('web_browsing', 'download', 'static_ip', 'gaming', 'rejected')),
             health_score            INTEGER NOT NULL DEFAULT 100,
             status                  TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('pending', 'active', 'inactive', 'rejected')),
             fail_count              INTEGER NOT NULL DEFAULT 0,
@@ -387,6 +387,7 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
             allow_web               INTEGER NOT NULL DEFAULT 1,
             allow_download          INTEGER NOT NULL DEFAULT 1,
             allow_static_ip         INTEGER NOT NULL DEFAULT 0,
+            allow_gaming            INTEGER NOT NULL DEFAULT 0,
             gemini_ok               INTEGER NOT NULL DEFAULT 0,
             trading_safe            INTEGER NOT NULL DEFAULT 0,
             speed_score             INTEGER NOT NULL DEFAULT 50,
@@ -585,6 +586,7 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
         ("allow_web", "INTEGER NOT NULL DEFAULT 1"),
         ("allow_download", "INTEGER NOT NULL DEFAULT 1"),
         ("allow_static_ip", "INTEGER NOT NULL DEFAULT 0"),
+        ("allow_gaming", "INTEGER NOT NULL DEFAULT 0"),
         ("gemini_ok", "INTEGER NOT NULL DEFAULT 0"),
         ("trading_safe", "INTEGER NOT NULL DEFAULT 0"),
         ("speed_score", "INTEGER NOT NULL DEFAULT 50"),
@@ -607,6 +609,7 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_donated_country_code ON donated_outbounds(country_code)",
         "CREATE INDEX IF NOT EXISTS idx_donated_speed_score ON donated_outbounds(speed_score)",
         "CREATE INDEX IF NOT EXISTS idx_donated_allow_static ON donated_outbounds(allow_static_ip)",
+        "CREATE INDEX IF NOT EXISTS idx_donated_allow_gaming ON donated_outbounds(allow_gaming)",
         "CREATE INDEX IF NOT EXISTS idx_donated_allow_web ON donated_outbounds(allow_web)",
         "CREATE INDEX IF NOT EXISTS idx_donated_allow_dl ON donated_outbounds(allow_download)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_donated_fingerprint ON donated_outbounds(fingerprint_sha256)",
@@ -616,10 +619,10 @@ pub async fn run_migrations_and_seed(pool: &DbPool) -> anyhow::Result<()> {
         }
     }
 
-    let _ = sqlx::query("UPDATE donated_outbounds SET last_online_at = updated_at WHERE last_online_at IS NULL AND status = 'active'").execute(pool).await;
+    let _ = sqlx::query("UPDATE donated_outbounds SET last_online_at = updated_at WHERE last_online_at IS NULL AND status IN ('active', 'approved')").execute(pool).await;
     let _ = sqlx::query("UPDATE donated_outbounds SET allow_static_ip = 1 WHERE assigned_tier = 'static_ip'").execute(pool).await;
-    let _ = sqlx::query("UPDATE donated_outbounds SET allow_web = 1 WHERE assigned_tier IN ('web_browsing', 'static_ip')").execute(pool).await;
-    let _ = sqlx::query("UPDATE donated_outbounds SET allow_download = 1 WHERE assigned_tier IN ('download', 'static_ip')").execute(pool).await;
+    let _ = sqlx::query("UPDATE donated_outbounds SET allow_gaming = 1 WHERE assigned_tier = 'gaming' OR allocation_mode IN ('gaming_only', 'gaming', 'all')").execute(pool).await;
+    let _ = sqlx::query("UPDATE donated_outbounds SET allow_web = 1, allow_download = 1 WHERE status IN ('active', 'approved') AND allocation_mode NOT IN ('static_only', 'gaming_only')").execute(pool).await;
 
     // 8. DONATIONS table (Financial Support & Reward Tracking)
     sqlx::query(
@@ -953,9 +956,44 @@ impl Repository {
         Ok(())
     }
 
+    /// Returns true when at least one active outbound has been allocated to Gaming across the ecosystem.
+    /// Until an admin adds a Gaming outbound via Telegram Bot (or core outbounds), Gaming stays in "coming_soon".
+    pub async fn has_active_gaming_outbounds(pool: &DbPool) -> bool {
+        let donated_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM donated_outbounds
+            WHERE status IN ('active', 'approved')
+              AND (allow_gaming = 1 OR assigned_tier = 'gaming' OR allocation_mode IN ('gaming_only', 'gaming', 'all'))
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        if donated_count > 0 {
+            return true;
+        }
+
+        let core_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM outbounds
+            WHERE is_active = 1
+              AND server_address != '127.0.0.1'
+              AND mode_category = 'gaming'
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        core_count > 0
+    }
+
     /// Builds dynamic 4-mode information for a specific user
-    pub fn build_modes_info(sub: &Subscription) -> Vec<ConnectionModeInfo> {
+    pub fn build_modes_info(sub: &Subscription, gaming_enabled: bool) -> Vec<ConnectionModeInfo> {
         let is_free = sub.tier == "Sentra Lite";
+        let has_static = crate::compiler::tier_has_static_ip(&sub.tier);
+        let has_gaming = crate::compiler::tier_has_gaming(&sub.tier);
 
         let (wb_status, wb_rem) = if is_free {
             let rem = (2048 - sub.web_browsing_used_mb).max(0);
@@ -973,7 +1011,23 @@ impl Repository {
             ("active".to_string(), 999_999)
         };
 
-        let (static_status, static_badge, static_limit, static_used, static_rem) = if is_free {
+        let (gaming_status, gaming_badge, gaming_rem) = if !gaming_enabled {
+            ("coming_soon".to_string(), Some("به‌زودی".to_string()), 0i64)
+        } else if has_gaming {
+            (
+                "active".to_string(),
+                Some("پینگ کم • MTU 1280 / Full-Cone".to_string()),
+                999_999i64,
+            )
+        } else {
+            (
+                "locked".to_string(),
+                Some("قفل • ویژه پلن گیمینگ / Pro".to_string()),
+                0i64,
+            )
+        };
+
+        let (static_status, static_badge, static_limit, static_used, static_rem) = if !has_static {
             ("locked".to_string(), Some("قفل • نیاز به ارتقا".to_string()), 0i64, 0i64, 0i64)
         } else {
             let limit = 30_720i64; // 30 GB per monthly subscription
@@ -1018,14 +1072,18 @@ impl Repository {
                 id: "gaming".to_string(),
                 name: "گیمینگ".to_string(),
                 icon: "🎮".to_string(),
-                status: "coming_soon".to_string(),
-                badge: Some("به‌زودی اضافه می‌شود".to_string()),
+                status: gaming_status,
+                badge: gaming_badge,
                 daily_limit_mb: 0,
                 used_today_mb: 0,
-                remaining_today_mb: 0,
+                remaining_today_mb: gaming_rem,
                 speed_desc: "پینگ فوق‌العاده کم".to_string(),
-                security_desc: "پایداری بالا".to_string(),
-                description: "کاهش چشمگیر پینگ و جیتر ویژه بازی‌های آنلاین رقابتی".to_string(),
+                security_desc: "Full-Cone NAT / بدون جیتر".to_string(),
+                description: if gaming_enabled {
+                    "بهینه‌سازی اختصاصی ویندوز و اندروید (MTU 1280، حذف تاخیر DPI، DNS مستقیم UDP) و پروتکل WireGuard برای iOS".to_string()
+                } else {
+                    "بخش گیمینگ به زودی با سرورهای کم‌پینگ و پروتکل WireGuard برای iOS اضافه می‌شود.".to_string()
+                },
             },
             ConnectionModeInfo {
                 id: "static_ip".to_string(),
@@ -1044,7 +1102,13 @@ impl Repository {
     }
 
     /// Default public modes list for unauthenticated preview
-    pub fn build_default_modes_info() -> Vec<ConnectionModeInfo> {
+    pub fn build_default_modes_info(gaming_enabled: bool) -> Vec<ConnectionModeInfo> {
+        let (gaming_status, gaming_badge) = if !gaming_enabled {
+            ("coming_soon".to_string(), Some("به‌زودی".to_string()))
+        } else {
+            ("locked".to_string(), Some("قفل • ویژه پلن گیمینگ / Pro".to_string()))
+        };
+
         vec![
             ConnectionModeInfo {
                 id: "web_browsing".to_string(),
@@ -1076,14 +1140,18 @@ impl Repository {
                 id: "gaming".to_string(),
                 name: "گیمینگ".to_string(),
                 icon: "🎮".to_string(),
-                status: "coming_soon".to_string(),
-                badge: Some("به‌زودی اضافه می‌شود".to_string()),
+                status: gaming_status,
+                badge: gaming_badge,
                 daily_limit_mb: 0,
                 used_today_mb: 0,
                 remaining_today_mb: 0,
                 speed_desc: "پینگ فوق‌العاده کم".to_string(),
-                security_desc: "پایداری بالا".to_string(),
-                description: "کاهش چشمگیر پینگ و جیتر ویژه بازی‌های آنلاین رقابتی".to_string(),
+                security_desc: "Full-Cone NAT / بدون جیتر".to_string(),
+                description: if gaming_enabled {
+                    "بهینه‌سازی اختصاصی ویندوز و اندروید و پروتکل WireGuard برای iOS".to_string()
+                } else {
+                    "بخش گیمینگ به زودی به سیستم اضافه می‌شود.".to_string()
+                },
             },
             ConnectionModeInfo {
                 id: "static_ip".to_string(),
@@ -1345,9 +1413,17 @@ impl Repository {
             .fetch_one(pool)
             .await?;
 
-        let active_outbounds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbounds WHERE is_active = 1")
+        let active_base_outbounds: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM outbounds WHERE is_active = 1 AND server_address != '127.0.0.1'"
+        )
             .fetch_one(pool)
             .await?;
+        let active_ecosystem_outbounds: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM donated_outbounds WHERE status IN ('active', 'approved')"
+        )
+            .fetch_one(pool)
+            .await?;
+        let active_outbounds = active_base_outbounds + active_ecosystem_outbounds;
 
         let open_tickets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM support_tickets WHERE status = 'open'")
             .fetch_one(pool)
@@ -2374,6 +2450,181 @@ impl Repository {
         Ok(updated_user)
     }
 
+    /// Authenticate an existing Sentra app account (username/email + password) and securely link it to this Telegram ID.
+    /// Prevents account hijacking if already bound to a different Telegram user, and safely reconciles any prior record.
+    pub async fn login_and_link_telegram_account(
+        pool: &DbPool,
+        telegram_id: i64,
+        username: &str,
+        password: &str,
+        first_name: &str,
+    ) -> Result<(User, Subscription), CoreError> {
+        let (target_user, _sub) = Self::login_user_with_credentials(pool, username, password).await?;
+
+        if let Some(existing_tid) = target_user.telegram_id {
+            if existing_tid != telegram_id {
+                return Err(CoreError::AuthFailed(
+                    "این حساب کاربری قبلاً به حساب تلگرام دیگری متصل شده است.".to_string(),
+                ));
+            }
+        }
+
+        // Check if this telegram_id was previously associated with a different local user record
+        let existing_tg_user = sqlx::query_as::<_, User>(
+            "SELECT * FROM users WHERE telegram_id = ? AND id != ? LIMIT 1",
+        )
+        .bind(telegram_id)
+        .bind(target_user.id)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(old_u) = existing_tg_user {
+            if old_u.status == "suspended" || old_u.status == "banned" {
+                return Err(CoreError::AccountSuspended(
+                    "حساب تلگرام شما مسدود یا تعلیق شده است و امکان اتصال وجود ندارد.".to_string(),
+                ));
+            }
+
+            let old_sub = Self::get_subscription_by_user_id(pool, old_u.id).await.ok().flatten();
+            let target_sub = Self::get_subscription_by_user_id(pool, target_user.id).await.ok().flatten();
+
+            if let (Some(os), Some(ts)) = (old_sub, target_sub) {
+                let higher_tier = if os.tier.contains("Flow") || ts.tier.contains("Flow") {
+                    "Sentra Flow+"
+                } else if os.tier.contains("Pro") || ts.tier.contains("Pro") {
+                    "Sentra Pro"
+                } else {
+                    "Sentra Lite"
+                };
+
+                let higher_limit = os.traffic_limit_bytes.max(ts.traffic_limit_bytes);
+                let higher_devices = os.max_concurrent_devices.max(ts.max_concurrent_devices).min(3);
+                let later_expires = os.expires_at.max(ts.expires_at);
+
+                let max_web_mb = os.web_browsing_used_mb.max(ts.web_browsing_used_mb);
+                let max_dl_mb = os.download_used_mb.max(ts.download_used_mb);
+                let max_static_mb = os.static_ip_used_mb.max(ts.static_ip_used_mb);
+                let max_up_bytes = os.upload_bytes.max(ts.upload_bytes);
+                let max_down_bytes = os.download_bytes.max(ts.download_bytes);
+
+                sqlx::query(
+                    r#"
+                    UPDATE subscriptions
+                    SET tier = ?,
+                        traffic_limit_bytes = ?,
+                        max_concurrent_devices = ?,
+                        expires_at = ?,
+                        web_browsing_used_mb = ?,
+                        download_used_mb = ?,
+                        static_ip_used_mb = ?,
+                        upload_bytes = ?,
+                        download_bytes = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(higher_tier)
+                .bind(higher_limit)
+                .bind(higher_devices)
+                .bind(later_expires)
+                .bind(max_web_mb)
+                .bind(max_dl_mb)
+                .bind(max_static_mb)
+                .bind(max_up_bytes)
+                .bind(max_down_bytes)
+                .bind(ts.id)
+                .execute(pool)
+                .await?;
+
+                let _ = sqlx::query("DELETE FROM subscriptions WHERE id = ?")
+                    .bind(os.id)
+                    .execute(pool)
+                    .await;
+
+                let _ = sqlx::query("UPDATE user_devices SET user_id = ?, subscription_id = ? WHERE user_id = ?")
+                    .bind(target_user.id)
+                    .bind(ts.id)
+                    .bind(old_u.id)
+                    .execute(pool)
+                    .await;
+
+                #[derive(sqlx::FromRow)]
+                struct DevRow {
+                    id: i64,
+                }
+                let user_devs: Vec<DevRow> = sqlx::query_as(
+                    "SELECT id FROM user_devices WHERE user_id = ? ORDER BY last_active_at DESC",
+                )
+                .bind(target_user.id)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+
+                if user_devs.len() > 3 {
+                    for dev in &user_devs[3..] {
+                        let _ = sqlx::query("DELETE FROM user_devices WHERE id = ?")
+                            .bind(dev.id)
+                            .execute(pool)
+                            .await;
+                    }
+                }
+            }
+
+            let target_has_state: Option<i64> = sqlx::query_scalar(
+                "SELECT user_id FROM user_client_state WHERE user_id = ? LIMIT 1",
+            )
+            .bind(target_user.id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+            if target_has_state.is_none() {
+                let _ = sqlx::query("UPDATE user_client_state SET user_id = ? WHERE user_id = ?")
+                    .bind(target_user.id)
+                    .bind(old_u.id)
+                    .execute(pool)
+                    .await;
+            }
+
+            let _ = sqlx::query("UPDATE donations SET user_id = ? WHERE user_id = ?")
+                .bind(target_user.id)
+                .bind(old_u.id)
+                .execute(pool)
+                .await;
+
+            let _ = sqlx::query("UPDATE donated_outbounds SET donor_user_id = ? WHERE donor_user_id = ?")
+                .bind(target_user.id)
+                .bind(old_u.id)
+                .execute(pool)
+                .await;
+
+            let _ = sqlx::query("DELETE FROM users WHERE id = ?")
+                .bind(old_u.id)
+                .execute(pool)
+                .await;
+        }
+
+        let updated_user = sqlx::query_as::<_, User>(
+            r#"
+            UPDATE users
+            SET telegram_id = ?,
+                first_name = COALESCE(NULLIF(first_name, 'User'), ?),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            RETURNING *
+            "#,
+        )
+        .bind(telegram_id)
+        .bind(first_name)
+        .bind(target_user.id)
+        .fetch_one(pool)
+        .await?;
+
+        let mut refreshed_sub = Self::create_or_ensure_lite_subscription(pool, updated_user.id).await?;
+        let _ = Self::check_and_reset_daily_quota(pool, &mut refreshed_sub).await;
+
+        Ok((updated_user, refreshed_sub))
+    }
+
     /// Set or update username and password for a user
     pub async fn set_credentials_for_user(
         pool: &DbPool,
@@ -2502,15 +2753,31 @@ impl Repository {
         country_code: &str,
         country_name: &str,
     ) -> Result<DonatedOutbound, CoreError> {
+        let speed_score = (60 - (latency_ms / 20)).clamp(10, 100);
+        let online_ts = if status == "active" || status == "approved" {
+            Some(Utc::now())
+        } else {
+            None
+        };
+
         let row = sqlx::query_as::<_, DonatedOutbound>(
             r#"
             INSERT INTO donated_outbounds (
                 donor_user_id, tag, protocol, server_address, server_port, config_json,
                 latency_ms, speed_mbps, assigned_tier, health_score, status, raw_link,
                 rejection_reason, declared_or_detected_gb, bytes_served, monthly_reward_granted,
-                fingerprint_sha256, country_code, country_name, last_checked_at
+                fingerprint_sha256, label, country_code, country_name,
+                allow_web, allow_download, allow_static_ip, speed_score,
+                last_online_at, approved_at, last_checked_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 100, ?, ?, ?, ?, 0, 0, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, 100, ?, ?,
+                ?, ?, 0, 0,
+                ?, ?, ?, ?,
+                1, 1, 0, ?,
+                ?, ?, CURRENT_TIMESTAMP
+            )
             RETURNING *
             "#
         )
@@ -2528,8 +2795,12 @@ impl Repository {
         .bind(rejection_reason)
         .bind(declared_or_detected_gb)
         .bind(fingerprint_sha256)
+        .bind(tag)
         .bind(country_code)
         .bind(country_name)
+        .bind(speed_score)
+        .bind(online_ts)
+        .bind(online_ts)
         .fetch_one(pool)
         .await?;
 
@@ -2733,20 +3004,26 @@ impl Repository {
         pool: &DbPool,
         mode: &str,
     ) -> Result<Vec<DonatedOutbound>, CoreError> {
-        let rows = sqlx::query_as::<_, DonatedOutbound>(
-            "SELECT * FROM donated_outbounds WHERE status = 'active' AND assigned_tier = ? ORDER BY health_score DESC, speed_mbps DESC LIMIT 10"
-        )
-        .bind(mode)
-        .fetch_all(pool)
-        .await?;
+        let mode_cond = match mode {
+            "static_ip" => "(allow_static_ip = 1 OR assigned_tier = 'static_ip')",
+            "download" => "(allow_download = 1 OR assigned_tier = 'download')",
+            _ => "(allow_web = 1 OR assigned_tier = 'web_browsing')",
+        };
+        let sql = format!(
+            "SELECT * FROM donated_outbounds WHERE status IN ('active', 'approved') AND {} ORDER BY health_score DESC, speed_mbps DESC LIMIT 20",
+            mode_cond
+        );
+        let rows = sqlx::query_as::<_, DonatedOutbound>(&sql)
+            .fetch_all(pool)
+            .await?;
 
         Ok(rows)
     }
 
-    /// Retrieve all active donated outbounds for periodic 30-minute health checking
+    /// Retrieve all active donated & official outbounds for periodic health checking
     pub async fn get_all_active_donated_outbounds(pool: &DbPool) -> Result<Vec<DonatedOutbound>, CoreError> {
         let rows = sqlx::query_as::<_, DonatedOutbound>(
-            "SELECT * FROM donated_outbounds WHERE status = 'active'"
+            "SELECT * FROM donated_outbounds WHERE status IN ('active', 'approved')"
         )
         .fetch_all(pool)
         .await?;
@@ -2969,15 +3246,21 @@ impl Repository {
         country_code: &str,
         country_name: &str,
     ) -> Result<DonatedOutbound, CoreError> {
-        let (allow_web, allow_download, allow_static_ip, alloc_mode, assigned_tier) = match category {
-            "free_only" => (1, 1, 0, "free_only", "web_browsing"),
-            "static_only" | "static_ip" => (0, 0, 1, "static_only", "static_ip"),
-            "both" => (1, 1, 1, "both", "static_ip"),
-            "auto" => (1, 1, 0, "auto", "web_browsing"),
-            "download" => (0, 1, 0, "free_only", "download"),
-            _ => (1, 0, 0, "free_only", "web_browsing"),
+        let (allow_web, allow_download, allow_static_ip, allow_gaming, alloc_mode, assigned_tier) = match category {
+            "free_only" => (1, 1, 0, 0, "free_only", "web_browsing"),
+            "static_only" => (0, 0, 1, 0, "static_only", "static_ip"),
+            "static_ip" | "both" => (1, 1, 1, 0, "both", "static_ip"),
+            "gaming" | "gaming_only" => (0, 0, 0, 1, "gaming_only", "web_browsing"),
+            "all" => (1, 1, 1, 1, "all", "static_ip"),
+            "auto" => (1, 1, 0, 0, "auto", "web_browsing"),
+            "download" => (1, 1, 0, 0, "free_only", "download"),
+            _ => (1, 1, 0, 0, "free_only", "web_browsing"),
         };
-        let speed_score = (60 - (latency_ms / 20)).clamp(10, 100);
+        let speed_score = if latency_ms > 0 {
+            (60 - (latency_ms / 20)).clamp(10, 100)
+        } else {
+            50
+        };
 
         sqlx::query(
             r#"
@@ -2988,7 +3271,7 @@ impl Repository {
                 declared_or_detected_gb, bytes_served, first_used_at, monthly_reward_granted,
                 fingerprint_sha256, offline_since, clawback_executed, is_official, label,
                 country_code, country_name, last_checked_at, created_at, updated_at,
-                allow_web, allow_download, allow_static_ip, gemini_ok, trading_safe,
+                allow_web, allow_download, allow_static_ip, allow_gaming, gemini_ok, trading_safe,
                 speed_score, jitter_ms, last_online_at, allocation_mode
             )
             VALUES (
@@ -2998,7 +3281,7 @@ impl Repository {
                 10000, 0, NULL, 0,
                 ?, NULL, 0, 1, ?,
                 ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
-                ?, ?, ?, 0, 0,
+                ?, ?, ?, ?, 0, 0,
                 ?, 0, CURRENT_TIMESTAMP, ?
             )
             ON CONFLICT(fingerprint_sha256) DO UPDATE SET
@@ -3023,6 +3306,7 @@ impl Repository {
                 allow_web = excluded.allow_web,
                 allow_download = excluded.allow_download,
                 allow_static_ip = excluded.allow_static_ip,
+                allow_gaming = excluded.allow_gaming,
                 speed_score = excluded.speed_score,
                 allocation_mode = excluded.allocation_mode,
                 last_online_at = CURRENT_TIMESTAMP,
@@ -3048,6 +3332,7 @@ impl Repository {
         .bind(allow_web)
         .bind(allow_download)
         .bind(allow_static_ip)
+        .bind(allow_gaming)
         .bind(speed_score)
         .bind(alloc_mode)
         .execute(pool)
@@ -3078,6 +3363,7 @@ impl Repository {
         allow_web: bool,
         allow_download: bool,
         allow_static_ip: bool,
+        allow_gaming: bool,
         allocation_mode: &str,
     ) -> Result<(), CoreError> {
         let assigned_tier = if allow_static_ip {
@@ -3094,6 +3380,7 @@ impl Repository {
             SET allow_web = ?,
                 allow_download = ?,
                 allow_static_ip = ?,
+                allow_gaming = ?,
                 allocation_mode = ?,
                 assigned_tier = ?,
                 updated_at = CURRENT_TIMESTAMP
@@ -3103,6 +3390,7 @@ impl Repository {
         .bind(if allow_web { 1 } else { 0 })
         .bind(if allow_download { 1 } else { 0 })
         .bind(if allow_static_ip { 1 } else { 0 })
+        .bind(if allow_gaming { 1 } else { 0 })
         .bind(allocation_mode)
         .bind(assigned_tier)
         .bind(id)
@@ -3191,13 +3479,17 @@ impl Repository {
         Ok(())
     }
 
-    /// Automatically clean up dead outbounds older than 48 hours without successful response
+    /// Automatically clean up dead community donated outbounds older than 48 hours without successful response
+    /// Official admin-added outbounds (is_official = 1) are never auto-deleted.
     pub async fn cleanup_dead_outbounds(pool: &DbPool) -> Result<Vec<DonatedOutbound>, CoreError> {
         let dead_nodes = sqlx::query_as::<_, DonatedOutbound>(
             r#"
             SELECT * FROM donated_outbounds
-            WHERE (last_online_at IS NOT NULL AND last_online_at < datetime('now', '-48 hours'))
-               OR (last_online_at IS NULL AND created_at < datetime('now', '-48 hours') AND status = 'inactive')
+            WHERE is_official = 0
+              AND (
+                    (last_online_at IS NOT NULL AND last_online_at < datetime('now', '-48 hours'))
+                 OR (last_online_at IS NULL AND created_at < datetime('now', '-48 hours') AND status = 'inactive')
+              )
             "#
         )
         .fetch_all(pool)
@@ -3230,13 +3522,14 @@ impl Repository {
         Ok(row)
     }
 
-    /// Retrieve official outbounds registered for a specific category ('web_browsing', 'download', 'static_ip')
+    /// Retrieve official outbounds registered for a specific category ('web_browsing', 'download', 'static_ip', 'gaming')
     pub async fn get_official_outbounds_by_category(
         pool: &DbPool,
         category: &str,
     ) -> Result<Vec<DonatedOutbound>, CoreError> {
         let filter_col = match category {
             "static_ip" | "static_only" => "allow_static_ip = 1",
+            "gaming" | "gaming_only" => "(allow_gaming = 1 OR allocation_mode IN ('gaming_only', 'gaming', 'all'))",
             "download" => "allow_download = 1",
             _ => "allow_web = 1",
         };
@@ -3353,14 +3646,15 @@ impl Repository {
         Ok(())
     }
 
-    /// Retrieve active official outbounds for static_ip mode (and community nodes qualified for static_ip)
+    /// Retrieve active official outbounds for a mode (with fallback to official/active ecosystem outbounds)
     pub async fn get_active_official_outbounds_for_mode(
         pool: &DbPool,
         mode: &str,
     ) -> Result<Vec<DonatedOutbound>, CoreError> {
         let (filter_col, official_cond) = if mode == "static_ip" {
-            // Include official static outbounds and all nodes qualified for static_ip (e.g. gemini/trading passed)
             ("(allow_static_ip = 1 OR assigned_tier = 'static_ip')", "")
+        } else if mode == "gaming" {
+            ("(allow_gaming = 1 OR assigned_tier = 'gaming' OR allocation_mode IN ('gaming_only', 'gaming', 'all'))", "")
         } else if mode == "download" {
             ("(allow_download = 1 OR assigned_tier = 'download')", "AND is_official = 1")
         } else {
@@ -3370,7 +3664,7 @@ impl Repository {
         let query = format!(
             r#"
             SELECT * FROM donated_outbounds 
-            WHERE status = 'active' AND {} {}
+            WHERE status IN ('active', 'approved') AND {} {}
             ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC
             "#,
             filter_col, official_cond
@@ -3379,34 +3673,140 @@ impl Repository {
         let rows = sqlx::query_as::<_, DonatedOutbound>(&query)
             .fetch_all(pool)
             .await?;
-        Ok(rows)
+
+        if !rows.is_empty() || mode == "gaming" {
+            return Ok(rows);
+        }
+
+        // Ecosystem fallback: if no node was tagged specifically for this mode, use all active official/donated nodes
+        let fallback_rows = sqlx::query_as::<_, DonatedOutbound>(
+            r#"
+            SELECT * FROM donated_outbounds
+            WHERE status IN ('active', 'approved')
+            ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC
+            LIMIT 25
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(fallback_rows)
     }
 
-    /// Retrieve active outbounds for client modes (web_browsing and download), prioritizing official outbounds
+    /// Retrieve active outbounds for client modes (web_browsing, download, gaming, static_ip), prioritizing official outbounds
+    /// and falling back to active ecosystem outbounds (except gaming which strictly uses gaming-allocated nodes).
     pub async fn get_active_outbounds_for_mode_prioritized(
         pool: &DbPool,
         mode: &str,
     ) -> Result<Vec<DonatedOutbound>, CoreError> {
-        let filter_col = match mode {
-            "static_ip" => "(allow_static_ip = 1 OR assigned_tier = 'static_ip')",
-            "download" => "(allow_download = 1 OR assigned_tier = 'download')",
-            _ => "(allow_web = 1 OR assigned_tier = 'web_browsing')",
+        let (filter_col, order_by) = match mode {
+            "static_ip" => (
+                "(allow_static_ip = 1 OR assigned_tier = 'static_ip')",
+                "is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC",
+            ),
+            "gaming" => (
+                "(allow_gaming = 1 OR assigned_tier = 'gaming' OR allocation_mode IN ('gaming_only', 'gaming', 'all'))",
+                "is_official DESC, CASE WHEN latency_ms > 0 THEN latency_ms ELSE 9999 END ASC, jitter_ms ASC, speed_score DESC",
+            ),
+            "download" => (
+                "(allow_download = 1 OR assigned_tier = 'download')",
+                "is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC",
+            ),
+            _ => (
+                "(allow_web = 1 OR assigned_tier = 'web_browsing')",
+                "is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC",
+            ),
         };
 
         let query = format!(
             r#"
             SELECT * FROM donated_outbounds 
-            WHERE status = 'active' AND {}
-            ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC
-            LIMIT 15
+            WHERE status IN ('active', 'approved') AND {}
+            ORDER BY {}
+            LIMIT 25
             "#,
-            filter_col
+            filter_col, order_by
         );
 
         let rows = sqlx::query_as::<_, DonatedOutbound>(&query)
             .fetch_all(pool)
             .await?;
+        if !rows.is_empty() || mode == "gaming" {
+            return Ok(rows);
+        }
+
+        let fallback_rows = sqlx::query_as::<_, DonatedOutbound>(
+            r#"
+            SELECT * FROM donated_outbounds
+            WHERE status IN ('active', 'approved')
+            ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC
+            LIMIT 25
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(fallback_rows)
+    }
+
+    /// Retrieve ALL active ecosystem outbounds (admin official + community donated) eligible for a subscription tier
+    pub async fn get_all_active_ecosystem_outbounds_for_tier(
+        pool: &DbPool,
+        tier: &str,
+    ) -> Result<Vec<DonatedOutbound>, CoreError> {
+        let rows = if tier == "Sentra Lite" {
+            let free_rows = sqlx::query_as::<_, DonatedOutbound>(
+                r#"
+                SELECT * FROM donated_outbounds
+                WHERE status IN ('active', 'approved')
+                  AND (allow_web = 1 OR allow_download = 1 OR allocation_mode != 'static_only')
+                ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC
+                LIMIT 50
+                "#,
+            )
+            .fetch_all(pool)
+            .await?;
+
+            if !free_rows.is_empty() {
+                free_rows
+            } else {
+                sqlx::query_as::<_, DonatedOutbound>(
+                    r#"
+                    SELECT * FROM donated_outbounds
+                    WHERE status IN ('active', 'approved')
+                    ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC
+                    LIMIT 50
+                    "#,
+                )
+                .fetch_all(pool)
+                .await?
+            }
+        } else {
+            sqlx::query_as::<_, DonatedOutbound>(
+                r#"
+                SELECT * FROM donated_outbounds
+                WHERE status IN ('active', 'approved')
+                ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC
+                LIMIT 50
+                "#,
+            )
+            .fetch_all(pool)
+            .await?
+        };
+
         Ok(rows)
+    }
+
+    /// Fetch a single row from the core outbounds table by ID
+    pub async fn get_outbound_by_id(
+        pool: &DbPool,
+        id: i64,
+    ) -> Result<Option<Outbound>, CoreError> {
+        let row = sqlx::query_as::<_, Outbound>(
+            "SELECT * FROM outbounds WHERE id = ? LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row)
     }
 
     /// Retrieve active outbounds for a mode and optional location code (with auto fallback)
@@ -3418,6 +3818,7 @@ impl Repository {
         let code = location_code.unwrap_or("auto").trim();
         let filter_col = match mode {
             "static_ip" => "(allow_static_ip = 1 OR assigned_tier = 'static_ip')",
+            "gaming" => "(allow_gaming = 1 OR assigned_tier = 'gaming' OR allocation_mode IN ('gaming_only', 'gaming', 'all'))",
             "download" => "(allow_download = 1 OR assigned_tier = 'download')",
             _ => "(allow_web = 1 OR assigned_tier = 'web_browsing')",
         };
@@ -3426,9 +3827,9 @@ impl Repository {
             let query = format!(
                 r#"
                 SELECT * FROM donated_outbounds 
-                WHERE status = 'active' AND {} AND UPPER(country_code) = UPPER(?)
+                WHERE status IN ('active', 'approved') AND {} AND UPPER(country_code) = UPPER(?)
                 ORDER BY is_official DESC, speed_score DESC, latency_ms ASC, health_score DESC
-                LIMIT 15
+                LIMIT 25
                 "#,
                 filter_col
             );
@@ -3461,9 +3862,7 @@ impl Repository {
                 MIN(latency_ms) as min_ping,
                 COUNT(*) as active_count
             FROM donated_outbounds
-            WHERE status = 'active' 
-              AND (allow_web = 1 OR allow_download = 1 OR assigned_tier IN ('web_browsing', 'download'))
-              AND country_code != 'XX'
+            WHERE status IN ('active', 'approved')
             GROUP BY country_code, country_name
             HAVING active_count > 0
             ORDER BY min_ping ASC
@@ -3530,11 +3929,11 @@ impl Repository {
     ) -> Result<Vec<crate::models::ClientOutboundInfo>, CoreError> {
         let mut results: Vec<crate::models::ClientOutboundInfo> = Vec::new();
 
-        // 1. All active nodes from donated_outbounds (includes both Telegram admin official outbounds & approved user donations)
+        // 1. All active nodes from donated_outbounds (includes both Telegram admin official outbounds & approved/active user donations)
         let donated_rows = sqlx::query_as::<_, DonatedOutbound>(
             r#"
             SELECT * FROM donated_outbounds
-            WHERE status = 'active'
+            WHERE status IN ('active', 'approved')
             ORDER BY is_official DESC, health_score DESC, latency_ms ASC, id DESC
             "#,
         )
@@ -3586,7 +3985,7 @@ impl Repository {
                 },
                 health_score: row.health_score,
                 is_official: row.is_official == 1,
-                is_online: row.status == "active" && row.fail_count < 5,
+                is_online: (row.status == "active" || row.status == "approved") && row.fail_count < 5,
                 server_address: row.server_address,
                 server_port: row.server_port,
                 uri: row.raw_link,
@@ -3645,7 +4044,8 @@ impl Repository {
         Ok(results)
     }
 
-    /// Create a pending community-donated outbound submitted from the client app for admin Telegram review
+    /// Create and immediately activate a verified community-donated outbound submitted from the client app.
+    /// Reward remains pending (reward_granted = 0) until admin grants +7/+15/+30 days or rejects in Telegram.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_pending_donated_outbound(
         pool: &DbPool,
@@ -3662,6 +4062,7 @@ impl Repository {
         fingerprint_sha256: &str,
         user_note: Option<&str>,
     ) -> Result<i64, CoreError> {
+        let speed_score = (60 - (latency_ms / 20)).clamp(10, 100);
         let row = sqlx::query(
             r#"
             INSERT INTO donated_outbounds (
@@ -3669,13 +4070,13 @@ impl Repository {
                 latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
                 reward_granted, raw_link, fingerprint_sha256, is_official, label,
                 country_code, country_name, allow_web, allow_download, allow_static_ip,
-                reward_days, user_note, last_checked_at, created_at, updated_at
+                speed_score, reward_days, user_note, last_online_at, last_checked_at, created_at, updated_at
             ) VALUES (
                 ?, ?, ?, ?, ?, ?,
-                ?, 0.0, 'web_browsing', 100, 'pending', 0,
+                ?, 0.0, 'web_browsing', 100, 'active', 0,
                 0, ?, ?, 0, ?,
                 ?, ?, 1, 1, 0,
-                0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                ?, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             )
             RETURNING id
             "#,
@@ -3692,6 +4093,7 @@ impl Repository {
         .bind(tag)
         .bind(country_code)
         .bind(country_name)
+        .bind(speed_score)
         .bind(user_note)
         .fetch_one(pool)
         .await?;

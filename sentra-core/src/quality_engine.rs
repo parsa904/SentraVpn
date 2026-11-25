@@ -385,23 +385,30 @@ impl QualityEngine {
         for ob in &outbounds {
             let parsed_config: serde_json::Value = serde_json::from_str(&ob.config_json).unwrap_or_default();
 
-            // A. Security Audit
-            let (sec_ok, _sec_reason) = Self::audit_security(&ob.protocol, &parsed_config);
+            // A. Security Audit (never auto-disable admin official nodes on heuristic warnings)
+            let (sec_ok, sec_reason) = Self::audit_security(&ob.protocol, &parsed_config);
             if !sec_ok {
-                warn!("[QualityEngine] Outbound #{} ({}) failed security audit. Marking inactive.", ob.id, ob.tag);
-                let _ = Repository::update_outbound_quality_metrics(
-                    pool,
-                    ob.id,
-                    9999,
-                    9999,
-                    0.0,
-                    0,
-                    false,
-                    false,
-                    false,
-                )
-                .await;
-                continue;
+                if ob.is_official == 1 {
+                    warn!(
+                        "[QualityEngine] Official outbound #{} ({}) audit note ({:?}); keeping active as admin-registered node.",
+                        ob.id, ob.tag, sec_reason
+                    );
+                } else {
+                    warn!("[QualityEngine] Outbound #{} ({}) failed security audit. Marking inactive.", ob.id, ob.tag);
+                    let _ = Repository::update_outbound_quality_metrics(
+                        pool,
+                        ob.id,
+                        9999,
+                        9999,
+                        0.0,
+                        0,
+                        false,
+                        false,
+                        false,
+                    )
+                    .await;
+                    continue;
+                }
             }
 
             // B. Anti-SSRF and IP resolution
@@ -426,9 +433,21 @@ impl QualityEngine {
                 }
             };
 
-            // C. Speed & Latency & Jitter test
+            // C. Protocol-aware Speed & Latency & Jitter test (supports UDP protocols like hysteria2/tuic/wireguard)
+            let proto_lower = ob.protocol.to_lowercase();
             let (latency_ms, jitter_ms, speed_mbps, speed_score, is_healthy) =
-                Self::test_outbound_network_quality(ip, ob.server_port as u16).await;
+                if matches!(proto_lower.as_str(), "hysteria2" | "hy2" | "tuic" | "wireguard" | "wg") {
+                    let (lat, spd, ok, _err) = OutboundAnalyzer::benchmark_proxy_for_protocol(
+                        &ob.protocol,
+                        ip,
+                        ob.server_port as u16,
+                    )
+                    .await;
+                    let score = if ok { (65 - (lat / 20)).clamp(15, 100) } else { 0 };
+                    (lat, if ok { 10 } else { 9999 }, spd, score, ok)
+                } else {
+                    Self::test_outbound_network_quality(ip, ob.server_port as u16).await
+                };
 
             if !is_healthy {
                 let _ = Repository::update_outbound_quality_metrics(

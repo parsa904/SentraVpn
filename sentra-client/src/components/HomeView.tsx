@@ -7,6 +7,7 @@ import {
   ChevronRight,
   Clock,
   Download,
+  Gamepad2,
   Globe,
   Lock,
   Power,
@@ -66,6 +67,7 @@ const MODE_DEFINITIONS: Array<{
 }> = [
   { id: 'web_browsing', labelKey: 'modeWeb', icon: Globe },
   { id: 'download', labelKey: 'modeDownload', icon: Download },
+  { id: 'gaming', labelKey: 'modeGaming', icon: Gamepad2 },
   { id: 'static_ip', labelKey: 'modeStaticIp', icon: ShieldCheck },
 ];
 
@@ -127,10 +129,10 @@ export const HomeView: React.FC<HomeViewProps> = ({
         isConnected={isConnected}
       />
 
-      {/* Top Control Bar: Quick Connect Widget + Mode Selector (strictly 3 modes: Web, Download, Static IP — Gaming hidden) */}
-      <div className="relative z-10 mx-auto w-full max-w-2xl shrink-0">
-        <div className="flex flex-col sm:flex-row sm:items-stretch gap-2.5">
-          <div className="sm:flex-1 min-w-0">
+      {/* Top Control Bar: Quick Connect Widget + Mode Selector (Web, Download, Gaming, Static IP) */}
+      <div className="relative z-10 mx-auto w-full max-w-3xl shrink-0">
+        <div className="flex flex-col lg:flex-row lg:items-stretch gap-2.5">
+          <div className="lg:flex-1 lg:min-w-[248px] min-w-0">
             <QuickConnectWidget
               lang={lang}
               connectionStatus={connectionStatus}
@@ -144,13 +146,15 @@ export const HomeView: React.FC<HomeViewProps> = ({
           <div
             role="radiogroup"
             aria-label={t(lang, 'connectionModeAria')}
-            className="grid grid-cols-3 gap-1.5 rounded-2xl border border-slate-200/80 dark:border-slate-800/90 bg-white/80 dark:bg-slate-900/75 p-1.5 backdrop-blur-md sm:shrink-0"
+            className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 rounded-2xl border border-slate-200/80 dark:border-slate-800/90 bg-white/80 dark:bg-slate-900/75 p-1.5 backdrop-blur-md lg:shrink-0"
           >
             {MODE_DEFINITIONS.map((m) => {
               const Icon = m.icon;
               const serverInfo = modeById.get(m.id);
               const isLocked = serverInfo?.status === 'locked';
-              const isSelected = selectedMode === m.id;
+              const isComingSoon =
+                serverInfo?.status === 'coming_soon' || (!serverInfo && m.id === 'gaming');
+              const isSelected = selectedMode === m.id && !isComingSoon;
               return (
                 <button
                   key={m.id}
@@ -164,11 +168,25 @@ export const HomeView: React.FC<HomeViewProps> = ({
                       ? 'bg-emerald-600 text-white shadow-sm shadow-emerald-600/25'
                       : isLocked
                       ? 'cursor-not-allowed text-slate-400 dark:text-slate-600'
+                      : isComingSoon
+                      ? 'text-slate-500 dark:text-slate-400 hover:bg-slate-100/90 dark:hover:bg-slate-800/70'
                       : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800/80'
                   }`}
                 >
-                  {isLocked ? <Lock size={13} className="shrink-0" /> : <Icon size={13} className="shrink-0" />}
+                  {isLocked ? (
+                    <Lock size={13} className="shrink-0" />
+                  ) : (
+                    <Icon
+                      size={13}
+                      className={`shrink-0 ${isComingSoon ? 'opacity-70' : ''}`}
+                    />
+                  )}
                   <span className="truncate">{t(lang, m.labelKey)}</span>
+                  {isComingSoon && (
+                    <span className="text-[10px] font-medium text-amber-600 dark:text-amber-400">
+                      {t(lang, 'modeComingSoonBadge')}
+                    </span>
+                  )}
                 </button>
               );
             })}

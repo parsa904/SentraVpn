@@ -183,12 +183,12 @@ pub async fn run_telegram_bot(
                             if text == "/cancel" || text == "🔙 بازگشت" || text == "🔙 بازگشت به منوی اصلی" {
                                 user_handlers::clear_user_state(telegram_user_id).await;
                                 admin_handlers::clear_all_admin_states(telegram_user_id).await;
-                                let is_admin = admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id);
+                                let keyboard = user_handlers::resolve_user_main_keyboard(&pool, telegram_user_id, admin_chat_id).await;
                                 let _ = bot.send_message(
                                     msg.chat.id,
                                     "🔙 عملیات جاری لغو شد و به منوی اصلی بازگشتید.",
                                 )
-                                .reply_markup(keyboards::user_main_keyboard_with_admin(is_admin))
+                                .reply_markup(keyboard)
                                 .await;
                                 return respond(());
                             }
@@ -199,12 +199,14 @@ pub async fn run_telegram_bot(
                                 "/start"
                                     | "/admin"
                                     | "/health"
+                                    | "📝 ثبت نام"
+                                    | "👤 حساب کاربری"
                                     | "📥 دانلود اپلیکیشن Sentra Connect"
                                     | "📤 آپلود / بروزرسانی اپلیکیشن"
                                     | "🌐 مدیریت اوتباندها و نودها"
-                                    | "🎁 دریافت اشتراک رایگان (Sentra Lite)"
                                     | "⚡ ارتقا به پلن ویژه (Sentra Pro / Flow+)"
                                     | "🔑 دریافت کانفیگ و کد اتصال"
+                                    | "🍏 دریافت اشتراک iOS"
                                     | "🍏 دریافت اشتراک iOS (OpenVPN)"
                                     | "🤝 اهدای اوتباند (حمایت از Sentra)"
                                     | "💖 حمایت مالی از توسعه Sentra"
@@ -296,16 +298,39 @@ pub async fn run_telegram_bot(
                                     }
                                 }
 
-                                // Check active user state (e.g. direct 6-digit link code without /link prefix)
+                                // Check active user states (app credential login or 6-digit link code)
                                 if let Some(user_state) = user_handlers::get_user_state(telegram_user_id).await {
-                                    if user_state == user_handlers::UserState::AwaitingLinkCode
-                                        && text.len() == 6
-                                        && text.chars().all(|c| c.is_ascii_digit())
-                                    {
-                                        if let Err(e) = user_handlers::handle_link_command(&bot, &msg, &pool, text).await {
-                                            error!("Error in stateful handle_link_command: {:?}", e);
+                                    match user_state {
+                                        user_handlers::UserState::AwaitingAppLoginUsername => {
+                                            if let Err(e) = user_handlers::handle_app_login_username_input(&bot, &msg, text).await {
+                                                error!("Error in handle_app_login_username_input: {:?}", e);
+                                            }
+                                            return respond(());
                                         }
-                                        return respond(());
+                                        user_handlers::UserState::AwaitingAppLoginPassword { username } => {
+                                            if let Err(e) = user_handlers::handle_app_login_password_input(
+                                                &bot,
+                                                &msg,
+                                                &pool,
+                                                admin_chat_id,
+                                                &username,
+                                                text,
+                                            )
+                                            .await
+                                            {
+                                                error!("Error in handle_app_login_password_input: {:?}", e);
+                                            }
+                                            return respond(());
+                                        }
+                                        user_handlers::UserState::AwaitingLinkCode
+                                            if text.len() == 6 && text.chars().all(|c| c.is_ascii_digit()) =>
+                                        {
+                                            if let Err(e) = user_handlers::handle_link_command(&bot, &msg, &pool, text).await {
+                                                error!("Error in stateful handle_link_command: {:?}", e);
+                                            }
+                                            return respond(());
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -313,6 +338,14 @@ pub async fn run_telegram_bot(
                             if text == "/start" {
                                 if let Err(e) = user_handlers::handle_start(&bot, &msg, &pool, admin_chat_id).await {
                                     error!("Error in /start: {:?}", e);
+                                }
+                            } else if text == "📝 ثبت نام" {
+                                if let Err(e) = user_handlers::handle_register_menu(&bot, &msg, &pool, admin_chat_id).await {
+                                    error!("Error in handle_register_menu: {:?}", e);
+                                }
+                            } else if text == "👤 حساب کاربری" {
+                                if let Err(e) = user_handlers::handle_user_account_info(&bot, &msg, &pool, admin_chat_id).await {
+                                    error!("Error in handle_user_account_info: {:?}", e);
                                 }
                             } else if text == "📥 دانلود اپلیکیشن Sentra Connect" {
                                 if let Err(e) = user_handlers::handle_download_app_menu(&bot, &msg).await {
@@ -326,10 +359,6 @@ pub async fn run_telegram_bot(
                                 if let Err(e) = admin_handlers::handle_official_outbounds_hub(&bot, msg.chat.id, &pool, admin_chat_id, telegram_user_id).await {
                                     error!("Error in handle_official_outbounds_hub: {:?}", e);
                                 }
-                            } else if text == "🎁 دریافت اشتراک رایگان (Sentra Lite)" {
-                                if let Err(e) = user_handlers::handle_free_account(&bot, &msg, &pool).await {
-                                    error!("Error in handle_free_account: {:?}", e);
-                                }
                             } else if text == "⚡ ارتقا به پلن ویژه (Sentra Pro / Flow+)" {
                                 if let Err(e) = user_handlers::handle_upgrade_prompt(&bot, &msg).await {
                                     error!("Error in handle_upgrade_prompt: {:?}", e);
@@ -338,7 +367,7 @@ pub async fn run_telegram_bot(
                                 if let Err(e) = user_handlers::handle_get_config_and_links(&bot, &msg, &pool, &base_url).await {
                                     error!("Error in handle_get_config_and_links: {:?}", e);
                                 }
-                            } else if text == "🍏 دریافت اشتراک iOS (OpenVPN)" {
+                            } else if text == "🍏 دریافت اشتراک iOS" || text == "🍏 دریافت اشتراک iOS (OpenVPN)" {
                                 if let Err(e) = user_handlers::handle_ios_subscription_prompt(&bot, &msg, &pool).await {
                                     error!("Error in handle_ios_subscription_prompt: {:?}", e);
                                 }
@@ -413,11 +442,12 @@ pub async fn run_telegram_bot(
                                     error!("Error in handle_return_to_user_menu: {:?}", e);
                                 }
                             } else {
+                                let keyboard = user_handlers::resolve_user_main_keyboard(&pool, telegram_user_id, admin_chat_id).await;
                                 let _ = bot.send_message(
                                     msg.chat.id,
                                     "💡 لطفاً یکی از گزینه‌های منوی زیر را لمس نمایید یا /start را بفرستید.",
                                 )
-                                .reply_markup(keyboards::user_main_keyboard_with_admin(admin_handlers::is_authorized_admin(telegram_user_id, admin_chat_id)))
+                                .reply_markup(keyboard)
                                 .await;
                             }
                         }
@@ -456,8 +486,26 @@ pub async fn run_telegram_bot(
                         if let Some(ref data) = q.data {
                             // Global User Back to Main Menu (clears any pending UserState & Admin*State)
                             if data == "user_back_main" {
-                                if let Err(e) = user_handlers::handle_user_back_to_main_callback(&bot, &q, admin_chat_id).await {
+                                if let Err(e) = user_handlers::handle_user_back_to_main_callback(&bot, &q, &pool, admin_chat_id).await {
                                     error!("Error in user_back_main: {:?}", e);
+                                }
+                            }
+                            // Registration & App Account Login Callbacks
+                            else if data == "auth_register_new" {
+                                if let Err(e) = user_handlers::handle_register_new_callback(&bot, &q, &pool, admin_chat_id).await {
+                                    error!("Error in auth_register_new: {:?}", e);
+                                }
+                            } else if data == "auth_login_app" {
+                                if let Err(e) = user_handlers::handle_app_login_start_callback(&bot, &q).await {
+                                    error!("Error in auth_login_app: {:?}", e);
+                                }
+                            } else if data == "account_get_app_code" {
+                                if let Err(e) = user_handlers::handle_account_get_code_callback(&bot, &q, &pool).await {
+                                    error!("Error in account_get_app_code: {:?}", e);
+                                }
+                            } else if data == "account_upgrade_menu" {
+                                if let Err(e) = user_handlers::handle_account_upgrade_callback(&bot, &q).await {
+                                    error!("Error in account_upgrade_menu: {:?}", e);
                                 }
                             }
                             // User Device Management Callbacks
@@ -543,6 +591,26 @@ pub async fn run_telegram_bot(
                                     if let Err(e) = admin_handlers::handle_resync_subscription_callback(&bot, &q, &pool, admin_chat_id, source_id).await {
                                         error!("Error in adm_sub_resync: {:?}", e);
                                     }
+                                }
+                            } else if let Some(page_str) = data.strip_prefix("adm_sub_page_") {
+                                if let Ok(page) = page_str.parse::<usize>() {
+                                    if let Err(e) = admin_handlers::handle_sub_preview_page_callback(&bot, &q, admin_chat_id, page).await {
+                                        error!("Error in adm_sub_page: {:?}", e);
+                                    }
+                                }
+                            } else if let Some(idx_str) = data.strip_prefix("adm_sub_add_node_") {
+                                if let Ok(node_idx) = idx_str.parse::<usize>() {
+                                    if let Err(e) = admin_handlers::handle_sub_preview_add_node_callback(&bot, &q, &pool, admin_chat_id, node_idx).await {
+                                        error!("Error in adm_sub_add_node: {:?}", e);
+                                    }
+                                }
+                            } else if data == "adm_sub_add_all" {
+                                if let Err(e) = admin_handlers::handle_sub_preview_add_bulk_callback(&bot, &q, &pool, admin_chat_id, false).await {
+                                    error!("Error in adm_sub_add_all: {:?}", e);
+                                }
+                            } else if data == "adm_sub_add_healthy" {
+                                if let Err(e) = admin_handlers::handle_sub_preview_add_bulk_callback(&bot, &q, &pool, admin_chat_id, true).await {
+                                    error!("Error in adm_sub_add_healthy: {:?}", e);
                                 }
                             } else if data == "adm_warp_generate" {
                                 if let Err(e) = admin_handlers::handle_generate_warp_callback(&bot, &q, &pool, admin_chat_id).await {
@@ -686,6 +754,18 @@ pub async fn run_telegram_bot(
                                         error!("Error in adm_up_flow: {:?}", e);
                                     }
                                 }
+                            } else if let Some(uid_str) = data.strip_prefix("adm_up_gaming_") {
+                                if let Ok(uid) = uid_str.parse::<i64>() {
+                                    if let Err(e) = admin_handlers::handle_admin_upgrade_30_days(&bot, &q, &pool, admin_chat_id, uid, "Sentra Gaming").await {
+                                        error!("Error in adm_up_gaming: {:?}", e);
+                                    }
+                                }
+                            } else if let Some(uid_str) = data.strip_prefix("adm_up_static_") {
+                                if let Ok(uid) = uid_str.parse::<i64>() {
+                                    if let Err(e) = admin_handlers::handle_admin_upgrade_30_days(&bot, &q, &pool, admin_chat_id, uid, "Sentra Static IP").await {
+                                        error!("Error in adm_up_static: {:?}", e);
+                                    }
+                                }
                             } else if let Some(uid_str) = data.strip_prefix("adm_rst_quota_") {
                                 if let Ok(uid) = uid_str.parse::<i64>() {
                                     if let Err(e) = admin_handlers::handle_admin_reset_quota(&bot, &q, &pool, admin_chat_id, uid).await {
@@ -722,6 +802,18 @@ pub async fn run_telegram_bot(
                                 if let Ok(uid) = uid_str.parse::<i64>() {
                                     if let Err(e) = admin_handlers::handle_receipt_approve(&bot, &q, &pool, admin_chat_id, uid, "Sentra Flow+").await {
                                         error!("Error in rcpt_approve_flow: {:?}", e);
+                                    }
+                                }
+                            } else if let Some(uid_str) = data.strip_prefix("rcpt_approve_gaming_") {
+                                if let Ok(uid) = uid_str.parse::<i64>() {
+                                    if let Err(e) = admin_handlers::handle_receipt_approve(&bot, &q, &pool, admin_chat_id, uid, "Sentra Gaming").await {
+                                        error!("Error in rcpt_approve_gaming: {:?}", e);
+                                    }
+                                }
+                            } else if let Some(uid_str) = data.strip_prefix("rcpt_approve_static_") {
+                                if let Ok(uid) = uid_str.parse::<i64>() {
+                                    if let Err(e) = admin_handlers::handle_receipt_approve(&bot, &q, &pool, admin_chat_id, uid, "Sentra Static IP").await {
+                                        error!("Error in rcpt_approve_static: {:?}", e);
                                     }
                                 }
                             } else if let Some(uid_str) = data.strip_prefix("rcpt_reject_") {
@@ -796,14 +888,24 @@ pub async fn run_telegram_bot(
                                 if let Err(e) = user_handlers::handle_ticket_callback(&bot, &q, &pool, category).await {
                                     error!("Error in ticket callback: {:?}", e);
                                 }
+                            } else if data == "plan_info_gaming" {
+                                let _ = bot.answer_callback_query(q.id.clone())
+                                    .text("پلن Sentra Gaming: بهینه‌سازی اختصاصی ویندوز/اندروید + کانفیگ WireGuard کم‌پینگ برای iOS")
+                                    .show_alert(true)
+                                    .await;
+                            } else if data == "plan_info_static" {
+                                let _ = bot.answer_callback_query(q.id.clone())
+                                    .text("پلن Sentra Static IP: آی‌پی ثابت تمیز اختصاصی برای ترید، بانک و سرویس‌های هوش مصنوعی")
+                                    .show_alert(true)
+                                    .await;
                             } else if data == "plan_info_pro" {
                                 let _ = bot.answer_callback_query(q.id.clone())
-                                    .text("پلن Sentra Pro: مناسب استریم و وبگردی پرسرعت بدون قطعی (۱۵۰ گیگ)")
+                                    .text("پلن Sentra Pro: شامل گیمینگ (WireGuard iOS) + آی‌پی ثابت + سرعت نامحدود (۱۵۰ گیگ)")
                                     .show_alert(true)
                                     .await;
                             } else if data == "plan_info_flow" {
                                 let _ = bot.answer_callback_query(q.id.clone())
-                                    .text("پلن Sentra Flow+: دارای IP مسکونی ثابت آمریکا تضمین‌شده برای Google Flow و Gemini")
+                                    .text("پلن Sentra Flow+: شامل گیمینگ (WireGuard iOS) + IP مسکونی ثابت آمریکا برای Google Flow و Gemini")
                                     .show_alert(true)
                                     .await;
                             }
