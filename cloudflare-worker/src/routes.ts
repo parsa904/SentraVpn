@@ -7,6 +7,7 @@ import {
   hashPassword,
   verifyPassword,
 } from './security.ts';
+import { auditOutboundSecurity, parseOutboundInput } from './outboundAnalyzer.ts';
 import {
   buildSubscriptionUserInfoHeader,
   compileClientSingboxConfig,
@@ -22,6 +23,7 @@ import type {
   HealthReportPayload,
   OutboundRow,
   SubscriptionRow,
+  SubscriptionSourceRow,
   UserRow,
 } from './types.ts';
 
@@ -204,12 +206,19 @@ export async function routeRequest(
 
     const rows = await env.DB.prepare(
       `SELECT id, tag, protocol, server_address, server_port, config_json,
-              country_code, status, fail_count, is_official, allocation_mode
+              country_code, status, fail_count, is_official, allocation_mode, fingerprint_sha256
        FROM donated_outbounds
        WHERE status IN ('active', 'inactive')
        ORDER BY is_official DESC, id ASC
        LIMIT 200`
     ).all<DonatedOutboundRow>();
+
+    const subSources = await env.DB.prepare(
+      `SELECT id, category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at
+       FROM subscription_sources
+       ORDER BY id ASC
+       LIMIT 50`
+    ).all<SubscriptionSourceRow>();
 
     return jsonResponse({
       success: true,
@@ -226,6 +235,16 @@ export async function routeRequest(
         fail_count: row.fail_count,
         is_official: row.is_official === 1,
         allocation_mode: row.allocation_mode,
+        fingerprint_sha256: row.fingerprint_sha256,
+      })),
+      subscription_sources: (subSources.results || []).map((src) => ({
+        id: src.id,
+        category: src.category,
+        sub_url: src.sub_url,
+        tag: src.tag,
+        total_nodes: src.total_nodes,
+        healthy_nodes: src.healthy_nodes,
+        last_sync_at: src.last_sync_at,
       })),
     });
   }
@@ -247,15 +266,22 @@ export async function routeRequest(
       return errorResponse(400, 'بدنه JSON گزارش سلامت معتبر نیست.');
     }
 
-    if (!Array.isArray(payload.results) || payload.results.length === 0) {
-      return errorResponse(400, 'آرایه results خالی است.');
+    const nodeResults = Array.isArray(payload.results) ? payload.results : [];
+    const subReports = Array.isArray(payload.subscription_reports)
+      ? payload.subscription_reports
+      : [];
+
+    if (nodeResults.length === 0 && subReports.length === 0) {
+      return errorResponse(400, 'آرایه results و subscription_reports خالی است.');
     }
 
     let updated = 0;
     let deactivated = 0;
     let geminiReady = 0;
+    let subscriptionSourcesUpdated = 0;
+    let discoveredNodesAdded = 0;
 
-    for (const item of payload.results.slice(0, 250)) {
+    for (const item of nodeResults.slice(0, 250)) {
       const nodeId = Number(item.outbound_id);
       if (!Number.isInteger(nodeId) || nodeId <= 0) continue;
 
@@ -344,11 +370,118 @@ export async function routeRequest(
       updated += 1;
     }
 
+    for (const srcReport of subReports.slice(0, 50)) {
+      const sourceId = Number(srcReport.source_id);
+      if (!Number.isInteger(sourceId) || sourceId <= 0) continue;
+
+      const totalNodes = Math.max(0, Math.round(Number(srcReport.total_nodes) || 0));
+      const healthyNodes = Math.max(0, Math.round(Number(srcReport.healthy_nodes) || 0));
+
+      await env.DB.prepare(
+        `UPDATE subscription_sources
+         SET total_nodes = ?, healthy_nodes = ?, last_sync_at = CURRENT_TIMESTAMP
+         WHERE id = ?`
+      )
+        .bind(totalNodes, healthyNodes, sourceId)
+        .run();
+      subscriptionSourcesUpdated += 1;
+
+      const category = String(srcReport.category || 'web_browsing').trim().toLowerCase();
+      const allowWeb = category === 'web_browsing' || category === 'download' ? 1 : 0;
+      const allowDownload = category === 'download' || category === 'web_browsing' ? 1 : 0;
+      const allowGaming = category === 'gaming' ? 1 : 0;
+      const allowStaticIp = category === 'static_ip' ? 1 : 0;
+      const assignedTier =
+        category === 'gaming'
+          ? 'gaming'
+          : category === 'static_ip'
+          ? 'static_ip'
+          : category === 'download'
+          ? 'download'
+          : 'web_browsing';
+
+      const discovered = Array.isArray(srcReport.discovered_nodes)
+        ? srcReport.discovered_nodes.slice(0, 50)
+        : [];
+      for (const node of discovered) {
+        const fp = String(node.fingerprint_sha256 || '').trim();
+        if (!fp || !node.server_address || !node.protocol) continue;
+
+        const existingNode = await env.DB.prepare(
+          'SELECT id FROM donated_outbounds WHERE fingerprint_sha256 = ? LIMIT 1'
+        )
+          .bind(fp)
+          .first<{ id: number }>();
+
+        const lat = Math.max(0, Math.min(9999, Math.round(Number(node.latency_ms) || 120)));
+        const jit = Math.max(0, Math.min(9999, Math.round(Number(node.jitter_ms) || 0)));
+        const spd = Math.max(0, Number(node.speed_mbps) || 0);
+        const spdScore = Math.max(0, Math.min(100, Math.round(Number(node.speed_score) || 60)));
+        const hScore = Math.max(0, Math.min(100, Math.round(Number(node.health_score) || spdScore)));
+        const gOk = node.gemini_ok ? 1 : 0;
+        const tSafe = node.trading_safe ? 1 : 0;
+        if (gOk === 1) geminiReady += 1;
+
+        if (existingNode) {
+          await env.DB.prepare(
+            `UPDATE donated_outbounds
+             SET latency_ms = ?, jitter_ms = ?, speed_mbps = ?, speed_score = ?,
+                 health_score = ?, gemini_ok = ?, trading_safe = ?, status = 'active',
+                 fail_count = 0, offline_since = NULL,
+                 last_online_at = CURRENT_TIMESTAMP, last_checked_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?`
+          )
+            .bind(lat, jit, spd, spdScore, hScore, gOk, tSafe, existingNode.id)
+            .run();
+        } else {
+          await env.DB.prepare(
+            `INSERT INTO donated_outbounds (
+               donor_user_id, tag, protocol, server_address, server_port, config_json,
+               latency_ms, jitter_ms, speed_mbps, speed_score, assigned_tier, health_score,
+               status, fail_count, raw_link, fingerprint_sha256, is_official, label,
+               country_code, country_name, allow_web, allow_download, allow_gaming, allow_static_ip,
+               gemini_ok, trading_safe, allocation_mode, last_online_at, last_checked_at
+             ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+          )
+            .bind(
+              String(node.tag || 'SubNode').slice(0, 64),
+              String(node.protocol),
+              String(node.server_address),
+              Math.max(1, Math.min(65535, Math.round(Number(node.server_port) || 443))),
+              String(node.config_json || '{}'),
+              lat,
+              jit,
+              spd,
+              spdScore,
+              assignedTier,
+              hScore,
+              String(node.raw_link || ''),
+              fp,
+              String(node.tag || 'SubNode').slice(0, 64),
+              String(node.country_code || 'XX').slice(0, 4),
+              String(node.country_name || 'Global 🌐').slice(0, 40),
+              allowWeb,
+              allowDownload,
+              allowGaming,
+              allowStaticIp,
+              gOk,
+              tSafe,
+              category
+            )
+            .run();
+          discoveredNodesAdded += 1;
+        }
+      }
+    }
+
     return jsonResponse({
       success: true,
       updated,
       deactivated,
       gemini_ready: geminiReady,
+      subscription_sources_updated: subscriptionSourcesUpdated,
+      discovered_nodes_added: discoveredNodesAdded,
       recorded_at: new Date().toISOString(),
     });
   }
@@ -868,6 +1001,472 @@ export async function routeRequest(
         0,
         STATIC_IP_MONTHLY_QUOTA_MB - (found.sub.static_ip_used_mb + staticAdd)
       ),
+    });
+  }
+
+  // 15. Client Bootstrap (GET /api/v1/client/bootstrap) — Full account, devices, modes, outbounds & synced state
+  if (method === 'GET' && path === '/api/v1/client/bootstrap') {
+    const token = extractAuthToken(request);
+    if (!token) return errorResponse(401, 'توکن احراز هویت ارسال نشده است.', 'MISSING_TOKEN');
+    const found = await getSubscriptionWithUser(env.DB, token);
+    if (!found) return errorResponse(401, 'توکن اشتراک معتبر نیست.', 'INVALID_TOKEN');
+    if (found.user.status !== 'active' || found.sub.status !== 'active') {
+      return errorResponse(403, 'حساب کاربری یا اشتراک شما غیرفعال شده است.', 'ACCOUNT_SUSPENDED');
+    }
+
+    const deviceId = (request.headers.get('X-Device-Id') || '').trim();
+    if (deviceId.length >= 4) {
+      const ua = (request.headers.get('User-Agent') || '').toLowerCase();
+      const osName = ua.includes('android') ? 'android' : ua.includes('windows') ? 'windows' : 'client';
+      const deviceName = osName === 'android' ? 'Android Device' : osName === 'windows' ? 'Windows PC' : 'Sentra Client';
+      try {
+        await env.DB.prepare(
+          `INSERT INTO device_sessions (subscription_id, device_identifier, device_name, os, is_active, last_seen_at)
+           VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+           ON CONFLICT(subscription_id, device_identifier)
+           DO UPDATE SET is_active = 1, last_seen_at = CURRENT_TIMESTAMP`
+        )
+          .bind(found.sub.id, deviceId.slice(0, 128), deviceName, osName)
+          .run();
+      } catch {
+        // Non-fatal if concurrent upsert occurs
+      }
+    }
+
+    const devicesRes = await env.DB.prepare(
+      `SELECT id, device_identifier, device_name, os, last_seen_at, created_at
+       FROM device_sessions
+       WHERE subscription_id = ? AND is_active = 1
+       ORDER BY last_seen_at DESC
+       LIMIT 20`
+    )
+      .bind(found.sub.id)
+      .all<{
+        id: number;
+        device_identifier: string;
+        device_name: string;
+        os: string;
+        last_seen_at: string;
+        created_at: string;
+      }>();
+
+    const activeDevices = (devicesRes.results || []).map((d) => ({
+      id: d.id,
+      device_id: d.device_identifier,
+      device_name: d.device_name,
+      platform: d.os,
+      last_active_at: d.last_seen_at,
+      created_at: d.created_at,
+    }));
+
+    const outboundsRes = await env.DB.prepare(
+      `SELECT id, tag, label, protocol, server_address, server_port, assigned_tier,
+              country_code, country_name, latency_ms, health_score, is_official, status, raw_link
+       FROM donated_outbounds
+       WHERE status = 'active'
+       ORDER BY is_official DESC, health_score DESC, latency_ms ASC
+       LIMIT 100`
+    ).all<DonatedOutboundRow>();
+
+    const outbounds = (outboundsRes.results || []).map((row) => ({
+      id: `donated_${row.id}`,
+      db_id: row.id,
+      name: row.label || row.tag,
+      tag: row.tag,
+      protocol: row.protocol,
+      category: row.assigned_tier || 'web_browsing',
+      country_code: row.country_code || 'XX',
+      country_name: row.country_name || 'Global 🌐',
+      flag: (row.country_name || '🌍').split(' ').pop() || '🌍',
+      latency_ms: row.latency_ms,
+      health_score: row.health_score,
+      is_official: row.is_official === 1,
+      is_online: row.status === 'active',
+      server_address: row.server_address,
+      server_port: row.server_port,
+      uri: row.raw_link || null,
+    }));
+
+    const clientStateRow = await env.DB.prepare(
+      'SELECT personal_configs_json, preferences_json, updated_at FROM client_states WHERE user_id = ? LIMIT 1'
+    )
+      .bind(found.user.id)
+      .first<{ personal_configs_json: string; preferences_json: string; updated_at: string }>();
+
+    let personalConfigs: unknown[] = [];
+    let preferences: Record<string, unknown> = {};
+    if (clientStateRow) {
+      try {
+        const parsedCfg = JSON.parse(clientStateRow.personal_configs_json || '[]');
+        if (Array.isArray(parsedCfg)) personalConfigs = parsedCfg;
+      } catch {
+        personalConfigs = [];
+      }
+      try {
+        const parsedPref = JSON.parse(clientStateRow.preferences_json || '{}');
+        if (parsedPref && typeof parsedPref === 'object') preferences = parsedPref as Record<string, unknown>;
+      } catch {
+        preferences = {};
+      }
+    }
+
+    const usedBytes = found.sub.upload_bytes + found.sub.download_bytes;
+    const remainingBytes = Math.max(0, found.sub.traffic_limit_bytes - usedBytes);
+    const expiresMs = Date.parse(found.sub.expires_at);
+    const remainingDays = Number.isFinite(expiresMs)
+      ? Math.max(0, Math.ceil((expiresMs - Date.now()) / (24 * 60 * 60 * 1000)))
+      : 30;
+    const isLite = found.sub.tier.toLowerCase() === 'sentra lite';
+    const gamingLive = await hasActiveGamingOutbounds(env.DB);
+
+    return jsonResponse({
+      success: true,
+      server_time: new Date().toISOString(),
+      bot_username: (env.BOT_USERNAME || 'SentraVpnBot').replace(/^@/, ''),
+      user: {
+        id: found.user.id,
+        user_uuid: found.user.user_uuid,
+        username: found.user.username,
+        first_name: found.user.first_name,
+        telegram_id: found.user.telegram_id,
+        role: found.user.role,
+        status: found.user.status,
+      },
+      subscription: {
+        tier: found.sub.tier,
+        token: found.sub.token,
+        status: found.sub.status,
+        upload_bytes: found.sub.upload_bytes,
+        download_bytes: found.sub.download_bytes,
+        used_bytes: usedBytes,
+        traffic_limit_bytes: found.sub.traffic_limit_bytes,
+        remaining_bytes: remainingBytes,
+        web_browsing_used_mb: found.sub.web_browsing_used_mb,
+        download_used_mb: found.sub.download_used_mb,
+        static_ip_used_mb: found.sub.static_ip_used_mb,
+        active_devices_count: activeDevices.length,
+        max_concurrent_devices: found.sub.max_concurrent_devices,
+        remaining_days: remainingDays,
+        expires_at: found.sub.expires_at,
+      },
+      devices: activeDevices,
+      modes: [
+        {
+          id: 'web_browsing',
+          name: 'وب‌گردی',
+          status: isLite && found.sub.web_browsing_used_mb >= LITE_WEB_QUOTA_MB ? 'depleted' : 'active',
+          daily_limit_mb: isLite ? LITE_WEB_QUOTA_MB : 0,
+          used_today_mb: found.sub.web_browsing_used_mb,
+          remaining_today_mb: isLite ? Math.max(0, LITE_WEB_QUOTA_MB - found.sub.web_browsing_used_mb) : 0,
+          description: 'مناسب وب‌گردی، تلگرام، اینستاگرام و شبکه‌های اجتماعی',
+        },
+        {
+          id: 'download',
+          name: 'دانلود و استریم',
+          status: isLite && found.sub.download_used_mb >= LITE_DL_QUOTA_MB ? 'depleted' : 'active',
+          daily_limit_mb: isLite ? LITE_DL_QUOTA_MB : 0,
+          used_today_mb: found.sub.download_used_mb,
+          remaining_today_mb: isLite ? Math.max(0, LITE_DL_QUOTA_MB - found.sub.download_used_mb) : 0,
+          description: 'پهنای باند بهینه برای دانلود فایل و تماشای ویدیو',
+        },
+        {
+          id: 'gaming',
+          name: 'گیمینگ',
+          status: !gamingLive ? 'locked' : tierHasGaming(found.sub.tier) ? 'active' : 'locked',
+          daily_limit_mb: 0,
+          used_today_mb: 0,
+          remaining_today_mb: 0,
+          description: 'پینگ پایدار و بهینه برای بازی‌های آنلاین',
+        },
+        {
+          id: 'static_ip',
+          name: 'آی‌پی ثابت',
+          status: tierHasStaticIp(found.sub.tier) ? 'active' : 'locked',
+          daily_limit_mb: STATIC_IP_MONTHLY_QUOTA_MB,
+          used_today_mb: found.sub.static_ip_used_mb,
+          remaining_today_mb: Math.max(0, STATIC_IP_MONTHLY_QUOTA_MB - found.sub.static_ip_used_mb),
+          description: 'آی‌پی ثابت و ایمن مناسب ترید و حساب‌های بین‌المللی',
+        },
+      ],
+      outbounds,
+      client_state: {
+        personal_configs: personalConfigs,
+        preferences,
+        updated_at: clientStateRow?.updated_at ?? null,
+      },
+    });
+  }
+
+  // 16. Client Sync State (GET / PUT /api/v1/client/sync-state)
+  if ((method === 'GET' || method === 'PUT') && path === '/api/v1/client/sync-state') {
+    const token = extractAuthToken(request);
+    if (!token) return errorResponse(401, 'توکن احراز هویت ارسال نشده است.', 'MISSING_TOKEN');
+    const found = await getSubscriptionWithUser(env.DB, token);
+    if (!found) return errorResponse(401, 'توکن اشتراک معتبر نیست.', 'INVALID_TOKEN');
+
+    if (method === 'PUT') {
+      let body: Record<string, unknown> = {};
+      try {
+        body = (await request.json()) as Record<string, unknown>;
+      } catch {
+        return errorResponse(400, 'بدنه JSON معتبر نیست.');
+      }
+
+      const existing = await env.DB.prepare(
+        'SELECT personal_configs_json, preferences_json FROM client_states WHERE user_id = ? LIMIT 1'
+      )
+        .bind(found.user.id)
+        .first<{ personal_configs_json: string; preferences_json: string }>();
+
+      const nextConfigsJson = Array.isArray(body.personal_configs)
+        ? JSON.stringify(body.personal_configs.slice(0, 100))
+        : existing?.personal_configs_json || '[]';
+
+      const nextPrefsJson =
+        body.preferences && typeof body.preferences === 'object' && !Array.isArray(body.preferences)
+          ? JSON.stringify(body.preferences)
+          : existing?.preferences_json || '{}';
+
+      await env.DB.prepare(
+        `INSERT INTO client_states (user_id, personal_configs_json, preferences_json, updated_at)
+         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(user_id) DO UPDATE SET
+           personal_configs_json = excluded.personal_configs_json,
+           preferences_json = excluded.preferences_json,
+           updated_at = CURRENT_TIMESTAMP`
+      )
+        .bind(found.user.id, nextConfigsJson, nextPrefsJson)
+        .run();
+    }
+
+    const row = await env.DB.prepare(
+      'SELECT personal_configs_json, preferences_json, updated_at FROM client_states WHERE user_id = ? LIMIT 1'
+    )
+      .bind(found.user.id)
+      .first<{ personal_configs_json: string; preferences_json: string; updated_at: string }>();
+
+    let personalConfigs: unknown[] = [];
+    let preferences: Record<string, unknown> = {};
+    try {
+      const p = JSON.parse(row?.personal_configs_json || '[]');
+      if (Array.isArray(p)) personalConfigs = p;
+    } catch {
+      personalConfigs = [];
+    }
+    try {
+      const p = JSON.parse(row?.preferences_json || '{}');
+      if (p && typeof p === 'object') preferences = p as Record<string, unknown>;
+    } catch {
+      preferences = {};
+    }
+
+    return jsonResponse({
+      success: true,
+      personal_configs: personalConfigs,
+      preferences,
+      updated_at: row?.updated_at ?? null,
+    });
+  }
+
+  // 17. Client Devices Management (GET /api/v1/client/devices & POST /api/v1/client/devices/remove)
+  if (method === 'GET' && path === '/api/v1/client/devices') {
+    const token = extractAuthToken(request);
+    if (!token) return errorResponse(401, 'توکن ارسال نشده است.');
+    const found = await getSubscriptionWithUser(env.DB, token);
+    if (!found) return errorResponse(401, 'توکن معتبر نیست.');
+
+    const rows = await env.DB.prepare(
+      `SELECT id, device_identifier, device_name, os, last_seen_at, created_at
+       FROM device_sessions
+       WHERE subscription_id = ? AND is_active = 1
+       ORDER BY last_seen_at DESC`
+    )
+      .bind(found.sub.id)
+      .all<{
+        id: number;
+        device_identifier: string;
+        device_name: string;
+        os: string;
+        last_seen_at: string;
+        created_at: string;
+      }>();
+
+    return jsonResponse({
+      success: true,
+      max_concurrent_devices: found.sub.max_concurrent_devices,
+      devices: (rows.results || []).map((d) => ({
+        id: d.id,
+        device_id: d.device_identifier,
+        device_name: d.device_name,
+        platform: d.os,
+        last_active_at: d.last_seen_at,
+        created_at: d.created_at,
+      })),
+    });
+  }
+
+  if (method === 'POST' && path === '/api/v1/client/devices/remove') {
+    const token = extractAuthToken(request);
+    if (!token) return errorResponse(401, 'توکن ارسال نشده است.');
+    const found = await getSubscriptionWithUser(env.DB, token);
+    if (!found) return errorResponse(401, 'توکن معتبر نیست.');
+
+    let body: Record<string, unknown> = {};
+    try {
+      body = (await request.json()) as Record<string, unknown>;
+    } catch {
+      return errorResponse(400, 'بدنه درخواست معتبر نیست.');
+    }
+
+    const deviceId = String(body.device_id || '').trim();
+    if (!deviceId) return errorResponse(400, 'شناسه دستگاه ارسال نشده است.');
+
+    await env.DB.prepare(
+      'DELETE FROM device_sessions WHERE subscription_id = ? AND device_identifier = ?'
+    )
+      .bind(found.sub.id, deviceId)
+      .run();
+
+    return jsonResponse({ success: true, removed_device_id: deviceId });
+  }
+
+  // 18. Client Outbound Donation & Listing
+  if (
+    method === 'POST' &&
+    (path === '/api/v1/client/outbounds/donate' || path === '/api/v1/client/outbounds/add')
+  ) {
+    const token = extractAuthToken(request);
+    if (!token) return errorResponse(401, 'توکن احراز هویت ارسال نشده است.');
+    const found = await getSubscriptionWithUser(env.DB, token);
+    if (!found) return errorResponse(401, 'توکن معتبر نیست.');
+
+    let body: Record<string, unknown> = {};
+    try {
+      body = (await request.json()) as Record<string, unknown>;
+    } catch {
+      return errorResponse(400, 'بدنه JSON معتبر نیست.');
+    }
+
+    const rawUri = String(body.uri || '').trim();
+    if (!rawUri) return errorResponse(400, 'لینک کانفیگ خالی است.');
+
+    let parsed;
+    try {
+      parsed = await parseOutboundInput(rawUri);
+    } catch (err) {
+      return errorResponse(400, err instanceof Error ? err.message : 'فرمت لینک کانفیگ پشتیبانی نمی‌شود.');
+    }
+
+    const audit = auditOutboundSecurity(parsed.protocol, parsed.config_json);
+    if (!audit.passed) {
+      return errorResponse(400, audit.reason || 'کانفیگ از نظر امنیتی رد شد.');
+    }
+
+    const existing = await env.DB.prepare(
+      'SELECT id FROM donated_outbounds WHERE fingerprint_sha256 = ? LIMIT 1'
+    )
+      .bind(parsed.fingerprint_sha256)
+      .first<{ id: number }>();
+    if (existing) {
+      return errorResponse(409, 'این کانفیگ قبلاً در شبکه سنترا ثبت شده است.');
+    }
+
+    const isAdmin = found.user.role === 'admin';
+    const status = isAdmin && path.endsWith('/add') ? 'active' : 'pending';
+    const isOfficial = isAdmin && path.endsWith('/add') ? 1 : 0;
+    const label = String(body.name || parsed.tag || 'Community Node').trim().slice(0, 64);
+
+    const insertRes = await env.DB.prepare(
+      `INSERT INTO donated_outbounds (
+         donor_user_id, tag, protocol, server_address, server_port, config_json,
+         latency_ms, assigned_tier, health_score, status, raw_link, fingerprint_sha256,
+         is_official, label, country_code, country_name, allow_web, allow_download
+       ) VALUES (?, ?, ?, ?, ?, ?, 0, 'web_browsing', 100, ?, ?, ?, ?, ?, ?, ?, 1, 1)`
+    )
+      .bind(
+        found.user.id,
+        label,
+        parsed.protocol,
+        parsed.server_address,
+        parsed.server_port,
+        JSON.stringify(parsed.config_json),
+        status,
+        parsed.raw_link,
+        parsed.fingerprint_sha256,
+        isOfficial,
+        label,
+        parsed.country_code,
+        parsed.country_name
+      )
+      .run();
+
+    return jsonResponse(
+      {
+        success: true,
+        id: insertRes.meta.last_row_id,
+        is_official: isOfficial === 1,
+        status,
+        message:
+          status === 'active'
+            ? 'نود با موفقیت به شبکه رسمی سنترا اضافه شد.'
+            : 'کانفیگ شما ثبت شد و پس از تایید ادمین به شبکه اضافه می‌شود.',
+      },
+      201
+    );
+  }
+
+  if (method === 'GET' && path === '/api/v1/client/outbounds/my-donations') {
+    const token = extractAuthToken(request);
+    if (!token) return errorResponse(401, 'توکن ارسال نشده است.');
+    const found = await getSubscriptionWithUser(env.DB, token);
+    if (!found) return errorResponse(401, 'توکن معتبر نیست.');
+
+    const rows = await env.DB.prepare(
+      `SELECT id, tag, label, protocol, server_address, server_port, country_code, country_name,
+              latency_ms, status, reward_granted, rejection_reason, created_at, updated_at
+       FROM donated_outbounds
+       WHERE donor_user_id = ?
+       ORDER BY id DESC
+       LIMIT 50`
+    )
+      .bind(found.user.id)
+      .all<DonatedOutboundRow>();
+
+    return jsonResponse({
+      success: true,
+      donations: (rows.results || []).map((r) => ({
+        id: r.id,
+        name: r.label || r.tag,
+        protocol: r.protocol,
+        server_address: r.server_address,
+        server_port: r.server_port,
+        country_code: r.country_code || 'XX',
+        flag: (r.country_name || '🌍').split(' ').pop() || '🌍',
+        latency_ms: r.latency_ms,
+        status: r.status === 'active' ? 'approved' : r.status,
+        reward_days: r.reward_granted ? 7 : 0,
+        rejection_reason: r.rejection_reason || null,
+        created_at: r.created_at,
+        approved_at: r.status === 'active' ? r.updated_at : null,
+      })),
+    });
+  }
+
+  // 19. Client Version Metadata (GET /api/v1/client/version)
+  if (method === 'GET' && path === '/api/v1/client/version') {
+    return jsonResponse({
+      success: true,
+      latest_version: '1.0.0',
+      min_supported_version: '1.0.0',
+      release_url: 'https://github.com/parsa904/sentravpn/releases/latest',
+      downloads: {
+        android_universal: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-Universal.apk',
+        android_armv8: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-ARMv8.apk',
+        android_armv7: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-ARMv7.apk',
+        android_x64: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-x64.apk',
+        windows_setup_x64: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Windows-Setup-x64.exe',
+        windows_portable_x64: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Windows-Portable-x64.zip',
+      },
     });
   }
 

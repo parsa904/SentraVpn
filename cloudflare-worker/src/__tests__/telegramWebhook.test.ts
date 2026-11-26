@@ -424,7 +424,7 @@ test('env.ADMIN_TELEGRAM_ID grants admin menu and non-admin users are denied /ad
       }),
       env
     );
-    assert.ok(String(sentCalls[2].body.text).includes('دسترسی به پنل مدیریت ندارید'));
+    assert.ok(String(sentCalls[2].body.text).includes('⛔ دسترسی غیرمجاز'));
   } finally {
     globalThis.fetch = originalFetch;
     sqlite.close();
@@ -674,5 +674,433 @@ test('callback_query always awaits answerCallbackQuery first and sends clear fal
   } finally {
     globalThis.fetch = originalFetch;
     console.error = originalError;
+  }
+});
+
+test('Admin panel guard, official node ingestion, subscription sources CRUD, pending approvals, and error reporting', async () => {
+  const { db, sqlite } = createSqliteD1Adapter();
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; method: string; body: Record<string, unknown> }> = [];
+
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.startsWith('https://example.com/')) {
+      return new Response(
+        'vless://11111111-1111-4111-8111-111111111111@sub-node.example.com:443?security=tls&type=ws#SubNodeDE',
+        { status: 200, headers: { 'Content-Type': 'text/plain' } }
+      );
+    }
+    const method = url.split('/').pop() || '';
+    const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    calls.push({ url, method, body });
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 120 } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  const env = {
+    DB: db,
+    TELEGRAM_BOT_TOKEN: '123456:TEST_TOKEN',
+    ADMIN_TELEGRAM_ID: '999001',
+    PUBLIC_BASE_URL: 'https://sentra-core.kziepr.workers.dev',
+  } as Env;
+
+  const sendUpdate = async (update: Record<string, unknown>, customEnv: Env = env) => {
+    const before = calls.length;
+    const req = new Request('https://sentra-core.kziepr.workers.dev/api/v1/telegram/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(update),
+    });
+    const resp = await handleTelegramWebhook(req, customEnv);
+    assert.equal(resp.status, 200);
+    return calls.slice(before);
+  };
+
+  try {
+    const adminUser = { id: 999001, first_name: 'RootAdmin', username: 'root_admin' };
+    const regularUser = { id: 999002, first_name: 'NormalUser', username: 'normal_user' };
+
+    // Seed both users via /start
+    await sendUpdate({
+      update_id: 601,
+      message: { message_id: 1, chat: { id: 999001, type: 'private' }, from: adminUser, text: '/start' },
+    });
+    await sendUpdate({
+      update_id: 602,
+      message: { message_id: 2, chat: { id: 999002, type: 'private' }, from: regularUser, text: '/start' },
+    });
+
+    // 1. Non-admin guard on /admin, adm_stats, and admin_panel_home callbacks
+    const deniedCmd = await sendUpdate({
+      update_id: 603,
+      message: { message_id: 3, chat: { id: 999002, type: 'private' }, from: regularUser, text: '/admin' },
+    });
+    assert.ok(String(deniedCmd[0].body.text).includes('⛔ دسترسی غیرمجاز'));
+
+    const deniedCb1 = await sendUpdate({
+      update_id: 604,
+      callback_query: {
+        id: 'cb_deny_1',
+        from: regularUser,
+        message: { message_id: 120, chat: { id: 999002, type: 'private' } },
+        data: 'adm_stats',
+      },
+    });
+    assert.equal(deniedCb1[0].method, 'answerCallbackQuery');
+    assert.ok(deniedCb1.some((c) => String(c.body.text || '').includes('⛔ دسترسی غیرمجاز')));
+
+    const deniedCb2 = await sendUpdate({
+      update_id: 605,
+      callback_query: {
+        id: 'cb_deny_2',
+        from: regularUser,
+        message: { message_id: 120, chat: { id: 999002, type: 'private' } },
+        data: 'admin_panel_home',
+      },
+    });
+    assert.equal(deniedCb2[0].method, 'answerCallbackQuery');
+    assert.ok(deniedCb2.some((c) => String(c.body.text || '').includes('⛔ دسترسی غیرمجاز')));
+
+    // 2. Official node ingestion (is_official = 1, status = 'active', fingerprint_sha256)
+    await sendUpdate({
+      update_id: 606,
+      callback_query: {
+        id: 'cb_add_node',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: 'adm_add_node',
+      },
+    });
+    await sendUpdate({
+      update_id: 607,
+      callback_query: {
+        id: 'cb_alloc_free',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: 'adm_ob_alloc_free_only',
+      },
+    });
+    const addOfficialReply = await sendUpdate({
+      update_id: 608,
+      message: {
+        message_id: 10,
+        chat: { id: 999001, type: 'private' },
+        from: adminUser,
+        text: 'vless://22222222-2222-4222-8222-222222222222@official.example.com:443?security=tls&type=ws#OfficialDE',
+      },
+    });
+    assert.ok(addOfficialReply.some((c) => String(c.body.text || '').includes('با موفقیت اضافه شد')));
+    const officialNode = sqlite
+      .prepare(
+        'SELECT protocol, status, is_official, fingerprint_sha256 FROM donated_outbounds WHERE server_address = ?'
+      )
+      .get('official.example.com') as {
+      protocol: string;
+      status: string;
+      is_official: number;
+      fingerprint_sha256: string;
+    };
+    assert.ok(officialNode);
+    assert.equal(officialNode.protocol, 'vless');
+    assert.equal(officialNode.status, 'active');
+    assert.equal(officialNode.is_official, 1);
+    assert.equal(officialNode.fingerprint_sha256.length, 64);
+
+    // 3. Subscription sources CRUD (list -> add -> select category -> submit URL -> delete)
+    await sendUpdate({
+      update_id: 609,
+      callback_query: {
+        id: 'cb_sub_sources',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: 'adm_sub_sources',
+      },
+    });
+    await sendUpdate({
+      update_id: 610,
+      callback_query: {
+        id: 'cb_subsrc_add',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: 'adm_subsrc_add',
+      },
+    });
+    await sendUpdate({
+      update_id: 611,
+      callback_query: {
+        id: 'cb_subsrc_cat',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: 'adm_subsrc_cat_gaming',
+      },
+    });
+    const addSubSrcReply = await sendUpdate({
+      update_id: 612,
+      message: {
+        message_id: 11,
+        chat: { id: 999001, type: 'private' },
+        from: adminUser,
+        text: 'https://example.com/sub-gaming.txt',
+      },
+    });
+    assert.ok(addSubSrcReply.some((c) => String(c.body.text || '').includes('منبع سابسکریپشن')));
+    const subSourceRow = sqlite
+      .prepare('SELECT id, sub_url, category FROM subscription_sources WHERE sub_url = ?')
+      .get('https://example.com/sub-gaming.txt') as { id: number; sub_url: string; category: string };
+    assert.ok(subSourceRow);
+    assert.equal(subSourceRow.category, 'gaming');
+
+    const delSubSrcReply = await sendUpdate({
+      update_id: 613,
+      callback_query: {
+        id: 'cb_subsrc_del',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: `adm_subsrc_del_${subSourceRow.id}`,
+      },
+    });
+    assert.equal(delSubSrcReply[0].method, 'answerCallbackQuery');
+    const deletedSubSource = sqlite
+      .prepare('SELECT id FROM subscription_sources WHERE id = ?')
+      .get(subSourceRow.id);
+    assert.equal(deletedSubSource, undefined);
+
+    // 4. Pending donated outbounds approval & rejection with donor notification
+    const regularUserRow = sqlite
+      .prepare('SELECT id FROM users WHERE telegram_id = ?')
+      .get(999002) as { id: number };
+
+    // User donates a node via FSM -> inserted as status = 'pending'
+    await sendUpdate({
+      update_id: 614,
+      callback_query: {
+        id: 'cb_user_donate_ob',
+        from: regularUser,
+        message: { message_id: 120, chat: { id: 999002, type: 'private' } },
+        data: 'user_donate_outbound',
+      },
+    });
+    await sendUpdate({
+      update_id: 615,
+      message: {
+        message_id: 12,
+        chat: { id: 999002, type: 'private' },
+        from: regularUser,
+        text: 'vless://33333333-3333-4333-8333-333333333333@donor-ok.example.com:443?security=tls&type=ws#DonorOK',
+      },
+    });
+    const pendingNode1 = sqlite
+      .prepare('SELECT id, status, is_official FROM donated_outbounds WHERE server_address = ?')
+      .get('donor-ok.example.com') as { id: number; status: string; is_official: number };
+    assert.ok(pendingNode1);
+    assert.equal(pendingNode1.status, 'pending');
+    assert.equal(pendingNode1.is_official, 0);
+
+    // Seed a second pending donated node to test rejection
+    sqlite
+      .prepare(
+        `INSERT INTO donated_outbounds (
+           donor_user_id, tag, protocol, server_address, server_port, config_json,
+           status, fingerprint_sha256, is_official, label
+         ) VALUES (?, 'DonorReject', 'vless', 'donor-rej.example.com', 443, '{}', 'pending', 'fp_reject_test', 0, 'DonorReject')`
+      )
+      .run(regularUserRow.id);
+    const pendingNode2 = sqlite
+      .prepare('SELECT id FROM donated_outbounds WHERE server_address = ?')
+      .get('donor-rej.example.com') as { id: number };
+
+    const listPendingNodes = await sendUpdate({
+      update_id: 616,
+      callback_query: {
+        id: 'cb_pending_nodes',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: 'adm_pending_nodes',
+      },
+    });
+    assert.ok(listPendingNodes.some((c) => String(c.body.text || '').includes('نودهای اهدایی')));
+
+    const approveNodeCalls = await sendUpdate({
+      update_id: 617,
+      callback_query: {
+        id: 'cb_approve_node',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: `adm_node_approve_${pendingNode1.id}`,
+      },
+    });
+    assert.equal(
+      (
+        sqlite
+          .prepare('SELECT status FROM donated_outbounds WHERE id = ?')
+          .get(pendingNode1.id) as { status: string }
+      ).status,
+      'active'
+    );
+    assert.ok(
+      approveNodeCalls.some(
+        (c) => c.method === 'sendMessage' && c.body.chat_id === 999002 && String(c.body.text).includes('تأیید')
+      ),
+      'Expected donor approval notification'
+    );
+
+    const rejectNodeCalls = await sendUpdate({
+      update_id: 618,
+      callback_query: {
+        id: 'cb_reject_node',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: `adm_node_reject_${pendingNode2.id}`,
+      },
+    });
+    assert.equal(
+      (
+        sqlite
+          .prepare('SELECT status FROM donated_outbounds WHERE id = ?')
+          .get(pendingNode2.id) as { status: string }
+      ).status,
+      'rejected'
+    );
+    assert.ok(
+      rejectNodeCalls.some(
+        (c) => c.method === 'sendMessage' && c.body.chat_id === 999002 && String(c.body.text).includes('رد شد')
+      ),
+      'Expected donor rejection notification'
+    );
+
+    // 5. Pending financial donations approval (upgrades subscription + notifies user) & rejection
+    sqlite
+      .prepare(
+        `INSERT INTO donations (user_id, amount, receipt_file_id, file_unique_id, status)
+         VALUES (?, 180000, 'file_approve_1', 'uniq_approve_1', 'pending')`
+      )
+      .run(regularUserRow.id);
+    const donApprove = sqlite
+      .prepare('SELECT id FROM donations WHERE file_unique_id = ?')
+      .get('uniq_approve_1') as { id: number };
+
+    sqlite
+      .prepare(
+        `INSERT INTO donations (user_id, amount, receipt_file_id, file_unique_id, status)
+         VALUES (?, 180000, 'file_reject_2', 'uniq_reject_2', 'pending')`
+      )
+      .run(regularUserRow.id);
+    const donReject = sqlite
+      .prepare('SELECT id FROM donations WHERE file_unique_id = ?')
+      .get('uniq_reject_2') as { id: number };
+
+    const listPendingDonations = await sendUpdate({
+      update_id: 619,
+      callback_query: {
+        id: 'cb_pending_don',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: 'adm_pending_donations',
+      },
+    });
+    assert.ok(listPendingDonations.some((c) => String(c.body.text || '').includes('فیش‌های مالی')));
+
+    const approveDonCalls = await sendUpdate({
+      update_id: 620,
+      callback_query: {
+        id: 'cb_don_approve',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: `adm_don_approve_${donApprove.id}`,
+      },
+    });
+    const donApprovedRow = sqlite
+      .prepare('SELECT status, subscription_granted FROM donations WHERE id = ?')
+      .get(donApprove.id) as { status: string; subscription_granted: number };
+    assert.equal(donApprovedRow.status, 'approved');
+    assert.equal(donApprovedRow.subscription_granted, 1);
+
+    const upgradedSub = sqlite
+      .prepare('SELECT tier, status FROM subscriptions WHERE user_id = ?')
+      .get(regularUserRow.id) as { tier: string; status: string };
+    assert.equal(upgradedSub.tier, 'Sentra Pro');
+    assert.equal(upgradedSub.status, 'active');
+    assert.ok(
+      approveDonCalls.some(
+        (c) => c.method === 'sendMessage' && c.body.chat_id === 999002 && String(c.body.text).includes('Sentra Pro')
+      ),
+      'Expected user subscription upgrade notification'
+    );
+
+    const rejectDonCalls = await sendUpdate({
+      update_id: 621,
+      callback_query: {
+        id: 'cb_don_reject',
+        from: adminUser,
+        message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+        data: `adm_don_reject_${donReject.id}`,
+      },
+    });
+    assert.equal(
+      (
+        sqlite
+          .prepare('SELECT status FROM donations WHERE id = ?')
+          .get(donReject.id) as { status: string }
+      ).status,
+      'rejected'
+    );
+    assert.ok(
+      rejectDonCalls.some(
+        (c) => c.method === 'sendMessage' && c.body.chat_id === 999002 && String(c.body.text).includes('رد شد')
+      ),
+      'Expected user donation rejection notification'
+    );
+
+    // 6. Admin detailed SQL error reporting on D1 failure
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      const brokenDb = {
+        prepare() {
+          return {
+            bind() {
+              return this;
+            },
+            async first() {
+              throw new Error('SQLITE_CORRUPT_ADMIN_TEST');
+            },
+            async all() {
+              throw new Error('SQLITE_CORRUPT_ADMIN_TEST');
+            },
+            async run() {
+              throw new Error('SQLITE_CORRUPT_ADMIN_TEST');
+            },
+          };
+        },
+      } as unknown as D1Database;
+
+      const adminErrCalls = await sendUpdate(
+        {
+          update_id: 622,
+          callback_query: {
+            id: 'cb_admin_err',
+            from: adminUser,
+            message: { message_id: 120, chat: { id: 999001, type: 'private' } },
+            data: 'adm_stats',
+          },
+        },
+        { ...env, DB: brokenDb }
+      );
+      assert.ok(
+        adminErrCalls.some(
+          (c) =>
+            String(c.body.text || '').includes('خطای پنل مدیریت') &&
+            String(c.body.text || '').includes('SQLITE_CORRUPT_ADMIN_TEST')
+        ),
+        'Expected detailed admin SQL error message'
+      );
+    } finally {
+      console.error = originalError;
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    sqlite.close();
   }
 });

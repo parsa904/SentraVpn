@@ -10,7 +10,10 @@
     "dev": "tsx server.ts",
     "start": "NODE_ENV=production node server.ts",
     "build": "npm run build --workspace=sentra-connect",
+    "typecheck": "npm run typecheck --workspace=sentra-connect",
     "lint": "npm run lint --workspace=sentra-connect",
+    "test": "npm run test --workspace=sentra-connect && node --experimental-strip-types --test cloudflare-worker/src/__tests__/*.test.ts",
+    "check": "npm run typecheck && npm run test && npm run build",
     "preview": "npm run preview --workspace=sentra-connect"
   },
   "dependencies": {

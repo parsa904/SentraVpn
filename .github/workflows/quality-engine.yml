@@ -2,8 +2,8 @@ name: Sentra QualityEngine (Node Health & Gemini/Trading Probe)
 
 on:
   schedule:
-    # Runs automatically every 20 minutes
-    - cron: '*/20 * * * *'
+    # Runs automatically every 30 minutes to optimize free GitHub Actions quota
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -17,7 +17,7 @@ jobs:
   quality-check:
     name: Probe Active Nodes & Report to Cloudflare D1
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository

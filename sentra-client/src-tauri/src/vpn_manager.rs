@@ -1,5 +1,4 @@
 use crate::local_proxy::LocalProxyService;
-use crate::sandbox::SandboxEngine;
 use crate::state::{AppState, ConnectionStatus};
 use crate::sysproxy;
 use crate::telemetry::TelemetryService;
@@ -16,6 +15,8 @@ use tracing::{info, warn};
 
 #[cfg(not(target_os = "android"))]
 use std::process::Stdio;
+#[cfg(not(target_os = "android"))]
+use tauri::Manager;
 #[cfg(not(target_os = "android"))]
 use tokio::process::{Child, Command};
 
@@ -163,9 +164,8 @@ impl VpnManager {
         None
     }
 
-    /// Locate sing-box binary on the system (Sidecar path, environment, or system PATH) - Desktop Only
+    /// Locate sing-box binary on Windows/Desktop (env var, exe directory for NSIS & Portable, resource dir, or PATH)
     #[cfg(not(target_os = "android"))]
-    #[allow(dead_code)]
     pub fn locate_singbox_binary(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
         // 1. Check SING_BOX_PATH env var
         if let Ok(p) = std::env::var("SING_BOX_PATH") {
@@ -175,16 +175,54 @@ impl VpnManager {
             }
         }
 
-        // 2. Check Tauri Sidecar bundled binary path if app_handle is provided
-        if let Some(_app) = app_handle {
-            // Check relative binaries directory
-            let candidate = PathBuf::from("binaries").join(format!("sing-box-{}", std::env::consts::ARCH));
+        // 2. Check next to the running executable (Tauri NSIS Setup & Windows Portable ZIP layout)
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let exe_candidates = [
+                    exe_dir.join("sing-box.exe"),
+                    exe_dir.join("sing-box"),
+                    exe_dir.join("sing-box-x86_64-pc-windows-msvc.exe"),
+                    exe_dir.join("binaries").join("sing-box.exe"),
+                    exe_dir.join("binaries").join("sing-box-x86_64-pc-windows-msvc.exe"),
+                ];
+                for candidate in exe_candidates {
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+
+        // 3. Check Tauri bundled resource directory
+        if let Some(app) = app_handle {
+            if let Ok(res_dir) = app.path().resource_dir() {
+                let res_candidates = [
+                    res_dir.join("sing-box.exe"),
+                    res_dir.join("sing-box"),
+                    res_dir.join("binaries").join("sing-box.exe"),
+                    res_dir.join("binaries").join("sing-box-x86_64-pc-windows-msvc.exe"),
+                ];
+                for candidate in res_candidates {
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+
+        // 4. Check relative binaries directory (dev environment)
+        let dev_candidates = [
+            PathBuf::from("binaries").join("sing-box-x86_64-pc-windows-msvc.exe"),
+            PathBuf::from("binaries").join("sing-box.exe"),
+            PathBuf::from("binaries").join(format!("sing-box-{}", std::env::consts::ARCH)),
+        ];
+        for candidate in dev_candidates {
             if candidate.exists() {
                 return Some(candidate);
             }
         }
 
-        // 3. Check system PATH via where.exe (Windows)
+        // 5. Check system PATH via where.exe (Windows)
         let candidates = ["sing-box.exe", "sing-box"];
         for name in &candidates {
             if let Ok(output) = std::process::Command::new("where.exe").arg(name).output() {
@@ -272,10 +310,18 @@ impl VpnManager {
                     config_resp = Some(resp);
                     break;
                 }
-                Ok(resp) if resp.status().is_server_error() => {
+                Ok(resp) if resp.status().is_server_error() || resp.status().as_u16() == 404 => {
                     last_status = Some(resp.status());
                     last_err_body = resp.text().await.ok();
-                    warn!("Config endpoint {} returned 5xx; trying next fallback...", base_url);
+                    // Fallback to direct sing-box 1.14+ subscription endpoint GET /sub/{token}?format=singbox
+                    let sub_url = format!("{}/sub/{}?format=singbox&mode={}", base_url, token, selected_mode);
+                    if let Ok(sub_resp) = client.get(&sub_url).send().await {
+                        if sub_resp.status().is_success() {
+                            config_resp = Some(sub_resp);
+                            break;
+                        }
+                    }
+                    warn!("Config endpoint {} returned {}; trying next fallback...", base_url, last_status.map(|s| s.as_u16()).unwrap_or(0));
                 }
                 Ok(resp) => {
                     last_status = Some(resp.status());
@@ -333,6 +379,8 @@ impl VpnManager {
         {
             let target_sb = if config_val.get("singbox_config").is_some() {
                 config_val.get_mut("singbox_config").unwrap()
+            } else if config_val.get("config").is_some() {
+                config_val.get_mut("config").unwrap()
             } else {
                 &mut config_val
             };
@@ -371,25 +419,31 @@ impl VpnManager {
                 }
             }
 
-            // Strict Leak Protection for Static IP (Trade & Crypto Protection)
+            // Strict Leak Protection for Static IP (sing-box 1.14+ typed DNS & reject rule action)
             if selected_mode == "static_ip" {
-                info!("Enforcing Strict Leak Protection for Static IP (IPv6 blocked, Remote Clean Global DoH enforced).");
+                info!("Enforcing Strict Leak Protection for Static IP (sing-box 1.14+: IPv6 rejected, Remote Global DoH).");
                 if let Some(dns) = target_sb.get_mut("dns") {
                     dns["servers"] = json!([
                         {
-                            "tag": "dns-remote",
-                            "address": "https://1.1.1.1/dns-query",
-                            "strategy": "ipv4_only",
+                            "type": "https",
+                            "tag": "dns-doh",
+                            "server": "1.1.1.1",
+                            "server_port": 443,
+                            "path": "/dns-query",
                             "detour": "Sentra Select"
                         },
                         {
-                            "tag": "dns-block",
-                            "address": "rcode://success"
+                            "type": "local",
+                            "tag": "dns-direct"
                         }
                     ]);
-                    dns["rules"] = json!([
-                        { "outbound": "any", "server": "dns-remote" }
-                    ]);
+                    dns["rules"] = json!([]);
+                    dns["final"] = json!("dns-doh");
+                    dns["strategy"] = json!("ipv4_only");
+                    if let Some(obj) = dns.as_object_mut() {
+                        obj.remove("independent_cache");
+                        obj.remove("fakeip");
+                    }
                 }
                 if let Some(rules) = target_sb
                     .get_mut("route")
@@ -398,24 +452,26 @@ impl VpnManager {
                 {
                     rules.insert(0, json!({
                         "ip_version": 6,
-                        "outbound": "block"
+                        "action": "reject"
                     }));
                 }
             } else if selected_mode == "gaming" {
-                info!("Applying Ultra-Low-Latency Gaming optimizations for Windows/Android (MTU 1280, Full-Cone NAT, Direct UDP DNS, Zero DPI/MUX jitter).");
-                // 1. Optimize TUN inbound for gaming UDP streams
+                info!("Applying Ultra-Low-Latency Gaming optimizations (sing-box 1.14+: MTU 1280, Full-Cone NAT, Direct UDP DNS).");
+                // 1. Optimize TUN inbound for gaming UDP streams (sing-box 1.14+ `address` array)
                 if let Some(inbounds) = target_sb.get_mut("inbounds").and_then(|i| i.as_array_mut()) {
                     for ib in inbounds {
                         if ib.get("type").and_then(|t| t.as_str()) == Some("tun") {
+                            ib["address"] = json!(["172.19.0.1/30"]);
                             ib["mtu"] = json!(1280);
                             ib["stack"] = json!("system");
                             ib["endpoint_independent_nat"] = json!(true);
                             ib["udp_timeout"] = json!("5m");
-                            ib["sniff"] = json!(false);
-                            ib["sniff_override_destination"] = json!(false);
                             ib["strict_route"] = json!(true);
                             if let Some(obj) = ib.as_object_mut() {
+                                obj.remove("inet4_address");
                                 obj.remove("inet6_address");
+                                obj.remove("sniff");
+                                obj.remove("sniff_override_destination");
                             }
                         }
                     }
@@ -429,36 +485,37 @@ impl VpnManager {
                         }
                     }
                 }
-                // 3. Direct IPv4 UDP DNS (no DoH TLS handshake jitter)
-                let gaming_dns_primary = custom_dns_for_ovpn
+                // 3. Direct IPv4 UDP DNS (sing-box 1.14+ typed servers)
+                let gaming_dns_host = custom_dns_for_ovpn
                     .as_deref()
                     .filter(|addr| !addr.starts_with("http"))
-                    .map(|addr| format!("udp://{}", addr))
-                    .unwrap_or_else(|| "udp://1.1.1.1".to_string());
+                    .map(|addr| addr.trim_start_matches("udp://").split(':').next().unwrap_or("1.1.1.1").to_string())
+                    .unwrap_or_else(|| "1.1.1.1".to_string());
                 if let Some(dns) = target_sb.get_mut("dns") {
                     dns["servers"] = json!([
                         {
+                            "type": "udp",
                             "tag": "dns-remote",
-                            "address": gaming_dns_primary,
-                            "strategy": "ipv4_only",
+                            "server": gaming_dns_host,
+                            "server_port": 53,
                             "detour": "Sentra Select"
                         },
                         {
+                            "type": "udp",
                             "tag": "dns-remote-backup",
-                            "address": "udp://8.8.8.8",
-                            "strategy": "ipv4_only",
+                            "server": "8.8.8.8",
+                            "server_port": 53,
                             "detour": "Sentra Select"
                         },
                         {
-                            "tag": "dns-direct",
-                            "address": "local",
-                            "detour": "direct"
+                            "type": "local",
+                            "tag": "dns-direct"
                         }
                     ]);
                     dns["final"] = json!("dns-remote");
                     dns["strategy"] = json!("ipv4_only");
-                    dns["independent_cache"] = json!(true);
                     if let Some(obj) = dns.as_object_mut() {
+                        obj.remove("independent_cache");
                         obj.remove("fakeip");
                     }
                 }
@@ -468,12 +525,27 @@ impl VpnManager {
                     "timestamp": true
                 });
             } else if let Some(ref dns_addr) = custom_dns_for_ovpn {
-                info!("Injecting customized DNS into connection profile: {}", dns_addr);
+                info!("Injecting customized DNS into sing-box 1.14+ profile: {}", dns_addr);
                 if let Some(dns) = target_sb.get_mut("dns") {
                     if let Some(servers) = dns.get_mut("servers").and_then(|s| s.as_array_mut()) {
                         for s in servers {
-                            if s.get("tag").and_then(|t| t.as_str()) == Some("dns-remote") {
-                                s["address"] = json!(dns_addr);
+                            let tag = s.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+                            if tag == "dns-remote" || tag == "dns-doh" {
+                                if let Some(stripped) = dns_addr.strip_prefix("https://") {
+                                    let host = stripped.split('/').next().unwrap_or("1.1.1.1");
+                                    s["type"] = json!("https");
+                                    s["server"] = json!(host);
+                                    s["server_port"] = json!(443);
+                                    s["path"] = json!("/dns-query");
+                                } else {
+                                    let host = dns_addr.trim_start_matches("udp://").split(':').next().unwrap_or("1.1.1.1");
+                                    s["type"] = json!("udp");
+                                    s["server"] = json!(host);
+                                    s["server_port"] = json!(53);
+                                }
+                                if let Some(obj) = s.as_object_mut() {
+                                    obj.remove("address");
+                                }
                             }
                         }
                     }
@@ -547,20 +619,28 @@ impl VpnManager {
             }
         }
 
-        // 3. Anti-Poisoning DNS
-        let doh_url = match anti_dpi.dns_mode.as_str() {
-            "google" => "https://8.8.8.8/dns-query",
-            "quad9" => "https://9.9.9.9/dns-query",
-            "fakeip" => "fakeip",
-            _ => "https://1.1.1.1/dns-query",
+        // 3. Anti-Poisoning DNS (sing-box 1.14+ typed DNS server fields)
+        let doh_server = match anti_dpi.dns_mode.as_str() {
+            "google" => Some("8.8.8.8"),
+            "quad9" => Some("9.9.9.9"),
+            "fakeip" => None,
+            _ => Some("1.1.1.1"),
         };
 
-        if let Some(dns) = config.get_mut("dns") {
-            if let Some(servers) = dns.get_mut("servers").and_then(|s| s.as_array_mut()) {
-                for s in servers {
-                    let tag = s.get("tag").and_then(|t| t.as_str()).unwrap_or("");
-                    if tag == "dns-remote" || tag == "dns-doh" {
-                        s["address"] = json!(doh_url);
+        if let Some(server_ip) = doh_server {
+            if let Some(dns) = config.get_mut("dns") {
+                if let Some(servers) = dns.get_mut("servers").and_then(|s| s.as_array_mut()) {
+                    for s in servers {
+                        let tag = s.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+                        if tag == "dns-remote" || tag == "dns-doh" {
+                            s["type"] = json!("https");
+                            s["server"] = json!(server_ip);
+                            s["server_port"] = json!(443);
+                            s["path"] = json!("/dns-query");
+                            if let Some(obj) = s.as_object_mut() {
+                                obj.remove("address");
+                            }
+                        }
                     }
                 }
             }
@@ -577,27 +657,31 @@ impl VpnManager {
             }
         }
 
-        // 5. National Internet / UDP Disruption preset overrides
+        // 5. National Internet / UDP Disruption preset overrides (sing-box 1.14+ reject action)
         if anti_dpi.preset == "national_disruption" {
-            // Force TCP: block UDP on port 443 (QUIC / HTTP3) so traffic immediately uses TCP
+            // Force TCP: reject UDP on port 443 (QUIC / HTTP3) so traffic immediately uses TCP
             if let Some(route) = config.get_mut("route") {
                 if let Some(rules) = route.get_mut("rules").and_then(|r| r.as_array_mut()) {
                     rules.insert(0, json!({
                         "port": 443,
                         "network": "udp",
-                        "outbound": "block"
+                        "action": "reject"
                     }));
                 }
             }
         }
     }
 
-    /// Generate complete Sing-box v1.10+ config conforming to PROTOCOL_SPEC.md (Shared Desktop & Android)
+    /// Generate complete Sing-box v1.14+ config conforming to PROTOCOL_SPEC.md (Shared Desktop & Android)
     pub fn generate_fallback_config(selected_mode: &str, split_tunneling: bool) -> Value {
         let mut rules = vec![
             json!({
+                "action": "sniff",
+                "timeout": "300ms"
+            }),
+            json!({
                 "protocol": "dns",
-                "outbound": "dns-out"
+                "action": "hijack-dns"
             }),
             json!({
                 "ip_is_private": true,
@@ -636,38 +720,44 @@ impl VpnManager {
             },
             "dns": {
                 "servers": [
-                    { "tag": "dns-fakeip", "address": "fakeip" },
-                    { "tag": "dns-remote", "address": "https://1.1.1.1/dns-query", "address_resolver": "dns-direct", "strategy": "ipv4_only", "detour": "Sentra Select" },
-                    { "tag": "dns-direct", "address": "local", "detour": "direct" },
-                    { "tag": "dns-block", "address": "rcode://success" }
+                    {
+                        "type": "fakeip",
+                        "tag": "dns-fakeip",
+                        "inet4_range": "198.18.0.0/15",
+                        "inet6_range": "fc00::/18"
+                    },
+                    {
+                        "type": "https",
+                        "tag": "dns-doh",
+                        "server": "1.1.1.1",
+                        "server_port": 443,
+                        "path": "/dns-query",
+                        "detour": "Sentra Select"
+                    },
+                    {
+                        "type": "local",
+                        "tag": "dns-direct"
+                    }
                 ],
                 "rules": [
-                    { "outbound": "any", "server": "dns-direct" },
                     { "domain_suffix": [".ir", ".gov.ir", ".co.ir", "shaparak.ir"], "server": "dns-direct" },
                     { "clash_mode": "Direct", "server": "dns-direct" },
                     { "clash_mode": "Global", "server": "dns-fakeip" },
                     { "query_type": ["A", "AAAA"], "server": "dns-fakeip" }
                 ],
-                "fakeip": {
-                    "enabled": true,
-                    "inet4_range": "198.18.0.0/15",
-                    "inet6_range": "fc00::/18"
-                },
-                "independent_cache": true
+                "final": "dns-doh",
+                "strategy": "prefer_ipv4"
             },
             "inbounds": [
                 {
                     "type": "tun",
                     "tag": "tun-in",
                     "interface_name": "sentra-tun",
-                    "inet4_address": "172.19.0.1/30",
-                    "inet6_address": "fdfe:dcba:9876::1/126",
+                    "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
                     "mtu": 1400,
                     "auto_route": true,
                     "strict_route": true,
-                    "stack": "mixed",
-                    "sniff": true,
-                    "sniff_override_destination": true
+                    "stack": "mixed"
                 }
             ],
             "outbounds": [
@@ -675,70 +765,18 @@ impl VpnManager {
                     "type": "selector",
                     "tag": "Sentra Select",
                     "outbounds": [
-                        "Sentra Auto",
-                        "Sentra Hydra",
-                        "Sentra Shadow",
-                        "Sentra Stealth",
-                        "Sentra Pulse",
                         "direct"
                     ],
-                    "default": selected_mode
-                },
-                {
-                    "type": "urltest",
-                    "tag": "Sentra Auto",
-                    "outbounds": [
-                        "Sentra Hydra",
-                        "Sentra Shadow",
-                        "Sentra Stealth",
-                        "Sentra Pulse"
-                    ],
-                    "url": "https://cp.cloudflare.com/generate_204",
-                    "interval": "15s",
-                    "tolerance": 50
-                },
-                {
-                    "type": "socks",
-                    "tag": "Sentra Hydra",
-                    "server": "127.0.0.1",
-                    "server_port": 10801,
-                    "version": "5"
-                },
-                {
-                    "type": "socks",
-                    "tag": "Sentra Shadow",
-                    "server": "127.0.0.1",
-                    "server_port": 10802,
-                    "version": "5"
-                },
-                {
-                    "type": "http",
-                    "tag": "Sentra Stealth",
-                    "server": "127.0.0.1",
-                    "server_port": 10803
-                },
-                {
-                    "type": "socks",
-                    "tag": "Sentra Pulse",
-                    "server": "127.0.0.1",
-                    "server_port": 10804,
-                    "version": "5"
+                    "default": if selected_mode == "direct" { "direct" } else { "direct" }
                 },
                 {
                     "type": "direct",
                     "tag": "direct"
-                },
-                {
-                    "type": "block",
-                    "tag": "block"
-                },
-                {
-                    "type": "dns",
-                    "tag": "dns-out"
                 }
             ],
             "route": {
                 "auto_detect_interface": true,
+                "default_domain_resolver": "dns-direct",
                 "rules": rules,
                 "final": "Sentra Select"
             }
@@ -885,7 +923,11 @@ impl VpnManager {
         let singbox_path = app_dir.join("active_singbox.json");
         let auth_path = app_dir.join("auth.txt");
 
-        if let Some(sb_cfg) = config_json.get("singbox_config") {
+        let sb_cfg = config_json
+            .get("singbox_config")
+            .or_else(|| config_json.get("config"))
+            .unwrap_or(&config_json);
+        if sb_cfg.get("outbounds").is_some() {
             if let Ok(sb_str) = serde_json::to_string_pretty(sb_cfg) {
                 let _ = fs::write(&singbox_path, sb_str);
             }
@@ -930,8 +972,11 @@ impl VpnManager {
                 "[Android] Preparing Android VpnService via SentraVpnPlugin...",
             );
 
-            // Extract actual compiled Sing-box config JSON and active server display name for Android notification
-            let singbox_payload = config_json.get("singbox_config").unwrap_or(&config_json);
+            // Extract actual compiled Sing-box 1.14+ config JSON and active server display name for Android notification
+            let singbox_payload = config_json
+                .get("singbox_config")
+                .or_else(|| config_json.get("config"))
+                .unwrap_or(&config_json);
             let active_server_label = selected_outbound_id
                 .clone()
                 .or_else(|| {
@@ -972,13 +1017,10 @@ impl VpnManager {
         {
             let singbox_bin = Self::locate_singbox_binary(Some(&app_handle));
             let ovpn_bin = Self::locate_openvpn_binary(Some(&app_handle));
-            let prefer_singbox = mode == "gaming"
-                || selected_outbound_id.is_some()
-                || selected_personal_uri.is_some()
-                || (singbox_bin.is_some() && ovpn_bin.is_none());
+            let prefer_singbox = singbox_bin.is_some();
 
             if prefer_singbox && singbox_bin.is_some() && singbox_path.exists() {
-                let bin_path = singbox_bin.unwrap_or_else(|| PathBuf::from("sing-box"));
+                let bin_path = singbox_bin.unwrap_or_else(|| PathBuf::from("sing-box.exe"));
                 info!("Launching native sing-box sidecar: {:?}", bin_path);
                 TelemetryService::emit_log(
                     &app_handle,
@@ -989,6 +1031,10 @@ impl VpnManager {
                 command.arg("run").arg("-c").arg(&singbox_path);
                 command.stdout(Stdio::piped());
                 command.stderr(Stdio::piped());
+                #[cfg(target_os = "windows")]
+                {
+                    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                }
 
                 match command.spawn() {
                     Ok(mut child) => {
@@ -1074,14 +1120,14 @@ impl VpnManager {
             } else {
                 self.is_running.store(false, Ordering::SeqCst);
                 let _ = sysproxy::disable_system_proxy();
-                SandboxEngine::run_simulation(
-                    app_handle.clone(),
-                    app_state.clone(),
-                    mode.clone(),
-                    Arc::clone(&self.is_running),
-                )
-                .await;
-                return Err("Native VPN engine (sing-box or OpenVPN) was not found in binaries or system PATH.".to_string());
+                let err_msg = "هسته بومی sing-box در پوشه برنامه یافت نشد. لطفاً نسخه رسمی Windows را مجدداً نصب یا اکسترکت کنید.".to_string();
+                {
+                    let mut state = app_state.lock().await;
+                    state.status = ConnectionStatus::Disconnected;
+                    state.logs.push(format!("[ERROR] [Sidecar] {}", err_msg));
+                }
+                TelemetryService::emit_status_change(&app_handle, "Disconnected", &mode, Some(&err_msg));
+                return Err(err_msg);
             }
 
             // Manage Local Proxy (SOCKS5/HTTP) & Windows System Proxy

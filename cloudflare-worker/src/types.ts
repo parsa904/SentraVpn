@@ -127,8 +127,47 @@ export interface HealthReportNodeResult {
   error_msg?: string | null;
 }
 
+export interface SubscriptionSourceRow {
+  id: number;
+  category: string;
+  sub_url: string;
+  tag: string | null;
+  total_nodes: number;
+  healthy_nodes: number;
+  last_sync_at: string | null;
+}
+
+export interface DiscoveredSubNodeReport {
+  tag: string;
+  protocol: string;
+  server_address: string;
+  server_port: number;
+  config_json: string;
+  raw_link: string;
+  fingerprint_sha256: string;
+  country_code: string;
+  country_name: string;
+  latency_ms: number;
+  jitter_ms: number;
+  speed_mbps: number;
+  speed_score: number;
+  health_score: number;
+  gemini_ok: boolean;
+  trading_safe: boolean;
+}
+
+export interface SubscriptionSourceHealthReport {
+  source_id: number;
+  category: string;
+  total_nodes: number;
+  healthy_nodes: number;
+  error_msg?: string | null;
+  discovered_nodes?: DiscoveredSubNodeReport[];
+}
+
 export interface HealthReportPayload {
   checked_at?: string;
   runner?: string;
   results: HealthReportNodeResult[];
+  subscription_reports?: SubscriptionSourceHealthReport[];
 }

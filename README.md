@@ -1,77 +1,109 @@
-# 🛡 پلتفرم سنترا (Sentra Platform) — معماری ۱۰۰٪ Serverless (Zero-VPS)
+<div align="center" dir="rtl">
 
-پلتفرم **Sentra** یک اکوسیستم ماژولار، سبک و کاملاً **بدون سرور (Zero-VPS)** است که با هزینه صفر روی **Cloudflare Workers + Cloudflare D1 + GitHub Actions** اجرا می‌شود. کلاینت‌های کاربر (ویندوز، اندروید و iOS) کانفیگ استاندارد `sing-box 1.14+` را مستقیماً از Cloudflare Worker دریافت کرده و بدون نیاز به هیچ سرور واسط (Bridge VPS)، مستقیماً به نودهای سالم ثبت‌شده در دیتابیس متصل می‌شوند.
+# 🛡️ SentraVPN (سنترا وی‌پی‌ان)
 
----
+**دسترسی آزاد، سریع و امن به اینترنت بدون محدودیت**
 
-## 🏗 ساختار پروژه (Monorepo Architecture)
+SentraVPN یک کلاینت هوشمند و پرسرعت برای اندروید و ویندوز است که با بهره‌گیری از پروتکل‌های مدرن ضد فیلترینگ، انتخاب خودکار سریع‌ترین سرورها و قابلیت تفکیک ترافیک داخلی (Split Tunneling)، تجربه‌ای پایدار و روان برای وب‌گردی، شبکه‌های اجتماعی، استریم و دانلود فراهم می‌کند.
 
-```text
-sentra-platform/
-├── cloudflare-worker/              # هسته مرکزی Serverless (Cloudflare Workers + D1 + Telegram Webhook)
-│   ├── wrangler.toml               # پیکربندی Worker (sentra-core) و دیتابیس D1 (sentra-db)
-│   ├── schema.sql                  # اسکیمای کامل D1 (سازگار با wrangler d1 execute بدون PRAGMA/TRIGGER)
-│   └── src/
-│       ├── index.ts                # نقطه ورود Worker با هدرهای امنیتی و CORS محدود
-│       ├── routes.ts               # اندپوینت‌های REST (/health, /sub/:token, /api/v1/client/config, /api/v1/nodes/*)
-│       ├── outboundAnalyzer.ts     # پارسر لینک‌ها، استخراج fp، uTLS اجباری Reality و اثرانگشت SHA-256
-│       ├── singboxCompiler.ts      # کامپایلر مستقیم کلاینت sing-box 1.14+ (fakeip، rule_actions، Split Tunneling)
-│       ├── telegramWebhook.ts      # ربات تلگرام مبتنی بر Webhook با ذخیره وضعیت در D1
-│       └── security.ts             # PBKDF2-SHA256، مقایسه امن کلیدها و اعتبارسنجی آدرس‌ها
-├── .github/
-│   ├── scripts/
-│   │   └── quality-check.ts        # موتور مستقل پایش کیفیت نودها (پینگ، جیتر، Gemini و پلتفرم‌های ترید)
-│   └── workflows/
-│       ├── deploy-cloudflare.yml   # اجرای تست‌ها، به‌روزرسانی D1 (schema.sql) و دیپلوی خودکار Worker
-│       └── quality-engine.yml      # اجرای خودکار پایش نودها هر ۲۰ دقیقه در GitHub Actions
-├── sentra-client/                  # اپلیکیشن کلاینت دسکتاپ و اندروید (Tauri v2 + Vite + TailwindCSS)
-└── docs/                           # مستندات فنی و طراحی محصول
-```
+<p>
+  <a href="https://t.me/SentraVpnBot">
+    <img src="https://img.shields.io/badge/Telegram_Bot-@SentraVpnBot-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="ربات تلگرام SentraVPN" />
+  </a>
+  <a href="https://github.com/parsa904/sentravpn/releases/latest">
+    <img src="https://img.shields.io/github/v/release/parsa904/sentravpn?style=for-the-badge&label=%D8%A2%D8%AE%D8%B1%DB%8C%D9%86%20%D9%86%D8%B3%D8%AE%D9%87&color=10B981" alt="آخرین نسخه" />
+  </a>
+</p>
+
+</div>
 
 ---
 
-## 🚀 راه‌اندازی و دیپلوی کاملاً رایگان (Cloudflare + GitHub Actions)
+<div dir="rtl">
 
-### ۱. تنظیم سکرت‌های Cloudflare Worker (`sentra-core`)
-از داخل پوشه `cloudflare-worker` یا پنل Cloudflare Workers مقادیر زیر را ثبت کنید:
-- `TELOXIDE_TOKEN` — توکن ربات تلگرام
-- `TELEGRAM_WEBHOOK_SECRET` — کلید تصادفی تایید هدر وب‌هوک تلگرام
-- `ADMIN_CHAT_ID` — شناسه عددی ادمین اصلی در تلگرام
-- `QUALITY_ENGINE_SECRET` — کلید مشترک برای ارتباط امن GitHub Actions با اندپوینت‌های پایش کیفیت
-- `WIREGUARD_SERVER_PUBLIC_KEY` و `WIREGUARD_KEY_SALT` — (اختیاری) جهت تولید پروفایل WireGuard گیمینگ iOS
+## ✨ چرا SentraVPN؟
 
-### ۲. تنظیم سکرت‌های GitHub Actions
-در بخش **Settings → Secrets and variables → Actions** مخزن گیتهاب:
-- `CLOUDFLARE_API_TOKEN`
-- `CLOUDFLARE_ACCOUNT_ID`
-- `QUALITY_ENGINE_SECRET`
-- `SENTRA_WORKER_URL` (پیش‌فرض: `https://sentra-core.kziepr.workers.dev`)
-
-### ۳. دیپلوی خودکار و ثبت Webhook تلگرام
-با هر Push به شاخه `main`، ورک‌فلو `deploy-cloudflare.yml` به‌صورت خودکار تست‌ها را اجرا، فایل `schema.sql` را روی دیتابیس D1 اعمال و Worker را دیپلوی می‌کند. سپس یک‌بار Webhook تلگرام را ثبت کنید:
-
-```bash
-curl -X POST "https://api.telegram.org/bot<TELOXIDE_TOKEN>/setWebhook" \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://sentra-core.kziepr.workers.dev/api/v1/telegram/webhook","secret_token":"<TELEGRAM_WEBHOOK_SECRET>"}'
-```
+- **اتصال یک‌کلیکی و هوشمند:** انتخاب خودکار سریع‌ترین و پایدارترین سرور متناسب با اینترنت شما.
+- **مقاوم در برابر فیلترینگ شدید:** پشتیبانی از پروتکل‌های رمزنگاری‌شده جدید با پایداری بالا روی اینترنت همراه و خانگی.
+- **باز شدن هم‌زمان سایت‌ها و اپ‌های داخلی:** عبور مستقیم ترافیک ایران بدون نیاز به قطع کردن فیلترشکن (Split Tunneling).
+- **دریافت آنی اشتراک از تلگرام:** بدون نیاز به مراحل پیچیده؛ اشتراک و کد ورود خود را مستقیماً از ربات تلگرام [@SentraVpnBot](https://t.me/SentraVpnBot) دریافت کنید.
+- **اتصال خودکار پس از تغییر شبکه:** حفظ پایداری اتصال هنگام جابه‌جایی بین وای‌فای و اینترنت موبایل.
 
 ---
 
-## 💻 توسعه محلی اپلیکیشن کلاینت (`sentra-client`)
+## 📥 دانلود آخرین نسخه
 
-```bash
-cd sentra-client
-npm install
-npm run dev          # پیش‌نمایش رابط کاربری
-npm run tauri dev    # اجرای دسکتاپ نیتیو Tauri v2
-```
+نسخه مناسب دستگاه خود را از جدول زیر انتخاب و دانلود کنید:
+
+</div>
+
+<div align="center">
+
+<table>
+  <thead>
+    <tr>
+      <th align="center">System</th>
+      <th align="center">Download</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td align="center"><strong>Android</strong></td>
+      <td align="center">
+        <a href="https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-Universal.apk">
+          <img src="https://img.shields.io/badge/APK-Universal-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Download Android Universal APK" />
+        </a>
+        <a href="https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-ARMv8.apk">
+          <img src="https://img.shields.io/badge/APK-ARMv8-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Download Android ARMv8 APK" />
+        </a>
+        <a href="https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-ARMv7.apk">
+          <img src="https://img.shields.io/badge/APK-ARMv7-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Download Android ARMv7 APK" />
+        </a>
+        <a href="https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-x64.apk">
+          <img src="https://img.shields.io/badge/APK-x64-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Download Android x64 APK" />
+        </a>
+      </td>
+    </tr>
+    <tr>
+      <td align="center"><strong>Windows</strong></td>
+      <td align="center">
+        <a href="https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Windows-Setup-x64.exe">
+          <img src="https://img.shields.io/badge/Setup-x64-0078D6?style=for-the-badge&logo=windows&logoColor=white" alt="Download Windows Setup x64" />
+        </a>
+        <a href="https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Windows-Portable-x64.zip">
+          <img src="https://img.shields.io/badge/Portable-x64-0078D6?style=for-the-badge&logo=windows&logoColor=white" alt="Download Windows Portable x64" />
+        </a>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+</div>
+
+<div dir="rtl">
+
+> **راهنمای انتخاب نسخه مناسب:**
+> - در **اندروید**: اگر مطمئن نیستید کدام نسخه برای گوشی شما مناسب است، نسخه **Universal** را دانلود کنید. برای گوشی‌های جدیدتر با حجم فایل کمتر، نسخه **ARMv8** بهترین انتخاب است.
+> - در **ویندوز**: برای نصب دائمی همراه با میانبر منوی استارت نسخه **Setup x64** و برای اجرا بدون نیاز به نصب (فایل فشرده آماده) نسخه **Portable x64** را انتخاب کنید.
 
 ---
 
-## 🌟 ویژگی‌های کلیدی معماری Zero-VPS
+## 🚀 راهنمای شروع سریع (۳ مرحله ساده)
 
-- **اتصال مستقیم کلاینت به نودها (`Direct-to-Node`):** هیچ سرور واسط (VPS) در مسیر ترافیک وجود ندارد؛ کلاینت‌ها لیست نودهای سالم (`donated_outbounds` و `outbounds`) را در قالب JSON استاندارد `sing-box 1.14+` می‌گیرند.
-- **سازگاری کامل با `sing-box 1.14+`:** استفاده از `type: "fakeip"` داخل `dns.servers`، استفاده از `rule_actions` (`sniff` و `hijack-dns`) به جای `dns-out`، Split Tunneling دامنه‌های `.ir` و بانک‌های ایرانی (`direct`)، تزریق اجباری `utls` برای Reality و حذف کامل کلیدهای منسوخ `independent_cache` و `_sentra_meta`.
-- **پایش خودکار کیفیت در GitHub Actions:** هر ۲۰ دقیقه تمام نودها از نظر پینگ، جیتر، امنیت پروتکل، دسترسی به Google Gemini و پلتفرم‌های ترید بررسی و نتیجه به `POST /api/v1/nodes/health-report` ارسال می‌شود.
-- **ربات تلگرام Webhook-based:** مدیریت ثبت‌نام/ورود، پروفایل کاربری، بخش گیمینگ (فعال‌سازی خودکار با افزودن نود گیمینگ)، اهدای اوتباند و ایمپورت لینک ساب ادمین بدون نیاز به سرور همیشه روشن.
+1. **دریافت اشتراک از ربات تلگرام:**
+   وارد ربات رسمی [@SentraVpnBot](https://t.me/SentraVpnBot) شوید، دکمه **Start** را بزنید و لینک اشتراک یا کد ورود ۸ رقمی خود را دریافت کنید.
+2. **دانلود و نصب اپلیکیشن:**
+   از جدول بالا نسخه مناسب دستگاه **اندروید** یا **ویندوز** خود را دانلود و نصب (یا در نسخه پرتابل ویندوز، از حالت فشرده خارج) کنید.
+3. **ورود و اتصال:**
+   برنامه **SentraVPN** را باز کنید، با کد ورود تلگرام (یا نام کاربری و رمز عبور / لینک اشتراک) وارد شوید و دکمه **اتصال** را بزنید تا به اینترنت آزاد متصل شوید.
+
+---
+
+## 💬 پشتیبانی و اطلاع‌رسانی
+
+برای دریافت اشتراک، تمدید، ارتقای پلن یا ارتباط با پشتیبانی، از طریق ربات رسمی تلگرام با ما در ارتباط باشید:
+
+- ربات رسمی تلگرام: [@SentraVpnBot](https://t.me/SentraVpnBot)
+- صفحه آخرین انتشارها: [GitHub Releases](https://github.com/parsa904/sentravpn/releases/latest)
+
+</div>

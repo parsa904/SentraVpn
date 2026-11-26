@@ -601,15 +601,17 @@ async function insertOfficialOutboundD1(
     return { inserted: false, duplicate: true };
   }
 
-  const allowWeb = ['free_only', 'both', 'all', 'auto'].includes(allocationMode) ? 1 : 0;
-  const allowDownload = ['free_only', 'both', 'all', 'auto'].includes(allocationMode) ? 1 : 0;
-  const allowGaming = ['gaming_only', 'all'].includes(allocationMode) ? 1 : 0;
-  const allowStatic = ['static_only', 'both', 'all'].includes(allocationMode) ? 1 : 0;
+  const allowWeb = ['free_only', 'both', 'all', 'auto', 'web_browsing'].includes(allocationMode) ? 1 : 0;
+  const allowDownload = ['free_only', 'both', 'all', 'auto', 'download'].includes(allocationMode) ? 1 : 0;
+  const allowGaming = ['gaming_only', 'all', 'gaming'].includes(allocationMode) ? 1 : 0;
+  const allowStatic = ['static_only', 'both', 'all', 'static_ip'].includes(allocationMode) ? 1 : 0;
   const assignedTier =
-    allocationMode === 'gaming_only'
+    allocationMode === 'gaming_only' || allocationMode === 'gaming'
       ? 'gaming'
-      : allocationMode === 'static_only'
+      : allocationMode === 'static_only' || allocationMode === 'static_ip'
       ? 'static_ip'
+      : allocationMode === 'download'
+      ? 'download'
       : 'web_browsing';
 
   await db
@@ -671,9 +673,22 @@ async function handleAdminOutboundSubmission(
       return;
     }
 
-    const resp = await fetch(validUrl.toString(), {
-      headers: { 'User-Agent': 'SentraCore/2.0 (Cloudflare-Worker)' },
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(validUrl.toString(), {
+        headers: { 'User-Agent': 'SentraCore/2.0 (Cloudflare-Worker)' },
+        signal: AbortSignal.timeout(12_000),
+      });
+    } catch (err) {
+      await tgSendMessage(
+        env,
+        chatId,
+        `❌ خطا یا اتمام زمان (Timeout) در دریافت سابسکریپشن:\n<code>${escapeHtml(
+          err instanceof Error ? err.message : String(err)
+        )}</code>`
+      );
+      return;
+    }
     if (!resp.ok) {
       await tgSendMessage(env, chatId, `❌ خطا در دریافت سابسکریپشن (کد HTTP ${resp.status}).`);
       return;
@@ -695,17 +710,19 @@ async function handleAdminOutboundSubmission(
     }
 
     const category =
-      allocationMode === 'gaming_only'
+      allocationMode === 'gaming_only' || allocationMode === 'gaming'
         ? 'gaming'
-        : allocationMode === 'static_only'
+        : allocationMode === 'static_only' || allocationMode === 'static_ip'
         ? 'static_ip'
+        : allocationMode === 'download'
+        ? 'download'
         : 'web_browsing';
 
     await env.DB.prepare(
       `INSERT INTO subscription_sources (category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at)
        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
     )
-      .bind(category, validUrl.toString(), `Sub (${allocationMode})`, nodes.length, added)
+      .bind(category, validUrl.toString(), `Sub (${category})`, nodes.length, added)
       .run();
 
     const gamingNote =
@@ -790,17 +807,311 @@ const ADMIN_TIER_CONFIG: Record<string, { tier: string; limitBytes: number; labe
 function buildAdminPanelHomeView(): { text: string; replyMarkup: Record<string, unknown> } {
   return {
     text:
-      '🛠 <b>پنل مدیریت Sentra Platform</b>\n\n' +
-      'از منوی زیر بخش مورد نظر خود را برای افزودن نود، مدیریت سابسکریپشن‌ها یا مشاهده آمار سیستم انتخاب کنید:',
+      '🛠 <b>پنل مدیریت Sentra Platform (Cloudflare D1)</b>\n\n' +
+      'از منوی زیر بخش مورد نظر را برای مدیریت نودهای رسمی، منابع سابسکریپشن، بررسی نودهای اهدایی و فیش‌های مالی، مدیریت کاربران یا آمار سیستم انتخاب کنید:',
     replyMarkup: {
       inline_keyboard: [
         [
-          { text: '➕ افزودن نود / ساب‌لینک', callback_data: 'adm_add_node' },
+          { text: '➕ افزودن نود رسمی', callback_data: 'adm_add_node' },
           { text: '📋 لیست نودها', callback_data: 'adm_list_nodes' },
         ],
         [
-          { text: '👥 مدیریت سابسکریپشن‌ها', callback_data: 'adm_manage_subs' },
+          { text: '🔗 منابع سابسکریپشن', callback_data: 'adm_sub_sources' },
+          { text: '👥 کاربران و اشتراک‌ها', callback_data: 'adm_manage_subs' },
+        ],
+        [
+          { text: '📥 نودهای اهدایی (در انتظار)', callback_data: 'adm_pending_nodes' },
+          { text: '💳 فیش‌های مالی (در انتظار)', callback_data: 'adm_pending_donations' },
+        ],
+        [
           { text: '📊 آمار سیستم', callback_data: 'adm_stats' },
+          { text: '🏠 بازگشت به منوی اصلی', callback_data: 'user_menu_home' },
+        ],
+      ],
+    },
+  };
+}
+
+const VALID_SUB_SOURCE_CATEGORIES = ['web_browsing', 'download', 'gaming', 'static_ip'] as const;
+type SubSourceCategory = (typeof VALID_SUB_SOURCE_CATEGORIES)[number];
+
+async function buildAdminSubSourcesView(
+  env: Env
+): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
+  const rows = await env.DB.prepare(
+    `SELECT id, category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at
+     FROM subscription_sources
+     ORDER BY id DESC
+     LIMIT 10`
+  ).all<{
+    id: number;
+    category: string;
+    sub_url: string;
+    tag: string | null;
+    total_nodes: number;
+    healthy_nodes: number;
+    last_sync_at: string;
+  }>();
+
+  const list = rows.results || [];
+  const lines = list.map((s) => {
+    const shortUrl = s.sub_url.length > 48 ? `${s.sub_url.slice(0, 48)}...` : s.sub_url;
+    return (
+      `🔹 <b>#${s.id}</b> [<code>${escapeHtml(s.category)}</code>] — نودها: <b>${s.healthy_nodes}/${s.total_nodes}</b>\n` +
+      `   🔗 <code>${escapeHtml(shortUrl)}</code>`
+    );
+  });
+
+  const deleteButtons: Array<Array<{ text: string; callback_data: string }>> = [];
+  for (let i = 0; i < list.length; i += 2) {
+    const rowBtns: Array<{ text: string; callback_data: string }> = [];
+    for (const src of list.slice(i, i + 2)) {
+      rowBtns.push({
+        text: `🗑 حذف #${src.id} (${src.category})`,
+        callback_data: `adm_subsrc_del_${src.id}`,
+      });
+    }
+    deleteButtons.push(rowBtns);
+  }
+
+  return {
+    text:
+      `🔗 <b>مدیریت منابع سابسکریپشن (subscription_sources)</b>\n\n` +
+      (lines.length > 0 ? lines.join('\n') : '<i>هیچ منبع سابسکریپشنی هنوز ثبت نشده است.</i>'),
+    replyMarkup: {
+      inline_keyboard: [
+        [{ text: '➕ افزودن لینک سابسکریپشن جدید', callback_data: 'adm_subsrc_add' }],
+        ...deleteButtons,
+        [
+          { text: '🔄 بروزرسانی', callback_data: 'adm_sub_sources' },
+          { text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' },
+        ],
+      ],
+    },
+  };
+}
+
+function buildAdminAddSubSourceCategoryView(): {
+  text: string;
+  replyMarkup: Record<string, unknown>;
+} {
+  return {
+    text:
+      '🔗 <b>افزودن منبع سابسکریپشن جدید</b>\n\n' +
+      'ابتدا دسته‌بندی هدف برای این لینک سابسکریپشن را انتخاب کنید:',
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          { text: '🌐 وب‌گردی (web_browsing)', callback_data: 'adm_subsrc_cat_web_browsing' },
+          { text: '📥 دانلود (download)', callback_data: 'adm_subsrc_cat_download' },
+        ],
+        [
+          { text: '🎮 گیمینگ (gaming)', callback_data: 'adm_subsrc_cat_gaming' },
+          { text: '💎 آی‌پی ثابت (static_ip)', callback_data: 'adm_subsrc_cat_static_ip' },
+        ],
+        [{ text: '🔙 بازگشت به منابع سابسکریپشن', callback_data: 'adm_sub_sources' }],
+      ],
+    },
+  };
+}
+
+async function handleAdminSubSourceSubmission(
+  env: Env,
+  chatId: number,
+  rawUrl: string,
+  category: SubSourceCategory
+): Promise<void> {
+  let validUrl: URL;
+  try {
+    validUrl = validateExternalHttpsUrl(rawUrl.trim());
+  } catch (err) {
+    await tgSendMessage(
+      env,
+      chatId,
+      `❌ ${escapeHtml(err instanceof Error ? err.message : 'لینک سابسکریپشن نامعتبر است.')}`,
+      { inline_keyboard: [[{ text: '🔙 منابع سابسکریپشن', callback_data: 'adm_sub_sources' }]] }
+    );
+    return;
+  }
+
+  let totalNodes = 0;
+  let addedNodes = 0;
+  let duplicates = 0;
+  let skipped = 0;
+  let fetchWarning = '';
+
+  try {
+    const resp = await fetch(validUrl.toString(), {
+      headers: { 'User-Agent': 'SentraCore/2.0 (Cloudflare-Worker)' },
+      signal: AbortSignal.timeout(12_000),
+    });
+    if (resp.ok) {
+      const body = await resp.text();
+      const parsedSub = await parseSubscriptionPayload(body);
+      totalNodes = parsedSub.nodes.length;
+      skipped = parsedSub.skipped;
+      for (const node of parsedSub.nodes.slice(0, 100)) {
+        const res = await insertOfficialOutboundD1(env.DB, node, category);
+        if (res.inserted) addedNodes += 1;
+        else if (res.duplicate) duplicates += 1;
+      }
+    } else {
+      fetchWarning = `\n⚠️ دریافت اولیه نودها با کد HTTP ${resp.status} مواجه شد، اما منبع در دیتابیس ذخیره گردید.`;
+    }
+  } catch (err) {
+    fetchWarning = `\n⚠️ خطای دریافت اولیه نودها (${escapeHtml(
+      err instanceof Error ? err.message : String(err)
+    )})؛ منبع ذخیره شد.`;
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO subscription_sources (category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at)
+     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+  )
+    .bind(category, validUrl.toString(), `Source (${category})`, totalNodes, addedNodes)
+    .run();
+
+  const gamingNote =
+    category === 'gaming' && addedNodes > 0
+      ? '\n\n🎮 <b>بخش گیمینگ به صورت خودکار در کل اکوسیستم فعال شد!</b>'
+      : '';
+
+  await tgSendMessage(
+    env,
+    chatId,
+    `✅ <b>منبع سابسکریپشن جدید ثبت شد</b>\n\n` +
+      `📂 دسته‌بندی: <code>${escapeHtml(category)}</code>\n` +
+      `🔗 آدرس: <code>${escapeHtml(validUrl.toString())}</code>\n` +
+      `🔹 نودهای ثبت‌شده: <b>${addedNodes}</b> از <b>${totalNodes}</b> (تکراری: ${duplicates} | نامعتبر: ${skipped})${fetchWarning}${gamingNote}`,
+    {
+      inline_keyboard: [
+        [{ text: '🔗 مشاهده لیست منابع', callback_data: 'adm_sub_sources' }],
+        [{ text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' }],
+      ],
+    }
+  );
+}
+
+interface PendingNodeRow {
+  id: number;
+  donor_user_id: number | null;
+  tag: string;
+  protocol: string;
+  server_address: string;
+  server_port: number;
+  country_name: string;
+  created_at: string;
+  donor_telegram_id: number | null;
+  donor_first_name: string | null;
+  donor_username: string | null;
+}
+
+async function buildAdminPendingNodesView(
+  env: Env
+): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
+  const rows = await env.DB.prepare(
+    `SELECT
+       d.id, d.donor_user_id, d.tag, d.protocol, d.server_address, d.server_port,
+       d.country_name, d.created_at,
+       u.telegram_id AS donor_telegram_id, u.first_name AS donor_first_name, u.username AS donor_username
+     FROM donated_outbounds d
+     LEFT JOIN users u ON u.id = d.donor_user_id
+     WHERE d.status = 'pending'
+     ORDER BY d.id ASC
+     LIMIT 5`
+  ).all<PendingNodeRow>();
+
+  const list = rows.results || [];
+  const lines = list.map((n) => {
+    const donor = n.donor_username
+      ? `@${escapeHtml(n.donor_username)}`
+      : n.donor_first_name
+      ? escapeHtml(n.donor_first_name)
+      : 'ناشناس';
+    return (
+      `🔹 <b>نود #${n.id}</b> — <code>${escapeHtml(n.protocol)}</code>\n` +
+      `   🏷 ${escapeHtml(n.tag.slice(0, 32))} | 🌍 ${escapeHtml(n.country_name)}\n` +
+      `   🌐 <code>${escapeHtml(n.server_address)}:${n.server_port}</code> | 👤 اهداکننده: ${donor}`
+    );
+  });
+
+  const actionRows: Array<Array<{ text: string; callback_data: string }>> = list.map((n) => [
+    { text: `✅ تأیید نود #${n.id}`, callback_data: `adm_node_approve_${n.id}` },
+    { text: `❌ رد نود #${n.id}`, callback_data: `adm_node_reject_${n.id}` },
+  ]);
+
+  return {
+    text:
+      `📥 <b>نودهای اهدایی در انتظار تأیید (${list.length})</b>\n\n` +
+      (lines.length > 0 ? lines.join('\n\n') : '<i>✅ هیچ نود اهدایی در انتظار تأیید وجود ندارد.</i>'),
+    replyMarkup: {
+      inline_keyboard: [
+        ...actionRows,
+        [
+          { text: '🔄 بروزرسانی', callback_data: 'adm_pending_nodes' },
+          { text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' },
+        ],
+      ],
+    },
+  };
+}
+
+interface PendingDonationRow {
+  id: number;
+  user_id: number;
+  amount: number;
+  receipt_file_id: string;
+  status: string;
+  created_at: string;
+  telegram_id: number | null;
+  username: string | null;
+  first_name: string;
+}
+
+async function buildAdminPendingDonationsView(
+  env: Env
+): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
+  const rows = await env.DB.prepare(
+    `SELECT
+       d.id, d.user_id, d.amount, d.receipt_file_id, d.status, d.created_at,
+       u.telegram_id, u.username, u.first_name
+     FROM donations d
+     JOIN users u ON u.id = d.user_id
+     WHERE d.status = 'pending'
+     ORDER BY d.id ASC
+     LIMIT 5`
+  ).all<PendingDonationRow>();
+
+  const list = rows.results || [];
+  const lines = list.map((d) => {
+    const userLabel = d.username
+      ? `${escapeHtml(d.first_name)} (@${escapeHtml(d.username)})`
+      : `${escapeHtml(d.first_name)} (ID:${d.telegram_id ?? 'N/A'})`;
+    const refPreview = d.receipt_file_id.startsWith('text_ref:')
+      ? `کد پیگیری: <code>${escapeHtml(d.receipt_file_id.slice('text_ref:'.length, 60))}</code>`
+      : `فایل فیش: <code>${escapeHtml(d.receipt_file_id.slice(0, 24))}...</code>`;
+    return (
+      `💳 <b>فیش #DON-${d.id}</b> — <b>${d.amount.toLocaleString('en-US')} تومان</b>\n` +
+      `   👤 ${userLabel}\n` +
+      `   🧾 ${refPreview} | 📅 ${escapeHtml(d.created_at.slice(0, 16))}`
+    );
+  });
+
+  const actionRows: Array<Array<{ text: string; callback_data: string }>> = list.map((d) => [
+    { text: `✅ تأیید #DON-${d.id}`, callback_data: `adm_don_approve_${d.id}` },
+    { text: `❌ رد #DON-${d.id}`, callback_data: `adm_don_reject_${d.id}` },
+  ]);
+
+  return {
+    text:
+      `💳 <b>فیش‌های مالی در انتظار تأیید (${list.length})</b>\n\n` +
+      (lines.length > 0 ? lines.join('\n\n') : '<i>✅ هیچ فیش مالی در انتظار بررسی وجود ندارد.</i>'),
+    replyMarkup: {
+      inline_keyboard: [
+        ...actionRows,
+        [
+          { text: '🔄 بروزرسانی', callback_data: 'adm_pending_donations' },
+          { text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' },
         ],
       ],
     },
@@ -1096,6 +1407,13 @@ async function buildAdminStatsView(
     'SELECT COUNT(*) AS total_sources FROM subscription_sources'
   ).first<{ total_sources: number }>();
 
+  const pendingStats = await env.DB.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM donated_outbounds WHERE status = 'pending') AS pending_nodes,
+       (SELECT COUNT(*) FROM donations WHERE status = 'pending') AS pending_donations,
+       (SELECT COUNT(*) FROM support_tickets WHERE status = 'open') AS open_tickets`
+  ).first<{ pending_nodes: number; pending_donations: number; open_tickets: number }>();
+
   const gamingLive = await hasActiveGamingOutbounds(env.DB);
   const tierLines = (tierBreakdown.results || [])
     .map((t) => `   • ${escapeHtml(t.tier)}: <b>${t.cnt}</b>`)
@@ -1107,9 +1425,10 @@ async function buildAdminStatsView(
     `🎫 <b>سابسکریپشن‌ها:</b> ${subStats?.total_subs || 0} (فعال: ${subStats?.active_subs || 0})\n` +
     (tierLines ? `${tierLines}\n` : '') +
     `📈 <b>کل ترافیک مصرفی:</b> ${formatGb(subStats?.total_bytes || 0)} GB\n\n` +
-    `🌐 <b>نودها و اوتباندها:</b> ${nodeStats?.total_nodes || 0} (فعال: ${nodeStats?.active_nodes || 0} | رسمی: ${nodeStats?.official_nodes || 0})\n` +
+    `🌐 <b>نودها و اوتباندها:</b> ${nodeStats?.total_nodes || 0} (سالم/فعال: ${nodeStats?.active_nodes || 0} | رسمی: ${nodeStats?.official_nodes || 0})\n` +
     `   • گیمینگ فعال: <b>${nodeStats?.gaming_nodes || 0}</b> | آی‌پی ثابت: <b>${nodeStats?.static_nodes || 0}</b>\n` +
-    `   • منابع سابسکریپشن ثبت‌شده: <b>${sourceStats?.total_sources || 0}</b>\n` +
+    `   • منابع سابسکریپشن ثبت‌شده: <b>${sourceStats?.total_sources || 0}</b>\n\n` +
+    `⏳ <b>صف بررسی مدیریت:</b> نود اهدایی (${pendingStats?.pending_nodes || 0}) | فیش مالی (${pendingStats?.pending_donations || 0}) | تیکت باز (${pendingStats?.open_tickets || 0})\n` +
     `🎮 <b>وضعیت بخش گیمینگ:</b> ${gamingLive ? 'فعال ✅' : 'به‌زودی ⏳'}`;
 
   return {
@@ -1117,7 +1436,10 @@ async function buildAdminStatsView(
     replyMarkup: {
       inline_keyboard: [
         [{ text: '🔄 بروزرسانی آمار', callback_data: 'adm_stats' }],
-        [{ text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' }],
+        [
+          { text: '🔙 پنل مدیریت', callback_data: 'adm_panel_home' },
+          { text: '🏠 منوی اصلی', callback_data: 'user_menu_home' },
+        ],
       ],
     },
   };
@@ -1854,14 +2176,14 @@ async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<
       return;
     }
 
-    // --- Admin Panel Callbacks ---
-    if (data.startsWith('adm_')) {
+    // --- Admin Panel Callbacks (Strict Admin Guard for adm_* / admin_*) ---
+    if (data.startsWith('adm_') || data.startsWith('admin_')) {
       if (!isAdmin) {
-        await tgSendMessage(env, chatId, '⛔️ شما دسترسی به پنل مدیریت ندارید.');
+        await tgSendMessage(env, chatId, '⛔ دسترسی غیرمجاز');
         return;
       }
 
-      if (data === 'adm_panel_home') {
+      if (data === 'adm_panel_home' || data === 'admin_panel_home') {
         await clearBotState(env.DB, telegramId);
         await sendOrEditView(env, chatId, messageId, buildAdminPanelHomeView());
         return;
@@ -1874,6 +2196,217 @@ async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<
 
       if (data === 'adm_list_nodes') {
         const view = await buildAdminNodesView(env);
+        await sendOrEditView(env, chatId, messageId, view);
+        return;
+      }
+
+      // --- Subscription Sources Management (subscription_sources) ---
+      if (data === 'adm_sub_sources') {
+        await clearBotState(env.DB, telegramId);
+        const view = await buildAdminSubSourcesView(env);
+        await sendOrEditView(env, chatId, messageId, view);
+        return;
+      }
+
+      if (data === 'adm_subsrc_add') {
+        await sendOrEditView(env, chatId, messageId, buildAdminAddSubSourceCategoryView());
+        return;
+      }
+
+      if (data.startsWith('adm_subsrc_cat_')) {
+        const rawCat = data.slice('adm_subsrc_cat_'.length);
+        if (!VALID_SUB_SOURCE_CATEGORIES.includes(rawCat as SubSourceCategory)) {
+          await tgSendMessage(env, chatId, '❌ دسته‌بندی انتخابی نامعتبر است.');
+          return;
+        }
+        await setBotState(env.DB, telegramId, 'admin_awaiting_sub_source', { category: rawCat });
+        await tgSendMessage(
+          env,
+          chatId,
+          `🔗 <b>ارسال لینک سابسکریپشن برای دسته <code>${escapeHtml(rawCat)}</code></b>\n\n` +
+            `لطفاً آدرس کامل سابسکریپشن (<code>https://...</code>) را ارسال کنید:`,
+          buildCancelStateInlineMarkup()
+        );
+        return;
+      }
+
+      if (data.startsWith('adm_subsrc_del_')) {
+        const srcId = Number(data.slice('adm_subsrc_del_'.length));
+        if (!Number.isInteger(srcId) || srcId <= 0) return;
+        await env.DB.prepare('DELETE FROM subscription_sources WHERE id = ?').bind(srcId).run();
+        const view = await buildAdminSubSourcesView(env);
+        await sendOrEditView(env, chatId, messageId, view);
+        return;
+      }
+
+      // --- Pending Donated Outbounds Review (donated_outbounds status='pending') ---
+      if (data === 'adm_pending_nodes') {
+        const view = await buildAdminPendingNodesView(env);
+        await sendOrEditView(env, chatId, messageId, view);
+        return;
+      }
+
+      if (data.startsWith('adm_node_approve_') || data.startsWith('adm_node_reject_')) {
+        const isApprove = data.startsWith('adm_node_approve_');
+        const nodeId = Number(
+          data.slice(isApprove ? 'adm_node_approve_'.length : 'adm_node_reject_'.length)
+        );
+        if (!Number.isInteger(nodeId) || nodeId <= 0) return;
+
+        const nodeRow = await env.DB.prepare(
+          `SELECT d.id, d.tag, d.status, u.telegram_id AS donor_telegram_id
+           FROM donated_outbounds d
+           LEFT JOIN users u ON u.id = d.donor_user_id
+           WHERE d.id = ?
+           LIMIT 1`
+        )
+          .bind(nodeId)
+          .first<{ id: number; tag: string; status: string; donor_telegram_id: number | null }>();
+
+        if (!nodeRow) {
+          await tgSendMessage(env, chatId, '❌ نود مورد نظر یافت نشد.');
+          return;
+        }
+
+        if (isApprove) {
+          await env.DB.prepare(
+            `UPDATE donated_outbounds
+             SET status = 'active', rejection_reason = NULL,
+                 last_online_at = CURRENT_TIMESTAMP, last_checked_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?`
+          )
+            .bind(nodeId)
+            .run();
+
+          if (nodeRow.donor_telegram_id) {
+            await tgSendMessage(
+              env,
+              nodeRow.donor_telegram_id,
+              `✅ <b>نود اهدایی شما تأیید و فعال شد!</b>\n\n` +
+                `🏷 نام نود: <b>${escapeHtml(nodeRow.tag)}</b> (#${nodeRow.id})\n` +
+                `🤝 از حمایت ارزشمند شما از اکوسیستم Sentra سپاسگزاریم.`
+            );
+          }
+        } else {
+          await env.DB.prepare(
+            `UPDATE donated_outbounds
+             SET status = 'rejected', rejection_reason = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?`
+          )
+            .bind('رد شده توسط مدیریت', nodeId)
+            .run();
+
+          if (nodeRow.donor_telegram_id) {
+            await tgSendMessage(
+              env,
+              nodeRow.donor_telegram_id,
+              `❌ <b>نود اهدایی شما (#${nodeRow.id}) توسط مدیریت رد شد.</b>\n\n` +
+                `🏷 نام نود: <b>${escapeHtml(nodeRow.tag)}</b>\n` +
+                `در صورت تمایل می‌توانید نود سالم دیگری ارسال کنید.`
+            );
+          }
+        }
+
+        const view = await buildAdminPendingNodesView(env);
+        await sendOrEditView(env, chatId, messageId, view);
+        return;
+      }
+
+      // --- Pending Financial Receipts Review (donations status='pending') ---
+      if (data === 'adm_pending_donations') {
+        const view = await buildAdminPendingDonationsView(env);
+        await sendOrEditView(env, chatId, messageId, view);
+        return;
+      }
+
+      if (data.startsWith('adm_don_approve_') || data.startsWith('adm_don_reject_')) {
+        const isApprove = data.startsWith('adm_don_approve_');
+        const donId = Number(
+          data.slice(isApprove ? 'adm_don_approve_'.length : 'adm_don_reject_'.length)
+        );
+        if (!Number.isInteger(donId) || donId <= 0) return;
+
+        const donRow = await env.DB.prepare(
+          `SELECT d.id, d.user_id, d.amount, d.status, u.telegram_id, u.first_name
+           FROM donations d
+           JOIN users u ON u.id = d.user_id
+           WHERE d.id = ?
+           LIMIT 1`
+        )
+          .bind(donId)
+          .first<{
+            id: number;
+            user_id: number;
+            amount: number;
+            status: string;
+            telegram_id: number | null;
+            first_name: string;
+          }>();
+
+        if (!donRow) {
+          await tgSendMessage(env, chatId, '❌ فیش مالی مورد نظر یافت نشد.');
+          return;
+        }
+
+        if (isApprove) {
+          const basePrice = Number(env.PRO_SUBSCRIPTION_PRICE || '150000') || 150000;
+          const isFlow = donRow.amount >= Math.round(basePrice * 1.8);
+          const targetTier = isFlow ? 'Sentra Flow+' : 'Sentra Pro';
+          const targetLimit = isFlow
+            ? 500 * 1024 * 1024 * 1024
+            : 200 * 1024 * 1024 * 1024;
+
+          await env.DB.prepare(
+            `UPDATE donations SET status = 'approved', subscription_granted = 1 WHERE id = ?`
+          )
+            .bind(donId)
+            .run();
+
+          const userSub = await env.DB.prepare(
+            'SELECT id, expires_at FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1'
+          )
+            .bind(donRow.user_id)
+            .first<{ id: number; expires_at: string }>();
+
+          if (userSub) {
+            const baseMs = Math.max(Date.now(), Date.parse(userSub.expires_at) || Date.now());
+            const nextExpires = new Date(baseMs + 30 * 24 * 60 * 60 * 1000).toISOString();
+            await env.DB.prepare(
+              `UPDATE subscriptions
+               SET tier = ?, traffic_limit_bytes = ?, status = 'active',
+                   expires_at = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?`
+            )
+              .bind(targetTier, targetLimit, nextExpires, userSub.id)
+              .run();
+          }
+
+          if (donRow.telegram_id) {
+            await tgSendMessage(
+              env,
+              donRow.telegram_id,
+              `✅ <b>فیش واریزی شما (#DON-${donRow.id}) تأیید شد!</b>\n\n` +
+                `💎 اشتراک شما به پلن <b>${escapeHtml(targetTier)}</b> ارتقا یافت و به‌مدت ۳۰ روز فعال شد.\n` +
+                `از بخش «👤 حساب کاربری» می‌توانید وضعیت جدید خود را مشاهده کنید.`
+            );
+          }
+        } else {
+          await env.DB.prepare(`UPDATE donations SET status = 'rejected' WHERE id = ?`)
+            .bind(donId)
+            .run();
+
+          if (donRow.telegram_id) {
+            await tgSendMessage(
+              env,
+              donRow.telegram_id,
+              `❌ <b>فیش واریزی شما (#DON-${donRow.id}) توسط مدیریت رد شد.</b>\n\n` +
+                `در صورت نیاز به پیگیری، از بخش «🎫 پشتیبانی» تیکت ثبت کنید.`
+            );
+          }
+        }
+
+        const view = await buildAdminPendingDonationsView(env);
         await sendOrEditView(env, chatId, messageId, view);
         return;
       }
@@ -2006,8 +2539,8 @@ async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<
         await tgSendMessage(
           env,
           chatId,
-          `📥 <b>ارسال اوتباند یا ساب‌لینک (${escapeHtml(alloc)})</b>\n\n` +
-            `لینک پروکسی (vless/vmess/trojan/hy2/ss/wg)، کانفیگ JSON سینگ‌باکس یا لینک سابسکریپشن (<code>https://...</code>) را ارسال کنید.`,
+          `📥 <b>ارسال اوتباند رسمی یا ساب‌لینک (${escapeHtml(alloc)})</b>\n\n` +
+            `لینک پروکسی (<code>vless://</code>, <code>vmess://</code>, <code>trojan://</code>, <code>hysteria2://</code>, <code>ss://</code>, <code>wg://</code>)، کانفیگ JSON سینگ‌باکس یا لینک سابسکریپشن (<code>https://...</code>) را ارسال کنید:`,
           buildCancelStateInlineMarkup()
         );
         return;
@@ -2024,16 +2557,20 @@ async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<
       buildUserMenuHomeView(record?.user || null, record?.sub || null, isAdmin).replyMarkup
     );
   } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
     console.error('[Sentra Callback Query Error]', {
       callback_data: data,
       telegram_id: telegramId,
-      error: err instanceof Error ? err.message : String(err),
+      error: errMsg,
       err,
     });
+    const showDetail = isEnvAdmin(env, telegramId) || (await resolveIsAdmin(env, telegramId));
     await tgSendMessage(
       env,
       chatId,
-      '⚠️ خطایی در پردازش درخواست شما رخ داد. لطفاً لحظاتی دیگر دوباره تلاش کنید یا /start را ارسال نمایید.'
+      showDetail
+        ? `⚠️ <b>خطای پنل مدیریت:</b>\n<code>${escapeHtml(errMsg.slice(0, 350))}</code>`
+        : '⚠️ خطایی در پردازش درخواست شما رخ داد. لطفاً لحظاتی دیگر دوباره تلاش کنید یا /start را ارسال نمایید.'
     );
   }
 }
@@ -2190,7 +2727,7 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
                raw_link, fingerprint_sha256, is_official, label, country_code, country_name,
                allow_web, allow_download, allow_gaming, allow_static_ip, allocation_mode,
                last_online_at, last_checked_at
-             ) VALUES (?, ?, ?, ?, ?, ?, 90, 12.0, 'web_browsing', 100, 'active', 0, ?, ?, 0, ?, ?, ?, 1, 1, 0, 0, 'free_only', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+             ) VALUES (?, ?, ?, ?, ?, ?, 90, 12.0, 'web_browsing', 100, 'pending', 0, ?, ?, 0, ?, ?, ?, 1, 1, 0, 0, 'free_only', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
           )
             .bind(
               existing?.user.id ?? null,
@@ -2210,7 +2747,7 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
           await tgSendMessage(
             env,
             chatId,
-            `🤝 <b>سپاس از حمایت شما!</b>\nنود <b>${escapeHtml(parsed.tag)}</b> در کل اکوسیستم سنترا فعال شد.`,
+            `🤝 <b>سپاس از حمایت شما!</b>\nنود <b>${escapeHtml(parsed.tag)}</b> ثبت شد و در صف بررسی مدیریت قرار گرفت. پس از تأیید، به شما اطلاع داده خواهد شد.`,
             buildMainKeyboard(true, isAdmin)
           );
         } catch (err) {
@@ -2341,30 +2878,50 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
         return;
       }
 
-      if (state.state_type === 'admin_awaiting_outbound' && isAdmin) {
-        const payload = JSON.parse(state.payload_json || '{}') as { allocation?: string };
-        await clearBotState(env.DB, telegramId);
-        await handleAdminOutboundSubmission(env, chatId, text, payload.allocation || 'auto');
-        return;
-      }
-
-      if (state.state_type === 'admin_awaiting_sub_lookup' && isAdmin) {
-        await clearBotState(env.DB, telegramId);
-        const foundSubId = await findSubscriptionForAdmin(env.DB, text);
-        if (!foundSubId) {
-          await tgSendMessage(
-            env,
-            chatId,
-            '❌ هیچ سابسکریپشنی با این مشخصات یافت نشد.',
-            buildAdminPanelHomeView().replyMarkup
-          );
+      if (state.state_type.startsWith('admin_')) {
+        if (!isAdmin) {
+          await clearBotState(env.DB, telegramId);
+          await tgSendMessage(env, chatId, '⛔ دسترسی غیرمجاز');
           return;
         }
-        const view = await buildAdminSubscriptionDetailView(env, foundSubId);
-        if (view) {
-          await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+
+        if (state.state_type === 'admin_awaiting_outbound') {
+          const payload = JSON.parse(state.payload_json || '{}') as { allocation?: string };
+          await clearBotState(env.DB, telegramId);
+          await handleAdminOutboundSubmission(env, chatId, text, payload.allocation || 'auto');
+          return;
         }
-        return;
+
+        if (state.state_type === 'admin_awaiting_sub_source') {
+          const payload = JSON.parse(state.payload_json || '{}') as { category?: string };
+          await clearBotState(env.DB, telegramId);
+          const category = VALID_SUB_SOURCE_CATEGORIES.includes(
+            payload.category as SubSourceCategory
+          )
+            ? (payload.category as SubSourceCategory)
+            : 'web_browsing';
+          await handleAdminSubSourceSubmission(env, chatId, text, category);
+          return;
+        }
+
+        if (state.state_type === 'admin_awaiting_sub_lookup') {
+          await clearBotState(env.DB, telegramId);
+          const foundSubId = await findSubscriptionForAdmin(env.DB, text);
+          if (!foundSubId) {
+            await tgSendMessage(
+              env,
+              chatId,
+              '❌ هیچ سابسکریپشنی با این مشخصات یافت نشد.',
+              buildAdminPanelHomeView().replyMarkup
+            );
+            return;
+          }
+          const view = await buildAdminSubscriptionDetailView(env, foundSubId);
+          if (view) {
+            await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+          }
+          return;
+        }
       }
     }
 
@@ -2460,7 +3017,7 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
 
       case 'admin': {
         if (!isAdmin) {
-          await tgSendMessage(env, chatId, '⛔️ شما دسترسی به پنل مدیریت ندارید.');
+          await tgSendMessage(env, chatId, '⛔ دسترسی غیرمجاز');
           return;
         }
         const panel = buildAdminPanelHomeView();
@@ -2483,16 +3040,20 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
       }
     }
   } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
     console.error('[Sentra Message Handler Error]', {
       telegram_id: telegramId,
       text: text.slice(0, 120),
-      error: err instanceof Error ? err.message : String(err),
+      error: errMsg,
       err,
     });
+    const showDetail = envAdmin || (await resolveIsAdmin(env, telegramId));
     await tgSendMessage(
       env,
       chatId,
-      '⚠️ خطایی در پردازش پیام شما رخ داد. لطفاً لحظاتی دیگر دوباره تلاش کنید یا /start را ارسال نمایید.'
+      showDetail
+        ? `⚠️ <b>خطای پنل مدیریت:</b>\n<code>${escapeHtml(errMsg.slice(0, 350))}</code>`
+        : '⚠️ خطایی در پردازش پیام شما رخ داد. لطفاً لحظاتی دیگر دوباره تلاش کنید یا /start را ارسال نمایید.'
     );
   }
 }

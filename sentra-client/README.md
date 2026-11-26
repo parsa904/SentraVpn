@@ -131,11 +131,11 @@ sing-box-<target-triple>[.exe]
 
 ---
 
-## ۶. ارتباط با سرور مرکزی `sentra-core`
+## ۶. ارتباط با سرور مرکزی `sentra-core` (Cloudflare Workers)
 
-کلاینت در هنگام لاگین و اتصال، به API محلی مستقر روی `http://127.0.0.1:8080` متصل می‌شود:
+کلاینت در هنگام لاگین و اتصال، به API مرکزی مستقر روی `https://sentra-core.kziepr.workers.dev` (قابل تنظیم از طریق `VITE_API_BASE_URL` در `.env.production`) متصل می‌شود:
 - ورود و تبادل کد ۸ رقمی: `POST /api/v1/auth/code-login`
-- دریافت کانفیگ هوشمند: `POST /api/v1/client/config`
+- دریافت کانفیگ هوشمند `sing-box 1.14+`: `POST /api/v1/client/config` یا `GET /sub/{token}?format=singbox`
 - بررسی زنده بودن سرور: `GET /health` (از طریق دکمه «بررسی اتصال به API مرکزی» در پنل تنظیمات).
 
 ---

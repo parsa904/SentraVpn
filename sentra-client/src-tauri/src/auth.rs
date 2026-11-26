@@ -5,8 +5,7 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 
 pub const BACKEND_FALLBACK_URLS: &[&str] = &[
-    "http://116.203.188.124:8080",
-    "https://head.cyberservice.sbs:8443",
+    "https://sentra-core.kziepr.workers.dev",
 ];
 
 /// Returns ordered list of backend API base URLs (never localhost unless explicitly configured).
@@ -288,7 +287,7 @@ impl AuthManager {
             }
             None => {
                 let err_msg = last_err.map(|e| e.to_string()).unwrap_or_else(|| "سرور پاسخگو نیست".to_string());
-                Err(format!("عدم برقراری ارتباط با سرور سنترا (116.203.188.124): لطفاً اتصال اینترنت را بررسی کنید ({})", err_msg))
+                Err(format!("عدم برقراری ارتباط با سرور مرکزی سنترا: لطفاً اتصال اینترنت خود را بررسی کنید ({})", err_msg))
             }
         }
     }
@@ -382,7 +381,7 @@ impl AuthManager {
             }
             None => {
                 let err_msg = last_err.map(|e| e.to_string()).unwrap_or_else(|| "سرور پاسخگو نیست".to_string());
-                Err(format!("عدم برقراری ارتباط با سرور سنترا (116.203.188.124): لطفاً اتصال اینترنت را بررسی کنید ({})", err_msg))
+                Err(format!("عدم برقراری ارتباط با سرور مرکزی سنترا: لطفاً اتصال اینترنت خود را بررسی کنید ({})", err_msg))
             }
         }
     }

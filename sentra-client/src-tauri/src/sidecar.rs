@@ -135,7 +135,21 @@ fn which_singbox() -> Option<PathBuf> {
         }
     }
 
-    let default_names = ["sing-box", "sing-box.exe"];
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            for candidate in [
+                exe_dir.join("sing-box.exe"),
+                exe_dir.join("sing-box"),
+                exe_dir.join("binaries").join("sing-box.exe"),
+            ] {
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    let default_names = ["sing-box.exe", "sing-box"];
     for name in &default_names {
         if let Ok(output) = std::process::Command::new("where.exe").arg(name).output() {
             if output.status.success() {

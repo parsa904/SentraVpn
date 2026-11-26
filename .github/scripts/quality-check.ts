@@ -6,6 +6,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { parseSubscriptionPayload } from '../../cloudflare-worker/src/outboundAnalyzer.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -21,6 +22,14 @@ interface RemoteNode {
   fail_count: number;
   is_official: boolean;
   allocation_mode: string;
+  fingerprint_sha256?: string | null;
+}
+
+interface RemoteSubscriptionSource {
+  id: number;
+  category: string;
+  sub_url: string;
+  tag: string | null;
 }
 
 interface NodeHealthResult {
@@ -37,10 +46,42 @@ interface NodeHealthResult {
   error_msg: string | null;
 }
 
-const WORKER_URL = (process.env.SENTRA_WORKER_URL || '').trim().replace(/\/+$/, '');
+interface DiscoveredSubNodeReport {
+  tag: string;
+  protocol: string;
+  server_address: string;
+  server_port: number;
+  config_json: string;
+  raw_link: string;
+  fingerprint_sha256: string;
+  country_code: string;
+  country_name: string;
+  latency_ms: number;
+  jitter_ms: number;
+  speed_mbps: number;
+  speed_score: number;
+  health_score: number;
+  gemini_ok: boolean;
+  trading_safe: boolean;
+}
+
+interface SubscriptionSourceHealthReport {
+  source_id: number;
+  category: string;
+  total_nodes: number;
+  healthy_nodes: number;
+  error_msg: string | null;
+  discovered_nodes: DiscoveredSubNodeReport[];
+}
+
+const DEFAULT_WORKER_URL = 'https://sentra-core.kziepr.workers.dev';
+const WORKER_URL = (process.env.SENTRA_WORKER_URL || DEFAULT_WORKER_URL)
+  .trim()
+  .replace(/\/+$/, '');
 const QUALITY_SECRET = (process.env.QUALITY_ENGINE_SECRET || '').trim();
 const CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.QUALITY_CONCURRENCY || 6)));
 const SINGBOX_BIN = (process.env.SINGBOX_BIN || 'sing-box').trim();
+const MAX_NODES_PER_SUB_SOURCE = 25;
 
 function isPrivateIp(ip: string): boolean {
   const clean = ip.trim().toLowerCase().replace(/^::ffff:/, '');
@@ -470,6 +511,137 @@ async function runWithConcurrency<T, R>(
   return results;
 }
 
+async function validatePublicSubscriptionUrl(rawUrl: string): Promise<URL> {
+  const parsed = new URL(rawUrl.trim());
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error('Unsupported subscription protocol');
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!host || host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) {
+    throw new Error(`Blocked internal host: ${host}`);
+  }
+  const resolvedIp = net.isIP(host) ? host : (await dns.lookup(host)).address;
+  if (isPrivateIp(resolvedIp)) {
+    throw new Error(`Blocked private subscription IP: ${resolvedIp}`);
+  }
+  return parsed;
+}
+
+async function evaluateSubscriptionSource(
+  source: RemoteSubscriptionSource,
+  existingFingerprints: Set<string>,
+  singboxAvailable: boolean
+): Promise<SubscriptionSourceHealthReport> {
+  let validUrl: URL;
+  try {
+    validUrl = await validatePublicSubscriptionUrl(source.sub_url);
+  } catch (err) {
+    return {
+      source_id: source.id,
+      category: source.category,
+      total_nodes: 0,
+      healthy_nodes: 0,
+      error_msg: err instanceof Error ? err.message : 'Invalid subscription URL',
+      discovered_nodes: [],
+    };
+  }
+
+  let bodyText: string;
+  try {
+    const resp = await fetch(validUrl.toString(), {
+      headers: { 'User-Agent': 'SentraQualityEngine/2.0 (GitHub-Actions)' },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!resp.ok) {
+      return {
+        source_id: source.id,
+        category: source.category,
+        total_nodes: 0,
+        healthy_nodes: 0,
+        error_msg: `HTTP ${resp.status}`,
+        discovered_nodes: [],
+      };
+    }
+    bodyText = await resp.text();
+  } catch (err) {
+    return {
+      source_id: source.id,
+      category: source.category,
+      total_nodes: 0,
+      healthy_nodes: 0,
+      error_msg: err instanceof Error ? err.message : 'Subscription fetch failed',
+      discovered_nodes: [],
+    };
+  }
+
+  const parsedSub = await parseSubscriptionPayload(bodyText);
+  const candidates = parsedSub.nodes.slice(0, MAX_NODES_PER_SUB_SOURCE);
+  if (candidates.length === 0) {
+    return {
+      source_id: source.id,
+      category: source.category,
+      total_nodes: 0,
+      healthy_nodes: 0,
+      error_msg: 'No valid proxy nodes found in subscription payload',
+      discovered_nodes: [],
+    };
+  }
+
+  const discoveredHealthy: DiscoveredSubNodeReport[] = [];
+  let healthyCount = 0;
+
+  await runWithConcurrency(candidates, CONCURRENCY, async (parsedNode) => {
+    const pseudoRemote: RemoteNode = {
+      id: 0,
+      tag: parsedNode.tag,
+      protocol: parsedNode.protocol,
+      server_address: parsedNode.server_address,
+      server_port: parsedNode.server_port,
+      config_json: JSON.stringify(parsedNode.config_json),
+      country_code: parsedNode.country_code,
+      status: 'active',
+      fail_count: 0,
+      is_official: true,
+      allocation_mode: source.category,
+    };
+
+    const res = await evaluateNode(pseudoRemote, singboxAvailable);
+    if (res.is_healthy && res.security_passed) {
+      healthyCount += 1;
+      if (!existingFingerprints.has(parsedNode.fingerprint_sha256)) {
+        existingFingerprints.add(parsedNode.fingerprint_sha256);
+      }
+      discoveredHealthy.push({
+        tag: parsedNode.tag,
+        protocol: parsedNode.protocol,
+        server_address: parsedNode.server_address,
+        server_port: parsedNode.server_port,
+        config_json: JSON.stringify(parsedNode.config_json),
+        raw_link: parsedNode.raw_link,
+        fingerprint_sha256: parsedNode.fingerprint_sha256,
+        country_code: parsedNode.country_code,
+        country_name: parsedNode.country_name,
+        latency_ms: res.latency_ms,
+        jitter_ms: res.jitter_ms,
+        speed_mbps: res.speed_mbps,
+        speed_score: res.speed_score,
+        health_score: res.health_score,
+        gemini_ok: res.gemini_ok,
+        trading_safe: res.trading_safe,
+      });
+    }
+  });
+
+  return {
+    source_id: source.id,
+    category: source.category,
+    total_nodes: parsedSub.nodes.length,
+    healthy_nodes: healthyCount,
+    error_msg: null,
+    discovered_nodes: discoveredHealthy,
+  };
+}
+
 async function main(): Promise<void> {
   if (!WORKER_URL || !QUALITY_SECRET) {
     throw new Error(
@@ -487,30 +659,57 @@ async function main(): Promise<void> {
       'X-Quality-Secret': QUALITY_SECRET,
       Accept: 'application/json',
     },
+    signal: AbortSignal.timeout(15_000),
   });
 
   if (!listResp.ok) {
     throw new Error(`Failed to fetch active nodes: HTTP ${listResp.status}`);
   }
 
-  const listData = (await listResp.json()) as { nodes?: RemoteNode[] };
+  const listData = (await listResp.json()) as {
+    nodes?: RemoteNode[];
+    subscription_sources?: RemoteSubscriptionSource[];
+  };
   const nodes = Array.isArray(listData.nodes) ? listData.nodes : [];
-  console.log(`[QualityEngine] Loaded ${nodes.length} candidate nodes.`);
+  const subSources = Array.isArray(listData.subscription_sources)
+    ? listData.subscription_sources
+    : [];
+  console.log(
+    `[QualityEngine] Loaded ${nodes.length} candidate nodes and ${subSources.length} subscription sources.`
+  );
 
-  if (nodes.length === 0) {
-    console.log('[QualityEngine] No nodes to test. Exiting cleanly.');
+  if (nodes.length === 0 && subSources.length === 0) {
+    console.log('[QualityEngine] No nodes or subscription sources to test. Exiting cleanly.');
     return;
   }
 
-  const results = await runWithConcurrency(nodes, CONCURRENCY, (node) =>
-    evaluateNode(node, singboxAvailable)
+  const existingFingerprints = new Set<string>(
+    nodes.map((n) => n.fingerprint_sha256 || '').filter(Boolean)
   );
+
+  const results =
+    nodes.length > 0
+      ? await runWithConcurrency(nodes, CONCURRENCY, (node) =>
+          evaluateNode(node, singboxAvailable)
+        )
+      : [];
+
+  const subscriptionReports: SubscriptionSourceHealthReport[] = [];
+  for (const src of subSources) {
+    const report = await evaluateSubscriptionSource(src, existingFingerprints, singboxAvailable);
+    subscriptionReports.push(report);
+    console.log(
+      `[QualityEngine] Subscription source #${src.id} (${src.category}): healthy=${report.healthy_nodes}/${report.total_nodes}${
+        report.error_msg ? ` (err: ${report.error_msg})` : ''
+      }`
+    );
+  }
 
   const healthyCount = results.filter((r) => r.is_healthy).length;
   const geminiCount = results.filter((r) => r.gemini_ok).length;
   const tradingCount = results.filter((r) => r.trading_safe).length;
   console.log(
-    `[QualityEngine] Evaluated ${results.length} nodes: healthy=${healthyCount}, gemini_ok=${geminiCount}, trading_safe=${tradingCount}`
+    `[QualityEngine] Evaluated ${results.length} DB nodes (healthy=${healthyCount}, gemini_ok=${geminiCount}, trading_safe=${tradingCount}) and ${subscriptionReports.length} subscription sources.`
   );
 
   const reportResp = await fetch(`${WORKER_URL}/api/v1/nodes/health-report`, {
@@ -523,7 +722,9 @@ async function main(): Promise<void> {
       checked_at: new Date().toISOString(),
       runner: 'github-actions-quality-engine',
       results,
+      subscription_reports: subscriptionReports,
     }),
+    signal: AbortSignal.timeout(20_000),
   });
 
   if (!reportResp.ok) {

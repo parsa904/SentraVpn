@@ -27,7 +27,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: blob: https: http:; font-src 'self' https: data:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline'; connect-src 'self' http://116.203.188.124:8080 http://116.203.188.124:* https://116.203.188.124:* https://head.cyberservice.sbs:8443 https: http: ipc: http://ipc.localhost tauri://localhost http://tauri.localhost https://tauri.localhost;"
+      "csp": "default-src 'self'; img-src 'self' data: blob: https: http:; font-src 'self' https: data:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline'; connect-src 'self' https://sentra-core.kziepr.workers.dev https://api.github.com https: ipc: http://ipc.localhost tauri://localhost http://tauri.localhost https://tauri.localhost;"
     }
   },
   "bundle": {

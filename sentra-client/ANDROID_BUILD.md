@@ -113,12 +113,8 @@ npx @tauri-apps/cli android init
    cd sentra-client
    npm run tauri android dev
    ```
-3. **اتصال به سرور محلی `sentra-core` با ADB Reverse:**
-   برای اینکه کلاینت روی گوشی موبایل بتواند به API مرکزی `sentra-core` که روی کامپیوتر شما (`127.0.0.1:8080`) در حال اجراست دسترسی داشته باشد، دستور زیر را در ترمینال اجرا کنید:
-   ```bash
-   adb reverse tcp:8080 tcp:8080
-   ```
-   با این دستور، تمام درخواست‌های ارسالی از گوشی به پورت ۸۰۸۰ بدون نیاز به آی‌پی شبکه محلی، مستقیماً به رایانه توسعه منتقل می‌شوند.
+3. **اتصال به سرور مرکزی `sentra-core` (Zero-VPS):**
+   کلاینت اندروید به صورت پیش‌فرض و بدون نیاز به هیچ سرور محلی یا `adb reverse`، مستقیماً از طریق HTTPS به Cloudflare Worker روی آدرس `https://sentra-core.kziepr.workers.dev` (مقدار `VITE_API_BASE_URL` در `.env.production`) متصل می‌شود.
 
 ---
 

@@ -22,27 +22,34 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import io.nekohasekai.libbox.BoxService
-import io.nekohasekai.libbox.Libbox
-import io.nekohasekai.libbox.PlatformInterface
-import io.nekohasekai.libbox.TunOptions
+import java.io.BufferedReader
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStreamReader
+import java.lang.reflect.Proxy
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * SentraVpnService: Android Foreground VpnService for Sentra Connect
- * Implements io.nekohasekai.libbox.PlatformInterface for native Sing-box TUN integration,
- * with automatic reconnection on Wi-Fi <-> Cellular switches and Doze/sleep wake.
+ * SentraVpnService: Android Foreground VpnService for Sentra Connect.
+ *
+ * Dual-mode Sing-box 1.14+ runtime:
+ *  1. If `io.nekohasekai.libbox.Libbox` (libbox.aar) is packaged in `app/libs/`,
+ *     dynamically bridges PlatformInterface via reflection so compilation never breaks
+ *     across libbox API updates.
+ *  2. Otherwise launches the bundled native `libsingbox.so` executable from
+ *     `applicationInfo.nativeLibraryDir` alongside an established Android TUN interface.
+ *
+ * Includes automatic reconnection on Wi-Fi <-> Cellular switches and Doze/sleep wake.
  */
-class SentraVpnService : VpnService(), PlatformInterface {
+class SentraVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var isServiceRunning = AtomicBoolean(false)
     private var isReconnecting = AtomicBoolean(false)
     private var userDisconnected = AtomicBoolean(false)
     private var lostNetworkPending = AtomicBoolean(false)
-    private var boxService: BoxService? = null
+    private var libboxService: Any? = null
+    private var singboxProcess: Process? = null
     private var activeConfig: String? = null
     private var activeMode: String = "Sentra Auto"
     private var activeServerName: String = "Sentra Auto"
@@ -51,6 +58,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var wakeReceiver: BroadcastReceiver? = null
     private var activeNetworkId: Long? = null
+
     @Volatile
     private var lastHeartbeatWallMs: Long = System.currentTimeMillis()
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -77,7 +85,6 @@ class SentraVpnService : VpnService(), PlatformInterface {
         @Volatile
         var autoReconnectEnabled: Boolean = true
 
-        // Telemetry stats shared with Tauri plugin
         @Volatile
         var isVpnActive: Boolean = false
             private set
@@ -106,7 +113,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
         var uptimeSeconds: Long = 0
             private set
 
-        // List of major Iranian banking, payment, and public service apps for Split Tunneling
+        // Major Iranian banking, payment, and local service apps bypassed in Split Tunneling mode
         private val IRANIAN_APPS_SPLIT = listOf(
             "ir.divar",
             "com.digikala",
@@ -163,62 +170,50 @@ class SentraVpnService : VpnService(), PlatformInterface {
     }
 
     // =========================================================================
-    // PlatformInterface Implementation (Sing-box Core Integration)
+    // Android TUN & Sing-box Core Engine Bridge (libbox reflection + native binary)
     // =========================================================================
 
-    /**
-     * Prevents network loop by protecting outbound sockets from entering the VPN tunnel
-     */
-    override fun autoDetectInterfaceControl(fd: Int) {
-        val protected = protect(fd)
-        if (!protected) {
-            Log.w(TAG, "Failed to protect socket fd=$fd from VPN routing loop.")
-        } else {
-            Log.d(TAG, "Protected socket fd=$fd successfully.")
-        }
-    }
-
-    /**
-     * Opens and configures the virtual Android TUN interface
-     */
-    override fun openTun(options: TunOptions): Int {
-        Log.i(TAG, "openTun requested by libbox. Configuring TUN interface...")
+    private fun establishTunInterface(mtu: Int = 1400, detachForLibbox: Boolean): Int {
+        val safeMtu = if (mtu in 1280..9000) mtu else 1400
         return try {
             val builder = Builder()
                 .setSession("Sentra Connect")
-                .setMtu(if (options.mtu in 1280..9000) options.mtu else 1400)
+                .setMtu(safeMtu)
                 .addAddress("172.19.0.1", 30)
-                .addDnsServer("198.18.0.1") // Sing-box FakeIP DNS
-                .addRoute("0.0.0.0", 0)     // Route global IPv4 traffic through tunnel
+                .addDnsServer("198.18.0.1")
+                .addRoute("0.0.0.0", 0)
                 .setBlocking(false)
 
-            // Prevent self-traffic looping
             try {
                 builder.addDisallowedApplication(packageName)
             } catch (e: Exception) {
                 Log.w(TAG, "Could not disallow own package: ${e.message}")
             }
 
-            // Split Tunneling for Iranian applications & services
             if (splitTunnelIr) {
-                Log.i(TAG, "Applying Split Tunneling for Iranian applications and local services...")
                 for (pkg in IRANIAN_APPS_SPLIT) {
                     try {
                         builder.addDisallowedApplication(pkg)
                     } catch (_: Exception) {
-                        // Package may not be installed on user's device
+                        // Package not installed on this device
                     }
                 }
             }
 
-            vpnInterface = builder.establish()
-            if (vpnInterface == null) {
-                Log.e(TAG, "Builder.establish() returned null.")
+            val established = builder.establish()
+            if (established == null) {
+                Log.e(TAG, "VpnService.Builder.establish() returned null.")
                 -1
             } else {
-                val fd = vpnInterface!!.detachFd()
-                Log.i(TAG, "TUN interface established with detached fd=$fd")
-                fd
+                vpnInterface = established
+                if (detachForLibbox) {
+                    val fd = established.detachFd()
+                    Log.i(TAG, "TUN interface established with detached fd=$fd")
+                    fd
+                } else {
+                    Log.i(TAG, "TUN interface established (fd=${established.fd})")
+                    established.fd
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Exception creating TUN interface: ${e.message}", e)
@@ -226,16 +221,155 @@ class SentraVpnService : VpnService(), PlatformInterface {
         }
     }
 
-    /**
-     * Receives log output from Sing-box core
-     */
-    override fun writeLog(message: String) {
-        Log.i("SentraLibbox", message)
+    private fun writeCoreLog(message: String) {
+        Log.i("SentraCore", message)
         SentraVpnPlugin.broadcastLog(message)
     }
 
-    override fun usePlatformAutoDetectInterfaceControl(): Boolean {
+    private fun tryStartLibboxEngine(configJson: String): Boolean {
+        return try {
+            val libboxClass = Class.forName("io.nekohasekai.libbox.Libbox")
+            val platformInterfaceClass = Class.forName("io.nekohasekai.libbox.PlatformInterface")
+
+            val proxy = Proxy.newProxyInstance(
+                classLoader,
+                arrayOf(platformInterfaceClass)
+            ) { _, method, args ->
+                when (method.name) {
+                    "autoDetectInterfaceControl" -> {
+                        val fd = (args?.firstOrNull() as? Number)?.toInt() ?: -1
+                        if (fd >= 0 && !protect(fd)) {
+                            Log.w(TAG, "Failed to protect socket fd=$fd")
+                        }
+                        null
+                    }
+                    "openTun" -> {
+                        val mtu = try {
+                            val opts = args?.firstOrNull()
+                            val getMtu = opts?.javaClass?.methods?.firstOrNull { it.name == "getMTU" || it.name == "getMtu" }
+                            (getMtu?.invoke(opts) as? Number)?.toInt() ?: 1400
+                        } catch (_: Exception) {
+                            1400
+                        }
+                        establishTunInterface(mtu, detachForLibbox = true)
+                    }
+                    "writeLog" -> {
+                        val msg = args?.firstOrNull()?.toString() ?: ""
+                        if (msg.isNotBlank()) writeCoreLog(msg)
+                        null
+                    }
+                    "usePlatformAutoDetectInterfaceControl" -> true
+                    "useProcFS" -> false
+                    "underNetworkExtension" -> false
+                    "includeAllNetworks" -> false
+                    "findConnectionOwner" -> -1
+                    "packageNameByUid" -> ""
+                    "uidByPackageName" -> -1
+                    else -> when (method.returnType) {
+                        java.lang.Boolean.TYPE -> false
+                        java.lang.Integer.TYPE -> 0
+                        java.lang.Long.TYPE -> 0L
+                        else -> null
+                    }
+                }
+            }
+
+            val newServiceMethod = libboxClass.getMethod("newService", String::class.java, platformInterfaceClass)
+            val service = newServiceMethod.invoke(null, configJson, proxy)
+            val startMethod = service.javaClass.getMethod("start")
+            startMethod.invoke(service)
+            libboxService = service
+            Log.i(TAG, "Sing-box started via embedded libbox.aar PlatformInterface.")
+            true
+        } catch (_: ClassNotFoundException) {
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "libbox.aar runtime unavailable (${e.message}); falling back to native sing-box binary.")
+            false
+        }
+    }
+
+    private fun startNativeSingboxBinary(configFile: File): Boolean {
+        val nativeDir = applicationInfo.nativeLibraryDir
+        val candidates = listOf(
+            File(nativeDir, "libsingbox.so"),
+            File(nativeDir, "sing-box")
+        )
+        val binary = candidates.firstOrNull { it.exists() && it.canExecute() }
+            ?: candidates.firstOrNull { it.exists() }
+
+        if (binary == null) {
+            throw IllegalStateException(
+                "موتور بومی sing-box در بسته اندروید یافت نشد (libsingbox.so). لطفاً آخرین نسخه رسمی را نصب کنید."
+            )
+        }
+
+        if (!binary.canExecute()) {
+            binary.setExecutable(true, true)
+        }
+
+        val tunFd = establishTunInterface(1400, detachForLibbox = false)
+        if (tunFd < 0) {
+            throw IllegalStateException("امکان ایجاد رابط شبکه مجازی TUN در اندروید وجود نداشت.")
+        }
+
+        val pb = ProcessBuilder(binary.absolutePath, "run", "-c", configFile.absolutePath)
+            .directory(cacheDir)
+            .redirectErrorStream(true)
+
+        val proc = pb.start()
+        singboxProcess = proc
+
+        Thread {
+            try {
+                BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
+                    var line: String?
+                    while (reader.readLine().also { line = it } != null) {
+                        line?.takeIf { it.isNotBlank() }?.let { writeCoreLog("[sing-box] $it") }
+                    }
+                }
+            } catch (_: Exception) {
+                // Process terminated normally
+            }
+        }.start()
+
+        Log.i(TAG, "Native sing-box binary launched from ${binary.absolutePath}")
         return true
+    }
+
+    private fun startCoreEngine(configJson: String) {
+        val configFile = File(cacheDir, "singbox_active_config.json")
+        FileOutputStream(configFile).use { it.write(configJson.toByteArray(Charsets.UTF_8)) }
+
+        if (!tryStartLibboxEngine(configJson)) {
+            startNativeSingboxBinary(configFile)
+        }
+    }
+
+    private fun stopCoreEngine() {
+        try {
+            libboxService?.let { svc ->
+                val closeMethod = svc.javaClass.methods.firstOrNull { it.name == "close" && it.parameterCount == 0 }
+                closeMethod?.invoke(svc)
+            }
+            libboxService = null
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing libbox service: ${e.message}")
+        }
+
+        try {
+            singboxProcess?.destroy()
+            singboxProcess = null
+        } catch (e: Exception) {
+            Log.w(TAG, "Error stopping sing-box process: ${e.message}")
+        }
+
+        try {
+            vpnInterface?.close()
+            vpnInterface = null
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing TUN interface: ${e.message}")
+        }
     }
 
     // =========================================================================
@@ -251,7 +385,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
             return
         }
 
-        Log.i(TAG, "Starting Sentra VPN Tunnel on [$serverName] in mode [$mode] (Split Tunneling: $split, Auto-Reconnect: $autoReconnectEnabled)...")
+        Log.i(TAG, "Starting Sentra VPN Tunnel on [$serverName] in mode [$mode] (Split: $split, Auto-Reconnect: $autoReconnectEnabled)...")
         activeConfig = configJson
         activeMode = mode
         activeServerName = serverName
@@ -261,36 +395,25 @@ class SentraVpnService : VpnService(), PlatformInterface {
         lostNetworkPending.set(false)
         lastHeartbeatWallMs = System.currentTimeMillis()
 
-        // 1. Enter foreground mode with persistent notification
         val notification = buildPersistentNotification(serverName, false)
         startForeground(NOTIFICATION_ID, notification)
 
         try {
-            // 2. Write active configuration to private cache
-            val configFile = File(cacheDir, "singbox_active_config.json")
-            FileOutputStream(configFile).use { it.write(configJson.toByteArray()) }
-
-            // 3. Initialize and start Sing-box via PlatformInterface
-            Log.i(TAG, "Launching Sing-box core with PlatformInterface...")
-            val service = Libbox.newService(configJson, this)
-            service.start()
-            boxService = service
+            startCoreEngine(configJson)
 
             isServiceRunning.set(true)
             isVpnActive = true
 
-            // 4. Register NetworkCallback and wake/Doze receiver for automatic reconnect
             registerNetworkCallback()
             registerWakeReceiver()
-
-            // 5. Start telemetry metrics ticker (also monitors wall-clock sleep jumps)
             startTelemetryTicker()
             checkAndNotifyBatteryOptimization()
-            SentraVpnPlugin.broadcastStatus("Connected", mode)
-            writeLog("[Core] Sentra Connect Android VpnService online (mode: $mode)")
 
+            SentraVpnPlugin.broadcastStatus("Connected", mode)
+            writeCoreLog("[Core] Sentra Connect Android VpnService online (mode: $mode)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start VPN tunnel: ${e.message}", e)
+            writeCoreLog("[ERROR] Failed to start Android VPN tunnel: ${e.message}")
             stopVpnTunnel()
         }
     }
@@ -329,10 +452,8 @@ class SentraVpnService : VpnService(), PlatformInterface {
                     totalDownBytes += dl
                     totalUpBytes += ul
 
-                    // Broadcast real traffic throughput to Tauri UI
                     SentraVpnPlugin.broadcastSpeed(dl, ul, totalDownBytes, totalUpBytes, uptimeSeconds, 0)
-
-                } catch (e: InterruptedException) {
+                } catch (_: InterruptedException) {
                     break
                 }
             }
@@ -367,30 +488,18 @@ class SentraVpnService : VpnService(), PlatformInterface {
         Thread {
             try {
                 Log.i(TAG, "Auto-reconnecting VPN tunnel due to $reason...")
-                writeLog("[AutoReconnect] Triggered ($reason). Re-establishing VPN tunnel...")
+                writeCoreLog("[AutoReconnect] Triggered ($reason). Re-establishing VPN tunnel...")
                 updateNotification(activeServerName, true)
                 SentraVpnPlugin.broadcastStatus("Connecting", activeMode)
 
-                // Cleanly release stale libbox instance and TUN fd before rebuilding
-                try {
-                    boxService?.close()
-                    boxService = null
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error closing stale BoxService during reconnect: ${e.message}")
-                }
-                try {
-                    vpnInterface?.close()
-                    vpnInterface = null
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error closing stale TUN interface during reconnect: ${e.message}")
-                }
+                stopCoreEngine()
 
                 val retryDelaysMs = longArrayOf(0L, 2_000L, 4_000L)
                 var reconnected = false
 
                 for (attemptIdx in retryDelaysMs.indices) {
                     if (userDisconnected.get() || !autoReconnectEnabled) {
-                        Log.i(TAG, "Auto-reconnect aborted because user disconnected or disabled setting.")
+                        Log.i(TAG, "Auto-reconnect aborted by user.")
                         return@Thread
                     }
                     val waitMs = retryDelaysMs[attemptIdx]
@@ -407,33 +516,24 @@ class SentraVpnService : VpnService(), PlatformInterface {
 
                     try {
                         Log.i(TAG, "Auto-reconnect attempt ${attemptIdx + 1}/${retryDelaysMs.size} ($reason)...")
-                        val newService = Libbox.newService(cfg, this)
-                        newService.start()
-                        boxService = newService
+                        startCoreEngine(cfg)
                         isServiceRunning.set(true)
                         isVpnActive = true
                         lastHeartbeatWallMs = System.currentTimeMillis()
                         updateNotification(activeServerName, false)
                         SentraVpnPlugin.broadcastStatus("Connected", activeMode)
-                        writeLog("[AutoReconnect] VPN tunnel re-established after $reason.")
+                        writeCoreLog("[AutoReconnect] VPN tunnel re-established after $reason.")
                         reconnected = true
                         break
                     } catch (e: Exception) {
                         Log.w(TAG, "Auto-reconnect attempt ${attemptIdx + 1} failed: ${e.message}")
-                        try {
-                            boxService?.close()
-                            boxService = null
-                        } catch (_: Exception) {}
-                        try {
-                            vpnInterface?.close()
-                            vpnInterface = null
-                        } catch (_: Exception) {}
+                        stopCoreEngine()
                     }
                 }
 
                 if (!reconnected && !userDisconnected.get()) {
                     Log.e(TAG, "Failed to auto-reconnect VPN tunnel after ${retryDelaysMs.size} attempts.")
-                    writeLog("[AutoReconnect] Reconnect failed after ${retryDelaysMs.size} attempts.")
+                    writeCoreLog("[AutoReconnect] Reconnect failed after ${retryDelaysMs.size} attempts.")
                     isServiceRunning.set(false)
                     isVpnActive = false
                     SentraVpnPlugin.broadcastStatus("Disconnected", "None")
@@ -457,22 +557,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
 
         unregisterNetworkCallback()
         unregisterWakeReceiver()
-
-        try {
-            boxService?.close()
-            boxService = null
-            Log.i(TAG, "BoxService closed.")
-        } catch (e: Exception) {
-            Log.w(TAG, "Error closing BoxService: ${e.message}")
-        }
-
-        try {
-            vpnInterface?.close()
-            vpnInterface = null
-            Log.i(TAG, "Virtual TUN interface closed.")
-        } catch (e: Exception) {
-            Log.w(TAG, "Error closing TUN interface: ${e.message}")
-        }
+        stopCoreEngine()
 
         SentraVpnPlugin.broadcastStatus("Disconnected", "None")
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -512,13 +597,6 @@ class SentraVpnService : VpnService(), PlatformInterface {
                     Log.i(TAG, "Network transition detected (prev=$previousId -> curr=$netId, recovered=$recoveredFromLoss).")
                     if (autoReconnectEnabled && !userDisconnected.get()) {
                         scheduleAutoReconnect("network_switch")
-                    } else {
-                        try {
-                            scheduleAutoReconnect("network_switch_refresh")
-                            writeLog("[Network] Underlying network switched. Libbox sockets refreshed.")
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Error refreshing network in boxService: ${e.message}")
-                        }
                     }
                 }
             }
@@ -529,7 +607,7 @@ class SentraVpnService : VpnService(), PlatformInterface {
                 Log.w(TAG, "Network connection lost: $netId")
                 if (activeNetworkId == null || activeNetworkId == netId) {
                     lostNetworkPending.set(true)
-                    writeLog("[Network] Active network lost; awaiting next available interface...")
+                    writeCoreLog("[Network] Active network lost; awaiting next available interface...")
                 }
             }
         }
@@ -751,6 +829,6 @@ class SentraVpnService : VpnService(), PlatformInterface {
             .build()
 
         notificationManager.notify(BATTERY_WARNING_NOTIFICATION_ID, warningNotification)
-        writeLog("[Battery] Android battery optimization is enabled; background VPN reconnection may be restricted.")
+        writeCoreLog("[Battery] Android battery optimization is enabled; background VPN reconnection may be restricted.")
     }
 }

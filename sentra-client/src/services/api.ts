@@ -18,27 +18,37 @@ import {
 } from '../utils/proxyParser';
 import type { BatteryOptimizationStatus } from '../utils/reconnectPolicy';
 import { clearOfflineConfigCache } from '../utils/offlineCache';
+import {
+  extractSingboxConfig,
+  translateNetworkErrorToPersian,
+  validateSingbox114Config,
+} from '../utils/singboxConfig';
 
 const SESSION_STORAGE_KEY = 'sentra_session_v2';
 const PERSONAL_CONFIGS_KEY = 'sentra_personal_configs_v2';
 const DEVICE_ID_KEY = 'sentra_device_id_v2';
 
-const REMOTE_BACKEND_URLS = [
-  import.meta.env.VITE_API_BASE_URL as string | undefined,
-  'http://116.203.188.124:8080',
-  'https://head.cyberservice.sbs:8443',
-].filter((u): u is string => Boolean(u && u.trim()));
+export const DEFAULT_API_BASE_URL = 'https://sentra-core.kziepr.workers.dev';
 
-function getActiveBackendUrls(): string[] {
+function normalizeBaseUrl(url: string | undefined): string {
+  return (url || '').trim().replace(/\/+$/, '');
+}
+
+const CONFIGURED_API_BASE_URL =
+  normalizeBaseUrl(import.meta.env.VITE_API_BASE_URL as string | undefined) ||
+  DEFAULT_API_BASE_URL;
+
+const REMOTE_BACKEND_URLS = Array.from(
+  new Set([CONFIGURED_API_BASE_URL, DEFAULT_API_BASE_URL].filter(Boolean))
+);
+
+export function getActiveBackendUrls(): string[] {
   if (!isTauriRuntime() && typeof window !== 'undefined' && window.location?.origin) {
-    const configured = (import.meta.env.VITE_API_BASE_URL as string | undefined)
-      ?.trim()
-      .replace(/\/+$/, '');
     const sameOrigin = window.location.origin.replace(/\/+$/, '');
-    if (configured && configured !== sameOrigin) {
-      return ['', configured];
+    if (CONFIGURED_API_BASE_URL && CONFIGURED_API_BASE_URL !== sameOrigin) {
+      return [CONFIGURED_API_BASE_URL, ''];
     }
-    return [''];
+    return [CONFIGURED_API_BASE_URL || ''];
   }
   return REMOTE_BACKEND_URLS;
 }
@@ -236,7 +246,7 @@ async function fetchBackendJson<T>(
         const msg =
           (typeof parsed.error === 'string' && parsed.error) ||
           (typeof parsed.message === 'string' && parsed.message) ||
-          `خطای سرور (${response.status})`;
+          translateNetworkErrorToPersian(null, response.status);
         throw new Error(msg);
       }
 
@@ -252,16 +262,83 @@ async function fetchBackendJson<T>(
         !message.includes('Failed to fetch') &&
         !message.includes('AbortError') &&
         !message.includes('aborted') &&
+        !message.includes('Timeout') &&
         !message.includes('NetworkError') &&
         !message.includes('Load failed')
       ) {
-        throw err;
+        throw new Error(translateNetworkErrorToPersian(err));
       }
-      lastError = 'ارتباط با سرور سنترا برقرار نشد. اینترنت خود را بررسی کنید.';
+      lastError = translateNetworkErrorToPersian(err);
     }
   }
 
   throw new Error(lastError);
+}
+
+/**
+ * Fetches and validates a sing-box 1.14+ configuration from POST /api/v1/client/config,
+ * automatically falling back to GET /sub/{token}?format=singbox if needed.
+ */
+export async function fetchSingboxClientConfig(
+  token: string,
+  mode: ConnectionModeId = 'web_browsing',
+  locationCode?: string
+): Promise<Record<string, unknown>> {
+  try {
+    const raw = await fetchBackendJson<Record<string, unknown>>('/api/v1/client/config', {
+      method: 'POST',
+      headers: {
+        'X-Subscription-Token': token,
+        'X-Device-Id': getOrCreateWebDeviceId(),
+      },
+      body: JSON.stringify({
+        token,
+        mode,
+        ...(locationCode && locationCode !== 'auto' ? { location_code: locationCode } : {}),
+      }),
+      timeoutMs: 12000,
+    });
+    const extracted = extractSingboxConfig(raw);
+    const validated = validateSingbox114Config(extracted);
+    if (!validated.valid) {
+      throw new Error(validated.errors[0] || 'پیکربندی دریافتی با sing-box 1.14+ سازگار نیست.');
+    }
+    return validated.config;
+  } catch (primaryErr) {
+    const msg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+    if (msg.startsWith('AUTH_EXPIRED:')) {
+      throw primaryErr;
+    }
+    return fetchSingboxSubscriptionConfig(token, mode, locationCode);
+  }
+}
+
+/**
+ * Fetches a sing-box 1.14+ configuration directly from GET /sub/{token}?format=singbox.
+ */
+export async function fetchSingboxSubscriptionConfig(
+  token: string,
+  mode: ConnectionModeId = 'web_browsing',
+  locationCode?: string
+): Promise<Record<string, unknown>> {
+  const params = new URLSearchParams({ format: 'singbox', mode });
+  if (locationCode && locationCode !== 'auto') {
+    params.set('location', locationCode);
+  }
+  const path = `/sub/${encodeURIComponent(token.trim())}?${params.toString()}`;
+  const raw = await fetchBackendJson<Record<string, unknown>>(path, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+    timeoutMs: 12000,
+  });
+  const extracted = extractSingboxConfig(raw);
+  const validated = validateSingbox114Config(extracted);
+  if (!validated.valid) {
+    throw new Error(validated.errors[0] || 'پیکربندی لینک اشتراک با sing-box 1.14+ سازگار نیست.');
+  }
+  return validated.config;
 }
 
 export async function restorePersistedSession(): Promise<PersistedSession | null> {
@@ -772,7 +849,7 @@ export async function setUseWarpNative(enabled: boolean): Promise<void> {
 export async function connectVpnNative(): Promise<void> {
   if (!isTauriRuntime()) {
     throw new Error(
-      'Native VPN tunnel is only available in the installed Windows or Android Sentra app.'
+      'تونل بومی VPN فقط در نسخه نصبی ویندوز یا اندروید اپلیکیشن Sentra Connect در دسترس است.'
     );
   }
   await invokeTauri('connect_vpn');
@@ -818,7 +895,7 @@ export interface GithubReleaseUpdate {
 }
 
 const GITHUB_RELEASES_API =
-  'https://api.github.com/repos/parsa904/SentraVpn/releases/latest';
+  'https://api.github.com/repos/parsa904/sentravpn/releases/latest';
 
 export async function checkGithubLatestRelease(
   currentVersion: string

@@ -124,7 +124,7 @@ impl Default for ClientState {
             expires_at: None,
             status: ConnectionStatus::Disconnected,
             selected_mode: "web_browsing".to_string(),
-            selected_protocol: "openvpn_udp".to_string(),
+            selected_protocol: "singbox".to_string(),
             selected_location: "auto".to_string(),
             selected_outbound_id: None,
             selected_personal_uri: None,
