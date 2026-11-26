@@ -7,6 +7,7 @@ import {
   constantTimeEquals,
   generateNumericCode,
   generateSubscriptionToken,
+  sha256Hex,
   validateExternalHttpsUrl,
   verifyPassword,
 } from './security.ts';
@@ -24,11 +25,27 @@ interface TelegramUser {
   username?: string;
 }
 
+interface TelegramPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width?: number;
+  height?: number;
+}
+
+interface TelegramDocument {
+  file_id: string;
+  file_unique_id: string;
+  file_name?: string;
+}
+
 interface TelegramMessage {
   message_id: number;
   from?: TelegramUser;
   chat: { id: number; type: string };
   text?: string;
+  caption?: string;
+  photo?: TelegramPhotoSize[];
+  document?: TelegramDocument;
 }
 
 interface TelegramCallbackQuery {
@@ -65,8 +82,150 @@ function resolveBotToken(env: Env): string {
   return (env.TELEGRAM_BOT_TOKEN || '').trim();
 }
 
+const USER_BTN = {
+  ACCOUNT: '👤 حساب کاربری',
+  AUTH: '📝 ثبت‌نام / ورود',
+  GET_SUB: '🔑 دریافت کانفیگ و کد اتصال',
+  IOS_CONFIG: '🍏 دریافت کانفیگ iOS',
+  UPGRADE: '💎 ارتقای اشتراک',
+  DONATE_OUTBOUND: '🤝 اهدای اوتباند (حمایت از Sentra)',
+  GUIDE: '📖 راهنمای اتصال',
+  DOWNLOAD_APP: '📥 دانلود اپلیکیشن Sentra Connect',
+  SUPPORT: '🎫 پشتیبانی',
+  BACK: '🔙 بازگشت',
+  CANCEL: '❌ انصراف',
+} as const;
+
 const ADMIN_PANEL_BUTTON = '🛠 پنل مدیریت';
 const LEGACY_ADMIN_PANEL_BUTTON = '🛡 پنل مدیریت اوتباندها';
+
+type MenuAction =
+  | 'account'
+  | 'auth'
+  | 'get_sub'
+  | 'ios_menu'
+  | 'upgrade'
+  | 'donate_outbound'
+  | 'guide'
+  | 'download_app'
+  | 'support'
+  | 'back'
+  | 'admin';
+
+function normalizePersianButton(raw: string): string {
+  return raw
+    .replace(/\u200c/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function matchMenuAction(rawText: string): MenuAction | null {
+  const text = rawText.trim();
+  const norm = normalizePersianButton(text);
+
+  if (
+    text === '/admin' ||
+    text.startsWith('/admin ') ||
+    /^\/admin@[A-Za-z0-9_]+(\s|$)/.test(text) ||
+    text === ADMIN_PANEL_BUTTON ||
+    text === LEGACY_ADMIN_PANEL_BUTTON ||
+    norm === '🛠 پنل مدیریت' ||
+    norm === 'پنل مدیریت'
+  ) {
+    return 'admin';
+  }
+  if (
+    text === USER_BTN.BACK ||
+    text === USER_BTN.CANCEL ||
+    norm === '🔙 بازگشت' ||
+    norm === 'بازگشت' ||
+    norm === '🔙 بازگشت به منوی اصلی' ||
+    norm === 'بازگشت به منوی اصلی' ||
+    norm === '❌ انصراف' ||
+    norm === 'انصراف'
+  ) {
+    return 'back';
+  }
+  if (
+    text === USER_BTN.AUTH ||
+    norm === '📝 ثبت نام / ورود' ||
+    norm === 'ثبت نام / ورود'
+  ) {
+    return 'auth';
+  }
+  if (
+    text === USER_BTN.ACCOUNT ||
+    norm === '👤 حساب کاربری' ||
+    norm === 'حساب کاربری' ||
+    norm === 'وضعیت حساب' ||
+    norm === '📊 وضعیت حساب' ||
+    norm === '📊 وضعیت اشتراک'
+  ) {
+    return 'account';
+  }
+  if (
+    text === USER_BTN.GET_SUB ||
+    norm === '🔑 دریافت کانفیگ و کد اتصال' ||
+    norm === 'دریافت لینک اشتراک' ||
+    norm === '🔗 دریافت لینک اشتراک' ||
+    norm === 'دریافت کانفیگ'
+  ) {
+    return 'get_sub';
+  }
+  if (
+    text === USER_BTN.IOS_CONFIG ||
+    norm === '🍏 دریافت کانفیگ iOS' ||
+    norm === 'دریافت کانفیگ iOS'
+  ) {
+    return 'ios_menu';
+  }
+  if (
+    text === USER_BTN.UPGRADE ||
+    norm === '💎 ارتقای اشتراک' ||
+    norm === 'ارتقای اشتراک' ||
+    norm === 'خرید اشتراک' ||
+    norm === '💎 خرید / ارتقای اشتراک'
+  ) {
+    return 'upgrade';
+  }
+  if (
+    text === USER_BTN.DONATE_OUTBOUND ||
+    norm === '🤝 اهدای اوتباند (حمایت از Sentra)' ||
+    norm === 'اهدای اوتباند' ||
+    norm === 'اهدای نود' ||
+    norm === '🤝 اهدای نود' ||
+    norm === 'اهدای کانفیگ'
+  ) {
+    return 'donate_outbound';
+  }
+  if (
+    text === USER_BTN.GUIDE ||
+    norm === '📖 راهنمای اتصال' ||
+    norm === 'راهنمای اتصال' ||
+    norm === '📚 راهنمای اتصال'
+  ) {
+    return 'guide';
+  }
+  if (
+    text === USER_BTN.DOWNLOAD_APP ||
+    norm === '📥 دانلود اپلیکیشن Sentra Connect' ||
+    norm === 'دانلود اپلیکیشن' ||
+    norm === '📥 دانلود اپلیکیشن'
+  ) {
+    return 'download_app';
+  }
+  if (
+    text === USER_BTN.SUPPORT ||
+    norm === '🎫 پشتیبانی' ||
+    norm === 'پشتیبانی' ||
+    norm === '💬 پشتیبانی' ||
+    norm === 'تیکت پشتیبانی'
+  ) {
+    return 'support';
+  }
+
+  return null;
+}
 
 function isEnvAdmin(env: Env, telegramId: number): boolean {
   const idStr = String(telegramId);
@@ -238,15 +397,30 @@ async function tgSendTextDocument(
   }
 }
 
+async function tgSendDocumentByFileId(
+  env: Env,
+  chatId: number,
+  fileId: string,
+  caption: string
+): Promise<boolean> {
+  return await tgApi(env, 'sendDocument', {
+    chat_id: chatId,
+    document: fileId,
+    caption,
+    parse_mode: 'HTML',
+  });
+}
+
 function buildMainKeyboard(isRegistered: boolean, isAdmin: boolean): Record<string, unknown> {
-  const firstRow = isRegistered
-    ? [{ text: '👤 حساب کاربری' }]
-    : [{ text: '📝 ثبت‌نام / ورود' }];
+  const accountOrAuthBtn = isRegistered
+    ? { text: USER_BTN.ACCOUNT }
+    : { text: USER_BTN.AUTH };
 
   const rows: Array<Array<{ text: string }>> = [
-    firstRow,
-    [{ text: '🔑 دریافت کانفیگ و کد اتصال' }, { text: '🍏 دریافت کانفیگ iOS' }],
-    [{ text: '🤝 اهدای اوتباند (حمایت از Sentra)' }, { text: '📥 دانلود اپلیکیشن Sentra Connect' }],
+    [accountOrAuthBtn, { text: USER_BTN.GET_SUB }],
+    [{ text: USER_BTN.IOS_CONFIG }, { text: USER_BTN.UPGRADE }],
+    [{ text: USER_BTN.DONATE_OUTBOUND }, { text: USER_BTN.GUIDE }],
+    [{ text: USER_BTN.DOWNLOAD_APP }, { text: USER_BTN.SUPPORT }],
   ];
   if (isAdmin) {
     rows.push([{ text: ADMIN_PANEL_BUTTON }]);
@@ -949,7 +1123,7 @@ async function buildAdminStatsView(
   };
 }
 
-async function sendOrEditAdminView(
+async function sendOrEditView(
   env: Env,
   chatId: number,
   messageId: number | undefined,
@@ -962,28 +1136,401 @@ async function sendOrEditAdminView(
   await tgSendMessage(env, chatId, view.text, view.replyMarkup);
 }
 
+// ==============================================================================
+// User Panel View Builders (Shared between Reply Keyboard & Inline Callbacks)
+// ==============================================================================
+
+function buildCancelStateInlineMarkup(): Record<string, unknown> {
+  return {
+    inline_keyboard: [[{ text: '❌ انصراف و بازگشت', callback_data: 'user_cancel_state' }]],
+  };
+}
+
+function buildUserMenuHomeView(
+  user: UserRow | null,
+  sub: SubscriptionRow | null,
+  isAdmin: boolean
+): { text: string; replyMarkup: Record<string, unknown> } {
+  const greeting = user
+    ? `👋 <b>منوی سریع کاربری Sentra</b>\n\n` +
+      `👤 کاربر: <b>${escapeHtml(user.first_name)}</b>\n` +
+      `💎 پلن فعال: <b>${escapeHtml(sub?.tier || 'Sentra Lite')}</b>\n\n` +
+      `بخش مورد نظر خود را انتخاب کنید:`
+    : `👋 <b>به Sentra Platform خوش آمدید!</b>\n\nبرای دسترسی به اشتراک رایگان و کانفیگ‌ها ابتدا ثبت‌نام یا ورود انجام دهید:`;
+
+  const inlineRows: Array<Array<{ text: string; callback_data: string }>> = user
+    ? [
+        [
+          { text: '👤 وضعیت حساب و حجم', callback_data: 'user_account' },
+          { text: '🔑 دریافت لینک اشتراک', callback_data: 'user_get_sub' },
+        ],
+        [
+          { text: '🍏 کانفیگ iOS', callback_data: 'user_ios_menu' },
+          { text: '💎 ارتقای اشتراک', callback_data: 'user_upgrade' },
+        ],
+        [
+          { text: '🤝 اهدای نود / کانفیگ', callback_data: 'user_donate_outbound' },
+          { text: '📖 راهنمای اتصال', callback_data: 'user_guide' },
+        ],
+        [
+          { text: '📥 دانلود اپلیکیشن', callback_data: 'user_download_app' },
+          { text: '🎫 پشتیبانی و تیکت', callback_data: 'user_support' },
+        ],
+      ]
+    : [
+        [{ text: '✨ ثبت‌نام جدید (فوری)', callback_data: 'auth_register_new' }],
+        [{ text: '🔑 ورود با حساب برنامه', callback_data: 'auth_login_app' }],
+        [{ text: '📖 راهنمای اتصال', callback_data: 'user_guide' }],
+      ];
+
+  if (isAdmin) {
+    inlineRows.push([{ text: '🛠 ورود به پنل مدیریت', callback_data: 'adm_panel_home' }]);
+  }
+
+  return {
+    text: greeting,
+    replyMarkup: { inline_keyboard: inlineRows },
+  };
+}
+
+function buildUserAccountView(
+  user: UserRow,
+  sub: SubscriptionRow
+): { text: string; replyMarkup: Record<string, unknown> } {
+  const usedBytes = sub.upload_bytes + sub.download_bytes;
+  const remainingBytes = Math.max(0, sub.traffic_limit_bytes - usedBytes);
+  const statusLabel =
+    sub.status === 'active'
+      ? '🟢 فعال'
+      : sub.status === 'expired'
+      ? '🟡 منقضی‌شده'
+      : sub.status === 'depleted'
+      ? '🟠 اتمام حجم'
+      : '🔴 غیرفعال';
+
+  return {
+    text:
+      `👤 <b>وضعیت حساب کاربری شما</b>\n\n` +
+      `🆔 شناسه یکتا: <code>${escapeHtml(user.user_uuid)}</code>\n` +
+      `💎 نوع اشتراک: <b>${escapeHtml(sub.tier)}</b>\n` +
+      `📌 وضعیت: ${statusLabel}\n` +
+      `📊 حجم مصرفی: <b>${formatGb(usedBytes)} GB</b> از <b>${formatGb(sub.traffic_limit_bytes)} GB</b>\n` +
+      `🔋 حجم باقیمانده: <b>${formatGb(remainingBytes)} GB</b>\n` +
+      `📱 حداکثر دستگاه هم‌زمان: <b>${sub.max_concurrent_devices}</b>\n` +
+      `📅 تاریخ انقضا: <code>${escapeHtml(sub.expires_at.slice(0, 10))}</code>`,
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          { text: '🔑 دریافت لینک اشتراک و کد', callback_data: 'user_get_sub' },
+          { text: '💎 ارتقای اشتراک', callback_data: 'user_upgrade' },
+        ],
+        [
+          { text: '🎫 تیکت‌های من', callback_data: 'user_support' },
+          { text: '🔄 بروزرسانی', callback_data: 'user_account' },
+        ],
+        [{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }],
+      ],
+    },
+  };
+}
+
+async function buildUserSubscriptionView(
+  env: Env,
+  user: UserRow,
+  sub: SubscriptionRow
+): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
+  const otp = generateNumericCode(8);
+  const expires = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  await env.DB.prepare(
+    'UPDATE users SET auth_code = ?, auth_code_expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+  )
+    .bind(otp, expires, user.id)
+    .run();
+
+  const baseUrl = (env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+  const singboxUrl = baseUrl
+    ? `${baseUrl}/sub/${sub.token}?format=singbox`
+    : `/sub/${sub.token}?format=singbox`;
+  const v2rayUrl = baseUrl ? `${baseUrl}/sub/${sub.token}` : `/sub/${sub.token}`;
+
+  return {
+    text:
+      `🔑 <b>اطلاعات اتصال و لینک اشتراک شما</b>\n\n` +
+      `🔢 <b>کد ورود ۸ رقمی اپلیکیشن Sentra Connect (اعتبار ۵ دقیقه):</b>\n<code>${otp}</code>\n\n` +
+      `🔗 <b>لینک سابسکریپشن Sing-box 1.14+ (پیشنهادی):</b>\n<code>${escapeHtml(singboxUrl)}</code>\n\n` +
+      `🌐 <b>لینک سابسکریپشن عمومی (V2Ray / Base64):</b>\n<code>${escapeHtml(v2rayUrl)}</code>\n\n` +
+      `💡 برای کپی، روی کد یا لینک بالا ضربه بزنید.`,
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          { text: '🍏 کانفیگ اختصاصی iOS', callback_data: 'user_ios_menu' },
+          { text: '📖 راهنمای اتصال', callback_data: 'user_guide' },
+        ],
+        [
+          { text: '🔄 تولید کد جدید', callback_data: 'user_get_sub' },
+          { text: '👤 وضعیت حساب', callback_data: 'user_account' },
+        ],
+        [{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }],
+      ],
+    },
+  };
+}
+
+async function buildUserIosMenuView(
+  env: Env,
+  sub: SubscriptionRow
+): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
+  const gamingLive = await hasActiveGamingOutbounds(env.DB);
+  const canStatic = tierHasStaticIp(sub.tier);
+  const canGaming = tierHasGaming(sub.tier);
+
+  const buttons: Array<Array<{ text: string; callback_data: string }>> = [
+    [
+      { text: '🌐 وب‌گردی (رایگان)', callback_data: 'ios_mode_web_browsing' },
+      { text: '📥 دانلود (رایگان)', callback_data: 'ios_mode_download' },
+    ],
+  ];
+  if (gamingLive && canGaming) {
+    buttons.push([{ text: '🎮 گیمینگ (WireGuard)', callback_data: 'ios_mode_gaming' }]);
+  } else {
+    buttons.push([{ text: '🎮 گیمینگ (به‌زودی)', callback_data: 'ios_mode_gaming' }]);
+  }
+  if (canStatic) {
+    buttons.push([{ text: '💎 آی‌پی ثابت اختصاصی', callback_data: 'ios_mode_static_ip' }]);
+  } else {
+    buttons.push([{ text: '🔒 آی‌پی ثابت (نیازمند ارتقا)', callback_data: 'ios_mode_static_ip' }]);
+  }
+  buttons.push([{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }]);
+
+  return {
+    text:
+      '🍏 <b>دریافت کانفیگ اختصاصی iOS</b>\n\n' +
+      'حالت اتصال مورد نظر خود را انتخاب کنید تا لینک سابسکریپشن SFI / Streisand یا پروفایل WireGuard برای شما ساخته شود:',
+    replyMarkup: { inline_keyboard: buttons },
+  };
+}
+
+function buildUserUpgradeView(
+  env: Env,
+  sub: SubscriptionRow | null
+): { text: string; replyMarkup: Record<string, unknown> } {
+  const proPrice = Number(env.PRO_SUBSCRIPTION_PRICE || '150000') || 150000;
+  const flowPrice = Math.round(proPrice * 2);
+
+  return {
+    text:
+      `💎 <b>ارتقای اشتراک و حمایت از Sentra</b>\n\n` +
+      `پلن فعلی شما: <b>${escapeHtml(sub?.tier || 'Sentra Lite')}</b>\n\n` +
+      `🚀 <b>Sentra Pro (۲۰۰ گیگابایت / ماهانه)</b>\n` +
+      `• دسترسی به نودهای پرسرعت + آی‌پی ثابت (ترید و جمنای)\n` +
+      `• مبلغ حمایت: <b>${proPrice.toLocaleString('en-US')} تومان</b>\n\n` +
+      `🔥 <b>Sentra Flow+ (۵۰۰ گیگابایت / ماهانه)</b>\n` +
+      `• تمام امکانات Pro + اولویت ترافیک و دسترسی کامل به گیمینگ پس از فعال‌سازی\n` +
+      `• مبلغ حمایت: <b>${flowPrice.toLocaleString('en-US')} تومان</b>\n\n` +
+      `💡 همچنین می‌توانید با <b>اهدای اوتباند فعال</b> به اکوسیستم کمک کنید.`,
+    replyMarkup: {
+      inline_keyboard: [
+        [{ text: '💳 ارسال فیش واریزی پلن Pro', callback_data: 'user_submit_receipt_pro' }],
+        [{ text: '💳 ارسال فیش واریزی پلن Flow+', callback_data: 'user_submit_receipt_flow' }],
+        [{ text: '🤝 اهدای نود / اوتباند', callback_data: 'user_donate_outbound' }],
+        [{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }],
+      ],
+    },
+  };
+}
+
+function buildUserGuideView(
+  platform: 'overview' | 'android' | 'ios' | 'windows' = 'overview'
+): { text: string; replyMarkup: Record<string, unknown> } {
+  let text =
+    '📖 <b>راهنمای اتصال به Sentra Platform</b>\n\n' +
+    'سیستم‌عامل خود را از دکمه‌های زیر انتخاب کنید تا مراحل اتصال نمایش داده شود:';
+
+  if (platform === 'android') {
+    text =
+      '🤖 <b>راهنمای اتصال در اندروید</b>\n\n' +
+      '۱. اپلیکیشن <b>Sentra Connect</b> (یا Hiddify / sing-box SFA) را نصب کنید.\n' +
+      '۲. از بخش «🔑 دریافت کانفیگ و کد اتصال»، کد ۸ رقمی یا لینک Sing-box 1.14+ را کپی کنید.\n' +
+      '۳. در Sentra Connect کد ۸ رقمی را وارد کنید یا در sing-box لینک سابسکریپشن را Import نمایید.\n' +
+      '۴. روی دکمه اتصال بزنید و مجوز VPN را تأیید کنید.';
+  } else if (platform === 'ios') {
+    text =
+      '🍏 <b>راهنمای اتصال در iOS (آیفون و آیپد)</b>\n\n' +
+      '۱. یکی از اپلیکیشن‌های <b>sing-box (SFI)</b>، <b>Streisand</b> یا <b>Hiddify</b> را از App Store نصب کنید.\n' +
+      '۲. از بخش «🍏 دریافت کانفیگ iOS» حالت مورد نظر را انتخاب کرده و لینک اشتراک را کپی کنید.\n' +
+      '۳. در برنامه گزینه <b>Add Profile / Subscription</b> را بزنید و لینک را وارد کنید.\n' +
+      '۴. پروفایل را انتخاب کرده و اتصال را فعال کنید.';
+  } else if (platform === 'windows') {
+    text =
+      '💻 <b>راهنمای اتصال در ویندوز / مک</b>\n\n' +
+      '۱. اپلیکیشن <b>Sentra Connect</b> یا <b>Hiddify / sing-box</b> نسخه دسکتاپ را دانلود و اجرا کنید.\n' +
+      '۲. از منوی ربات روی «🔑 دریافت کانفیگ و کد اتصال» بزنید.\n' +
+      '۳. کد ورود ۸ رقمی را در Sentra Connect وارد کنید (یا لینک Sing-box 1.14+ را در کلاینت اضافه نمایید).\n' +
+      '۴. حالت اتصال (وب‌گردی، دانلود یا آی‌پی ثابت) را انتخاب و متصل شوید.';
+  }
+
+  return {
+    text,
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          { text: '🤖 اندروید', callback_data: 'user_guide_android' },
+          { text: '🍏 iOS', callback_data: 'user_guide_ios' },
+          { text: '💻 ویندوز', callback_data: 'user_guide_windows' },
+        ],
+        [
+          { text: '📥 دانلود اپلیکیشن', callback_data: 'user_download_app' },
+          { text: '🔑 دریافت لینک اشتراک', callback_data: 'user_get_sub' },
+        ],
+        [{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }],
+      ],
+    },
+  };
+}
+
+async function buildUserDownloadAppView(
+  env: Env
+): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
+  const releases = await env.DB.prepare(
+    'SELECT platform, version, file_name, file_size_mb, changelog, updated_at FROM app_releases ORDER BY platform ASC'
+  ).all<{
+    platform: string;
+    version: string;
+    file_name: string;
+    file_size_mb: number;
+    changelog: string;
+    updated_at: string;
+  }>();
+
+  const rows = releases.results || [];
+  const win = rows.find((r) => r.platform === 'windows');
+  const andr = rows.find((r) => r.platform === 'android');
+
+  const lines: string[] = [];
+  if (andr) {
+    lines.push(
+      `🤖 <b>اندروید:</b> نسخه <code>${escapeHtml(andr.version)}</code> (${andr.file_size_mb.toFixed(1)} MB)` +
+        (andr.changelog ? `\n   📝 ${escapeHtml(andr.changelog.slice(0, 120))}` : '')
+    );
+  } else {
+    lines.push('🤖 <b>اندروید:</b> فایل نصبی به‌زودی بارگذاری می‌شود (فعلاً از sing-box SFA یا Hiddify استفاده کنید).');
+  }
+  if (win) {
+    lines.push(
+      `💻 <b>ویندوز:</b> نسخه <code>${escapeHtml(win.version)}</code> (${win.file_size_mb.toFixed(1)} MB)` +
+        (win.changelog ? `\n   📝 ${escapeHtml(win.changelog.slice(0, 120))}` : '')
+    );
+  } else {
+    lines.push('💻 <b>ویندوز:</b> فایل نصبی به‌زودی بارگذاری می‌شود (فعلاً از Hiddify یا sing-box 1.14+ استفاده کنید).');
+  }
+
+  return {
+    text:
+      `📥 <b>دانلود اپلیکیشن رسمی Sentra Connect</b>\n\n` +
+      `${lines.join('\n\n')}\n\n` +
+      `پلتفرم مورد نظر خود را برای دریافت فایل انتخاب کنید:`,
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          { text: '🤖 دانلود نسخه اندروید', callback_data: 'user_dl_android' },
+          { text: '💻 دانلود نسخه ویندوز', callback_data: 'user_dl_windows' },
+        ],
+        [
+          { text: '📖 راهنمای اتصال', callback_data: 'user_guide' },
+          { text: '🔙 منوی اصلی', callback_data: 'user_menu_home' },
+        ],
+      ],
+    },
+  };
+}
+
+async function buildUserSupportView(
+  env: Env,
+  user: UserRow
+): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
+  const tickets = await env.DB.prepare(
+    `SELECT ticket_number, category, subject, status, created_at
+     FROM support_tickets
+     WHERE user_id = ?
+     ORDER BY id DESC
+     LIMIT 5`
+  )
+    .bind(user.id)
+    .all<{
+      ticket_number: string;
+      category: string;
+      subject: string;
+      status: string;
+      created_at: string;
+    }>();
+
+  const list = tickets.results || [];
+  const statusMap: Record<string, string> = {
+    open: '🟢 باز',
+    awaiting_user: '🟡 در انتظار پاسخ شما',
+    investigating: '🔵 در حال بررسی',
+    resolved: '✅ حل‌شده',
+    closed: '⚪️ بسته‌شده',
+  };
+
+  const ticketLines = list.map(
+    (t) =>
+      `• <code>${escapeHtml(t.ticket_number)}</code> — ${statusMap[t.status] || escapeHtml(t.status)}\n` +
+      `  ${escapeHtml(t.subject.slice(0, 60))}`
+  );
+
+  return {
+    text:
+      `🎫 <b>پشتیبانی Sentra Platform</b>\n\n` +
+      (ticketLines.length > 0
+        ? `<b>آخرین تیکت‌های شما:</b>\n${ticketLines.join('\n')}\n\n`
+        : '<i>شما هنوز تیکت پشتیبانی ثبت نکرده‌اید.</i>\n\n') +
+      `برای ثبت تیکت جدید، موضوع مشکل خود را انتخاب کنید:`,
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          { text: '🌐 مشکل اتصال', callback_data: 'user_ticket_new_connection' },
+          { text: '💳 پرداخت و اشتراک', callback_data: 'user_ticket_new_billing' },
+        ],
+        [
+          { text: '📱 راه‌اندازی دستگاه', callback_data: 'user_ticket_new_device_setup' },
+          { text: '💬 سایر موارد', callback_data: 'user_ticket_new_other' },
+        ],
+        [{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }],
+      ],
+    },
+  };
+}
+
+// ==============================================================================
+// Callback Query Handler (Inline Keyboards)
+// ==============================================================================
+
 async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<void> {
   const chatId = q.message?.chat.id || q.from.id;
   const messageId = q.message?.message_id;
   const telegramId = q.from.id;
-  const isAdmin = await resolveIsAdmin(env, telegramId);
-  const data = q.data || '';
+  const data = (q.data || '').trim();
 
+  // 1. ALWAYS acknowledge the callback query first with await to clear Telegram's loading spinner
   await tgAnswerCallbackQuery(env, q.id);
 
-  if (data === 'auth_register_new') {
-    try {
+  try {
+    const isAdmin = await resolveIsAdmin(env, telegramId);
+
+    // --- Auth Callbacks ---
+    if (data === 'auth_register_new') {
       const { user, sub, isNewUser } = await ensureTelegramUserAndSubscription(
         env.DB,
         q.from,
         isEnvAdmin(env, telegramId)
       );
       const effectiveIsAdmin = isEnvAdmin(env, telegramId) || user.role === 'admin';
-      if (q.message) {
+      if (messageId) {
         await tgEditMessageText(
           env,
           chatId,
-          q.message.message_id,
+          messageId,
           isNewUser
             ? `🎉 <b>ثبت‌نام شما با موفقیت انجام شد!</b>\n\n🆔 <b>کد شناسایی یکتا:</b> <code>${escapeHtml(user.user_uuid)}</code>\n💎 <b>پلن فعال:</b> ${escapeHtml(sub.tier)} (۱۰ گیگابایت)`
             : `✅ حساب شما از قبل فعال است.\n🆔 شناسه یکتا: <code>${escapeHtml(user.user_uuid)}</code>`
@@ -992,580 +1539,962 @@ async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<
       await tgSendMessage(
         env,
         chatId,
-        `از این پس می‌توانید وضعیت اشتراک و حجم مصرفی خود را از دکمه «👤 حساب کاربری» مشاهده کنید.`,
+        `از این پس می‌توانید وضعیت اشتراک، لینک اتصال و پشتیبانی را از منوی زیر مدیریت کنید.`,
         buildMainKeyboard(true, effectiveIsAdmin)
       );
-    } catch (err) {
-      console.error(
-        '[Sentra D1 Error] auth_register_new failed:',
-        err instanceof Error ? err.message : String(err),
-        err
-      );
-      await tgSendMessage(
-        env,
-        chatId,
-        '⚠️ خطایی در ثبت‌نام و ذخیره اطلاعات در دیتابیس رخ داد. لطفاً لحظاتی دیگر دوباره تلاش کنید.'
-      );
-    }
-    return;
-  }
-
-  if (data === 'auth_login_app') {
-    await setBotState(env.DB, telegramId, 'awaiting_login_username');
-    await tgSendMessage(
-      env,
-      chatId,
-      '🔐 <b>ورود با حساب اپلیکیشن Sentra</b>\n\nلطفاً <b>نام کاربری (Username)</b> حساب خود در اپلیکیشن را ارسال کنید:'
-    );
-    return;
-  }
-
-  if (data.startsWith('ios_mode_')) {
-    const mode = data.slice('ios_mode_'.length);
-    const record = await getUserAndSubByTelegramId(env.DB, telegramId);
-    if (!record || !record.sub) {
-      await tgSendMessage(env, chatId, '❌ لطفاً ابتدا از منوی اصلی ثبت‌نام یا ورود انجام دهید.');
       return;
     }
 
-    if (mode === 'gaming') {
-      const gamingLive = await hasActiveGamingOutbounds(env.DB);
-      if (!gamingLive) {
-        await tgSendMessage(
+    if (data === 'auth_login_app') {
+      await setBotState(env.DB, telegramId, 'awaiting_login_username');
+      await tgSendMessage(
+        env,
+        chatId,
+        '🔐 <b>ورود با حساب اپلیکیشن Sentra</b>\n\nلطفاً <b>نام کاربری (Username)</b> حساب خود در اپلیکیشن را ارسال کنید:',
+        buildCancelStateInlineMarkup()
+      );
+      return;
+    }
+
+    // --- Cancel FSM State ---
+    if (data === 'user_cancel_state') {
+      await clearBotState(env.DB, telegramId);
+      const record = await getUserAndSubByTelegramId(env.DB, telegramId);
+      const effectiveIsAdmin = isAdmin || record?.user.role === 'admin';
+      await sendOrEditView(
+        env,
+        chatId,
+        messageId,
+        buildUserMenuHomeView(record?.user || null, record?.sub || null, effectiveIsAdmin)
+      );
+      return;
+    }
+
+    // --- User Home Menu ---
+    if (data === 'user_menu_home' || data === 'back_to_main') {
+      await clearBotState(env.DB, telegramId);
+      const record = await getUserAndSubByTelegramId(env.DB, telegramId);
+      const effectiveIsAdmin = isAdmin || record?.user.role === 'admin';
+      await sendOrEditView(
+        env,
+        chatId,
+        messageId,
+        buildUserMenuHomeView(record?.user || null, record?.sub || null, effectiveIsAdmin)
+      );
+      return;
+    }
+
+    // --- User Account Status ---
+    if (data === 'user_account') {
+      const { user, sub } = await ensureTelegramUserAndSubscription(
+        env.DB,
+        q.from,
+        isEnvAdmin(env, telegramId)
+      );
+      await sendOrEditView(env, chatId, messageId, buildUserAccountView(user, sub));
+      return;
+    }
+
+    // --- User Subscription Link & OTP Code ---
+    if (data === 'user_get_sub') {
+      const { user, sub } = await ensureTelegramUserAndSubscription(
+        env.DB,
+        q.from,
+        isEnvAdmin(env, telegramId)
+      );
+      const view = await buildUserSubscriptionView(env, user, sub);
+      await sendOrEditView(env, chatId, messageId, view);
+      return;
+    }
+
+    // --- User iOS Menu & Mode Selection ---
+    if (data === 'user_ios_menu') {
+      const { sub } = await ensureTelegramUserAndSubscription(
+        env.DB,
+        q.from,
+        isEnvAdmin(env, telegramId)
+      );
+      const view = await buildUserIosMenuView(env, sub);
+      await sendOrEditView(env, chatId, messageId, view);
+      return;
+    }
+
+    if (data.startsWith('ios_mode_')) {
+      const mode = data.slice('ios_mode_'.length);
+      const { sub } = await ensureTelegramUserAndSubscription(
+        env.DB,
+        q.from,
+        isEnvAdmin(env, telegramId)
+      );
+
+      if (mode === 'gaming') {
+        const gamingLive = await hasActiveGamingOutbounds(env.DB);
+        if (!gamingLive) {
+          await tgSendMessage(
+            env,
+            chatId,
+            '🎮 <b>بخش گیمینگ به‌زودی راه‌اندازی می‌شود!</b>\n\nبه‌محض افزودن سرور اختصاصی گیمینگ، کانفیگ WireGuard کم‌تاخیر iOS به صورت خودکار فعال خواهد شد.',
+            { inline_keyboard: [[{ text: '🔙 بازگشت به منوی iOS', callback_data: 'user_ios_menu' }]] }
+          );
+          return;
+        }
+        if (!tierHasGaming(sub.tier)) {
+          await tgSendMessage(
+            env,
+            chatId,
+            '🔒 دسترسی به کانفیگ گیمینگ WireGuard نیازمند اشتراک گیمینگ یا ویژه است.',
+            {
+              inline_keyboard: [
+                [{ text: '💎 ارتقای اشتراک', callback_data: 'user_upgrade' }],
+                [{ text: '🔙 بازگشت', callback_data: 'user_ios_menu' }],
+              ],
+            }
+          );
+          return;
+        }
+        const serverHost = env.PUBLIC_BASE_URL
+          ? new URL(env.PUBLIC_BASE_URL).hostname
+          : 'vpn.sentra.local';
+        const wg = await generateWireguardGamingProfile({
+          subscription: sub,
+          serverHost,
+          serverPublicKey: env.WIREGUARD_SERVER_PUBLIC_KEY || 'REPLACE_SERVER_WG_PUBLIC_KEY',
+          port: Number(env.WIREGUARD_PORT || 51820),
+          keySalt: env.WIREGUARD_KEY_SALT || 'sentra-wg-salt',
+        });
+        await tgSendTextDocument(
           env,
           chatId,
-          '🎮 <b>بخش گیمینگ به‌زودی راه‌اندازی می‌شود!</b>\n\nبه‌محض افزودن سرور اختصاصی گیمینگ، کانفیگ WireGuard کم‌تاخیر iOS به صورت خودکار فعال خواهد شد.'
+          wg.filename,
+          wg.config,
+          `🍏 <b>کانفیگ اختصاصی WireGuard گیمینگ (iOS)</b>\n\n` +
+            `🔹 پروتکل: <b>WireGuard UDP (MTU 1280)</b>\n` +
+            `🔹 پلن: <b>${escapeHtml(sub.tier)}</b>\n\n` +
+            `فایل بالا را با اپلیکیشن رسمی WireGuard در iOS باز و فعال کنید.`
         );
         return;
       }
-      if (!tierHasGaming(record.sub.tier)) {
+
+      if (mode === 'static_ip' && !tierHasStaticIp(sub.tier)) {
         await tgSendMessage(
           env,
           chatId,
-          '🔒 دسترسی به کانفیگ گیمینگ WireGuard نیازمند اشتراک گیمینگ یا ویژه است.'
+          '🔒 حالت آی‌پی ثابت مخصوص پلن‌های ویژه (Pro / Flow+ / Static IP) است.',
+          {
+            inline_keyboard: [
+              [{ text: '💎 ارتقای اشتراک', callback_data: 'user_upgrade' }],
+              [{ text: '🔙 بازگشت به منوی iOS', callback_data: 'user_ios_menu' }],
+            ],
+          }
         );
         return;
       }
-      const serverHost = env.PUBLIC_BASE_URL
-        ? new URL(env.PUBLIC_BASE_URL).hostname
-        : 'vpn.sentra.local';
-      const wg = await generateWireguardGamingProfile({
-        subscription: record.sub,
-        serverHost,
-        serverPublicKey: env.WIREGUARD_SERVER_PUBLIC_KEY || 'REPLACE_SERVER_WG_PUBLIC_KEY',
-        port: Number(env.WIREGUARD_PORT || 51820),
-        keySalt: env.WIREGUARD_KEY_SALT || 'sentra-wg-salt',
+
+      const baseUrl = (env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+      const subUrl = baseUrl
+        ? `${baseUrl}/sub/${sub.token}?format=singbox&mode=${encodeURIComponent(mode)}`
+        : `/sub/${sub.token}?format=singbox&mode=${encodeURIComponent(mode)}`;
+      await sendOrEditView(env, chatId, messageId, {
+        text:
+          `🍏 <b>پروفایل iOS (${escapeHtml(mode)}) آماده است</b>\n\n` +
+          `لینک زیر را در اپلیکیشن‌های سازگار با Sing-box 1.14+ (مانند SFI / Streisand / Hiddify) ایمپورت کنید:\n` +
+          `<code>${escapeHtml(subUrl)}</code>`,
+        replyMarkup: {
+          inline_keyboard: [
+            [{ text: '📖 راهنمای اتصال iOS', callback_data: 'user_guide_ios' }],
+            [
+              { text: '🔙 انتخاب حالت دیگر', callback_data: 'user_ios_menu' },
+              { text: '🏠 منوی اصلی', callback_data: 'user_menu_home' },
+            ],
+          ],
+        },
       });
-      await tgSendTextDocument(
-        env,
-        chatId,
-        wg.filename,
-        wg.config,
-        `🍏 <b>کانفیگ اختصاصی WireGuard گیمینگ (iOS)</b>\n\n` +
-          `🔹 پروتکل: <b>WireGuard UDP (MTU 1280)</b>\n` +
-          `🔹 پلن: <b>${escapeHtml(record.sub.tier)}</b>\n\n` +
-          `فایل بالا را با اپلیکیشن رسمی WireGuard در iOS باز و فعال کنید.`
-      );
       return;
     }
 
-    if (mode === 'static_ip' && !tierHasStaticIp(record.sub.tier)) {
-      await tgSendMessage(env, chatId, '🔒 حالت آی‌پی ثابت مخصوص پلن‌های ویژه است.');
+    // --- User Upgrade & Payment Receipt ---
+    if (data === 'user_upgrade') {
+      const record = await getUserAndSubByTelegramId(env.DB, telegramId);
+      await sendOrEditView(env, chatId, messageId, buildUserUpgradeView(env, record?.sub || null));
       return;
     }
 
-    const baseUrl = (env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
-    await tgSendMessage(
-      env,
-      chatId,
-      `🍏 <b>پروفایل iOS (${escapeHtml(mode)}) آماده است</b>\n\n` +
-        `می‌توانید از طریق اپلیکیشن‌های سازگار با Sing-box 1.14+ (مانند SFI / Streisand / Hiddify) اشتراک خود را ایمپورت کنید.\n` +
-        (baseUrl ? `لینک اشتراک (SFI): <code>${escapeHtml(baseUrl)}/sub/${escapeHtml(record.sub.token)}?format=singbox&amp;mode=${escapeHtml(mode)}</code>` : '')
-    );
-    return;
-  }
+    if (data === 'user_submit_receipt_pro' || data === 'user_submit_receipt_flow') {
+      await ensureTelegramUserAndSubscription(env.DB, q.from, isEnvAdmin(env, telegramId));
+      const basePrice = Number(env.PRO_SUBSCRIPTION_PRICE || '150000') || 150000;
+      const isFlow = data === 'user_submit_receipt_flow';
+      const plan = isFlow ? 'Sentra Flow+' : 'Sentra Pro';
+      const amount = isFlow ? Math.round(basePrice * 2) : basePrice;
 
-  if (data.startsWith('adm_')) {
-    if (!isAdmin) {
-      await tgSendMessage(env, chatId, '⛔️ شما دسترسی به پنل مدیریت ندارید.');
-      return;
-    }
-
-    if (data === 'adm_panel_home') {
-      await clearBotState(env.DB, telegramId);
-      await sendOrEditAdminView(env, chatId, messageId, buildAdminPanelHomeView());
-      return;
-    }
-
-    if (data === 'adm_add_node') {
-      await sendOrEditAdminView(env, chatId, messageId, buildAdminAddNodeView());
-      return;
-    }
-
-    if (data === 'adm_list_nodes') {
-      const view = await buildAdminNodesView(env);
-      await sendOrEditAdminView(env, chatId, messageId, view);
-      return;
-    }
-
-    if (data === 'adm_manage_subs') {
-      await clearBotState(env.DB, telegramId);
-      const view = await buildAdminSubscriptionsView(env);
-      await sendOrEditAdminView(env, chatId, messageId, view);
-      return;
-    }
-
-    if (data === 'adm_sub_search') {
-      await setBotState(env.DB, telegramId, 'admin_awaiting_sub_lookup');
+      await setBotState(env.DB, telegramId, 'awaiting_donation_receipt', { plan, amount });
       await tgSendMessage(
         env,
         chatId,
-        '🔎 <b>جستجوی سابسکریپشن</b>\n\nلطفاً یکی از موارد زیر را ارسال کنید:\n• شناسه عددی تلگرام کاربر (Telegram ID)\n• نام کاربری تلگرام (مثلاً <code>@username</code>)\n• شماره اشتراک یا توکن اشتراک'
+        `💳 <b>ارسال فیش واریزی برای پلن ${escapeHtml(plan)}</b>\n\n` +
+          `💰 مبلغ: <b>${amount.toLocaleString('en-US')} تومان</b>\n\n` +
+          `لطفاً <b>تصویر فیش واریزی</b> یا <b>شماره پیگیری تراکنش</b> خود را همینجا ارسال کنید تا پس از تأیید مدیریت، اشتراک شما ارتقا یابد:`,
+        buildCancelStateInlineMarkup()
       );
       return;
     }
 
-    if (data.startsWith('adm_sub_view_')) {
-      const subId = Number(data.slice('adm_sub_view_'.length));
-      if (!Number.isInteger(subId) || subId <= 0) return;
-      const view = await buildAdminSubscriptionDetailView(env, subId);
-      if (!view) {
-        await tgSendMessage(env, chatId, '❌ اشتراک مورد نظر یافت نشد.');
+    // --- User Donate Outbound ---
+    if (data === 'user_donate_outbound') {
+      await ensureTelegramUserAndSubscription(env.DB, q.from, isEnvAdmin(env, telegramId));
+      await setBotState(env.DB, telegramId, 'awaiting_donate_outbound');
+      await tgSendMessage(
+        env,
+        chatId,
+        '🤝 <b>اهدای اوتباند (حمایت از Sentra)</b>\n\n' +
+          'لینک پروکسی خود (<code>vless://</code>, <code>vmess://</code>, <code>trojan://</code>, <code>hy2://</code>, <code>ss://</code>, <code>wg://</code>) یا کانفیگ JSON سینگ‌باکس را ارسال کنید تا پس از بررسی امنیتی در اکوسیستم ثبت شود:',
+        buildCancelStateInlineMarkup()
+      );
+      return;
+    }
+
+    // --- User Connection Guide ---
+    if (data === 'user_guide') {
+      await sendOrEditView(env, chatId, messageId, buildUserGuideView('overview'));
+      return;
+    }
+    if (data === 'user_guide_android') {
+      await sendOrEditView(env, chatId, messageId, buildUserGuideView('android'));
+      return;
+    }
+    if (data === 'user_guide_ios') {
+      await sendOrEditView(env, chatId, messageId, buildUserGuideView('ios'));
+      return;
+    }
+    if (data === 'user_guide_windows') {
+      await sendOrEditView(env, chatId, messageId, buildUserGuideView('windows'));
+      return;
+    }
+
+    // --- User Download App ---
+    if (data === 'user_download_app') {
+      const view = await buildUserDownloadAppView(env);
+      await sendOrEditView(env, chatId, messageId, view);
+      return;
+    }
+
+    if (data === 'user_dl_android' || data === 'user_dl_windows') {
+      const platform = data === 'user_dl_android' ? 'android' : 'windows';
+      const rel = await env.DB.prepare(
+        'SELECT platform, version, telegram_file_id, file_name, file_size_mb, changelog FROM app_releases WHERE platform = ? LIMIT 1'
+      )
+        .bind(platform)
+        .first<{
+          platform: string;
+          version: string;
+          telegram_file_id: string;
+          file_name: string;
+          file_size_mb: number;
+          changelog: string;
+        }>();
+
+      if (rel && rel.telegram_file_id) {
+        await tgSendDocumentByFileId(
+          env,
+          chatId,
+          rel.telegram_file_id,
+          `📥 <b>Sentra Connect (${escapeHtml(platform === 'android' ? 'Android' : 'Windows')})</b>\n` +
+            `🔹 نسخه: <code>${escapeHtml(rel.version)}</code> (${rel.file_size_mb.toFixed(1)} MB)\n` +
+            (rel.changelog ? `📝 ${escapeHtml(rel.changelog)}` : '')
+        );
+      } else {
+        await tgSendMessage(
+          env,
+          chatId,
+          `📥 نسخه رسمی <b>${platform === 'android' ? 'اندروید' : 'ویندوز'} Sentra Connect</b> هنوز روی ربات بارگذاری نشده است.\n\n` +
+            `در حال حاضر می‌توانید لینک اشتراک Sing-box 1.14+ خود را از بخش «🔑 دریافت کانفیگ و کد اتصال» دریافت کرده و در اپلیکیشن‌های <b>Hiddify</b> یا <b>sing-box</b> استفاده کنید.`,
+          {
+            inline_keyboard: [
+              [{ text: '🔑 دریافت لینک اشتراک', callback_data: 'user_get_sub' }],
+              [{ text: '📖 راهنمای اتصال', callback_data: platform === 'android' ? 'user_guide_android' : 'user_guide_windows' }],
+            ],
+          }
+        );
+      }
+      return;
+    }
+
+    // --- User Support & Tickets ---
+    if (data === 'user_support' || data === 'user_tickets') {
+      const { user } = await ensureTelegramUserAndSubscription(
+        env.DB,
+        q.from,
+        isEnvAdmin(env, telegramId)
+      );
+      const view = await buildUserSupportView(env, user);
+      await sendOrEditView(env, chatId, messageId, view);
+      return;
+    }
+
+    if (data.startsWith('user_ticket_new_')) {
+      const rawCat = data.slice('user_ticket_new_'.length);
+      const allowedCategories = ['connection', 'billing', 'device_setup', 'performance', 'other'];
+      const category = allowedCategories.includes(rawCat) ? rawCat : 'other';
+      const catNames: Record<string, string> = {
+        connection: 'مشکل اتصال',
+        billing: 'پرداخت و اشتراک',
+        device_setup: 'راه‌اندازی دستگاه',
+        performance: 'سرعت و کیفیت',
+        other: 'سایر موارد',
+      };
+
+      await ensureTelegramUserAndSubscription(env.DB, q.from, isEnvAdmin(env, telegramId));
+      await setBotState(env.DB, telegramId, 'awaiting_support_ticket', { category });
+      await tgSendMessage(
+        env,
+        chatId,
+        `🎫 <b>ثبت تیکت پشتیبانی (${escapeHtml(catNames[category])})</b>\n\n` +
+          `لطفاً توضیحات مشکل یا درخواست خود را در یک پیام متنی ارسال کنید تا تیکت شما ثبت و پیگیری شود:`,
+        buildCancelStateInlineMarkup()
+      );
+      return;
+    }
+
+    // --- Admin Panel Callbacks ---
+    if (data.startsWith('adm_')) {
+      if (!isAdmin) {
+        await tgSendMessage(env, chatId, '⛔️ شما دسترسی به پنل مدیریت ندارید.');
         return;
       }
-      await sendOrEditAdminView(env, chatId, messageId, view);
-      return;
-    }
 
-    if (data.startsWith('adm_sub_tier_')) {
-      const match = /^adm_sub_tier_(\d+)_(lite|gaming|static|pro|flow)$/.exec(data);
-      if (!match) return;
-      const subId = Number(match[1]);
-      const cfg = ADMIN_TIER_CONFIG[match[2]];
-      await env.DB.prepare(
-        `UPDATE subscriptions
-         SET tier = ?, traffic_limit_bytes = ?, status = 'active', updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?`
-      )
-        .bind(cfg.tier, cfg.limitBytes, subId)
-        .run();
-      const view = await buildAdminSubscriptionDetailView(env, subId);
-      if (view) {
-        await sendOrEditAdminView(env, chatId, messageId, view);
+      if (data === 'adm_panel_home') {
+        await clearBotState(env.DB, telegramId);
+        await sendOrEditView(env, chatId, messageId, buildAdminPanelHomeView());
+        return;
       }
-      return;
-    }
 
-    if (data.startsWith('adm_sub_ext_')) {
-      const subId = Number(data.slice('adm_sub_ext_'.length));
-      if (!Number.isInteger(subId) || subId <= 0) return;
-      const current = await env.DB.prepare('SELECT expires_at FROM subscriptions WHERE id = ? LIMIT 1')
-        .bind(subId)
-        .first<{ expires_at: string }>();
-      if (current) {
-        const baseMs = Math.max(Date.now(), Date.parse(current.expires_at) || Date.now());
-        const nextExpires = new Date(baseMs + 30 * 24 * 60 * 60 * 1000).toISOString();
+      if (data === 'adm_add_node') {
+        await sendOrEditView(env, chatId, messageId, buildAdminAddNodeView());
+        return;
+      }
+
+      if (data === 'adm_list_nodes') {
+        const view = await buildAdminNodesView(env);
+        await sendOrEditView(env, chatId, messageId, view);
+        return;
+      }
+
+      if (data === 'adm_manage_subs') {
+        await clearBotState(env.DB, telegramId);
+        const view = await buildAdminSubscriptionsView(env);
+        await sendOrEditView(env, chatId, messageId, view);
+        return;
+      }
+
+      if (data === 'adm_sub_search') {
+        await setBotState(env.DB, telegramId, 'admin_awaiting_sub_lookup');
+        await tgSendMessage(
+          env,
+          chatId,
+          '🔎 <b>جستجوی سابسکریپشن</b>\n\nلطفاً یکی از موارد زیر را ارسال کنید:\n• شناسه عددی تلگرام کاربر (Telegram ID)\n• نام کاربری تلگرام (مثلاً <code>@username</code>)\n• شماره اشتراک یا توکن اشتراک',
+          buildCancelStateInlineMarkup()
+        );
+        return;
+      }
+
+      if (data.startsWith('adm_sub_view_')) {
+        const subId = Number(data.slice('adm_sub_view_'.length));
+        if (!Number.isInteger(subId) || subId <= 0) return;
+        const view = await buildAdminSubscriptionDetailView(env, subId);
+        if (!view) {
+          await tgSendMessage(env, chatId, '❌ اشتراک مورد نظر یافت نشد.');
+          return;
+        }
+        await sendOrEditView(env, chatId, messageId, view);
+        return;
+      }
+
+      if (data.startsWith('adm_sub_tier_')) {
+        const match = /^adm_sub_tier_(\d+)_(lite|gaming|static|pro|flow)$/.exec(data);
+        if (!match) return;
+        const subId = Number(match[1]);
+        const cfg = ADMIN_TIER_CONFIG[match[2]];
         await env.DB.prepare(
           `UPDATE subscriptions
-           SET expires_at = ?, status = 'active', updated_at = CURRENT_TIMESTAMP
+           SET tier = ?, traffic_limit_bytes = ?, status = 'active', updated_at = CURRENT_TIMESTAMP
            WHERE id = ?`
         )
-          .bind(nextExpires, subId)
+          .bind(cfg.tier, cfg.limitBytes, subId)
           .run();
-      }
-      const view = await buildAdminSubscriptionDetailView(env, subId);
-      if (view) {
-        await sendOrEditAdminView(env, chatId, messageId, view);
-      }
-      return;
-    }
-
-    if (data.startsWith('adm_sub_rst_')) {
-      const subId = Number(data.slice('adm_sub_rst_'.length));
-      if (!Number.isInteger(subId) || subId <= 0) return;
-      await env.DB.prepare(
-        `UPDATE subscriptions
-         SET upload_bytes = 0, download_bytes = 0, web_browsing_used_mb = 0,
-             download_used_mb = 0, static_ip_used_mb = 0, status = 'active',
-             last_quota_reset = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?`
-      )
-        .bind(subId)
-        .run();
-      const view = await buildAdminSubscriptionDetailView(env, subId);
-      if (view) {
-        await sendOrEditAdminView(env, chatId, messageId, view);
-      }
-      return;
-    }
-
-    if (data.startsWith('adm_sub_tgl_')) {
-      const subId = Number(data.slice('adm_sub_tgl_'.length));
-      if (!Number.isInteger(subId) || subId <= 0) return;
-      const current = await env.DB.prepare('SELECT status FROM subscriptions WHERE id = ? LIMIT 1')
-        .bind(subId)
-        .first<{ status: string }>();
-      if (current) {
-        const nextStatus = current.status === 'active' ? 'disabled' : 'active';
-        await env.DB.prepare(
-          'UPDATE subscriptions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
-        )
-          .bind(nextStatus, subId)
-          .run();
-      }
-      const view = await buildAdminSubscriptionDetailView(env, subId);
-      if (view) {
-        await sendOrEditAdminView(env, chatId, messageId, view);
-      }
-      return;
-    }
-
-    if (data === 'adm_stats') {
-      const view = await buildAdminStatsView(env);
-      await sendOrEditAdminView(env, chatId, messageId, view);
-      return;
-    }
-
-    if (data.startsWith('adm_ob_alloc_')) {
-      const alloc = data.slice('adm_ob_alloc_'.length);
-      if (!['free_only', 'gaming_only', 'static_only', 'all', 'auto', 'both'].includes(alloc)) {
+        const view = await buildAdminSubscriptionDetailView(env, subId);
+        if (view) {
+          await sendOrEditView(env, chatId, messageId, view);
+        }
         return;
       }
-      await setBotState(env.DB, telegramId, 'admin_awaiting_outbound', { allocation: alloc });
-      await tgSendMessage(
-        env,
-        chatId,
-        `📥 <b>ارسال اوتباند یا ساب‌لینک (${escapeHtml(alloc)})</b>\n\n` +
-          `لینک پروکسی (vless/vmess/trojan/hy2/ss/wg)، کانفیگ JSON سینگ‌باکس یا لینک سابسکریپشن (<code>https://...</code>) را ارسال کنید.`
-      );
-      return;
+
+      if (data.startsWith('adm_sub_ext_')) {
+        const subId = Number(data.slice('adm_sub_ext_'.length));
+        if (!Number.isInteger(subId) || subId <= 0) return;
+        const current = await env.DB.prepare('SELECT expires_at FROM subscriptions WHERE id = ? LIMIT 1')
+          .bind(subId)
+          .first<{ expires_at: string }>();
+        if (current) {
+          const baseMs = Math.max(Date.now(), Date.parse(current.expires_at) || Date.now());
+          const nextExpires = new Date(baseMs + 30 * 24 * 60 * 60 * 1000).toISOString();
+          await env.DB.prepare(
+            `UPDATE subscriptions
+             SET expires_at = ?, status = 'active', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?`
+          )
+            .bind(nextExpires, subId)
+            .run();
+        }
+        const view = await buildAdminSubscriptionDetailView(env, subId);
+        if (view) {
+          await sendOrEditView(env, chatId, messageId, view);
+        }
+        return;
+      }
+
+      if (data.startsWith('adm_sub_rst_')) {
+        const subId = Number(data.slice('adm_sub_rst_'.length));
+        if (!Number.isInteger(subId) || subId <= 0) return;
+        await env.DB.prepare(
+          `UPDATE subscriptions
+           SET upload_bytes = 0, download_bytes = 0, web_browsing_used_mb = 0,
+               download_used_mb = 0, static_ip_used_mb = 0, status = 'active',
+               last_quota_reset = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`
+        )
+          .bind(subId)
+          .run();
+        const view = await buildAdminSubscriptionDetailView(env, subId);
+        if (view) {
+          await sendOrEditView(env, chatId, messageId, view);
+        }
+        return;
+      }
+
+      if (data.startsWith('adm_sub_tgl_')) {
+        const subId = Number(data.slice('adm_sub_tgl_'.length));
+        if (!Number.isInteger(subId) || subId <= 0) return;
+        const current = await env.DB.prepare('SELECT status FROM subscriptions WHERE id = ? LIMIT 1')
+          .bind(subId)
+          .first<{ status: string }>();
+        if (current) {
+          const nextStatus = current.status === 'active' ? 'disabled' : 'active';
+          await env.DB.prepare(
+            'UPDATE subscriptions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+          )
+            .bind(nextStatus, subId)
+            .run();
+        }
+        const view = await buildAdminSubscriptionDetailView(env, subId);
+        if (view) {
+          await sendOrEditView(env, chatId, messageId, view);
+        }
+        return;
+      }
+
+      if (data === 'adm_stats') {
+        const view = await buildAdminStatsView(env);
+        await sendOrEditView(env, chatId, messageId, view);
+        return;
+      }
+
+      if (data.startsWith('adm_ob_alloc_')) {
+        const alloc = data.slice('adm_ob_alloc_'.length);
+        if (!['free_only', 'gaming_only', 'static_only', 'all', 'auto', 'both'].includes(alloc)) {
+          return;
+        }
+        await setBotState(env.DB, telegramId, 'admin_awaiting_outbound', { allocation: alloc });
+        await tgSendMessage(
+          env,
+          chatId,
+          `📥 <b>ارسال اوتباند یا ساب‌لینک (${escapeHtml(alloc)})</b>\n\n` +
+            `لینک پروکسی (vless/vmess/trojan/hy2/ss/wg)، کانفیگ JSON سینگ‌باکس یا لینک سابسکریپشن (<code>https://...</code>) را ارسال کنید.`,
+          buildCancelStateInlineMarkup()
+        );
+        return;
+      }
     }
+
+    // Fallback for any unrecognized or outdated callback_data so no click goes unanswered
+    console.warn('[Sentra Unhandled Callback Data]', { data, telegramId });
+    const record = await getUserAndSubByTelegramId(env.DB, telegramId);
+    await tgSendMessage(
+      env,
+      chatId,
+      'ℹ️ این دکمه منقضی شده است. لطفاً از منوی زیر گزینه مورد نظر را انتخاب کنید:',
+      buildUserMenuHomeView(record?.user || null, record?.sub || null, isAdmin).replyMarkup
+    );
+  } catch (err) {
+    console.error('[Sentra Callback Query Error]', {
+      callback_data: data,
+      telegram_id: telegramId,
+      error: err instanceof Error ? err.message : String(err),
+      err,
+    });
+    await tgSendMessage(
+      env,
+      chatId,
+      '⚠️ خطایی در پردازش درخواست شما رخ داد. لطفاً لحظاتی دیگر دوباره تلاش کنید یا /start را ارسال نمایید.'
+    );
   }
 }
+
+// ==============================================================================
+// Incoming Message Handler (Commands, Reply Keyboard Buttons & FSM States)
+// ==============================================================================
 
 async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> {
   const from = msg.from;
   if (!from) return;
   const chatId = msg.chat.id;
   const telegramId = from.id;
-  const text = (msg.text || '').trim();
+  const text = (msg.text || msg.caption || '').trim();
   const envAdmin = isEnvAdmin(env, telegramId);
 
-  if (text === '/start' || text.startsWith('/start ') || /^\/start@[A-Za-z0-9_]+(\s|$)/.test(text)) {
+  try {
+    if (text === '/start' || text.startsWith('/start ') || /^\/start@[A-Za-z0-9_]+(\s|$)/.test(text)) {
+      try {
+        await clearBotState(env.DB, telegramId);
+        const { user, sub, isNewUser } = await ensureTelegramUserAndSubscription(
+          env.DB,
+          from,
+          envAdmin
+        );
+        const isAdmin = envAdmin || user.role === 'admin';
+        const welcome = isNewUser
+          ? `👋 به <b>Sentra Platform</b> خوش آمدید <b>${escapeHtml(user.first_name)}</b>!\n\n` +
+            `✅ حساب شما به‌صورت خودکار ایجاد و فعال شد:\n` +
+            `🆔 <b>کد شناسایی یکتا:</b> <code>${escapeHtml(user.user_uuid)}</code>\n` +
+            `💎 <b>پلن اولیه:</b> ${escapeHtml(sub.tier)} (۱۰ گیگابایت)\n\n` +
+            `از دکمه‌های منوی پایین برای دریافت لینک اشتراک، وضعیت حساب یا پشتیبانی استفاده کنید.`
+          : `👋 خوش آمدید <b>${escapeHtml(user.first_name)}</b>!\n\n` +
+            `حساب شما متصل و آماده استفاده است.\n` +
+            `💎 <b>پلن فعال:</b> ${escapeHtml(sub.tier)}`;
+        await tgSendMessage(env, chatId, welcome, buildMainKeyboard(true, isAdmin));
+      } catch (err) {
+        console.error(
+          '[Sentra D1 Error] /start failed:',
+          err instanceof Error ? err.message : String(err),
+          err
+        );
+        await tgSendMessage(
+          env,
+          chatId,
+          '⚠️ خطایی در اتصال به دیتابیس و ثبت اطلاعات شما رخ داد. لطفاً لحظاتی دیگر دوباره /start را ارسال کنید.'
+        );
+      }
+      return;
+    }
+
+    let existing: { user: UserRow; sub: SubscriptionRow | null } | null = null;
     try {
-      await clearBotState(env.DB, telegramId);
-      const { user, sub, isNewUser } = await ensureTelegramUserAndSubscription(
-        env.DB,
-        from,
-        envAdmin
-      );
-      const isAdmin = envAdmin || user.role === 'admin';
-      const welcome = isNewUser
-        ? `👋 به <b>Sentra Platform</b> خوش آمدید <b>${escapeHtml(user.first_name)}</b>!\n\n` +
-          `✅ حساب شما به‌صورت خودکار ایجاد و فعال شد:\n` +
-          `🆔 <b>کد شناسایی یکتا:</b> <code>${escapeHtml(user.user_uuid)}</code>\n` +
-          `💎 <b>پلن اولیه:</b> ${escapeHtml(sub.tier)} (۱۰ گیگابایت)\n\n` +
-          `از منوی زیر برای دریافت کانفیگ یا مدیریت حساب استفاده کنید.`
-        : `👋 خوش آمدید <b>${escapeHtml(user.first_name)}</b>!\n\n` +
-          `حساب شما متصل و آماده استفاده است.\n` +
-          `💎 <b>پلن فعال:</b> ${escapeHtml(sub.tier)}`;
-      await tgSendMessage(env, chatId, welcome, buildMainKeyboard(true, isAdmin));
+      existing = await getUserAndSubByTelegramId(env.DB, telegramId);
     } catch (err) {
       console.error(
-        '[Sentra D1 Error] /start failed:',
+        '[Sentra D1 Error] Failed to query user:',
         err instanceof Error ? err.message : String(err),
         err
       );
       await tgSendMessage(
         env,
         chatId,
-        '⚠️ خطایی در اتصال به دیتابیس و ثبت اطلاعات شما رخ داد. لطفاً لحظاتی دیگر دوباره /start را ارسال کنید.'
+        '⚠️ در حال حاضر ارتباط با دیتابیس با خطا مواجه شد. لطفاً لحظاتی دیگر دوباره تلاش کنید.'
       );
-    }
-    return;
-  }
-
-  let existing: { user: UserRow; sub: SubscriptionRow | null } | null = null;
-  try {
-    existing = await getUserAndSubByTelegramId(env.DB, telegramId);
-  } catch (err) {
-    console.error(
-      '[Sentra D1 Error] Failed to query user:',
-      err instanceof Error ? err.message : String(err),
-      err
-    );
-    await tgSendMessage(
-      env,
-      chatId,
-      '⚠️ در حال حاضر ارتباط با دیتابیس با خطا مواجه شد. لطفاً لحظاتی دیگر دوباره تلاش کنید.'
-    );
-    return;
-  }
-
-  const isRegistered = Boolean(existing);
-  const isAdmin = envAdmin || existing?.user.role === 'admin';
-
-  if (text === '🔙 بازگشت') {
-    await clearBotState(env.DB, telegramId);
-    const welcome = isRegistered
-      ? `👋 خوش آمدید <b>${escapeHtml(existing!.user.first_name)}</b>!\nحساب شما متصل و آماده استفاده است.`
-      : `👋 به <b>Sentra Platform</b> خوش آمدید!\n\nبرای شروع، روی دکمه <b>📝 ثبت‌نام / ورود</b> کلیک کنید.`;
-    await tgSendMessage(env, chatId, welcome, buildMainKeyboard(isRegistered, isAdmin));
-    return;
-  }
-
-  // Handle active FSM state stored in D1
-  const state = await getBotState(env.DB, telegramId);
-  if (state && !text.startsWith('/')) {
-    if (state.state_type === 'awaiting_login_username') {
-      await setBotState(env.DB, telegramId, 'awaiting_login_password', { username: text });
-      await tgSendMessage(env, chatId, '🔑 اکنون <b>رمز عبور (Password)</b> حساب خود را وارد کنید:');
       return;
     }
 
-    if (state.state_type === 'awaiting_login_password') {
-      const payload = JSON.parse(state.payload_json || '{}') as { username?: string };
-      await clearBotState(env.DB, telegramId);
-      const username = (payload.username || '').trim();
-      const user = await env.DB.prepare(
-        'SELECT * FROM users WHERE lower(username) = lower(?) OR lower(email) = lower(?) LIMIT 1'
-      )
-        .bind(username, username)
-        .first<UserRow>();
+    const isRegistered = Boolean(existing);
+    const isAdmin = envAdmin || existing?.user.role === 'admin';
+    const menuAction = text ? matchMenuAction(text) : null;
 
-      if (!user || !(await verifyPassword(text, user.password_hash))) {
+    // If user clicked a menu button or typed a /command while in an active FSM state,
+    // cancel the FSM state first so menu buttons always stay responsive.
+    const state = await getBotState(env.DB, telegramId);
+    if (state && !text.startsWith('/') && !menuAction) {
+      if (state.state_type === 'awaiting_login_username') {
+        if (!text) {
+          await tgSendMessage(env, chatId, '❌ لطفاً نام کاربری خود را به‌صورت متن ارسال کنید:');
+          return;
+        }
+        await setBotState(env.DB, telegramId, 'awaiting_login_password', { username: text });
         await tgSendMessage(
           env,
           chatId,
-          '❌ نام کاربری یا رمز عبور اشتباه است. لطفاً دوباره تلاش کنید.',
-          buildMainKeyboard(isRegistered, isAdmin)
+          '🔑 اکنون <b>رمز عبور (Password)</b> حساب خود را وارد کنید:',
+          buildCancelStateInlineMarkup()
         );
         return;
       }
 
-      await env.DB.prepare(
-        'UPDATE users SET telegram_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
-      )
-        .bind(telegramId, user.id)
-        .run();
-
-      const loggedInIsAdmin = envAdmin || user.role === 'admin';
-      await tgSendMessage(
-        env,
-        chatId,
-        `✅ <b>ورود موفق!</b>\nحساب <b>${escapeHtml(user.username || user.first_name)}</b> به تلگرام شما متصل شد.`,
-        buildMainKeyboard(true, loggedInIsAdmin)
-      );
-      return;
-    }
-
-    if (state.state_type === 'awaiting_donate_outbound') {
-      await clearBotState(env.DB, telegramId);
-      try {
-        const parsed = await parseOutboundInput(text);
-        const audit = auditOutboundSecurity(parsed.protocol, parsed.config_json);
-        if (!audit.passed) {
-          await tgSendMessage(env, chatId, `🚫 ${escapeHtml(audit.reason || 'پروتکل ناامن')}`);
-          return;
-        }
-        const dup = await env.DB.prepare(
-          'SELECT id FROM donated_outbounds WHERE fingerprint_sha256 = ? LIMIT 1'
+      if (state.state_type === 'awaiting_login_password') {
+        const payload = JSON.parse(state.payload_json || '{}') as { username?: string };
+        await clearBotState(env.DB, telegramId);
+        const username = (payload.username || '').trim();
+        const user = await env.DB.prepare(
+          'SELECT * FROM users WHERE lower(username) = lower(?) OR lower(email) = lower(?) LIMIT 1'
         )
-          .bind(parsed.fingerprint_sha256)
-          .first<{ id: number }>();
-        if (dup) {
-          await tgSendMessage(env, chatId, '⚠️ این سرور قبلاً در سیستم ثبت شده است.');
+          .bind(username, username)
+          .first<UserRow>();
+
+        if (!user || !(await verifyPassword(text, user.password_hash))) {
+          await tgSendMessage(
+            env,
+            chatId,
+            '❌ نام کاربری یا رمز عبور اشتباه است. لطفاً دوباره تلاش کنید.',
+            buildMainKeyboard(isRegistered, isAdmin)
+          );
           return;
         }
+
         await env.DB.prepare(
-          `INSERT INTO donated_outbounds (
-             donor_user_id, tag, protocol, server_address, server_port, config_json,
-             latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
-             raw_link, fingerprint_sha256, is_official, label, country_code, country_name,
-             allow_web, allow_download, allow_gaming, allow_static_ip, allocation_mode,
-             last_online_at, last_checked_at
-           ) VALUES (?, ?, ?, ?, ?, ?, 90, 12.0, 'web_browsing', 100, 'active', 0, ?, ?, 0, ?, ?, ?, 1, 1, 0, 0, 'free_only', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+          'UPDATE users SET telegram_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
         )
-          .bind(
-            existing?.user.id ?? null,
-            parsed.tag,
-            parsed.protocol,
-            parsed.server_address,
-            parsed.server_port,
-            JSON.stringify(parsed.config_json),
-            parsed.raw_link,
-            parsed.fingerprint_sha256,
-            parsed.tag,
-            parsed.country_code,
-            parsed.country_name
+          .bind(telegramId, user.id)
+          .run();
+
+        const loggedInIsAdmin = envAdmin || user.role === 'admin';
+        await tgSendMessage(
+          env,
+          chatId,
+          `✅ <b>ورود موفق!</b>\nحساب <b>${escapeHtml(user.username || user.first_name)}</b> به تلگرام شما متصل شد.`,
+          buildMainKeyboard(true, loggedInIsAdmin)
+        );
+        return;
+      }
+
+      if (state.state_type === 'awaiting_donate_outbound') {
+        await clearBotState(env.DB, telegramId);
+        try {
+          if (!text) {
+            await tgSendMessage(env, chatId, '❌ لطفاً لینک پروکسی یا کانفیگ JSON را به‌صورت متن ارسال کنید.');
+            return;
+          }
+          const parsed = await parseOutboundInput(text);
+          const audit = auditOutboundSecurity(parsed.protocol, parsed.config_json);
+          if (!audit.passed) {
+            await tgSendMessage(env, chatId, `🚫 ${escapeHtml(audit.reason || 'پروتکل ناامن')}`);
+            return;
+          }
+          const dup = await env.DB.prepare(
+            'SELECT id FROM donated_outbounds WHERE fingerprint_sha256 = ? LIMIT 1'
           )
+            .bind(parsed.fingerprint_sha256)
+            .first<{ id: number }>();
+          if (dup) {
+            await tgSendMessage(env, chatId, '⚠️ این سرور قبلاً در سیستم ثبت شده است.');
+            return;
+          }
+          await env.DB.prepare(
+            `INSERT INTO donated_outbounds (
+               donor_user_id, tag, protocol, server_address, server_port, config_json,
+               latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
+               raw_link, fingerprint_sha256, is_official, label, country_code, country_name,
+               allow_web, allow_download, allow_gaming, allow_static_ip, allocation_mode,
+               last_online_at, last_checked_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 90, 12.0, 'web_browsing', 100, 'active', 0, ?, ?, 0, ?, ?, ?, 1, 1, 0, 0, 'free_only', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+          )
+            .bind(
+              existing?.user.id ?? null,
+              parsed.tag,
+              parsed.protocol,
+              parsed.server_address,
+              parsed.server_port,
+              JSON.stringify(parsed.config_json),
+              parsed.raw_link,
+              parsed.fingerprint_sha256,
+              parsed.tag,
+              parsed.country_code,
+              parsed.country_name
+            )
+            .run();
+
+          await tgSendMessage(
+            env,
+            chatId,
+            `🤝 <b>سپاس از حمایت شما!</b>\nنود <b>${escapeHtml(parsed.tag)}</b> در کل اکوسیستم سنترا فعال شد.`,
+            buildMainKeyboard(true, isAdmin)
+          );
+        } catch (err) {
+          await tgSendMessage(
+            env,
+            chatId,
+            `❌ ${escapeHtml(err instanceof Error ? err.message : 'خطا در ثبت اوتباند.')}`
+          );
+        }
+        return;
+      }
+
+      if (state.state_type === 'awaiting_donation_receipt') {
+        const payload = JSON.parse(state.payload_json || '{}') as { plan?: string; amount?: number };
+        const ensured = existing?.user
+          ? existing
+          : await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
+
+        const largestPhoto =
+          Array.isArray(msg.photo) && msg.photo.length > 0
+            ? msg.photo[msg.photo.length - 1]
+            : null;
+        const receiptFileId =
+          largestPhoto?.file_id || msg.document?.file_id || (text ? `text_ref:${text.slice(0, 180)}` : '');
+        const fileUniqueId =
+          largestPhoto?.file_unique_id ||
+          msg.document?.file_unique_id ||
+          (text ? `txt_${(await sha256Hex(`${ensured.user.id}:${text}`)).slice(0, 24)}` : null);
+
+        if (!receiptFileId) {
+          await tgSendMessage(
+            env,
+            chatId,
+            '❌ لطفاً تصویر فیش واریزی یا کد پیگیری متنی را ارسال کنید.',
+            buildCancelStateInlineMarkup()
+          );
+          return;
+        }
+
+        const receiptHash = await sha256Hex(fileUniqueId || receiptFileId);
+        const dup = await env.DB.prepare(
+          'SELECT id FROM donations WHERE file_unique_id = ? OR image_sha256 = ? LIMIT 1'
+        )
+          .bind(fileUniqueId, receiptHash)
+          .first<{ id: number }>();
+
+        await clearBotState(env.DB, telegramId);
+
+        if (dup) {
+          await tgSendMessage(
+            env,
+            chatId,
+            '⚠️ این فیش یا کد پیگیری قبلاً در سیستم ثبت شده است.',
+            buildMainKeyboard(true, isAdmin)
+          );
+          return;
+        }
+
+        const amount = Math.max(0, Math.round(Number(payload.amount) || 150000));
+        const insertRes = await env.DB.prepare(
+          `INSERT INTO donations (user_id, amount, receipt_file_id, file_unique_id, image_sha256, status, subscription_granted)
+           VALUES (?, ?, ?, ?, ?, 'pending', 0)`
+        )
+          .bind(ensured.user.id, amount, receiptFileId, fileUniqueId, receiptHash)
           .run();
 
         await tgSendMessage(
           env,
           chatId,
-          `🤝 <b>سپاس از حمایت شما!</b>\nنود <b>${escapeHtml(parsed.tag)}</b> در کل اکوسیستم سنترا فعال شد.`
-        );
-      } catch (err) {
-        await tgSendMessage(
-          env,
-          chatId,
-          `❌ ${escapeHtml(err instanceof Error ? err.message : 'خطا در ثبت اوتباند.')}`
-        );
-      }
-      return;
-    }
-
-    if (state.state_type === 'admin_awaiting_outbound' && isAdmin) {
-      const payload = JSON.parse(state.payload_json || '{}') as { allocation?: string };
-      await clearBotState(env.DB, telegramId);
-      await handleAdminOutboundSubmission(env, chatId, text, payload.allocation || 'auto');
-      return;
-    }
-
-    if (state.state_type === 'admin_awaiting_sub_lookup' && isAdmin) {
-      await clearBotState(env.DB, telegramId);
-      const foundSubId = await findSubscriptionForAdmin(env.DB, text);
-      if (!foundSubId) {
-        await tgSendMessage(
-          env,
-          chatId,
-          '❌ هیچ سابسکریپشنی با این مشخصات یافت نشد.',
-          buildAdminPanelHomeView().replyMarkup
+          `✅ <b>فیش واریزی شما با موفقیت ثبت شد!</b>\n\n` +
+            `🆔 کد پیگیری داخلی: <code>#DON-${insertRes.meta.last_row_id}</code>\n` +
+            `💎 پلن درخواستی: <b>${escapeHtml(payload.plan || 'Sentra Pro')}</b>\n` +
+            `💰 مبلغ: <b>${amount.toLocaleString('en-US')} تومان</b>\n\n` +
+            `پس از بررسی توسط مدیریت، اشتراک شما به صورت خودکار ارتقا خواهد یافت.`,
+          buildMainKeyboard(true, isAdmin)
         );
         return;
       }
-      const view = await buildAdminSubscriptionDetailView(env, foundSubId);
-      if (view) {
+
+      if (state.state_type === 'awaiting_support_ticket') {
+        const payload = JSON.parse(state.payload_json || '{}') as { category?: string };
+        if (text.length < 5) {
+          await tgSendMessage(
+            env,
+            chatId,
+            '❌ لطفاً توضیح مشکل خود را حداقل در ۵ کاراکتر بنویسید تا قابل پیگیری باشد:',
+            buildCancelStateInlineMarkup()
+          );
+          return;
+        }
+
+        const ensured = existing?.user
+          ? existing
+          : await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
+
+        const allowedCategories = ['connection', 'billing', 'device_setup', 'performance', 'other'];
+        const category =
+          payload.category && allowedCategories.includes(payload.category)
+            ? payload.category
+            : 'other';
+        const ticketNumber = `TKT-${generateNumericCode(6)}`;
+        const subject = text.split('\n')[0].slice(0, 80);
+
+        await env.DB.prepare(
+          `INSERT INTO support_tickets (ticket_number, user_id, subscription_id, category, subject, description, priority, status)
+           VALUES (?, ?, ?, ?, ?, ?, 'medium', 'open')`
+        )
+          .bind(
+            ticketNumber,
+            ensured.user.id,
+            ensured.sub?.id ?? null,
+            category,
+            subject,
+            text.slice(0, 2000)
+          )
+          .run();
+
+        await clearBotState(env.DB, telegramId);
+        await tgSendMessage(
+          env,
+          chatId,
+          `✅ <b>تیکت پشتیبانی شما با موفقیت ثبت شد!</b>\n\n` +
+            `🎫 شماره تیکت: <code>${escapeHtml(ticketNumber)}</code>\n` +
+            `📌 موضوع: <b>${escapeHtml(subject)}</b>\n\n` +
+            `تیم پشتیبانی در کوتاه‌ترین زمان درخواست شما را بررسی خواهد کرد.`,
+          buildMainKeyboard(true, isAdmin)
+        );
+        return;
+      }
+
+      if (state.state_type === 'admin_awaiting_outbound' && isAdmin) {
+        const payload = JSON.parse(state.payload_json || '{}') as { allocation?: string };
+        await clearBotState(env.DB, telegramId);
+        await handleAdminOutboundSubmission(env, chatId, text, payload.allocation || 'auto');
+        return;
+      }
+
+      if (state.state_type === 'admin_awaiting_sub_lookup' && isAdmin) {
+        await clearBotState(env.DB, telegramId);
+        const foundSubId = await findSubscriptionForAdmin(env.DB, text);
+        if (!foundSubId) {
+          await tgSendMessage(
+            env,
+            chatId,
+            '❌ هیچ سابسکریپشنی با این مشخصات یافت نشد.',
+            buildAdminPanelHomeView().replyMarkup
+          );
+          return;
+        }
+        const view = await buildAdminSubscriptionDetailView(env, foundSubId);
+        if (view) {
+          await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+        }
+        return;
+      }
+    }
+
+    // Clear stale state when navigating via a recognized menu button
+    if (state && (menuAction || text.startsWith('/'))) {
+      await clearBotState(env.DB, telegramId);
+    }
+
+    // --- Route Recognized Menu Actions ---
+    switch (menuAction) {
+      case 'back': {
+        const welcome = isRegistered
+          ? `👋 خوش آمدید <b>${escapeHtml(existing!.user.first_name)}</b>!\nحساب شما متصل و آماده استفاده است.`
+          : `👋 به <b>Sentra Platform</b> خوش آمدید!\n\nبرای شروع، روی دکمه <b>📝 ثبت‌نام / ورود</b> کلیک کنید.`;
+        await tgSendMessage(env, chatId, welcome, buildMainKeyboard(isRegistered, isAdmin));
+        return;
+      }
+
+      case 'auth': {
+        await tgSendMessage(
+          env,
+          chatId,
+          '🔐 <b>احراز هویت Sentra</b>\n\nاگر قبلاً داخل اپلیکیشن حساب ساخته‌اید روی «ورود با حساب برنامه» بزنید، در غیر این صورت ثبت‌نام فوری انجام دهید:',
+          {
+            inline_keyboard: [
+              [{ text: '✨ ثبت‌نام جدید (فوری)', callback_data: 'auth_register_new' }],
+              [{ text: '🔑 ورود با حساب برنامه', callback_data: 'auth_login_app' }],
+            ],
+          }
+        );
+        return;
+      }
+
+      case 'account': {
+        const { user, sub } = await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
+        const view = buildUserAccountView(user, sub);
         await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+        return;
       }
-      return;
-    }
-  }
 
-  if (text === '📝 ثبت‌نام / ورود') {
-    await tgSendMessage(
-      env,
-      chatId,
-      '🔐 <b>احراز هویت Sentra</b>\n\nاگر قبلاً داخل اپلیکیشن حساب ساخته‌اید روی «ورود با حساب برنامه» بزنید، در غیر این صورت ثبت‌نام فوری انجام دهید:',
-      {
-        inline_keyboard: [
-          [{ text: '✨ ثبت‌نام جدید (فوری)', callback_data: 'auth_register_new' }],
-          [{ text: '🔑 ورود با حساب برنامه', callback_data: 'auth_login_app' }],
-        ],
+      case 'get_sub': {
+        const { user, sub } = await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
+        const view = await buildUserSubscriptionView(env, user, sub);
+        await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+        return;
       }
-    );
-    return;
-  }
 
-  if (text === '👤 حساب کاربری') {
-    if (!existing || !existing.sub) {
-      await tgSendMessage(env, chatId, '❌ ابتدا از گزینه «📝 ثبت‌نام / ورود» حساب خود را فعال کنید.');
-      return;
+      case 'ios_menu': {
+        const { sub } = await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
+        const view = await buildUserIosMenuView(env, sub);
+        await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+        return;
+      }
+
+      case 'upgrade': {
+        const { sub } = await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
+        const view = buildUserUpgradeView(env, sub);
+        await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+        return;
+      }
+
+      case 'donate_outbound': {
+        await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
+        await setBotState(env.DB, telegramId, 'awaiting_donate_outbound');
+        await tgSendMessage(
+          env,
+          chatId,
+          '🤝 <b>اهدای اوتباند (حمایت از Sentra)</b>\n\n' +
+            'لینک پروکسی خود (vless/vmess/trojan/hy2/ss/wg) یا JSON سینگ‌باکس را ارسال کنید تا پس از بررسی امنیتی و اثرانگشت در کل اکوسیستم فعال شود:',
+          buildCancelStateInlineMarkup()
+        );
+        return;
+      }
+
+      case 'guide': {
+        const view = buildUserGuideView('overview');
+        await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+        return;
+      }
+
+      case 'download_app': {
+        const view = await buildUserDownloadAppView(env);
+        await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+        return;
+      }
+
+      case 'support': {
+        const { user } = await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
+        const view = await buildUserSupportView(env, user);
+        await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+        return;
+      }
+
+      case 'admin': {
+        if (!isAdmin) {
+          await tgSendMessage(env, chatId, '⛔️ شما دسترسی به پنل مدیریت ندارید.');
+          return;
+        }
+        const panel = buildAdminPanelHomeView();
+        await tgSendMessage(env, chatId, panel.text, panel.replyMarkup);
+        return;
+      }
+
+      default: {
+        const quickMenu = buildUserMenuHomeView(
+          existing?.user || null,
+          existing?.sub || null,
+          isAdmin
+        );
+        await tgSendMessage(
+          env,
+          chatId,
+          'از دکمه‌های منوی پایین یا گزینه سریع زیر برای ادامه استفاده کنید:',
+          quickMenu.replyMarkup
+        );
+      }
     }
-    const used = existing.sub.upload_bytes + existing.sub.download_bytes;
-    await tgSendMessage(
-      env,
-      chatId,
-      `👤 <b>حساب کاربری شما</b>\n\n` +
-        `🆔 شناسه یکتا: <code>${escapeHtml(existing.user.user_uuid)}</code>\n` +
-        `💎 نوع اشتراک: <b>${escapeHtml(existing.sub.tier)}</b>\n` +
-        `📊 حجم مصرفی: <b>${formatGb(used)} GB</b> از <b>${formatGb(existing.sub.traffic_limit_bytes)} GB</b>\n` +
-        `📅 تاریخ انقضا: <code>${escapeHtml(existing.sub.expires_at.slice(0, 10))}</code>`
-    );
-    return;
-  }
-
-  if (text === '🔑 دریافت کانفیگ و کد اتصال') {
-    if (!existing || !existing.sub) {
-      await tgSendMessage(env, chatId, '❌ لطفاً ابتدا ثبت‌نام یا ورود انجام دهید.');
-      return;
-    }
-    const otp = generateNumericCode(8);
-    const expires = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-    await env.DB.prepare(
-      'UPDATE users SET auth_code = ?, auth_code_expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
-    )
-      .bind(otp, expires, existing.user.id)
-      .run();
-
-    const baseUrl = (env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
-    const subLine = baseUrl
-      ? `\n🔗 <b>لینک سابسکریپشن Sing-box 1.14+:</b>\n<code>${escapeHtml(baseUrl)}/sub/${escapeHtml(existing.sub.token)}?format=singbox</code>`
-      : '';
-
-    await tgSendMessage(
-      env,
-      chatId,
-      `🔑 <b>کد ورود ۸ رقمی اپلیکیشن (اعتبار ۵ دقیقه):</b>\n<code>${otp}</code>${subLine}`
-    );
-    return;
-  }
-
-  if (text === '🍏 دریافت کانفیگ iOS') {
-    if (!existing || !existing.sub) {
-      await tgSendMessage(env, chatId, '❌ لطفاً ابتدا ثبت‌نام یا ورود انجام دهید.');
-      return;
-    }
-    const gamingLive = await hasActiveGamingOutbounds(env.DB);
-    const canStatic = tierHasStaticIp(existing.sub.tier);
-    const canGaming = tierHasGaming(existing.sub.tier);
-
-    const buttons: Array<Array<{ text: string; callback_data: string }>> = [
-      [
-        { text: '🌐 وب‌گردی (رایگان)', callback_data: 'ios_mode_web_browsing' },
-        { text: '📥 دانلود (رایگان)', callback_data: 'ios_mode_download' },
-      ],
-    ];
-    if (gamingLive && canGaming) {
-      buttons.push([{ text: '🎮 گیمینگ (WireGuard)', callback_data: 'ios_mode_gaming' }]);
-    } else {
-      buttons.push([{ text: '🎮 گیمینگ (به‌زودی)', callback_data: 'ios_mode_gaming' }]);
-    }
-    if (canStatic) {
-      buttons.push([{ text: '💎 آی‌پی ثابت اختصاصی', callback_data: 'ios_mode_static_ip' }]);
-    }
-
-    await tgSendMessage(env, chatId, '🍏 <b>انتخاب حالت کانفیگ iOS:</b>', {
-      inline_keyboard: buttons,
+  } catch (err) {
+    console.error('[Sentra Message Handler Error]', {
+      telegram_id: telegramId,
+      text: text.slice(0, 120),
+      error: err instanceof Error ? err.message : String(err),
+      err,
     });
-    return;
-  }
-
-  if (text === '🤝 اهدای اوتباند (حمایت از Sentra)') {
-    await setBotState(env.DB, telegramId, 'awaiting_donate_outbound');
     await tgSendMessage(
       env,
       chatId,
-      '🤝 لینک پروکسی خود (vless/vmess/trojan/hy2/ss/wg) را ارسال کنید تا پس از بررسی امنیتی و اثرانگشت در کل اکوسیستم فعال شود:'
+      '⚠️ خطایی در پردازش پیام شما رخ داد. لطفاً لحظاتی دیگر دوباره تلاش کنید یا /start را ارسال نمایید.'
     );
-    return;
   }
-
-  const isAdminCommand =
-    text === '/admin' ||
-    text.startsWith('/admin ') ||
-    /^\/admin@[A-Za-z0-9_]+(\s|$)/.test(text) ||
-    text === ADMIN_PANEL_BUTTON ||
-    text === LEGACY_ADMIN_PANEL_BUTTON;
-
-  if (isAdminCommand) {
-    if (!isAdmin) {
-      await tgSendMessage(env, chatId, '⛔️ شما دسترسی به پنل مدیریت ندارید.');
-      return;
-    }
-    await clearBotState(env.DB, telegramId);
-    const panel = buildAdminPanelHomeView();
-    await tgSendMessage(env, chatId, panel.text, panel.replyMarkup);
-    return;
-  }
-
-  await tgSendMessage(
-    env,
-    chatId,
-    'از دکمه‌های منوی پایین برای ادامه استفاده کنید.',
-    buildMainKeyboard(isRegistered, isAdmin)
-  );
 }
 
 /**

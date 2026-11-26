@@ -430,3 +430,249 @@ test('env.ADMIN_TELEGRAM_ID grants admin menu and non-admin users are denied /ad
     sqlite.close();
   }
 });
+
+test('User panel reply buttons, inline callbacks, and multi-step telegram_states FSM work end-to-end', async () => {
+  const { db, sqlite } = createSqliteD1Adapter();
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const method = url.split('/').pop() || '';
+    const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    calls.push({ method, body });
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 70 } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  const env = {
+    DB: db,
+    TELEGRAM_BOT_TOKEN: '123456:TEST_TOKEN',
+    PUBLIC_BASE_URL: 'https://sentra-core.kziepr.workers.dev',
+    PRO_SUBSCRIPTION_PRICE: '180000',
+  } as Env;
+
+  const sendUpdate = async (update: Record<string, unknown>) => {
+    const before = calls.length;
+    const req = new Request('https://sentra-core.kziepr.workers.dev/api/v1/telegram/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(update),
+    });
+    const resp = await handleTelegramWebhook(req, env);
+    assert.equal(resp.status, 200);
+    return calls.slice(before);
+  };
+
+  try {
+    const user = { id: 555001, first_name: 'Nima', username: 'nima_u' };
+
+    // 1. /start
+    await sendUpdate({
+      update_id: 401,
+      message: { message_id: 1, chat: { id: 555001, type: 'private' }, from: user, text: '/start' },
+    });
+
+    // 2. Reply buttons: Account, Get Sub, iOS, Upgrade, Guide, Download App, Support
+    const accountCalls = await sendUpdate({
+      update_id: 402,
+      message: { message_id: 2, chat: { id: 555001, type: 'private' }, from: user, text: '👤 حساب کاربری' },
+    });
+    assert.ok(String(accountCalls[0].body.text).includes('حجم باقیمانده'));
+
+    const subCalls = await sendUpdate({
+      update_id: 403,
+      message: { message_id: 3, chat: { id: 555001, type: 'private' }, from: user, text: '🔑 دریافت کانفیگ و کد اتصال' },
+    });
+    assert.ok(String(subCalls[0].body.text).includes('https://sentra-core.kziepr.workers.dev/sub/'));
+
+    const guideCalls = await sendUpdate({
+      update_id: 404,
+      message: { message_id: 4, chat: { id: 555001, type: 'private' }, from: user, text: '📖 راهنمای اتصال' },
+    });
+    assert.ok(String(guideCalls[0].body.text).includes('راهنمای اتصال'));
+
+    const dlCalls = await sendUpdate({
+      update_id: 405,
+      message: { message_id: 5, chat: { id: 555001, type: 'private' }, from: user, text: '📥 دانلود اپلیکیشن Sentra Connect' },
+    });
+    assert.ok(String(dlCalls[0].body.text).includes('دانلود اپلیکیشن رسمی Sentra Connect'));
+
+    // 3. Inline callback: answerCallbackQuery MUST be called first
+    const cbGuide = await sendUpdate({
+      update_id: 406,
+      callback_query: {
+        id: 'cb_guide_ios',
+        from: user,
+        message: { message_id: 70, chat: { id: 555001, type: 'private' } },
+        data: 'user_guide_ios',
+      },
+    });
+    assert.equal(cbGuide[0].method, 'answerCallbackQuery');
+    assert.equal(cbGuide[0].body.callback_query_id, 'cb_guide_ios');
+    assert.equal(cbGuide[1].method, 'editMessageText');
+    assert.ok(String(cbGuide[1].body.text).includes('راهنمای اتصال در iOS'));
+
+    // 4. Support ticket multi-step FSM -> inserts into support_tickets
+    const cbTicket = await sendUpdate({
+      update_id: 407,
+      callback_query: {
+        id: 'cb_tkt_new',
+        from: user,
+        message: { message_id: 70, chat: { id: 555001, type: 'private' } },
+        data: 'user_ticket_new_connection',
+      },
+    });
+    assert.equal(cbTicket[0].method, 'answerCallbackQuery');
+    assert.ok(String(cbTicket[1].body.text).includes('ثبت تیکت پشتیبانی'));
+
+    const ticketReply = await sendUpdate({
+      update_id: 408,
+      message: {
+        message_id: 6,
+        chat: { id: 555001, type: 'private' },
+        from: user,
+        text: 'سرعت دانلود روی اینترنت همراه اول پایین است',
+      },
+    });
+    assert.ok(String(ticketReply[0].body.text).includes('TKT-'));
+    const ticketRow = sqlite
+      .prepare('SELECT ticket_number, category, status FROM support_tickets LIMIT 1')
+      .get() as { ticket_number: string; category: string; status: string };
+    assert.ok(ticketRow);
+    assert.equal(ticketRow.category, 'connection');
+    assert.equal(ticketRow.status, 'open');
+
+    // 5. Payment receipt multi-step FSM (photo upload) -> inserts into donations
+    const cbReceipt = await sendUpdate({
+      update_id: 409,
+      callback_query: {
+        id: 'cb_rcpt_pro',
+        from: user,
+        message: { message_id: 70, chat: { id: 555001, type: 'private' } },
+        data: 'user_submit_receipt_pro',
+      },
+    });
+    assert.equal(cbReceipt[0].method, 'answerCallbackQuery');
+    assert.ok(String(cbReceipt[1].body.text).includes('180,000'));
+
+    const receiptReply = await sendUpdate({
+      update_id: 410,
+      message: {
+        message_id: 7,
+        chat: { id: 555001, type: 'private' },
+        from: user,
+        photo: [{ file_id: 'AgAC_RECEIPT_123', file_unique_id: 'AQAD_UNIQ_123' }],
+      },
+    });
+    assert.ok(String(receiptReply[0].body.text).includes('#DON-'));
+    const donationRow = sqlite
+      .prepare('SELECT amount, receipt_file_id, status FROM donations LIMIT 1')
+      .get() as { amount: number; receipt_file_id: string; status: string };
+    assert.ok(donationRow);
+    assert.equal(donationRow.amount, 180000);
+    assert.equal(donationRow.receipt_file_id, 'AgAC_RECEIPT_123');
+    assert.equal(donationRow.status, 'pending');
+
+    // 6. Active FSM state is automatically cleared if user clicks a main menu button instead
+    await sendUpdate({
+      update_id: 411,
+      callback_query: {
+        id: 'cb_donate',
+        from: user,
+        message: { message_id: 70, chat: { id: 555001, type: 'private' } },
+        data: 'user_donate_outbound',
+      },
+    });
+    const escapeFsmCalls = await sendUpdate({
+      update_id: 412,
+      message: {
+        message_id: 8,
+        chat: { id: 555001, type: 'private' },
+        from: user,
+        text: '🎫 پشتیبانی',
+      },
+    });
+    assert.ok(String(escapeFsmCalls[0].body.text).includes('پشتیبانی Sentra Platform'));
+    const remainingState = sqlite
+      .prepare('SELECT * FROM telegram_states WHERE telegram_id = ?')
+      .get(555001);
+    assert.equal(remainingState, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    sqlite.close();
+  }
+});
+
+test('callback_query always awaits answerCallbackQuery first and sends clear fallback error on D1 failure', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalError = console.error;
+  const methods: string[] = [];
+  const sentTexts: string[] = [];
+  const logged: unknown[][] = [];
+
+  console.error = (...args: unknown[]) => logged.push(args);
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const method = String(input).split('/').pop() || '';
+    methods.push(method);
+    const body = JSON.parse(String(init?.body || '{}')) as { text?: string };
+    if (body.text) sentTexts.push(body.text);
+    return new Response(JSON.stringify({ ok: true, result: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  const brokenDb = {
+    prepare() {
+      return {
+        bind() {
+          return this;
+        },
+        async first() {
+          throw new Error('D1_SQL_FAILURE');
+        },
+        async all() {
+          throw new Error('D1_SQL_FAILURE');
+        },
+        async run() {
+          throw new Error('D1_SQL_FAILURE');
+        },
+      };
+    },
+  } as unknown as D1Database;
+
+  try {
+    const req = new Request('https://sentra-core.kziepr.workers.dev/api/v1/telegram/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        update_id: 501,
+        callback_query: {
+          id: 'cb_broken_db',
+          from: { id: 555999, first_name: 'BrokenDbUser' },
+          message: { message_id: 90, chat: { id: 555999, type: 'private' } },
+          data: 'user_account',
+        },
+      }),
+    });
+
+    const resp = await handleTelegramWebhook(req, {
+      DB: brokenDb,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_TOKEN',
+    } as Env);
+
+    assert.equal(resp.status, 200);
+    assert.equal(methods[0], 'answerCallbackQuery', 'answerCallbackQuery must run before D1 queries');
+    assert.ok(sentTexts.some((t) => t.includes('خطایی در پردازش')));
+    assert.ok(
+      logged.some((args) => args.some((a) => JSON.stringify(a).includes('D1_SQL_FAILURE'))),
+      'Expected D1 error to be logged with console.error'
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.error = originalError;
+  }
+});
