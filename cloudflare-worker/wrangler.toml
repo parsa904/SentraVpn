@@ -1,4 +1,4 @@
-name = "sentra-core-worker"
+name = "sentra-core"
 main = "src/index.ts"
 compatibility_date = "2025-04-01"
 compatibility_flags = ["nodejs_compat"]
@@ -12,13 +12,13 @@ enabled = true
 [[d1_databases]]
 binding = "DB"
 database_name = "sentra-db"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "f1f48cc6-f965-4bf0-8670-8cb0248f8e99"
 migrations_dir = "migrations"
 
 [vars]
 BOT_USERNAME = "SentraVpnBot"
 PRO_SUBSCRIPTION_PRICE = "150000"
-PUBLIC_BASE_URL = "https://sentra-core-worker.YOUR_SUBDOMAIN.workers.dev"
+PUBLIC_BASE_URL = "https://sentra-core.kziepr.workers.dev"
 ALLOWED_ORIGINS = ""
 WIREGUARD_PORT = "51820"
 
