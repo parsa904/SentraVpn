@@ -215,3 +215,218 @@ test('logs full Telegram API error when ok: false and sends fallback error reply
     console.error = originalError;
   }
 });
+
+test('DB role="admin" shows 🛠 پنل مدیریت in /start and opens /admin panel with nodes, subscriptions, and stats', async () => {
+  const { db, sqlite } = createSqliteD1Adapter();
+  const originalFetch = globalThis.fetch;
+  const sentCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
+
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    sentCalls.push({ url, body });
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 50 } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  try {
+    // Seed an existing admin user in DB without setting any ADMIN_* env var
+    sqlite
+      .prepare(
+        `INSERT INTO users (user_uuid, telegram_id, username, first_name, role, status, outbound_reward_banned)
+         VALUES ('uuid-db-admin', 777001, 'dbadmin', 'AdminUser', 'admin', 'active', 0)`
+      )
+      .run();
+
+    const sendUpdate = async (update: Record<string, unknown>, envOverrides: Partial<Env> = {}) => {
+      const req = new Request('https://sentra-core.kziepr.workers.dev/api/v1/telegram/webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(update),
+      });
+      return await handleTelegramWebhook(req, {
+        DB: db,
+        TELEGRAM_BOT_TOKEN: '123456:TEST_TOKEN',
+        ...envOverrides,
+      } as Env);
+    };
+
+    // 1. /start as DB admin -> keyboard includes '🛠 پنل مدیریت'
+    const startResp = await sendUpdate({
+      update_id: 201,
+      message: {
+        message_id: 10,
+        chat: { id: 777001, type: 'private' },
+        from: { id: 777001, first_name: 'AdminUser', username: 'dbadmin' },
+        text: '/start',
+      },
+    });
+    assert.equal(startResp.status, 200);
+    const startMarkup = sentCalls[0].body.reply_markup as { keyboard: Array<Array<{ text: string }>> };
+    const flatButtons = startMarkup.keyboard.flat().map((b) => b.text);
+    assert.ok(flatButtons.includes('🛠 پنل مدیریت'), 'Expected 🛠 پنل مدیریت in main menu for DB admin');
+
+    // 2. Clicking '🛠 پنل مدیریت' opens admin panel with Add Node, Subscriptions, Stats
+    await sendUpdate({
+      update_id: 202,
+      message: {
+        message_id: 11,
+        chat: { id: 777001, type: 'private' },
+        from: { id: 777001, first_name: 'AdminUser', username: 'dbadmin' },
+        text: '🛠 پنل مدیریت',
+      },
+    });
+    const panelMsg = sentCalls[1].body;
+    assert.ok(String(panelMsg.text).includes('پنل مدیریت'));
+    const inlineData = (
+      panelMsg.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> }
+    ).inline_keyboard
+      .flat()
+      .map((b) => b.callback_data);
+    assert.ok(inlineData.includes('adm_add_node'));
+    assert.ok(inlineData.includes('adm_manage_subs'));
+    assert.ok(inlineData.includes('adm_stats'));
+
+    // 3. /admin also opens admin panel
+    await sendUpdate({
+      update_id: 203,
+      message: {
+        message_id: 12,
+        chat: { id: 777001, type: 'private' },
+        from: { id: 777001, first_name: 'AdminUser', username: 'dbadmin' },
+        text: '/admin',
+      },
+    });
+    assert.ok(String(sentCalls[2].body.text).includes('پنل مدیریت'));
+
+    // 4. Stats callback returns live stats
+    await sendUpdate({
+      update_id: 204,
+      callback_query: {
+        id: 'cb_stats',
+        from: { id: 777001, first_name: 'AdminUser' },
+        message: { message_id: 50, chat: { id: 777001, type: 'private' } },
+        data: 'adm_stats',
+      },
+    });
+    const statsCall = sentCalls.find((c) => c.url.includes('/editMessageText'));
+    assert.ok(statsCall && String(statsCall.body.text).includes('آمار زنده'));
+
+    // 5. Manage subscriptions callback lists subscriptions
+    await sendUpdate({
+      update_id: 205,
+      callback_query: {
+        id: 'cb_subs',
+        from: { id: 777001, first_name: 'AdminUser' },
+        message: { message_id: 50, chat: { id: 777001, type: 'private' } },
+        data: 'adm_manage_subs',
+      },
+    });
+    const subsCall = sentCalls.filter((c) => c.url.includes('/editMessageText')).at(-1);
+    assert.ok(subsCall && String(subsCall.body.text).includes('مدیریت سابسکریپشن‌ها'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    sqlite.close();
+  }
+});
+
+test('env.ADMIN_TELEGRAM_ID grants admin menu and non-admin users are denied /admin', async () => {
+  const { db, sqlite } = createSqliteD1Adapter();
+  const originalFetch = globalThis.fetch;
+  const sentCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
+
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    sentCalls.push({ url, body });
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 60 } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  try {
+    const env = {
+      DB: db,
+      TELEGRAM_BOT_TOKEN: '123456:TEST_TOKEN',
+      ADMIN_TELEGRAM_ID: '888001',
+    } as Env;
+
+    // 1. Admin via env.ADMIN_TELEGRAM_ID runs /start
+    await handleTelegramWebhook(
+      new Request('https://sentra-core.kziepr.workers.dev/api/v1/telegram/webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          update_id: 301,
+          message: {
+            message_id: 20,
+            chat: { id: 888001, type: 'private' },
+            from: { id: 888001, first_name: 'EnvAdmin' },
+            text: '/start',
+          },
+        }),
+      }),
+      env
+    );
+    const adminButtons = (
+      sentCalls[0].body.reply_markup as { keyboard: Array<Array<{ text: string }>> }
+    ).keyboard
+      .flat()
+      .map((b) => b.text);
+    assert.ok(adminButtons.includes('🛠 پنل مدیریت'));
+
+    const envAdminRow = sqlite
+      .prepare('SELECT role FROM users WHERE telegram_id = ?')
+      .get(888001) as { role: string };
+    assert.equal(envAdminRow.role, 'admin');
+
+    // 2. Non-admin runs /start -> no admin button
+    await handleTelegramWebhook(
+      new Request('https://sentra-core.kziepr.workers.dev/api/v1/telegram/webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          update_id: 302,
+          message: {
+            message_id: 21,
+            chat: { id: 888002, type: 'private' },
+            from: { id: 888002, first_name: 'RegularUser' },
+            text: '/start',
+          },
+        }),
+      }),
+      env
+    );
+    const userButtons = (
+      sentCalls[1].body.reply_markup as { keyboard: Array<Array<{ text: string }>> }
+    ).keyboard
+      .flat()
+      .map((b) => b.text);
+    assert.ok(!userButtons.includes('🛠 پنل مدیریت'));
+
+    // 3. Non-admin tries /admin -> access denied
+    await handleTelegramWebhook(
+      new Request('https://sentra-core.kziepr.workers.dev/api/v1/telegram/webhook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          update_id: 303,
+          message: {
+            message_id: 22,
+            chat: { id: 888002, type: 'private' },
+            from: { id: 888002, first_name: 'RegularUser' },
+            text: '/admin',
+          },
+        }),
+      }),
+      env
+    );
+    assert.ok(String(sentCalls[2].body.text).includes('دسترسی به پنل مدیریت ندارید'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    sqlite.close();
+  }
+});

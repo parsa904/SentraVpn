@@ -26,6 +26,7 @@ WIREGUARD_PORT = "51820"
 # - TELEGRAM_BOT_TOKEN        (Telegram Bot API token)
 # - TELEGRAM_WEBHOOK_SECRET   (Random secret string set in setWebhook secret_token)
 # - QUALITY_ENGINE_SECRET     (Shared secret for GitHub Actions QualityEngine endpoints)
-# - ADMIN_CHAT_ID             (Optional: Telegram numeric admin chat ID; or comma-separated ADMIN_TELEGRAM_IDS)
+# - ADMIN_TELEGRAM_ID         (Optional: Primary Telegram numeric admin ID; also supports ADMIN_CHAT_ID / ADMIN_TELEGRAM_IDS)
+# - ADMIN_CHAT_ID             (Optional: Legacy Telegram numeric admin chat ID; or comma-separated ADMIN_TELEGRAM_IDS)
 # - WIREGUARD_SERVER_PUBLIC_KEY
 # - WIREGUARD_KEY_SALT

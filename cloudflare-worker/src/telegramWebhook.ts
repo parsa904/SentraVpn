@@ -65,15 +65,38 @@ function resolveBotToken(env: Env): string {
   return (env.TELEGRAM_BOT_TOKEN || '').trim();
 }
 
-function isAdminUser(env: Env, telegramId: number): boolean {
+const ADMIN_PANEL_BUTTON = '🛠 پنل مدیریت';
+const LEGACY_ADMIN_PANEL_BUTTON = '🛡 پنل مدیریت اوتباندها';
+
+function isEnvAdmin(env: Env, telegramId: number): boolean {
   const idStr = String(telegramId);
   const candidates = [
+    ...(env.ADMIN_TELEGRAM_ID ? env.ADMIN_TELEGRAM_ID.split(',') : []),
     ...(env.ADMIN_CHAT_ID ? env.ADMIN_CHAT_ID.split(',') : []),
     ...(env.ADMIN_TELEGRAM_IDS ? env.ADMIN_TELEGRAM_IDS.split(',') : []),
   ]
     .map((s) => s.trim())
     .filter(Boolean);
   return candidates.includes(idStr);
+}
+
+async function resolveIsAdmin(
+  env: Env,
+  telegramId: number,
+  existingUser?: UserRow | null
+): Promise<boolean> {
+  if (isEnvAdmin(env, telegramId)) return true;
+  if (existingUser) return existingUser.role === 'admin';
+
+  try {
+    const row = await env.DB.prepare('SELECT role FROM users WHERE telegram_id = ? LIMIT 1')
+      .bind(telegramId)
+      .first<{ role: string }>();
+    return row?.role === 'admin';
+  } catch (err) {
+    console.error('[Sentra Admin Check Error]', err);
+    return false;
+  }
 }
 
 interface TelegramApiResponse {
@@ -226,7 +249,7 @@ function buildMainKeyboard(isRegistered: boolean, isAdmin: boolean): Record<stri
     [{ text: '🤝 اهدای اوتباند (حمایت از Sentra)' }, { text: '📥 دانلود اپلیکیشن Sentra Connect' }],
   ];
   if (isAdmin) {
-    rows.push([{ text: '🛡 پنل مدیریت اوتباندها' }]);
+    rows.push([{ text: ADMIN_PANEL_BUTTON }]);
   }
   return {
     keyboard: rows,
@@ -321,6 +344,12 @@ async function ensureTelegramUserAndSubscription(
       throw new Error('Failed to load newly inserted user from D1');
     }
     isNewUser = true;
+  } else if (isAdmin && user.role !== 'admin') {
+    await db
+      .prepare("UPDATE users SET role = 'admin', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+      .bind(user.id)
+      .run();
+    user = { ...user, role: 'admin' };
   }
 
   let sub = existing?.sub ?? null;
@@ -572,10 +601,372 @@ async function handleAdminOutboundSubmission(
   );
 }
 
+const ADMIN_TIER_CONFIG: Record<string, { tier: string; limitBytes: number; label: string }> = {
+  lite: { tier: 'Sentra Lite', limitBytes: 10 * 1024 * 1024 * 1024, label: 'Lite (10GB)' },
+  gaming: { tier: 'Sentra Gaming', limitBytes: 100 * 1024 * 1024 * 1024, label: 'Gaming (100GB)' },
+  static: {
+    tier: 'Sentra Static IP',
+    limitBytes: 100 * 1024 * 1024 * 1024,
+    label: 'Static IP (100GB)',
+  },
+  pro: { tier: 'Sentra Pro', limitBytes: 200 * 1024 * 1024 * 1024, label: 'Pro (200GB)' },
+  flow: { tier: 'Sentra Flow+', limitBytes: 500 * 1024 * 1024 * 1024, label: 'Flow+ (500GB)' },
+};
+
+function buildAdminPanelHomeView(): { text: string; replyMarkup: Record<string, unknown> } {
+  return {
+    text:
+      '🛠 <b>پنل مدیریت Sentra Platform</b>\n\n' +
+      'از منوی زیر بخش مورد نظر خود را برای افزودن نود، مدیریت سابسکریپشن‌ها یا مشاهده آمار سیستم انتخاب کنید:',
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          { text: '➕ افزودن نود / ساب‌لینک', callback_data: 'adm_add_node' },
+          { text: '📋 لیست نودها', callback_data: 'adm_list_nodes' },
+        ],
+        [
+          { text: '👥 مدیریت سابسکریپشن‌ها', callback_data: 'adm_manage_subs' },
+          { text: '📊 آمار سیستم', callback_data: 'adm_stats' },
+        ],
+      ],
+    },
+  };
+}
+
+function buildAdminAddNodeView(): { text: string; replyMarkup: Record<string, unknown> } {
+  return {
+    text:
+      '➕ <b>افزودن نود یا ساب‌لینک (Serverless D1)</b>\n\n' +
+      'بخش هدف برای تخصیص نود یا لینک سابسکریپشن را انتخاب کنید:',
+    replyMarkup: {
+      inline_keyboard: [
+        [{ text: '🌐 بخش رایگان (وب‌گردی + دانلود)', callback_data: 'adm_ob_alloc_free_only' }],
+        [{ text: '🎮 بخش گیمینگ (فعال‌سازی خودکار گیمینگ)', callback_data: 'adm_ob_alloc_gaming_only' }],
+        [{ text: '💎 بخش آی‌پی ثابت (ترید و جمنای)', callback_data: 'adm_ob_alloc_static_only' }],
+        [{ text: '🔥 کل اکوسیستم (همه حالت‌ها)', callback_data: 'adm_ob_alloc_all' }],
+        [{ text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' }],
+      ],
+    },
+  };
+}
+
+async function buildAdminNodesView(
+  env: Env
+): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
+  const counts = await env.DB.prepare(
+    `SELECT
+       COUNT(*) AS total,
+       SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_cnt,
+       SUM(CASE WHEN status = 'active' AND allow_gaming = 1 THEN 1 ELSE 0 END) AS gaming_cnt,
+       SUM(CASE WHEN status = 'active' AND allow_static_ip = 1 THEN 1 ELSE 0 END) AS static_cnt
+     FROM donated_outbounds`
+  ).first<{ total: number; active_cnt: number | null; gaming_cnt: number | null; static_cnt: number | null }>();
+
+  const recent = await env.DB.prepare(
+    `SELECT id, tag, protocol, country_code, status, latency_ms, allocation_mode
+     FROM donated_outbounds
+     ORDER BY id DESC
+     LIMIT 10`
+  ).all<{
+    id: number;
+    tag: string;
+    protocol: string;
+    country_code: string;
+    status: string;
+    latency_ms: number;
+    allocation_mode: string;
+  }>();
+
+  const lines = (recent.results || []).map((n) => {
+    const icon = n.status === 'active' ? '🟢' : '🔴';
+    return `${icon} <b>#${n.id}</b> <code>${escapeHtml(n.protocol)}</code> | ${escapeHtml(n.tag.slice(0, 28))} (${escapeHtml(n.country_code)}) — <code>${escapeHtml(n.allocation_mode)}</code>`;
+  });
+
+  const text =
+    `📋 <b>لیست نودهای ثبت‌شده</b>\n\n` +
+    `🔹 کل نودها: <b>${counts?.total || 0}</b> (فعال: <b>${counts?.active_cnt || 0}</b>)\n` +
+    `🎮 گیمینگ فعال: <b>${counts?.gaming_cnt || 0}</b> | 💎 آی‌پی ثابت: <b>${counts?.static_cnt || 0}</b>\n\n` +
+    (lines.length > 0 ? lines.join('\n') : '<i>هیچ نودی هنوز ثبت نشده است.</i>');
+
+  return {
+    text,
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          { text: '➕ افزودن نود جدید', callback_data: 'adm_add_node' },
+          { text: '🔄 بروزرسانی', callback_data: 'adm_list_nodes' },
+        ],
+        [{ text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' }],
+      ],
+    },
+  };
+}
+
+interface AdminSubSummaryRow {
+  id: number;
+  user_id: number;
+  tier: string;
+  token: string;
+  status: string;
+  upload_bytes: number;
+  download_bytes: number;
+  traffic_limit_bytes: number;
+  expires_at: string;
+  telegram_id: number | null;
+  username: string | null;
+  first_name: string;
+}
+
+async function buildAdminSubscriptionsView(
+  env: Env
+): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
+  const rows = await env.DB.prepare(
+    `SELECT
+       s.id, s.user_id, s.tier, s.token, s.status,
+       s.upload_bytes, s.download_bytes, s.traffic_limit_bytes, s.expires_at,
+       u.telegram_id, u.username, u.first_name
+     FROM subscriptions s
+     JOIN users u ON u.id = s.user_id
+     ORDER BY s.id DESC
+     LIMIT 8`
+  ).all<AdminSubSummaryRow>();
+
+  const list = rows.results || [];
+  const lines = list.map((r) => {
+    const icon = r.status === 'active' ? '🟢' : '🔴';
+    const usedGb = formatGb(r.upload_bytes + r.download_bytes);
+    const limitGb = formatGb(r.traffic_limit_bytes);
+    const identity = r.username
+      ? `@${escapeHtml(r.username)}`
+      : r.telegram_id
+      ? `ID:${r.telegram_id}`
+      : escapeHtml(r.first_name);
+    return (
+      `${icon} <b>#${r.id}</b> ${identity} — <b>${escapeHtml(r.tier)}</b>\n` +
+      `   📊 ${usedGb}/${limitGb} GB | 📅 ${escapeHtml(r.expires_at.slice(0, 10))}`
+    );
+  });
+
+  const subButtons: Array<Array<{ text: string; callback_data: string }>> = [];
+  for (let i = 0; i < list.length; i += 2) {
+    const rowBtns: Array<{ text: string; callback_data: string }> = [];
+    for (const item of list.slice(i, i + 2)) {
+      const label = item.username ? `@${item.username}` : `#${item.id} (${item.first_name.slice(0, 10)})`;
+      rowBtns.push({ text: `⚙️ ${label}`, callback_data: `adm_sub_view_${item.id}` });
+    }
+    subButtons.push(rowBtns);
+  }
+
+  return {
+    text:
+      `👥 <b>مدیریت سابسکریپشن‌ها (آخرین اشتراک‌ها)</b>\n\n` +
+      (lines.length > 0 ? lines.join('\n') : '<i>هیچ سابسکریپشنی یافت نشد.</i>') +
+      `\n\nبرای ویرایش پلن، تمدید یا تغییر وضعیت، روی اشتراک کلیک کنید یا جستجو انجام دهید:`,
+    replyMarkup: {
+      inline_keyboard: [
+        ...subButtons,
+        [
+          { text: '🔎 جستجوی اشتراک', callback_data: 'adm_sub_search' },
+          { text: '🔄 بروزرسانی', callback_data: 'adm_manage_subs' },
+        ],
+        [{ text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' }],
+      ],
+    },
+  };
+}
+
+async function buildAdminSubscriptionDetailView(
+  env: Env,
+  subId: number
+): Promise<{ text: string; replyMarkup: Record<string, unknown> } | null> {
+  const row = await env.DB.prepare(
+    `SELECT
+       s.id, s.user_id, s.tier, s.token, s.status,
+       s.upload_bytes, s.download_bytes, s.traffic_limit_bytes, s.expires_at,
+       u.telegram_id, u.username, u.first_name
+     FROM subscriptions s
+     JOIN users u ON u.id = s.user_id
+     WHERE s.id = ?
+     LIMIT 1`
+  )
+    .bind(subId)
+    .first<AdminSubSummaryRow>();
+
+  if (!row) return null;
+
+  const usedGb = formatGb(row.upload_bytes + row.download_bytes);
+  const limitGb = formatGb(row.traffic_limit_bytes);
+  const statusLabel = row.status === 'active' ? '🟢 فعال' : `🔴 ${escapeHtml(row.status)}`;
+  const toggleBtnText = row.status === 'active' ? '⏸ غیرفعال‌سازی اشتراک' : '▶️ فعال‌سازی اشتراک';
+
+  return {
+    text:
+      `⚙️ <b>مدیریت اشتراک #${row.id}</b>\n\n` +
+      `👤 کاربر: <b>${escapeHtml(row.first_name)}</b>` +
+      (row.username ? ` (@${escapeHtml(row.username)})` : '') +
+      `\n🆔 Telegram ID: <code>${row.telegram_id ?? 'N/A'}</code>\n` +
+      `💎 پلن فعلی: <b>${escapeHtml(row.tier)}</b>\n` +
+      `📌 وضعیت: ${statusLabel}\n` +
+      `📊 مصرف: <b>${usedGb} GB</b> از <b>${limitGb} GB</b>\n` +
+      `📅 انقضا: <code>${escapeHtml(row.expires_at.slice(0, 10))}</code>\n` +
+      `🔑 توکن: <code>${escapeHtml(row.token)}</code>`,
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          { text: 'Lite', callback_data: `adm_sub_tier_${row.id}_lite` },
+          { text: 'Pro', callback_data: `adm_sub_tier_${row.id}_pro` },
+          { text: 'Flow+', callback_data: `adm_sub_tier_${row.id}_flow` },
+        ],
+        [
+          { text: 'Gaming', callback_data: `adm_sub_tier_${row.id}_gaming` },
+          { text: 'Static IP', callback_data: `adm_sub_tier_${row.id}_static` },
+        ],
+        [
+          { text: '📅 تمدید +۳۰ روز', callback_data: `adm_sub_ext_${row.id}` },
+          { text: '♻️ ریست حجم', callback_data: `adm_sub_rst_${row.id}` },
+        ],
+        [{ text: toggleBtnText, callback_data: `adm_sub_tgl_${row.id}` }],
+        [
+          { text: '👥 لیست اشتراک‌ها', callback_data: 'adm_manage_subs' },
+          { text: '🔙 پنل مدیریت', callback_data: 'adm_panel_home' },
+        ],
+      ],
+    },
+  };
+}
+
+async function findSubscriptionForAdmin(db: D1Database, rawQuery: string): Promise<number | null> {
+  const q = rawQuery.trim();
+  if (!q) return null;
+
+  const cleanHandle = q.replace(/^@/, '');
+  const numericVal = /^\d+$/.test(cleanHandle) ? Number(cleanHandle) : null;
+
+  if (numericVal !== null) {
+    const byTg = await db
+      .prepare(
+        `SELECT s.id FROM subscriptions s
+         JOIN users u ON u.id = s.user_id
+         WHERE u.telegram_id = ?
+         ORDER BY s.id DESC LIMIT 1`
+      )
+      .bind(numericVal)
+      .first<{ id: number }>();
+    if (byTg) return byTg.id;
+
+    const bySubId = await db
+      .prepare('SELECT id FROM subscriptions WHERE id = ? LIMIT 1')
+      .bind(numericVal)
+      .first<{ id: number }>();
+    if (bySubId) return bySubId.id;
+  }
+
+  const byToken = await db
+    .prepare('SELECT id FROM subscriptions WHERE token = ? LIMIT 1')
+    .bind(q)
+    .first<{ id: number }>();
+  if (byToken) return byToken.id;
+
+  const byUsername = await db
+    .prepare(
+      `SELECT s.id FROM subscriptions s
+       JOIN users u ON u.id = s.user_id
+       WHERE lower(u.username) = lower(?)
+       ORDER BY s.id DESC LIMIT 1`
+    )
+    .bind(cleanHandle)
+    .first<{ id: number }>();
+  return byUsername?.id ?? null;
+}
+
+async function buildAdminStatsView(
+  env: Env
+): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
+  const userStats = await env.DB.prepare(
+    `SELECT
+       COUNT(*) AS total_users,
+       SUM(CASE WHEN role = 'admin' THEN 1 ELSE 0 END) AS admin_users,
+       SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_users
+     FROM users`
+  ).first<{ total_users: number; admin_users: number | null; active_users: number | null }>();
+
+  const subStats = await env.DB.prepare(
+    `SELECT
+       COUNT(*) AS total_subs,
+       SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_subs,
+       SUM(upload_bytes + download_bytes) AS total_bytes
+     FROM subscriptions`
+  ).first<{ total_subs: number; active_subs: number | null; total_bytes: number | null }>();
+
+  const tierBreakdown = await env.DB.prepare(
+    `SELECT tier, COUNT(*) AS cnt FROM subscriptions WHERE status = 'active' GROUP BY tier`
+  ).all<{ tier: string; cnt: number }>();
+
+  const nodeStats = await env.DB.prepare(
+    `SELECT
+       COUNT(*) AS total_nodes,
+       SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_nodes,
+       SUM(CASE WHEN is_official = 1 THEN 1 ELSE 0 END) AS official_nodes,
+       SUM(CASE WHEN status = 'active' AND allow_gaming = 1 THEN 1 ELSE 0 END) AS gaming_nodes,
+       SUM(CASE WHEN status = 'active' AND allow_static_ip = 1 THEN 1 ELSE 0 END) AS static_nodes
+     FROM donated_outbounds`
+  ).first<{
+    total_nodes: number;
+    active_nodes: number | null;
+    official_nodes: number | null;
+    gaming_nodes: number | null;
+    static_nodes: number | null;
+  }>();
+
+  const sourceStats = await env.DB.prepare(
+    'SELECT COUNT(*) AS total_sources FROM subscription_sources'
+  ).first<{ total_sources: number }>();
+
+  const gamingLive = await hasActiveGamingOutbounds(env.DB);
+  const tierLines = (tierBreakdown.results || [])
+    .map((t) => `   • ${escapeHtml(t.tier)}: <b>${t.cnt}</b>`)
+    .join('\n');
+
+  const text =
+    `📊 <b>آمار زنده Sentra Platform (Cloudflare D1)</b>\n\n` +
+    `👥 <b>کاربران:</b> ${userStats?.total_users || 0} (فعال: ${userStats?.active_users || 0} | ادمین: ${userStats?.admin_users || 0})\n` +
+    `🎫 <b>سابسکریپشن‌ها:</b> ${subStats?.total_subs || 0} (فعال: ${subStats?.active_subs || 0})\n` +
+    (tierLines ? `${tierLines}\n` : '') +
+    `📈 <b>کل ترافیک مصرفی:</b> ${formatGb(subStats?.total_bytes || 0)} GB\n\n` +
+    `🌐 <b>نودها و اوتباندها:</b> ${nodeStats?.total_nodes || 0} (فعال: ${nodeStats?.active_nodes || 0} | رسمی: ${nodeStats?.official_nodes || 0})\n` +
+    `   • گیمینگ فعال: <b>${nodeStats?.gaming_nodes || 0}</b> | آی‌پی ثابت: <b>${nodeStats?.static_nodes || 0}</b>\n` +
+    `   • منابع سابسکریپشن ثبت‌شده: <b>${sourceStats?.total_sources || 0}</b>\n` +
+    `🎮 <b>وضعیت بخش گیمینگ:</b> ${gamingLive ? 'فعال ✅' : 'به‌زودی ⏳'}`;
+
+  return {
+    text,
+    replyMarkup: {
+      inline_keyboard: [
+        [{ text: '🔄 بروزرسانی آمار', callback_data: 'adm_stats' }],
+        [{ text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' }],
+      ],
+    },
+  };
+}
+
+async function sendOrEditAdminView(
+  env: Env,
+  chatId: number,
+  messageId: number | undefined,
+  view: { text: string; replyMarkup: Record<string, unknown> }
+): Promise<void> {
+  if (messageId) {
+    const edited = await tgEditMessageText(env, chatId, messageId, view.text, view.replyMarkup);
+    if (edited) return;
+  }
+  await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+}
+
 async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<void> {
   const chatId = q.message?.chat.id || q.from.id;
+  const messageId = q.message?.message_id;
   const telegramId = q.from.id;
-  const isAdmin = isAdminUser(env, telegramId);
+  const isAdmin = await resolveIsAdmin(env, telegramId);
   const data = q.data || '';
 
   await tgAnswerCallbackQuery(env, q.id);
@@ -585,8 +976,9 @@ async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<
       const { user, sub, isNewUser } = await ensureTelegramUserAndSubscription(
         env.DB,
         q.from,
-        isAdmin
+        isEnvAdmin(env, telegramId)
       );
+      const effectiveIsAdmin = isEnvAdmin(env, telegramId) || user.role === 'admin';
       if (q.message) {
         await tgEditMessageText(
           env,
@@ -601,7 +993,7 @@ async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<
         env,
         chatId,
         `از این پس می‌توانید وضعیت اشتراک و حجم مصرفی خود را از دکمه «👤 حساب کاربری» مشاهده کنید.`,
-        buildMainKeyboard(true, isAdmin)
+        buildMainKeyboard(true, effectiveIsAdmin)
       );
     } catch (err) {
       console.error(
@@ -693,15 +1085,161 @@ async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<
     return;
   }
 
-  if (data.startsWith('adm_ob_alloc_') && isAdmin) {
-    const alloc = data.slice('adm_ob_alloc_'.length);
-    await setBotState(env.DB, telegramId, 'admin_awaiting_outbound', { allocation: alloc });
-    await tgSendMessage(
-      env,
-      chatId,
-      `📥 <b>ارسال اوتباند یا ساب‌لینک (${escapeHtml(alloc)})</b>\n\n` +
-        `لینک پروکسی (vless/vmess/trojan/hy2/ss/wg)، کانفیگ JSON سینگ‌باکس یا لینک سابسکریپشن (<code>https://...</code>) را ارسال کنید.`
-    );
+  if (data.startsWith('adm_')) {
+    if (!isAdmin) {
+      await tgSendMessage(env, chatId, '⛔️ شما دسترسی به پنل مدیریت ندارید.');
+      return;
+    }
+
+    if (data === 'adm_panel_home') {
+      await clearBotState(env.DB, telegramId);
+      await sendOrEditAdminView(env, chatId, messageId, buildAdminPanelHomeView());
+      return;
+    }
+
+    if (data === 'adm_add_node') {
+      await sendOrEditAdminView(env, chatId, messageId, buildAdminAddNodeView());
+      return;
+    }
+
+    if (data === 'adm_list_nodes') {
+      const view = await buildAdminNodesView(env);
+      await sendOrEditAdminView(env, chatId, messageId, view);
+      return;
+    }
+
+    if (data === 'adm_manage_subs') {
+      await clearBotState(env.DB, telegramId);
+      const view = await buildAdminSubscriptionsView(env);
+      await sendOrEditAdminView(env, chatId, messageId, view);
+      return;
+    }
+
+    if (data === 'adm_sub_search') {
+      await setBotState(env.DB, telegramId, 'admin_awaiting_sub_lookup');
+      await tgSendMessage(
+        env,
+        chatId,
+        '🔎 <b>جستجوی سابسکریپشن</b>\n\nلطفاً یکی از موارد زیر را ارسال کنید:\n• شناسه عددی تلگرام کاربر (Telegram ID)\n• نام کاربری تلگرام (مثلاً <code>@username</code>)\n• شماره اشتراک یا توکن اشتراک'
+      );
+      return;
+    }
+
+    if (data.startsWith('adm_sub_view_')) {
+      const subId = Number(data.slice('adm_sub_view_'.length));
+      if (!Number.isInteger(subId) || subId <= 0) return;
+      const view = await buildAdminSubscriptionDetailView(env, subId);
+      if (!view) {
+        await tgSendMessage(env, chatId, '❌ اشتراک مورد نظر یافت نشد.');
+        return;
+      }
+      await sendOrEditAdminView(env, chatId, messageId, view);
+      return;
+    }
+
+    if (data.startsWith('adm_sub_tier_')) {
+      const match = /^adm_sub_tier_(\d+)_(lite|gaming|static|pro|flow)$/.exec(data);
+      if (!match) return;
+      const subId = Number(match[1]);
+      const cfg = ADMIN_TIER_CONFIG[match[2]];
+      await env.DB.prepare(
+        `UPDATE subscriptions
+         SET tier = ?, traffic_limit_bytes = ?, status = 'active', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`
+      )
+        .bind(cfg.tier, cfg.limitBytes, subId)
+        .run();
+      const view = await buildAdminSubscriptionDetailView(env, subId);
+      if (view) {
+        await sendOrEditAdminView(env, chatId, messageId, view);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm_sub_ext_')) {
+      const subId = Number(data.slice('adm_sub_ext_'.length));
+      if (!Number.isInteger(subId) || subId <= 0) return;
+      const current = await env.DB.prepare('SELECT expires_at FROM subscriptions WHERE id = ? LIMIT 1')
+        .bind(subId)
+        .first<{ expires_at: string }>();
+      if (current) {
+        const baseMs = Math.max(Date.now(), Date.parse(current.expires_at) || Date.now());
+        const nextExpires = new Date(baseMs + 30 * 24 * 60 * 60 * 1000).toISOString();
+        await env.DB.prepare(
+          `UPDATE subscriptions
+           SET expires_at = ?, status = 'active', updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`
+        )
+          .bind(nextExpires, subId)
+          .run();
+      }
+      const view = await buildAdminSubscriptionDetailView(env, subId);
+      if (view) {
+        await sendOrEditAdminView(env, chatId, messageId, view);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm_sub_rst_')) {
+      const subId = Number(data.slice('adm_sub_rst_'.length));
+      if (!Number.isInteger(subId) || subId <= 0) return;
+      await env.DB.prepare(
+        `UPDATE subscriptions
+         SET upload_bytes = 0, download_bytes = 0, web_browsing_used_mb = 0,
+             download_used_mb = 0, static_ip_used_mb = 0, status = 'active',
+             last_quota_reset = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`
+      )
+        .bind(subId)
+        .run();
+      const view = await buildAdminSubscriptionDetailView(env, subId);
+      if (view) {
+        await sendOrEditAdminView(env, chatId, messageId, view);
+      }
+      return;
+    }
+
+    if (data.startsWith('adm_sub_tgl_')) {
+      const subId = Number(data.slice('adm_sub_tgl_'.length));
+      if (!Number.isInteger(subId) || subId <= 0) return;
+      const current = await env.DB.prepare('SELECT status FROM subscriptions WHERE id = ? LIMIT 1')
+        .bind(subId)
+        .first<{ status: string }>();
+      if (current) {
+        const nextStatus = current.status === 'active' ? 'disabled' : 'active';
+        await env.DB.prepare(
+          'UPDATE subscriptions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+        )
+          .bind(nextStatus, subId)
+          .run();
+      }
+      const view = await buildAdminSubscriptionDetailView(env, subId);
+      if (view) {
+        await sendOrEditAdminView(env, chatId, messageId, view);
+      }
+      return;
+    }
+
+    if (data === 'adm_stats') {
+      const view = await buildAdminStatsView(env);
+      await sendOrEditAdminView(env, chatId, messageId, view);
+      return;
+    }
+
+    if (data.startsWith('adm_ob_alloc_')) {
+      const alloc = data.slice('adm_ob_alloc_'.length);
+      if (!['free_only', 'gaming_only', 'static_only', 'all', 'auto', 'both'].includes(alloc)) {
+        return;
+      }
+      await setBotState(env.DB, telegramId, 'admin_awaiting_outbound', { allocation: alloc });
+      await tgSendMessage(
+        env,
+        chatId,
+        `📥 <b>ارسال اوتباند یا ساب‌لینک (${escapeHtml(alloc)})</b>\n\n` +
+          `لینک پروکسی (vless/vmess/trojan/hy2/ss/wg)، کانفیگ JSON سینگ‌باکس یا لینک سابسکریپشن (<code>https://...</code>) را ارسال کنید.`
+      );
+      return;
+    }
   }
 }
 
@@ -711,16 +1249,17 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
   const chatId = msg.chat.id;
   const telegramId = from.id;
   const text = (msg.text || '').trim();
-  const isAdmin = isAdminUser(env, telegramId);
+  const envAdmin = isEnvAdmin(env, telegramId);
 
-  if (text === '/start' || text.startsWith('/start ')) {
+  if (text === '/start' || text.startsWith('/start ') || /^\/start@[A-Za-z0-9_]+(\s|$)/.test(text)) {
     try {
       await clearBotState(env.DB, telegramId);
       const { user, sub, isNewUser } = await ensureTelegramUserAndSubscription(
         env.DB,
         from,
-        isAdmin
+        envAdmin
       );
+      const isAdmin = envAdmin || user.role === 'admin';
       const welcome = isNewUser
         ? `👋 به <b>Sentra Platform</b> خوش آمدید <b>${escapeHtml(user.first_name)}</b>!\n\n` +
           `✅ حساب شما به‌صورت خودکار ایجاد و فعال شد:\n` +
@@ -764,6 +1303,7 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
   }
 
   const isRegistered = Boolean(existing);
+  const isAdmin = envAdmin || existing?.user.role === 'admin';
 
   if (text === '🔙 بازگشت') {
     await clearBotState(env.DB, telegramId);
@@ -809,11 +1349,12 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
         .bind(telegramId, user.id)
         .run();
 
+      const loggedInIsAdmin = envAdmin || user.role === 'admin';
       await tgSendMessage(
         env,
         chatId,
         `✅ <b>ورود موفق!</b>\nحساب <b>${escapeHtml(user.username || user.first_name)}</b> به تلگرام شما متصل شد.`,
-        buildMainKeyboard(true, isAdmin)
+        buildMainKeyboard(true, loggedInIsAdmin)
       );
       return;
     }
@@ -879,6 +1420,25 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
       const payload = JSON.parse(state.payload_json || '{}') as { allocation?: string };
       await clearBotState(env.DB, telegramId);
       await handleAdminOutboundSubmission(env, chatId, text, payload.allocation || 'auto');
+      return;
+    }
+
+    if (state.state_type === 'admin_awaiting_sub_lookup' && isAdmin) {
+      await clearBotState(env.DB, telegramId);
+      const foundSubId = await findSubscriptionForAdmin(env.DB, text);
+      if (!foundSubId) {
+        await tgSendMessage(
+          env,
+          chatId,
+          '❌ هیچ سابسکریپشنی با این مشخصات یافت نشد.',
+          buildAdminPanelHomeView().replyMarkup
+        );
+        return;
+      }
+      const view = await buildAdminSubscriptionDetailView(env, foundSubId);
+      if (view) {
+        await tgSendMessage(env, chatId, view.text, view.replyMarkup);
+      }
       return;
     }
   }
@@ -982,20 +1542,21 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
     return;
   }
 
-  if (text === '🛡 پنل مدیریت اوتباندها' && isAdmin) {
-    await tgSendMessage(
-      env,
-      chatId,
-      '🛡 <b>پنل مدیریت اوتباندها (Serverless D1)</b>\n\nبخش هدف برای افزودن نود یا ساب‌لینک را انتخاب کنید:',
-      {
-        inline_keyboard: [
-          [{ text: '🌐 بخش رایگان (وب‌گردی + دانلود)', callback_data: 'adm_ob_alloc_free_only' }],
-          [{ text: '🎮 بخش گیمینگ (فعال‌سازی خودکار گیمینگ)', callback_data: 'adm_ob_alloc_gaming_only' }],
-          [{ text: '💎 بخش آی‌پی ثابت (ترید و جمنای)', callback_data: 'adm_ob_alloc_static_only' }],
-          [{ text: '🔥 کل اکوسیستم (همه حالت‌ها)', callback_data: 'adm_ob_alloc_all' }],
-        ],
-      }
-    );
+  const isAdminCommand =
+    text === '/admin' ||
+    text.startsWith('/admin ') ||
+    /^\/admin@[A-Za-z0-9_]+(\s|$)/.test(text) ||
+    text === ADMIN_PANEL_BUTTON ||
+    text === LEGACY_ADMIN_PANEL_BUTTON;
+
+  if (isAdminCommand) {
+    if (!isAdmin) {
+      await tgSendMessage(env, chatId, '⛔️ شما دسترسی به پنل مدیریت ندارید.');
+      return;
+    }
+    await clearBotState(env.DB, telegramId);
+    const panel = buildAdminPanelHomeView();
+    await tgSendMessage(env, chatId, panel.text, panel.replyMarkup);
     return;
   }
 
