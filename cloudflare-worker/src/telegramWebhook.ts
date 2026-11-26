@@ -61,17 +61,68 @@ function formatGb(bytes: number): string {
   return (Math.max(0, bytes) / (1024 * 1024 * 1024)).toFixed(2);
 }
 
+function resolveBotToken(env: Env): string {
+  return (env.TELEGRAM_BOT_TOKEN || env.TELOXIDE_TOKEN || '').trim();
+}
+
+function isAdminUser(env: Env, telegramId: number): boolean {
+  const idStr = String(telegramId);
+  const candidates = [
+    ...(env.ADMIN_CHAT_ID ? env.ADMIN_CHAT_ID.split(',') : []),
+    ...(env.ADMIN_TELEGRAM_IDS ? env.ADMIN_TELEGRAM_IDS.split(',') : []),
+  ]
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return candidates.includes(idStr);
+}
+
+interface TelegramApiResponse {
+  ok?: boolean;
+  error_code?: number;
+  description?: string;
+}
+
 async function tgApi(
   env: Env,
   method: string,
   payload: Record<string, unknown>
-): Promise<void> {
-  if (!env.TELOXIDE_TOKEN) return;
-  await fetch(`https://api.telegram.org/bot${env.TELOXIDE_TOKEN}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+): Promise<boolean> {
+  const botToken = resolveBotToken(env);
+  if (!botToken) {
+    console.error('MISSING TELEGRAM_BOT_TOKEN');
+    return false;
+  }
+
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    const rawText = await resp.text();
+    let parsed: TelegramApiResponse | null = null;
+    try {
+      parsed = JSON.parse(rawText) as TelegramApiResponse;
+    } catch {
+      parsed = null;
+    }
+
+    if (!resp.ok || !parsed || parsed.ok !== true) {
+      console.error('[Telegram API Error]', {
+        method,
+        http_status: resp.status,
+        error_code: parsed?.error_code ?? null,
+        description: parsed?.description ?? rawText.slice(0, 500),
+      });
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error('[Telegram API Fetch Error]', method, err);
+    return false;
+  }
 }
 
 async function tgSendMessage(
@@ -79,13 +130,41 @@ async function tgSendMessage(
   chatId: number,
   text: string,
   replyMarkup?: Record<string, unknown>
-): Promise<void> {
-  await tgApi(env, 'sendMessage', {
+): Promise<boolean> {
+  return await tgApi(env, 'sendMessage', {
     chat_id: chatId,
     text,
     parse_mode: 'HTML',
     disable_web_page_preview: true,
     ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+  });
+}
+
+async function tgEditMessageText(
+  env: Env,
+  chatId: number,
+  messageId: number,
+  text: string,
+  replyMarkup?: Record<string, unknown>
+): Promise<boolean> {
+  return await tgApi(env, 'editMessageText', {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+  });
+}
+
+async function tgAnswerCallbackQuery(
+  env: Env,
+  callbackQueryId: string,
+  text?: string
+): Promise<boolean> {
+  return await tgApi(env, 'answerCallbackQuery', {
+    callback_query_id: callbackQueryId,
+    ...(text ? { text } : {}),
   });
 }
 
@@ -95,17 +174,45 @@ async function tgSendTextDocument(
   filename: string,
   content: string,
   caption: string
-): Promise<void> {
-  if (!env.TELOXIDE_TOKEN) return;
+): Promise<boolean> {
+  const botToken = resolveBotToken(env);
+  if (!botToken) {
+    console.error('MISSING TELEGRAM_BOT_TOKEN');
+    return false;
+  }
+
   const form = new FormData();
   form.append('chat_id', String(chatId));
   form.append('caption', caption);
   form.append('parse_mode', 'HTML');
   form.append('document', new Blob([content], { type: 'text/plain; charset=utf-8' }), filename);
-  await fetch(`https://api.telegram.org/bot${env.TELOXIDE_TOKEN}/sendDocument`, {
-    method: 'POST',
-    body: form,
-  });
+
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
+      method: 'POST',
+      body: form,
+    });
+    const rawText = await resp.text();
+    let parsed: TelegramApiResponse | null = null;
+    try {
+      parsed = JSON.parse(rawText) as TelegramApiResponse;
+    } catch {
+      parsed = null;
+    }
+    if (!resp.ok || !parsed || parsed.ok !== true) {
+      console.error('[Telegram API Error]', {
+        method: 'sendDocument',
+        http_status: resp.status,
+        error_code: parsed?.error_code ?? null,
+        description: parsed?.description ?? rawText.slice(0, 500),
+      });
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('[Telegram API Fetch Error]', 'sendDocument', err);
+    return false;
+  }
 }
 
 function buildMainKeyboard(isRegistered: boolean, isAdmin: boolean): Record<string, unknown> {
@@ -160,6 +267,90 @@ async function getUserAndSubByTelegramId(
     .bind(user.id)
     .first<SubscriptionRow>();
   return { user, sub: sub || null };
+}
+
+/**
+ * Ensures the Telegram user exists in `users` and has an initial active subscription
+ * in `subscriptions` using the exact columns defined in `schema.sql`.
+ */
+async function ensureTelegramUserAndSubscription(
+  db: D1Database,
+  tgUser: TelegramUser,
+  isAdmin: boolean
+): Promise<{ user: UserRow; sub: SubscriptionRow; isNewUser: boolean }> {
+  const existing = await getUserAndSubByTelegramId(db, tgUser.id);
+  let user = existing?.user ?? null;
+  let isNewUser = false;
+
+  if (!user) {
+    const userUuid = crypto.randomUUID();
+    let safeUsername: string | null = tgUser.username?.trim() || null;
+    if (safeUsername) {
+      const taken = await db
+        .prepare('SELECT id FROM users WHERE lower(username) = lower(?) LIMIT 1')
+        .bind(safeUsername)
+        .first<{ id: number }>();
+      if (taken) {
+        safeUsername = null;
+      }
+    }
+
+    await db
+      .prepare(
+        `INSERT INTO users (
+           user_uuid, telegram_id, username, email, password_hash,
+           first_name, last_name, role, status, outbound_reward_banned
+         ) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, 'active', 0)`
+      )
+      .bind(
+        userUuid,
+        tgUser.id,
+        safeUsername,
+        (tgUser.first_name || 'کاربر سنترا').trim() || 'کاربر سنترا',
+        tgUser.last_name || null,
+        isAdmin ? 'admin' : 'user'
+      )
+      .run();
+
+    user = await db
+      .prepare('SELECT * FROM users WHERE telegram_id = ? LIMIT 1')
+      .bind(tgUser.id)
+      .first<UserRow>();
+
+    if (!user) {
+      throw new Error('Failed to load newly inserted user from D1');
+    }
+    isNewUser = true;
+  }
+
+  let sub = existing?.sub ?? null;
+  if (!sub) {
+    const token = generateSubscriptionToken();
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    await db
+      .prepare(
+        `INSERT INTO subscriptions (
+           user_id, tier, token, status,
+           upload_bytes, download_bytes, traffic_limit_bytes, speed_limit_bps,
+           max_concurrent_devices, web_browsing_used_mb, download_used_mb,
+           static_ip_used_mb, expires_at
+         ) VALUES (?, 'Sentra Lite', ?, 'active', 0, 0, ?, 0, 3, 0, 0, 0, ?)`
+      )
+      .bind(user.id, token, 10 * 1024 * 1024 * 1024, expiresAt)
+      .run();
+
+    sub = await db
+      .prepare('SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1')
+      .bind(user.id)
+      .first<SubscriptionRow>();
+
+    if (!sub) {
+      throw new Error('Failed to load newly inserted subscription from D1');
+    }
+  }
+
+  return { user, sub, isNewUser };
 }
 
 async function setBotState(
@@ -384,58 +575,46 @@ async function handleAdminOutboundSubmission(
 async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<void> {
   const chatId = q.message?.chat.id || q.from.id;
   const telegramId = q.from.id;
-  const isAdmin = Boolean(env.ADMIN_CHAT_ID && String(telegramId) === String(env.ADMIN_CHAT_ID).trim());
+  const isAdmin = isAdminUser(env, telegramId);
   const data = q.data || '';
 
-  await tgApi(env, 'answerCallbackQuery', { callback_query_id: q.id });
+  await tgAnswerCallbackQuery(env, q.id);
 
   if (data === 'auth_register_new') {
-    const existing = await getUserAndSubByTelegramId(env.DB, telegramId);
-    if (existing) {
+    try {
+      const { user, sub, isNewUser } = await ensureTelegramUserAndSubscription(
+        env.DB,
+        q.from,
+        isAdmin
+      );
+      if (q.message) {
+        await tgEditMessageText(
+          env,
+          chatId,
+          q.message.message_id,
+          isNewUser
+            ? `🎉 <b>ثبت‌نام شما با موفقیت انجام شد!</b>\n\n🆔 <b>کد شناسایی یکتا:</b> <code>${escapeHtml(user.user_uuid)}</code>\n💎 <b>پلن فعال:</b> ${escapeHtml(sub.tier)} (۱۰ گیگابایت)`
+            : `✅ حساب شما از قبل فعال است.\n🆔 شناسه یکتا: <code>${escapeHtml(user.user_uuid)}</code>`
+        );
+      }
       await tgSendMessage(
         env,
         chatId,
-        `✅ حساب شما از قبل فعال است.\n🆔 شناسه یکتا: <code>${escapeHtml(existing.user.user_uuid)}</code>`,
+        `از این پس می‌توانید وضعیت اشتراک و حجم مصرفی خود را از دکمه «👤 حساب کاربری» مشاهده کنید.`,
         buildMainKeyboard(true, isAdmin)
       );
-      return;
+    } catch (err) {
+      console.error(
+        '[Sentra D1 Error] auth_register_new failed:',
+        err instanceof Error ? err.message : String(err),
+        err
+      );
+      await tgSendMessage(
+        env,
+        chatId,
+        '⚠️ خطایی در ثبت‌نام و ذخیره اطلاعات در دیتابیس رخ داد. لطفاً لحظاتی دیگر دوباره تلاش کنید.'
+      );
     }
-
-    const userUuid = crypto.randomUUID();
-    const token = generateSubscriptionToken();
-    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-
-    const inserted = await env.DB.prepare(
-      `INSERT INTO users (user_uuid, telegram_id, username, first_name, last_name, role, status)
-       VALUES (?, ?, ?, ?, ?, ?, 'active')`
-    )
-      .bind(
-        userUuid,
-        telegramId,
-        q.from.username || null,
-        q.from.first_name || 'کاربر سنترا',
-        q.from.last_name || null,
-        isAdmin ? 'admin' : 'user'
-      )
-      .run();
-
-    const userId = inserted.meta.last_row_id;
-    await env.DB.prepare(
-      `INSERT INTO subscriptions (user_id, tier, token, status, traffic_limit_bytes, max_concurrent_devices, expires_at)
-       VALUES (?, 'Sentra Lite', ?, 'active', ?, 3, ?)`
-    )
-      .bind(userId, token, 10 * 1024 * 1024 * 1024, expiresAt)
-      .run();
-
-    await tgSendMessage(
-      env,
-      chatId,
-      `🎉 <b>ثبت‌نام شما با موفقیت انجام شد!</b>\n\n` +
-        `🆔 <b>کد شناسایی یکتا:</b> <code>${escapeHtml(userUuid)}</code>\n` +
-        `💎 <b>پلن فعال:</b> Sentra Lite (۱۰ گیگابایت)\n\n` +
-        `از این پس می‌توانید وضعیت اشتراک و حجم مصرفی خود را از دکمه «👤 حساب کاربری» مشاهده کنید.`,
-      buildMainKeyboard(true, isAdmin)
-    );
     return;
   }
 
@@ -532,12 +711,61 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
   const chatId = msg.chat.id;
   const telegramId = from.id;
   const text = (msg.text || '').trim();
-  const isAdmin = Boolean(env.ADMIN_CHAT_ID && String(telegramId) === String(env.ADMIN_CHAT_ID).trim());
+  const isAdmin = isAdminUser(env, telegramId);
 
-  const existing = await getUserAndSubByTelegramId(env.DB, telegramId);
+  if (text === '/start' || text.startsWith('/start ')) {
+    try {
+      await clearBotState(env.DB, telegramId);
+      const { user, sub, isNewUser } = await ensureTelegramUserAndSubscription(
+        env.DB,
+        from,
+        isAdmin
+      );
+      const welcome = isNewUser
+        ? `👋 به <b>Sentra Platform</b> خوش آمدید <b>${escapeHtml(user.first_name)}</b>!\n\n` +
+          `✅ حساب شما به‌صورت خودکار ایجاد و فعال شد:\n` +
+          `🆔 <b>کد شناسایی یکتا:</b> <code>${escapeHtml(user.user_uuid)}</code>\n` +
+          `💎 <b>پلن اولیه:</b> ${escapeHtml(sub.tier)} (۱۰ گیگابایت)\n\n` +
+          `از منوی زیر برای دریافت کانفیگ یا مدیریت حساب استفاده کنید.`
+        : `👋 خوش آمدید <b>${escapeHtml(user.first_name)}</b>!\n\n` +
+          `حساب شما متصل و آماده استفاده است.\n` +
+          `💎 <b>پلن فعال:</b> ${escapeHtml(sub.tier)}`;
+      await tgSendMessage(env, chatId, welcome, buildMainKeyboard(true, isAdmin));
+    } catch (err) {
+      console.error(
+        '[Sentra D1 Error] /start failed:',
+        err instanceof Error ? err.message : String(err),
+        err
+      );
+      await tgSendMessage(
+        env,
+        chatId,
+        '⚠️ خطایی در اتصال به دیتابیس و ثبت اطلاعات شما رخ داد. لطفاً لحظاتی دیگر دوباره /start را ارسال کنید.'
+      );
+    }
+    return;
+  }
+
+  let existing: { user: UserRow; sub: SubscriptionRow | null } | null = null;
+  try {
+    existing = await getUserAndSubByTelegramId(env.DB, telegramId);
+  } catch (err) {
+    console.error(
+      '[Sentra D1 Error] Failed to query user:',
+      err instanceof Error ? err.message : String(err),
+      err
+    );
+    await tgSendMessage(
+      env,
+      chatId,
+      '⚠️ در حال حاضر ارتباط با دیتابیس با خطا مواجه شد. لطفاً لحظاتی دیگر دوباره تلاش کنید.'
+    );
+    return;
+  }
+
   const isRegistered = Boolean(existing);
 
-  if (text === '/start' || text === '🔙 بازگشت') {
+  if (text === '🔙 بازگشت') {
     await clearBotState(env.DB, telegramId);
     const welcome = isRegistered
       ? `👋 خوش آمدید <b>${escapeHtml(existing!.user.first_name)}</b>!\nحساب شما متصل و آماده استفاده است.`
@@ -816,9 +1044,20 @@ export async function handleTelegramWebhook(
     }
   } catch (err) {
     console.error('[Sentra Webhook Error]', err);
+    const fallbackChatId =
+      update.message?.chat.id ||
+      update.callback_query?.message?.chat.id ||
+      update.callback_query?.from.id;
+    if (fallbackChatId) {
+      await tgSendMessage(
+        env,
+        fallbackChatId,
+        '⚠️ خطایی در پردازش درخواست شما رخ داد. لطفاً لحظاتی دیگر دوباره تلاش کنید.'
+      );
+    }
   }
 
-  // Always return 200 OK to Telegram so updates are not retried infinitely
+  // Always return 200 OK to Telegram only AFTER all awaited replies complete
   return new Response(JSON.stringify({ ok: true }), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },

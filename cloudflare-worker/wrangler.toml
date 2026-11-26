@@ -23,9 +23,9 @@ ALLOWED_ORIGINS = ""
 WIREGUARD_PORT = "51820"
 
 # Configure the following secrets via `wrangler secret put <NAME>`:
-# - TELOXIDE_TOKEN            (Telegram Bot API token)
+# - TELEGRAM_BOT_TOKEN        (Telegram Bot API token; TELOXIDE_TOKEN also supported as alias)
 # - TELEGRAM_WEBHOOK_SECRET   (Random secret string set in setWebhook secret_token)
-# - ADMIN_CHAT_ID             (Telegram numeric admin chat ID)
+# - ADMIN_CHAT_ID             (Telegram numeric admin chat ID; or comma-separated ADMIN_TELEGRAM_IDS)
 # - QUALITY_ENGINE_SECRET     (Shared secret for GitHub Actions QualityEngine endpoints)
 # - WIREGUARD_SERVER_PUBLIC_KEY
 # - WIREGUARD_KEY_SALT

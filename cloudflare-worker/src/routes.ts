@@ -162,7 +162,11 @@ function normalizeMode(raw: string | null | undefined): ConnectionMode {
   return 'web_browsing';
 }
 
-export async function routeRequest(request: Request, env: Env): Promise<Response> {
+export async function routeRequest(
+  request: Request,
+  env: Env,
+  _ctx?: ExecutionContext
+): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, '') || '/';
   const method = request.method.toUpperCase();
@@ -183,9 +187,9 @@ export async function routeRequest(request: Request, env: Env): Promise<Response
     }
   }
 
-  // 2. Telegram Webhook
+  // 2. Telegram Webhook (await full processing + Telegram API replies before returning 200 OK)
   if (method === 'POST' && path === '/api/v1/telegram/webhook') {
-    return handleTelegramWebhook(request, env);
+    return await handleTelegramWebhook(request, env);
   }
 
   // 3. QualityEngine — Fetch Active/Candidate Nodes (Protected by QUALITY_ENGINE_SECRET)

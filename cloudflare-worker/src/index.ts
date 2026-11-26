@@ -35,7 +35,7 @@ function applySecurityAndCorsHeaders(
     headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     headers.set(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-Subscription-Token, X-Device-Id, X-Bridge-Secret, X-Quality-Secret'
+      'Content-Type, Authorization, X-Subscription-Token, X-Device-Id, X-Quality-Secret'
     );
   }
 
@@ -47,7 +47,7 @@ function applySecurityAndCorsHeaders(
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const allowedOrigin = resolveAllowedOrigin(request, env);
 
     if (request.method.toUpperCase() === 'OPTIONS') {
@@ -55,7 +55,7 @@ export default {
     }
 
     try {
-      const response = await routeRequest(request, env);
+      const response = await routeRequest(request, env, ctx);
       return applySecurityAndCorsHeaders(response, allowedOrigin);
     } catch (err) {
       console.error('[Sentra Worker Unhandled Error]', err);
