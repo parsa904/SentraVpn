@@ -4,7 +4,6 @@ import type {
   DonatedOutboundRow,
   OutboundRow,
   SubscriptionRow,
-  WarpAccountRow,
 } from './types.ts';
 
 export const IR_SPLIT_TUNNEL_DOMAINS = [
@@ -178,8 +177,9 @@ export function compileClientSingboxConfig(
     return candidate;
   };
 
-  // 1. Official & community donated outbounds
+  // 1. Healthy official & community donated outbounds (direct client-to-node)
   for (const dob of donatedOutbounds) {
+    if (dob.status && dob.status !== 'active') continue;
     try {
       const parsed = JSON.parse(dob.config_json) as SingboxOutboundConfig;
       const normalized = enforceRealityUtls(parsed);
@@ -195,11 +195,13 @@ export function compileClientSingboxConfig(
     }
   }
 
-  // 2. Non-loopback core outbounds
+  // 2. Active non-loopback core outbounds
+  const activeCoreOutbounds = outbounds.filter((ob) => ob.is_active !== 0);
   const hasRealNodes =
-    outboundTags.length > 0 || outbounds.some((ob) => ob.server_address !== '127.0.0.1');
+    outboundTags.length > 0 ||
+    activeCoreOutbounds.some((ob) => ob.server_address !== '127.0.0.1');
 
-  for (const ob of outbounds) {
+  for (const ob of activeCoreOutbounds) {
     if (hasRealNodes && ob.server_address === '127.0.0.1') continue;
     const tag = makeUniqueTag(ob.tag);
     outboundTags.push(tag);
@@ -413,288 +415,6 @@ export function compileClientSingboxConfig(
   }
 
   return config;
-}
-
-/**
- * Compiles the Linux Bridge VPS sing-box 1.14+ server config served by GET /api/v1/bridge/config.
- * Mirrors sentra-core/src/bridge_sync.rs without deprecated fields.
- */
-export function compileBridgeSingboxConfig(params: {
-  webOutbounds: DonatedOutboundRow[];
-  downloadOutbounds: DonatedOutboundRow[];
-  staticIpOutbounds: DonatedOutboundRow[];
-  gamingOutbounds: DonatedOutboundRow[];
-  coreOutbounds: OutboundRow[];
-  warpAccount: WarpAccountRow | null;
-}): Record<string, unknown> {
-  const singboxOutbounds: Record<string, unknown>[] = [
-    { type: 'direct', tag: 'direct-out' },
-  ];
-  const insertedTags = new Set<string>(['direct-out']);
-
-  const webTags: string[] = [];
-  const dlTags: string[] = [];
-  const staticTags: string[] = [];
-  const gamingTags: string[] = [];
-
-  const registerDonatedPool = (
-    rows: DonatedOutboundRow[],
-    prefix: string,
-    targetList: string[]
-  ) => {
-    for (const dob of rows) {
-      try {
-        const parsed = enforceRealityUtls(JSON.parse(dob.config_json) as SingboxOutboundConfig);
-        const tag = `${prefix}-${dob.country_code.toLowerCase()}-${dob.id}`;
-        if (!insertedTags.has(tag)) {
-          insertedTags.add(tag);
-          parsed.tag = tag;
-          singboxOutbounds.push(parsed);
-        }
-        if (!targetList.includes(tag)) {
-          targetList.push(tag);
-        }
-      } catch {
-        // skip invalid config_json
-      }
-    }
-  };
-
-  registerDonatedPool(params.webOutbounds, 'out-web', webTags);
-  registerDonatedPool(params.downloadOutbounds, 'out-dl', dlTags);
-  registerDonatedPool(params.staticIpOutbounds, 'out-static', staticTags);
-  registerDonatedPool(params.gamingOutbounds, 'out-game', gamingTags);
-
-  for (const ob of params.coreOutbounds) {
-    if (ob.is_active !== 1 || ob.server_address === '127.0.0.1') continue;
-    const tag = `out-core-${ob.country_code.toLowerCase()}-${ob.id}`;
-    if (!insertedTags.has(tag)) {
-      insertedTags.add(tag);
-      singboxOutbounds.push(buildCoreOutboundNode(ob, tag));
-    }
-    if (ob.mode_category === 'static_ip') {
-      if (!staticTags.includes(tag)) staticTags.push(tag);
-      if (!webTags.includes(tag)) webTags.push(tag);
-      if (!dlTags.includes(tag)) dlTags.push(tag);
-    } else if (ob.mode_category === 'gaming') {
-      if (!gamingTags.includes(tag)) gamingTags.push(tag);
-      if (!webTags.includes(tag)) webTags.push(tag);
-    } else if (ob.mode_category === 'download') {
-      if (!dlTags.includes(tag)) dlTags.push(tag);
-      if (!webTags.includes(tag)) webTags.push(tag);
-    } else {
-      if (!webTags.includes(tag)) webTags.push(tag);
-      if (!dlTags.includes(tag)) dlTags.push(tag);
-      if (!gamingTags.includes(tag)) gamingTags.push(tag);
-    }
-  }
-
-  let staticTarget = 'direct-out';
-  if (staticTags.length > 1) {
-    singboxOutbounds.push({
-      type: 'urltest',
-      tag: 'out-static-auto',
-      outbounds: staticTags,
-      url: 'https://api.binance.com/api/v3/ping',
-      interval: '5m',
-      tolerance: 30,
-    });
-    staticTarget = 'out-static-auto';
-  } else if (staticTags.length === 1) {
-    staticTarget = staticTags[0];
-  } else if (webTags.length > 0) {
-    staticTarget = webTags[0];
-  }
-
-  let webTarget = 'direct-out';
-  if (webTags.length > 0) {
-    singboxOutbounds.push({
-      type: 'urltest',
-      tag: 'out-web-auto',
-      outbounds: webTags,
-      url: 'https://cp.cloudflare.com/generate_204',
-      interval: '3m',
-      tolerance: 50,
-    });
-    webTarget = 'out-web-auto';
-  } else if (dlTags.length > 0) {
-    webTarget = dlTags[0];
-  }
-
-  let dlTarget = 'direct-out';
-  if (dlTags.length > 0) {
-    singboxOutbounds.push({
-      type: 'urltest',
-      tag: 'out-dl-auto',
-      outbounds: dlTags,
-      url: 'https://cp.cloudflare.com/generate_204',
-      interval: '3m',
-      tolerance: 50,
-    });
-    dlTarget = 'out-dl-auto';
-  } else if (webTags.length > 0) {
-    dlTarget = webTags[0];
-  }
-
-  let gamingTarget = 'direct-out';
-  if (gamingTags.length > 0) {
-    singboxOutbounds.push({
-      type: 'urltest',
-      tag: 'out-gaming-auto',
-      outbounds: gamingTags,
-      url: 'https://cp.cloudflare.com/generate_204',
-      interval: '1m',
-      tolerance: 15,
-    });
-    gamingTarget = 'out-gaming-auto';
-  } else if (webTags.length > 0) {
-    gamingTarget = webTarget;
-  }
-
-  const inbounds: Record<string, unknown>[] = [
-    {
-      type: 'tun',
-      tag: 'tun-web',
-      interface_name: 'tun-web',
-      address: ['10.10.0.1/30'],
-      auto_route: false,
-      strict_route: false,
-      stack: 'system',
-    },
-    {
-      type: 'tun',
-      tag: 'tun-dl',
-      interface_name: 'tun-dl',
-      address: ['10.10.1.1/30'],
-      auto_route: false,
-      strict_route: false,
-      stack: 'system',
-    },
-    {
-      type: 'tun',
-      tag: 'tun-static',
-      interface_name: 'tun-static',
-      address: ['10.10.2.1/30'],
-      auto_route: false,
-      strict_route: false,
-      stack: 'system',
-    },
-    {
-      type: 'tun',
-      tag: 'tun-gaming',
-      interface_name: 'tun-gaming',
-      address: ['10.10.3.1/30'],
-      mtu: 1280,
-      endpoint_independent_nat: true,
-      udp_timeout: '5m',
-      auto_route: false,
-      strict_route: false,
-      stack: 'system',
-    },
-  ];
-
-  const routeRules: Record<string, unknown>[] = [
-    { protocol: 'dns', action: 'hijack-dns' },
-    { inbound: ['tun-web'], outbound: webTarget },
-    { inbound: ['tun-dl'], outbound: dlTarget },
-    { inbound: ['tun-static'], outbound: staticTarget },
-    { inbound: ['tun-gaming'], outbound: gamingTarget },
-  ];
-
-  if (params.warpAccount) {
-    let reserved: number[] = [0, 0, 0];
-    try {
-      const parsedRes = JSON.parse(params.warpAccount.reserved) as unknown;
-      if (Array.isArray(parsedRes) && parsedRes.length === 3) {
-        reserved = parsedRes.map((n) => Number(n) || 0);
-      }
-    } catch {
-      reserved = [0, 0, 0];
-    }
-
-    singboxOutbounds.push(
-      {
-        type: 'wireguard',
-        tag: 'out-web-warp',
-        server: '162.159.192.1',
-        server_port: 2408,
-        local_address: [
-          `${params.warpAccount.ipv4_address}/32`,
-          `${params.warpAccount.ipv6_address}/128`,
-        ],
-        private_key: params.warpAccount.private_key,
-        peer_public_key: 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
-        reserved,
-        mtu: 1280,
-        detour: webTarget,
-      },
-      {
-        type: 'wireguard',
-        tag: 'out-dl-warp',
-        server: '162.159.192.1',
-        server_port: 2408,
-        local_address: [
-          `${params.warpAccount.ipv4_address}/32`,
-          `${params.warpAccount.ipv6_address}/128`,
-        ],
-        private_key: params.warpAccount.private_key,
-        peer_public_key: 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
-        reserved,
-        mtu: 1280,
-        detour: dlTarget,
-      }
-    );
-
-    inbounds.push(
-      {
-        type: 'tun',
-        tag: 'tun-web-warp',
-        interface_name: 'tun-web-warp',
-        address: ['10.10.10.1/30'],
-        auto_route: false,
-        strict_route: false,
-        stack: 'system',
-      },
-      {
-        type: 'tun',
-        tag: 'tun-dl-warp',
-        interface_name: 'tun-dl-warp',
-        address: ['10.10.11.1/30'],
-        auto_route: false,
-        strict_route: false,
-        stack: 'system',
-      }
-    );
-
-    routeRules.splice(
-      1,
-      0,
-      { inbound: ['tun-web-warp'], outbound: 'out-web-warp' },
-      { inbound: ['tun-dl-warp'], outbound: 'out-dl-warp' }
-    );
-  }
-
-  return {
-    log: {
-      level: 'warn',
-      timestamp: true,
-    },
-    dns: {
-      servers: [
-        { type: 'udp', tag: 'dns-cf', server: '1.1.1.1', server_port: 53 },
-        { type: 'local', tag: 'dns-local' },
-      ],
-      final: 'dns-cf',
-    },
-    inbounds,
-    outbounds: singboxOutbounds,
-    route: {
-      auto_detect_interface: true,
-      default_domain_resolver: 'dns-local',
-      rules: routeRules,
-      final: 'direct-out',
-    },
-  };
 }
 
 export function buildSubscriptionUserInfoHeader(sub: SubscriptionRow): string {

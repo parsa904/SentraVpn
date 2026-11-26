@@ -1,9 +1,8 @@
 -- ============================================================================
--- Sentra Platform — Cloudflare D1 (SQLite) Complete Schema
--- Derived from docs/SCHEMA_AND_API.md with Serverless Webhook & Gaming extensions
+-- Sentra Platform — Cloudflare D1 (SQLite) Complete Schema (Zero-VPS Serverless)
+-- Compatible with `wrangler d1 execute sentra-db --remote --file=./schema.sql`
+-- (No PRAGMA or TRIGGER statements)
 -- ============================================================================
-
-PRAGMA foreign_keys = ON;
 
 -- 1. USERS
 CREATE TABLE IF NOT EXISTS users (
@@ -212,7 +211,7 @@ CREATE TABLE IF NOT EXISTS ip_registrations (
 
 CREATE INDEX IF NOT EXISTS idx_ip_registrations_lookup ON ip_registrations(ip, created_at);
 
--- 4.5. WARP_ACCOUNTS (Cloudflare WARP Credentials for Dual-Chain Bridge)
+-- 4.5. WARP_ACCOUNTS (Optional Cloudflare WARP Credentials)
 CREATE TABLE IF NOT EXISTS warp_accounts (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id              TEXT NOT NULL,
@@ -277,11 +276,6 @@ CREATE TABLE IF NOT EXISTS app_releases (
     changelog               TEXT NOT NULL DEFAULT '',
     updated_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE TRIGGER IF NOT EXISTS trg_app_releases_updated_at AFTER UPDATE ON app_releases
-FOR EACH ROW BEGIN
-    UPDATE app_releases SET updated_at = CURRENT_TIMESTAMP WHERE platform = OLD.platform;
-END;
 
 -- 8. CLIENT_STATES (Cross-Device Personal Configs & Preferences Sync)
 CREATE TABLE IF NOT EXISTS client_states (

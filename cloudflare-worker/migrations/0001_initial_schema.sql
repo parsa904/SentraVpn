@@ -262,11 +262,6 @@ CREATE TABLE IF NOT EXISTS app_releases (
     updated_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TRIGGER IF NOT EXISTS trg_app_releases_updated_at AFTER UPDATE ON app_releases
-FOR EACH ROW BEGIN
-    UPDATE app_releases SET updated_at = CURRENT_TIMESTAMP WHERE platform = OLD.platform;
-END;
-
 CREATE TABLE IF NOT EXISTS client_states (
     user_id                 INTEGER PRIMARY KEY,
     personal_configs_json   TEXT NOT NULL DEFAULT '[]',

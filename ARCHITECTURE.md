@@ -1,193 +1,127 @@
-# 🏛️ معماری جامع و نقشه مهندسی پلتفرم سنترا (Sentra Architecture Specification)
+# 🏛️ معماری جامع پلتفرم سنترا (Sentra Zero-VPS Serverless Architecture)
 
-این سند مرجع رسمی و فنی برای توسعه‌دهندگان فعلی و آینده جهت شناخت ساختار کد، نقشه ماژول‌ها، جریان داده‌ها و راهنمای توسعه اکوسیستم **Sentra** است.
-
----
-
-## ۱. اصول بنیادین و الزامات امنیتی پلتفرم (Core Invariants)
-
-1. **پنهان‌سازی مطلق اسرار هسته در سرور (`Zero Secret Exposure`):**
-   - سرورهای بالادستی، آدرس‌های نودها، کلیدهای V2Ray/Sing-box (مانند VLESS Reality، VMess، Trojan، Hysteria 2) منحصراً در سرور (`sentra-core`) نگهداری می‌شوند.
-   - کلاینت‌های عمومی کاربر (ویندوز، اندروید، iOS) هرگز به طور مستقیم به V2Ray متصل نمی‌شوند و هیچ شناسه یا کلیدی به کلاینت ارسال نمی‌گردد.
-2. **پروتکل‌های ارتباطی کاربر:**
-   - ارتباط کاربران با لبه شبکه سنترا تنها از طریق پروتکل‌های استاندارد **OpenVPN (UDP/TCP)**، **Stealth (تونل رمزنگاری‌شده TLS 1.3 با Stunnel)** و **IKEv2 (Native)** برقرار می‌گردد.
-3. **تفکیک تجاری و ایزولاسیون سطوح دسترسی:**
-   - **وب‌گردی (`web_browsing`):** ۲ گیگابایت روزانه رایگان، بهینه‌شده برای پروتکل‌های وب.
-   - **دانلود پرسرعت (`download`):** ۳ گیگابایت روزانه رایگان، بهینه‌شده برای انتقال داده با ظرفیت بالا.
-   - **آی‌پی ثابت مسکونی (`static_ip`):** ویژه کاربران Pro و Flow+ با دیتاسنتر اختصاصی آمریکا، حفاظت نشت IP، مسدودسازی IPv6 و قفل اجباری Kill-Switch و حالت Tunnel.
+این سند نقشه مهندسی رسمی پلتفرم **Sentra** در معماری کاملاً **Serverless و بدون VPS (Zero-VPS)** مبتنی بر **Cloudflare Workers + Cloudflare D1 + GitHub Actions** است.
 
 ---
 
-## ۲. نقشه درختی فایل‌ها و ساختار ماژولار (Directory Structure)
+## ۱. اصول بنیادین معماری (Core Invariants)
+
+1. **اجرای ۱۰۰٪ بدون سرور (`Zero-VPS`):**
+   - هیچ سرور واسط (Bridge VPS) یا سرور همیشه روشن لینوکسی مورد نیاز نیست.
+   - تمام APIها، مدیریت اشتراک‌ها، همگام‌سازی کاربران و ربات تلگرام (به‌صورت Webhook) روی **Cloudflare Workers (`sentra-core`)** و دیتابیس **Cloudflare D1 (`sentra-db`)** اجرا می‌شوند.
+2. **اتصال مستقیم کلاینت به نودهای سالم (`Direct-to-Node sing-box 1.14+`):**
+   - اپلیکیشن‌های کلاینت (ویندوز، اندروید، iOS و کلاینت‌های سازگار با sing-box) از طریق اندپوینت‌های `GET /sub/{token}` و `POST /api/v1/client/config` کانفیگ استاندارد `sing-box 1.14+` شامل لیست نودهای سالم (`donated_outbounds` و `outbounds`) را دریافت کرده و مستقیماً به آن‌ها متصل می‌شوند.
+   - کامپایلر Worker تضمین می‌کند:
+     - تزریق اجباری `utls: { enabled: true, fingerprint: "chrome" }` برای تمامی نودهای Reality (یا حفظ `fp` مشخص‌شده در لینک).
+     - استفاده از `type: "fakeip"` در `dns.servers` و `rule_actions` (`sniff` و `hijack-dns`) به جای `dns-out`.
+     - حفظ Split Tunneling برای دامنه‌های `.ir` و بانک‌های ایرانی (`direct`).
+     - حذف کامل کلیدهای منسوخ `independent_cache` و `_sentra_meta`.
+3. **پایش مستقل کیفیت نودها در GitHub Actions (`QualityEngine`):**
+   - هر ۲۰ دقیقه ورک‌فلو `.github/workflows/quality-engine.yml` به‌صورت کاملاً مستقل در محیط GitHub Actions اجرا می‌شود، لیست نودها را از `GET /api/v1/nodes/active` می‌خواند، سلامت اتصال، پینگ، جیتر، امنیت پروتکل و دسترسی واقعی به **Google Gemini** و **پلتفرم‌های ترید** را با `sing-box` بررسی کرده و نتیجه را به `POST /api/v1/nodes/health-report` ارسال می‌کند.
+4. **تفکیک حالت‌های اتصال و سهمیه‌ها:**
+   - **وب‌گردی (`web_browsing`):** ۲ گیگابایت روزانه برای پلن رایگان (`Sentra Lite`).
+   - **دانلود (`download`):** ۳ گیگابایت روزانه برای پلن رایگان.
+   - **گیمینگ (`gaming`):** به‌صورت خودکار پس از افزودن نود گیمینگ فعال می‌شود؛ برای iOS پروفایل WireGuard ارائه می‌گردد.
+   - **آی‌پی ثابت (`static_ip`):** ویژه پلن‌های Pro و Flow+ (سقف ۳۰ گیگابایت ماهانه با نودهای تاییدشده برای Gemini و ترید).
+
+---
+
+## ۲. نقشه درختی فایل‌ها (Directory Structure)
 
 ```text
-SentraVpn/
-├── ARCHITECTURE.md                  # همین مستند (راهنمای جامع معماری)
-├── README.md                        # معرفی کلی پروژه و دستورات راه‌اندازی
-├── Cargo.toml                       # تعریف Workspace سراسری Rust
-├── Cargo.lock                       # قفل نسخه‌های وابستگی‌ها
-├── .gitignore                       # قوانین ایمن مخزن Git (حذف باینری‌های سنگین)
+sentra-platform/
+├── ARCHITECTURE.md                         # همین مستند (معماری Zero-VPS)
+├── README.md                               # راهنمای سریع راه‌اندازی و دیپلوی
 │
-├── docs/                            # مستندات رسمی مهندسی و تجاری
-│   ├── PRD.md                       # سند مشخصات نیازمندی‌های محصول (Product Requirement Document)
-│   ├── PROTOCOL_SPEC.md             # مشخصات فنی لایه شبکه و پروتکل‌ها
-│   ├── SCHEMA_AND_API.md            # ساختار دیتابیس DDL و قراردادهای REST API
-│   ├── MASTER_SPEC.md               # مشخصات جامع مهندسی سیستم
-│   ├── RULES.md                     # قوانین تجاری و سیاست‌های سهمیه
-│   └── DESIGN.md                    # اصول طراحی بصری و راهنمای رابط کاربری
-│
-├── sentra-core/                     # بک‌اند مرکزی، سرور API و ربات تلگرام (Rust Axum)
-│   ├── Cargo.toml                   # وابستگی‌های سرور (axum, teloxide, sqlx, x25519-dalek, ...)
+├── cloudflare-worker/                      # هسته مرکزی Serverless (TypeScript + Wrangler + D1)
+│   ├── package.json                        # اسکریپت‌های تست، typecheck و deploy
+│   ├── tsconfig.json                       # پیکربندی strict TypeScript
+│   ├── wrangler.toml                       # نام Worker (sentra-core) و اتصال D1 (sentra-db)
+│   ├── schema.sql                          # اسکیمای D1 بدون PRAGMA و TRIGGER
 │   ├── migrations/
-│   │   └── schema.sql               # اسکریپت ساخت جداول دیتابیس SQLite/PostgreSQL
+│   │   └── 0001_initial_schema.sql         # فایل مایگریشن همگام با schema.sql
 │   └── src/
-│       ├── main.rs                  # نقطه ورود سرور، پیکربندی Router، اجرای ربات و تسک‌های پس‌زمینه
-│       ├── models.rs                # تعاریف ساختارهای داده (User, Subscription, Outbound, WarpAccount, ...)
-│       ├── db.rs                    # استخر اتصالات و توابع کار با پایگاه داده (CRUD، مهاجرت‌ها)
-│       ├── warp_gen.rs              # تولیدکننده خودکار کلیدهای Curve25519 و ثبت‌نام اکانت Cloudflare WARP
-│       ├── bridge_sync.rs           # تولیدکننده پویا و خودکار bridge-config.json برای موتور Sing-box سرور
-│       ├── outbound_analyzer.rs     # اسکنر امنیتی SSRF، پارسر انواع پروتکل‌ها و بنچمارک پینگ و سرعت
-│       ├── worker.rs                # ورکر دوره‌ای جهت بررسی سلامت نودها و ریست سهمیه‌های روزانه
-│       ├── api/
-│       │   └── mod.rs               # کنترلرهای REST API (/api/v1/client/*, /auth/*, /heartbeat, ...)
-│       └── bot/
-│           ├── mod.rs               # دیسپچر اصلی رویدادها، پیام‌ها و کالبک‌های ربات تلگرام
-│           ├── user_handlers.rs     # هندلرهای بخش کاربر (دریافت کانفیگ iOS، اهدای نود، تیکت پشتیبانی)
-│           ├── admin_handlers.rs    # هندلرهای ادمین (مدیریت کاربران، تایید نودها، سابسکریپشن، برودکست)
-│           └── keyboards.rs         # سازنده کیبوردهای شیشه‌ای و منوهای تعاملی تلگرام
+│       ├── index.ts                        # ورودی fetch Worker + هدرهای امنیتی و CORS محدود
+│       ├── types.ts                        # تایپ‌های Env، جداول D1 و مدل گزارش سلامت
+│       ├── security.ts                     # PBKDF2-SHA256، مقایسه امن کلیدها و اعتبارسنجی آدرس‌ها
+│       ├── outboundAnalyzer.ts             # پارسر لینک‌ها، uTLS اجباری Reality و اثرانگشت SHA-256
+│       ├── singboxCompiler.ts              # کامپایلر کلاینت sing-box 1.14+، ساب V2Ray و WireGuard iOS
+│       ├── telegramWebhook.ts              # ربات تلگرام Webhook-based با مدیریت وضعیت در telegram_states
+│       ├── routes.ts                       # مسیریابی REST API، سابسکریپشن، احراز هویت و گزارش سلامت
+│       └── __tests__/                      # تست‌های واحد پارسر و کامپایلر (node:test)
 │
-└── sentra-client/                   # اپلیکیشن چندسکویی کلاینت (Tauri v2 + TypeScript)
-    ├── package.json                 # وابستگی‌های فرانت‌اند (Vite, TypeScript, Tailwind)
-    ├── vite.config.ts               # پیکربندی بیلد ابزار Vite
-    ├── index.html                   # سند تک‌صفحه‌ای داشبورد اصلی اپلیکیشن
-    ├── src/
-    │   ├── main.ts                  # کنترلر منطق فرانت‌اند، اتصال به IPC و مدیریت وضعیت
-    │   └── styles.css               # سیستم طراحی، پالت‌های تم و انیمیشن‌های Hyprland
-    └── src-tauri/                   # بک‌اند دسکتاپ (Rust)
-        ├── Cargo.toml               # وابستگی‌های بک‌اند کلاینت (tauri, tokio, reqwest, ...)
-        ├── src/
-        │   ├── lib.rs               # راه‌اندازی Tauri، پلاگین‌ها، چرخه‌حیات پنجره و پاکسازی پروکسی
-        │   ├── commands.rs          # توابع IPC فراخوانی‌شده توسط فرانت‌اند (Connect, Protocol, Mode, ...)
-        │   ├── state.rs             # مدیریت وضعیت حافظه‌ای سراسری کلاینت (ClientState)
-        │   ├── vpn_manager.rs       # مدیریت پروسه هسته OpenVPN، مانیتورینگ ترافیک و بازنشانی شبکه
-        │   ├── local_proxy.rs       # سرور سبک داخلی SOCKS5 (10808) و HTTP (10809)
-        │   ├── sysproxy.rs          # مدیریت خودکار کلیدهای رجیستری ویندوز و نوتیفیکیشن WinINet
-        │   ├── telemetry.rs         # مخابره لحظه‌ای سرعت، تاخیر، زمان اتصال و لاگ‌ها به فرانت‌اند
-        │   ├── auth.rs              # ذخیره‌سازی نشست‌ها و تولید اثرانگشت سخت‌افزاری دستگاه
-        │   └── sandbox.rs           # شبیه‌ساز آفلاین لوپ‌بک جهت تست سریع بدون نیاز به شبکه خارجی
-        └── plugins/
-            └── sentra-vpn/          # پلاگین اختصاصی اندروید (VpnService) و دسکتاپ
+├── .github/
+│   ├── scripts/
+│   │   └── quality-check.ts                # اسکریپت مستقل پایش نودها در GitHub Actions
+│   └── workflows/
+│       ├── deploy-cloudflare.yml           # تست، اجرای schema.sql روی D1 و دیپلوی Worker روی main
+│       └── quality-engine.yml              # کرون‌جاب ۲۰ دقیقه‌ای پایش سلامت نودها
+│
+├── sentra-client/                          # اپلیکیشن کلاینت چندسکویی (Tauri v2 + TypeScript + Tailwind)
+└── docs/                                   # مستندات طراحی، قوانین محصول و قراردادهای API
 ```
 
 ---
 
-## ۳. نمودار جریان داده‌ها و معماری شبکه (Data Flow Diagrams)
+## ۳. نمودار جریان داده‌ها در معماری Zero-VPS
 
-### ۳.۱. جریان اتصال کلاینت و عبور ترافیک از سرور پل
+### ۳.۱. جریان دریافت کانفیگ و اتصال مستقیم کلاینت به نودها
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor User as کاربر (ویندوز / اندروید / iOS)
-    participant Client as کلاینت سنترا (sentra-client)
-    participant CoreAPI as سرور مرکزی (sentra-core)
-    participant EdgeBridge as پل سرور (OpenVPN / Sing-box)
-    participant WARP as شبکه کلادفلر (WARP Anycast)
-    participant Web as اینترنت آزاد
+    participant Client as کلاینت سنترا (sing-box 1.14+)
+    participant Worker as Cloudflare Worker (sentra-core)
+    participant D1 as Cloudflare D1 (sentra-db)
+    participant Nodes as نودهای سالم (donated_outbounds / outbounds)
 
-    User->>Client: کلیک روی دکمه اتصال (یا انتخاب پروتکل/لوکیشن)
-    Client->>CoreAPI: POST /api/v1/client/config (توکن، حالت، پروتکل، WARP، لوکیشن)
-    Note over CoreAPI: احراز هویت توکن، بررسی سهمیه و تخصیص زیرشبکه
-    CoreAPI-->>Client: پاسخ امن ۲.۰ (پروفایل OpenVPN/Stealth، بدون افشای سکرت‌های سرور)
-    Client->>EdgeBridge: برقراری تونل رمزنگاری‌شده (پورت 1194 یا 11940 Stealth)
-    
-    alt کاربر WARP را خاموش نگه داشته است
-        EdgeBridge->>Web: اتصال مستقیم به اوتباند لوکیشن انتخابی (آلمان، هلند و ...)
-    else کاربر گزینه WARP را روشن کرده است (Opt-in)
-        EdgeBridge->>WARP: هدایت ترافیک اوتباند از طریق WireGuard Detour
-        WARP->>Web: خروج به اینترنت با IP تمیز کلادفلر (بدون کپچا)
-    end
-    
-    Web-->>EdgeBridge: پاسخ بسته‌های داده
-    EdgeBridge-->>Client: ارسال از داخل تونل رمزنگاری‌شده
-    Client-->>User: نمایش ترافیک، سرعت لحظه‌ای و پینگ
+    User->>Client: کلیک روی اتصال یا به‌روزرسانی اشتراک
+    Client->>Worker: POST /api/v1/client/config یا GET /sub/{token}
+    Worker->>D1: احراز هویت توکن، بررسی سهمیه و خواندن نودهای فعال
+    D1-->>Worker: لیست نودهای سالم مرتب‌شده بر اساس امتیاز کیفیت و پینگ
+    Worker-->>Client: خروجی JSON استاندارد sing-box 1.14+ (fakeip + rule_actions + Split Tunneling)
+    Client->>Nodes: اتصال مستقیم و رمزنگاری‌شده (VLESS Reality / Hysteria2 / Trojan / ...)
+    Nodes-->>Client: دسترسی مستقیم به اینترنت آزاد (دامنه‌های .ir از مسیر direct)
 ```
 
 ---
 
-### ۳.۲. معماری ۳ حالته مسیریابی کلاینت ویندوز
+### ۳.۲. چرخه خودکار پایش کیفیت نودها (GitHub Actions QualityEngine)
 
 ```mermaid
-graph TD
-    subgraph ClientWindows ["محیط سیستم‌عامل ویندوز کاربر"]
-        Apps["برنامه‌ها و مرورگرهای استاندارد"]
-        Telegram["تلگرام / کلاینت‌های اختصاصی"]
-        Games["بازی‌های آنلاین و برنامه‌های UDP"]
-    end
+sequenceDiagram
+    autonumber
+    participant GHA as GitHub Actions (هر ۲۰ دقیقه)
+    participant Worker as Cloudflare Worker (sentra-core)
+    participant D1 as Cloudflare D1 (sentra-db)
+    participant Targets as نودها + Gemini + Binance/TradingView
 
-    subgraph SentraClient ["کلاینت سنترا کانکت"]
-        ModeSelector{"انتخابگر حالت مسیریابی"}
-        LocalSocks["سرور SOCKS5 (127.0.0.1:10808)"]
-        LocalHttp["سرور HTTP (127.0.0.1:10809)"]
-        SysProxyMgr["مدیر رجیستری Windows WinINet"]
-        OpenVPNEngine["هسته OpenVPN با فلگ --route-nopull"]
-        WintunDriver["درایور هسته Wintun (کارت شبکه مجازی)"]
-    end
-
-    subgraph Server ["سرور لبه شبکه سنترا"]
-        SentraEdge["تونل امن سنترا"]
-    end
-
-    Apps --> ModeSelector
-    Telegram --> ModeSelector
-    Games --> ModeSelector
-
-    %% Mode 1: Tunnel
-    ModeSelector -- "حالت Tunnel (پیش‌فرض)" --> WintunDriver
-    WintunDriver --> SentraEdge
-
-    %% Mode 2: System Proxy
-    ModeSelector -- "حالت System Proxy" --> SysProxyMgr
-    SysProxyMgr -.-> Apps
-    Apps --> LocalHttp
-    LocalHttp --> OpenVPNEngine
-    OpenVPNEngine --> SentraEdge
-
-    %% Mode 3: Proxy
-    ModeSelector -- "حالت Proxy" --> LocalSocks
-    Telegram --> LocalSocks
-    LocalSocks --> OpenVPNEngine
+    GHA->>Worker: GET /api/v1/nodes/active (X-Quality-Secret)
+    Worker->>D1: خواندن نودهای فعال و کاندید
+    D1-->>Worker: لیست نودها
+    Worker-->>GHA: آرایه JSON نودها
+    GHA->>Targets: تست پینگ/جیتر + تست واقعی SOCKS5 با sing-box (Gemini و ترید)
+    Targets-->>GHA: نتایج دسترسی و کیفیت
+    GHA->>Worker: POST /api/v1/nodes/health-report (X-Quality-Secret)
+    Worker->>D1: به‌روزرسانی امتیاز کیفیت، وضعیت active/inactive و برچسب‌های Gemini/Trading
+    Worker-->>GHA: گزارش نهایی ثبت‌شده
 ```
 
 ---
 
-## ۴. راهنمای توسعه‌دهندگان جهت توسعه آینده (Developer Onboarding)
+## ۴. دستورات تست و اعتبارسنجی محلی
 
-### ۴.۱. نحوه افزودن پروتکل جدید به کلاینت و سرور
-1. **سرور (`sentra-core`):**
-   - در فایل `sentra-core/src/api/mod.rs` نام پروتکل جدید (مثلاً `wireguard_direct`) را در تابع اعتبارسنجی مجاز کنید.
-   - فیلدهای لازم جهت اتصال (مانند کلیدها و آدرس شنود) را در خروجی `ConfigResponse` قرار دهید.
-2. **کلاینت (`sentra-client`):**
-   - در `sentra-client/src-tauri/src/state.rs` نام پروتکل را مجاز کنید.
-   - در `sentra-client/src-tauri/src/vpn_manager.rs` نحوه راه‌اندازی پروسه کلاینتی آن پروتکل را تعریف کنید.
-   - در `sentra-client/index.html` دکمه مربوطه را در بخش `protocols-container` اضافه نمایید.
-
-### ۴.۲. نحوه افزودن یا تغییر تم بصری
-- در فایل `sentra-client/src/styles.css`، استایل‌های تم جدید را تحت سلکتور `[data-theme="نام_تم"]` با متغیرهای استاندارد CSS تعریف کنید:
-  `--bg-canvas`, `--bg-card`, `--border-subtle`, `--text-primary`, `--color-accent`.
-
-### ۴.۳. دستورات بیلد و اعتبارسنجی سلامت کل پروژه
 ```bash
-# ۱. اعتبارسنجی کامل کدهای Rust (بدون هشدار):
-cargo check --workspace
-cargo clippy --workspace
+# ۱. تست واحد پارسر و کامپایلر sing-box 1.14+
+cd cloudflare-worker
+npm test
 
-# ۲. بیلد فرانت‌اند کلاینت:
-cd sentra-client
+# ۲. بررسی تایپ‌های TypeScript
+npm run typecheck
+
+# ۳. بیلد اپلیکیشن کلاینت
+cd ../sentra-client
 npm install
 npm run build
-
-# ۳. اجرای سرور توسعه محلی:
-cd ../sentra-core
-cargo run
 ```

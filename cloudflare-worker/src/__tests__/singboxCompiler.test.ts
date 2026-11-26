@@ -2,10 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   IR_SPLIT_TUNNEL_DOMAINS,
-  compileBridgeSingboxConfig,
   compileClientSingboxConfig,
 } from '../singboxCompiler.ts';
-import type { DonatedOutboundRow } from '../types.ts';
+import type { DonatedOutboundRow, OutboundRow } from '../types.ts';
 
 function sampleRealityOutbound(id: number, overrides: Partial<DonatedOutboundRow> = {}): DonatedOutboundRow {
   return {
@@ -108,26 +107,67 @@ test('compileClientSingboxConfig strictly conforms to sing-box 1.14+ schema', ()
   assert.deepEqual(vlessNode?.tls?.utls, { enabled: true, fingerprint: 'chrome' });
 });
 
-test('compileBridgeSingboxConfig outputs clean 1.14+ bridge config with urltest groups and optional WARP', () => {
-  const bridge = compileBridgeSingboxConfig({
-    webOutbounds: [sampleRealityOutbound(1)],
-    downloadOutbounds: [sampleRealityOutbound(2)],
-    staticIpOutbounds: [sampleRealityOutbound(3, { allow_static_ip: 1 })],
-    gamingOutbounds: [sampleRealityOutbound(4, { allow_gaming: 1 })],
-    coreOutbounds: [],
-    warpAccount: null,
-  });
+test('compileClientSingboxConfig merges healthy donated_outbounds and active outbounds directly without bridge interfaces', () => {
+  const coreNodes: OutboundRow[] = [
+    {
+      id: 10,
+      tag: 'NL-Core-Reality',
+      protocol: 'vless',
+      mode_category: 'web_browsing',
+      server_address: '198.51.100.25',
+      server_port: 443,
+      uuid: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      password: null,
+      network_transport: 'tcp',
+      tls_enabled: 1,
+      tls_sni: 'learn.microsoft.com',
+      reality_public_key: 'CorePubKey123',
+      reality_short_id: 'cd34',
+      min_tier: 'Sentra Lite',
+      country_code: 'NL',
+      is_active: 1,
+      weight: 10,
+    },
+    {
+      id: 11,
+      tag: 'Inactive-Core-Node',
+      protocol: 'vless',
+      mode_category: 'web_browsing',
+      server_address: '198.51.100.26',
+      server_port: 443,
+      uuid: 'aaaaaaaa-bbbb-cccc-dddd-ffffffffffff',
+      password: null,
+      network_transport: 'tcp',
+      tls_enabled: 1,
+      tls_sni: 'learn.microsoft.com',
+      reality_public_key: null,
+      reality_short_id: null,
+      min_tier: 'Sentra Lite',
+      country_code: 'DE',
+      is_active: 0,
+      weight: 1,
+    },
+  ];
 
-  const serialized = JSON.stringify(bridge);
+  const donatedNodes: DonatedOutboundRow[] = [
+    sampleRealityOutbound(1, { status: 'active', label: 'DE-Healthy-1' }),
+    sampleRealityOutbound(2, { status: 'inactive', label: 'DE-Dead-2' }),
+  ];
+
+  const config = compileClientSingboxConfig(coreNodes, donatedNodes, {
+    mode: 'web_browsing',
+  });
+  const serialized = JSON.stringify(config);
+
+  assert.equal(serialized.includes('tun-web'), false);
+  assert.equal(serialized.includes('tun-dl'), false);
   assert.equal(serialized.includes('independent_cache'), false);
   assert.equal(serialized.includes('_sentra_meta'), false);
-  assert.equal(serialized.includes('dns-out'), false);
 
-  const inbounds = bridge.inbounds as Array<{ tag: string; address: string[] }>;
-  assert.deepEqual(
-    inbounds.map((i) => i.tag),
-    ['tun-web', 'tun-dl', 'tun-static', 'tun-gaming']
-  );
-  const route = bridge.route as { rules: Array<Record<string, unknown>> };
-  assert.ok(route.rules.some((r) => r.protocol === 'dns' && r.action === 'hijack-dns'));
+  const outbounds = config.outbounds as Array<{ tag: string; type: string }>;
+  const tags = outbounds.map((o) => o.tag);
+  assert.ok(tags.includes('👑 DE-Healthy-1'));
+  assert.ok(tags.includes('NL-Core-Reality'));
+  assert.equal(tags.includes('👑 DE-Dead-2'), false);
+  assert.equal(tags.includes('Inactive-Core-Node'), false);
 });

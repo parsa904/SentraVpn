@@ -269,7 +269,7 @@ async function probeGeminiAndTrading(
   jitterMs: number,
   singboxAvailable: boolean
 ): Promise<{ gemini_ok: boolean; trading_safe: boolean }> {
-  if (!singboxAvailable || jitterMs > 30) {
+  if (!singboxAvailable || jitterMs > 120) {
     return { gemini_ok: false, trading_safe: false };
   }
 

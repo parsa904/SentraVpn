@@ -5,12 +5,10 @@ import {
   generateNumericCode,
   generateSubscriptionToken,
   hashPassword,
-  sha256Hex,
   verifyPassword,
 } from './security.ts';
 import {
   buildSubscriptionUserInfoHeader,
-  compileBridgeSingboxConfig,
   compileClientSingboxConfig,
   compileV2RaySubscriptionBase64,
   tierHasGaming,
@@ -25,7 +23,6 @@ import type {
   OutboundRow,
   SubscriptionRow,
   UserRow,
-  WarpAccountRow,
 } from './types.ts';
 
 const LITE_WEB_QUOTA_MB = 2048;
@@ -191,49 +188,7 @@ export async function routeRequest(request: Request, env: Env): Promise<Response
     return handleTelegramWebhook(request, env);
   }
 
-  // 3. Bridge VPS Config (Protected by BRIDGE_SECRET_KEY)
-  if (method === 'GET' && path === '/api/v1/bridge/config') {
-    if (!env.BRIDGE_SECRET_KEY) {
-      return errorResponse(503, 'کلید امنیتی سرور پل (BRIDGE_SECRET_KEY) پیکربندی نشده است.');
-    }
-    const provided = extractBearerOrHeaderSecret(request, 'X-Bridge-Secret');
-    if (!provided || !(await constantTimeEquals(provided, env.BRIDGE_SECRET_KEY))) {
-      return errorResponse(401, 'احراز هویت سرور پل نامعتبر است.', 'UNAUTHORIZED_BRIDGE');
-    }
-
-    const [web, dl, staticPool, gaming, coreRes, warpRow] = await Promise.all([
-      queryOutboundsForMode(env.DB, 'web_browsing'),
-      queryOutboundsForMode(env.DB, 'download'),
-      queryOutboundsForMode(env.DB, 'static_ip'),
-      queryOutboundsForMode(env.DB, 'gaming'),
-      env.DB.prepare('SELECT * FROM outbounds WHERE is_active = 1').all<OutboundRow>(),
-      env.DB.prepare('SELECT * FROM warp_accounts WHERE is_active = 1 ORDER BY id DESC LIMIT 1').first<WarpAccountRow>(),
-    ]);
-
-    const bridgeConfig = compileBridgeSingboxConfig({
-      webOutbounds: web.donated,
-      downloadOutbounds: dl.donated,
-      staticIpOutbounds: staticPool.donated,
-      gamingOutbounds: gaming.donated,
-      coreOutbounds: coreRes.results || [],
-      warpAccount: warpRow || null,
-    });
-
-    const formatted = JSON.stringify(bridgeConfig, null, 2);
-    const etagHash = await sha256Hex(formatted);
-
-    return new Response(formatted, {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Cache-Control': 'no-store',
-        ETag: `"${etagHash}"`,
-        'X-Config-SHA256': etagHash,
-      },
-    });
-  }
-
-  // 4. QualityEngine — Fetch Active/Candidate Nodes (Protected by QUALITY_ENGINE_SECRET)
+  // 3. QualityEngine — Fetch Active/Candidate Nodes (Protected by QUALITY_ENGINE_SECRET)
   if (method === 'GET' && path === '/api/v1/nodes/active') {
     if (!env.QUALITY_ENGINE_SECRET) {
       return errorResponse(503, 'کلید امنیتی QualityEngine پیکربندی نشده است.');
@@ -433,6 +388,7 @@ export async function routeRequest(request: Request, env: Env): Promise<Response
       formatParam === 'sing-box' ||
       formatParam === 'json' ||
       userAgent.includes('sing-box') ||
+      userAgent.includes('sentra') ||
       userAgent.includes('sfa') ||
       userAgent.includes('sfi') ||
       userAgent.includes('hiddify');

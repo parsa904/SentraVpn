@@ -5,7 +5,6 @@ export interface Env {
   ADMIN_CHAT_ID?: string;
   BOT_USERNAME?: string;
   PUBLIC_BASE_URL?: string;
-  BRIDGE_SECRET_KEY?: string;
   QUALITY_ENGINE_SECRET?: string;
   PRO_SUBSCRIPTION_PRICE?: string;
   ALLOWED_ORIGINS?: string;
@@ -110,18 +109,6 @@ export interface DonatedOutboundRow {
   last_online_at: string | null;
   allocation_mode: string;
   last_checked_at: string;
-}
-
-export interface WarpAccountRow {
-  id: number;
-  account_id: string;
-  private_key: string;
-  public_key: string;
-  ipv4_address: string;
-  ipv6_address: string;
-  reserved: string;
-  license_key: string | null;
-  is_active: number;
 }
 
 export interface HealthReportNodeResult {

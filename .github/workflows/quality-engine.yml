@@ -40,7 +40,7 @@ jobs:
 
       - name: Execute QualityEngine check script
         env:
-          SENTRA_WORKER_URL: ${{ secrets.SENTRA_WORKER_URL }}
+          SENTRA_WORKER_URL: ${{ secrets.SENTRA_WORKER_URL || 'https://sentra-core.kziepr.workers.dev' }}
           QUALITY_ENGINE_SECRET: ${{ secrets.QUALITY_ENGINE_SECRET }}
           QUALITY_CONCURRENCY: '6'
           SINGBOX_BIN: /usr/local/bin/sing-box
