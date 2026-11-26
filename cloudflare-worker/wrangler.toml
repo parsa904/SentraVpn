@@ -1,0 +1,32 @@
+name = "sentra-core-worker"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# Cloudflare D1 Database Binding
+# Create database once with: wrangler d1 create sentra-db
+# Then replace database_id below (or set via CI environment override).
+[[d1_databases]]
+binding = "DB"
+database_name = "sentra-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[vars]
+BOT_USERNAME = "SentraVpnBot"
+PRO_SUBSCRIPTION_PRICE = "150000"
+PUBLIC_BASE_URL = "https://sentra-core-worker.YOUR_SUBDOMAIN.workers.dev"
+ALLOWED_ORIGINS = ""
+WIREGUARD_PORT = "51820"
+
+# Configure the following secrets via `wrangler secret put <NAME>`:
+# - TELOXIDE_TOKEN            (Telegram Bot API token)
+# - TELEGRAM_WEBHOOK_SECRET   (Random secret string set in setWebhook secret_token)
+# - ADMIN_CHAT_ID             (Telegram numeric admin chat ID)
+# - BRIDGE_SECRET_KEY         (Shared secret for Linux Bridge VPS GET /api/v1/bridge/config)
+# - QUALITY_ENGINE_SECRET     (Shared secret for GitHub Actions QualityEngine endpoints)
+# - WIREGUARD_SERVER_PUBLIC_KEY
+# - WIREGUARD_KEY_SALT

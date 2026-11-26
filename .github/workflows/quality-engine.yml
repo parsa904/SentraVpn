@@ -1,0 +1,47 @@
+name: Sentra QualityEngine (Node Health & Gemini/Trading Probe)
+
+on:
+  schedule:
+    # Runs automatically every 20 minutes
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sentra-quality-engine
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality-check:
+    name: Probe Active Nodes & Report to Cloudflare D1
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install sing-box for real Gemini & Trading proxy verification
+        run: |
+          set -euo pipefail
+          SINGBOX_VERSION="1.11.8"
+          ARCHIVE="sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${ARCHIVE}" -o "/tmp/${ARCHIVE}"
+          tar -xzf "/tmp/${ARCHIVE}" -C /tmp
+          sudo install -m 0755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version
+
+      - name: Execute QualityEngine check script
+        env:
+          SENTRA_WORKER_URL: ${{ secrets.SENTRA_WORKER_URL }}
+          QUALITY_ENGINE_SECRET: ${{ secrets.QUALITY_ENGINE_SECRET }}
+          QUALITY_CONCURRENCY: '6'
+          SINGBOX_BIN: /usr/local/bin/sing-box
+        run: node --experimental-strip-types .github/scripts/quality-check.ts
