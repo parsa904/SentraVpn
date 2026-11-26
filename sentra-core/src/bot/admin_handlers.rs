@@ -1197,7 +1197,6 @@ pub async fn handle_toggle_outbound_callback(
     }
 
     let is_now_active = Repository::toggle_outbound_status(pool, outbound_id).await?;
-    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
     let status_str = if is_now_active { "فعال شد 🟢" } else { "غیرفعال شد 🔴" };
 
     let _ = bot
@@ -2003,10 +2002,7 @@ pub async fn handle_admin_outbound_text_input(
         }
     };
 
-    // Auto-sync server sing-box bridge configuration
-    if let Err(e) = crate::bridge_sync::sync_server_bridge_config(pool).await {
-        warn!("Bridge sync warning after admin outbound insert #{}: {}", saved_outbound.id, e);
-    }
+
 
     // Clear active admin state
     clear_admin_outbound_state(telegram_user_id).await;
@@ -2249,7 +2245,6 @@ pub async fn handle_sub_preview_add_node_callback(
     }
 
     pending.added_indices.insert(node_idx);
-    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
 
     let page = node_idx / 8;
     let (text, kb) = build_sub_preview_message(&pending, page);
@@ -2356,7 +2351,6 @@ pub async fn handle_sub_preview_add_bulk_callback(
     .await
     .unwrap_or(0);
 
-    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
     clear_pending_sub_import(telegram_user_id).await;
 
     let mut country_summary = String::new();
@@ -2615,8 +2609,6 @@ pub async fn handle_ping_official_outbound_callback(
     )
     .await?;
 
-    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
-
     let alert_msg = if is_online {
         format!(
             "✅ نتایج تست کیفیت:\n• پینگ: {} ms | نوسان: {} ms\n• امتیاز سرعت: {}/100\n• تست جمنای: {}\n• تست ترید: {}",
@@ -2743,9 +2735,6 @@ pub async fn handle_set_outbound_allocation_callback(
     )
     .await?;
 
-    // Auto-sync server bridge
-    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
-
     let desc = category_label_fa(alloc_mode);
     let gaming_live_notice = if allow_gaming {
         "\n\n🎮 <b>بخش گیمینگ اکنون به صورت خودکار در کل اکوسیستم فعال شد!</b>"
@@ -2869,9 +2858,6 @@ pub async fn handle_toggle_official_outbound_callback(
     let new_status = Repository::toggle_official_outbound_status(pool, outbound_id).await?;
     let is_active = new_status == "active";
 
-    // Auto-sync server sing-box bridge
-    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
-
     let alert = if is_active {
         "🟢 نود با موفقیت فعال شد و در مدار قرار گرفت."
     } else {
@@ -2925,7 +2911,6 @@ pub async fn handle_delete_official_outbound_callback(
 
     let deleted = Repository::delete_official_outbound(pool, outbound_id).await?;
     if deleted {
-        let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
         bot.answer_callback_query(q.id.clone()).text("🗑 نود با موفقیت حذف شد.").show_alert(true).await?;
         if let Some(msg) = &q.message {
             let _ = bot
@@ -3066,8 +3051,6 @@ pub async fn handle_generate_warp_callback(
             )
             .await;
 
-            let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
-
             let text = format!(
                 r#"⚡️ <b>اکانت Cloudflare WARP با موفقیت ایجاد و شارژ شد!</b>
 
@@ -3137,9 +3120,6 @@ pub async fn handle_donated_outbound_approve(
 
     let (ob, donor_opt, sub_opt) =
         Repository::approve_donated_outbound_with_reward_days(pool, outbound_id, reward_days).await?;
-
-    // Immediately sync server bridge & client pool so all users see this outbound
-    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
 
     let donor_name = donor_opt
         .as_ref()
@@ -3228,8 +3208,6 @@ pub async fn handle_donated_outbound_reject(
         "توسط مدیر سیستم تایید نشد (عدم احراز شرایط کیفیت یا پایداری).",
     )
     .await?;
-
-    let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
 
     if let Some(ref donor) = donor_opt {
         if let Some(tg_id) = donor.telegram_id {

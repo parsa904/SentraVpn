@@ -1,4 +1,3 @@
-use crate::bridge_sync;
 use crate::db::{DbPool, Repository};
 use crate::error::CoreError;
 use crate::outbound_analyzer::OutboundAnalyzer;
@@ -350,7 +349,7 @@ impl QualityEngine {
 این نودها به دلیل عدم پاسخ به تست پینگ در ۴۸ ساعت گذشته، به صورت خودکار از دیتابیس و فایل پیکربندی sing-box حذف شدند:
 
 {}
-⚡️ پل سرور (bridge_sync) به صورت خودکار با نودهای سالم بازآرایی شد."#,
+⚡️ لیست نودهای سالم به‌صورت خودکار در دیتابیس به‌روزرسانی شد."#,
                     now_tehran.format("%Y-%m-%d %H:%M:%S"),
                     dead_nodes.len(),
                     list_str
@@ -362,9 +361,6 @@ impl QualityEngine {
                     .await;
             }
         }
-
-        // Immediately update server bridge configuration
-        let _ = bridge_sync::sync_server_bridge_config(pool).await;
 
         Ok(cleaned_tags)
     }
@@ -494,11 +490,6 @@ impl QualityEngine {
 
         // G. Run 7-day stability clawback enforcer for rewarded donated outbounds
         Self::enforce_donated_clawbacks(pool, bot_opt, admin_chat_id).await;
-
-        // H. Sync Sing-box bridge configuration with highest-ranked nodes
-        if let Err(e) = bridge_sync::sync_server_bridge_config(pool).await {
-            warn!("[QualityEngine] Post-quality-cycle bridge sync warning: {:?}", e);
-        }
 
         info!(
             "[QualityEngine] Cycle finished: {} tested, {} active, {} Gemini/Trading ready, {} dead nodes cleaned.",

@@ -1,7 +1,6 @@
 mod anomaly_detector;
 mod api;
 mod bot;
-pub mod bridge_sync;
 mod compiler;
 mod config;
 mod db;
@@ -37,11 +36,6 @@ async fn main() -> anyhow::Result<()> {
     // 3. Connect to SQLite and execute auto-migrations + default seed
     let pool = db::init_pool(&config.database_url).await?;
     db::run_migrations_and_seed(&pool).await?;
-
-    // Synchronize sing-box server bridge configuration on startup
-    if let Err(e) = bridge_sync::sync_server_bridge_config(&pool).await {
-        tracing::warn!("Startup bridge sync warning: {:?}", e);
-    }
 
     // 4. Spawn Telegram Bot in parallel Long-Polling mode (with proxy support)
     let bot_pool = pool.clone();

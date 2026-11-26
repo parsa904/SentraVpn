@@ -1,7 +1,6 @@
 export interface Env {
   DB: D1Database;
   TELEGRAM_BOT_TOKEN?: string;
-  TELOXIDE_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   ADMIN_CHAT_ID?: string;
   ADMIN_TELEGRAM_IDS?: string;

@@ -2376,9 +2376,6 @@ async fn donate_client_outbound(
     )
     .await?;
 
-    // Immediately activate across the server Sing-box bridge (OpenVPN/IKEv2/Stealth/WARP)
-    let _ = crate::bridge_sync::sync_server_bridge_config(&state.pool).await;
-
     // Notify Admin in Telegram with inline review buttons (+7 / +15 / +30 days reward or Reject)
     if let Some(ref bot) = state.bot {
         if state.admin_chat_id != 0 {
@@ -2535,8 +2532,6 @@ async fn add_ecosystem_outbound(
         &country_name,
     )
     .await?;
-
-    let _ = crate::bridge_sync::sync_server_bridge_config(&state.pool).await;
 
     Ok((
         StatusCode::CREATED,

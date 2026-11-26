@@ -62,7 +62,7 @@ function formatGb(bytes: number): string {
 }
 
 function resolveBotToken(env: Env): string {
-  return (env.TELEGRAM_BOT_TOKEN || env.TELOXIDE_TOKEN || '').trim();
+  return (env.TELEGRAM_BOT_TOKEN || '').trim();
 }
 
 function isAdminUser(env: Env, telegramId: number): boolean {

@@ -1,7 +1,7 @@
 # مشخصات فنی هسته شبکه، پروتکل‌ها و پیکربندی Sing-box و پروتکل‌های کلاینت (`docs/PROTOCOL_SPEC.md`)
 
 **نگارش:** ۳.۰.۰  
-**معماری هسته سرور:** پل ارتباطی سمت سرور (Server-Side Bridge) با Sing-box v1.10+ و ۳ کارت شبکه مجازی (`tun-web`, `tun-dl`, `tun-static`)  
+**معماری هسته (Zero-VPS):** اجرای ۱۰۰٪ Serverless روی Cloudflare Workers + D1 با تحویل مستقیم کانفیگ استاندارد `sing-box 1.14+` به کلاینت‌ها  
 **پروتکل‌های خروجی کلاینت:** ایزولاسیون ۱۰۰٪ اوتباندهای V2Ray/sing-box؛ ارائه انحصاری ۴ پروتکل امن کاربرپسند:
 1. `openvpn_udp` (سرعت بالا بر بستر UDP)
 2. `openvpn_tcp` (پایداری بالا روی پورت 443 در اختلالات شدید)
@@ -33,14 +33,14 @@
 ### ۱.۱. وب‌گردی (`web_browsing`)
 - **سطح دسترسی:** فعال برای تمامی کاربران (پلن رایگان `Sentra Lite` و پلن‌های تجاری `Pro` و `Flow+`).
 - **محدودیت حجم روزانه:** **۲ گیگابایت (2048 MB)** سهمیه روزانه رایگان که هر ۲۴ ساعت به صورت خودکار ریست می‌شود.
-- **استک فنی سرور:** هدایت پکت‌ها از ورودی `tun-web` (`10.10.0.1/30`) به بهترین نود رسمی و اهدایی VLESS/Trojan.
-- **پورت‌های کلاینت:** پورت `1194` (UDP) و `443` (TCP / Stealth).
+- **استک فنی:** اتصال مستقیم کلاینت (`sing-box 1.14+`) به بهترین نود رسمی و اهدایی سالم (`VLESS Reality` / `Trojan`) با گروه انتخاب خودکار `urltest`.
+- **پورت‌های کلاینت:** پورت `443` (VLESS Reality + uTLS Chrome) و سایر پورت‌های ثبت‌شده نودها.
 
 ### ۱.۲. دانلود (`download`)
 - **سطح دسترسی:** فعال برای تمام کاربران (`Sentra Lite` و بالاتر).
 - **محدودیت حجم روزانه:** **۳ گیگابایت (3072 MB)** سهمیه روزانه برای کاربران رایگان `Sentra Lite`.
-- **استک فنی سرور:** هدایت پکت‌ها از ورودی `tun-dl` (`10.10.1.1/30`) به اوتباندهای Hysteria 2 با کنترل ازدحام Brutal.
-- **پورت‌های کلاینت:** پورت `1195` (UDP) و `2053` (TCP).
+- **استک فنی:** اتصال مستقیم کلاینت به اوتباندهای پرسرعت (مانند `Hysteria 2` و نودهای دانلود تاییدشده).
+- **پورت‌های کلاینت:** مطابق پورت‌های ثبت‌شده نودهای دانلود در دیتابیس D1.
 
 ### ۱.۳. گیمینگ (`gaming`)
 - **سطح دسترسی و وضعیت:** در حال حاضر غیرفعال (`coming_soon`) برای تمامی کاربران.
@@ -49,53 +49,39 @@
 ### ۱.۴. آی‌پی ثابت مسکونی (`static_ip`)
 - **سطح دسترسی:** **قفل (`locked`) برای کاربران پلن رایگان (`Sentra Lite`)**؛ صرفاً قابل استفاده برای کاربران اشتراک ویژه (`Sentra Pro` و `Sentra Flow+`).
 - **سقف مصرف ماهانه:** ۳۰ گیگابایت (30720 MB) در هر دوره ۳۰ روزه.
-- **استک فنی سرور:** هدایت پکت‌ها از ورودی `tun-static` (`10.10.2.1/30`) منحصراً به اوتباند رسمی آمریکا (`is_official = 1`).
-- **پورت‌های کلاینت:** پورت `1196` (UDP) و `2083` (TCP).
-- **الزامات ضد نشت:** تزریق اجباری `block-outside-dns`، فیلتر و مسدودسازی کامل IPv6 و مسیریابی پیش‌فرض `redirect-gateway def1`.
+- **استک فنی:** اتصال مستقیم کلاینت به نودهای رسمی و تاییدشده آی‌پی ثابت (`allow_static_ip = 1`، تاییدشده برای Gemini و ترید).
+- **الزامات ضد نشت:** استفاده از DNS رمزنگاری‌شده DoH (`1.1.1.1` / `8.8.8.8`) و Split Tunneling دقیق.
 
 ---
 
-## ۲. معماری پل ارتباطی سرور (`Server-Side Bridge`)
+## ۲. معماری مستقیم کلاینت به نود (`Zero-VPS Direct-to-Node sing-box 1.14+`)
 
-جهت حفظ کامل امنیت سرورها و عدم افشای آدرس‌های اوتباند، کلاینت‌ها هرگز به صورت مستقیم به V2Ray یا sing-box متصل نمی‌شوند. تمام اوتباندهای ثبت‌شده توسط ادمین و کاربران اهدایی در فایل `/etc/sing-box/bridge-config.json` تجمیع شده و پل ارتباطی ۳ ورودی TUN را با ۳ دسته اوتباند برقرار می‌کند:
+در معماری Zero-VPS هیچ سرور واسطی وجود ندارد. Cloudflare Worker لیست نودهای سالم (`donated_outbounds` و `outbounds`) را از دیتابیس Cloudflare D1 خوانده و مستقیماً در قالب JSON استاندارد `sing-box 1.14+` با `type: "fakeip"` در `dns.servers`، `rule_actions` (`sniff` و `hijack-dns`) و قوانین Split Tunneling ایران (`.ir` و بانک‌ها به `direct`) تولید و به کلاینت ارسال می‌کند:
 
 ```json
 {
   "inbounds": [
     {
       "type": "tun",
-      "tag": "tun-web",
-      "interface_name": "tun-web",
-      "inet4_address": "10.10.0.1/30",
-      "auto_route": false,
-      "strict_route": false,
-      "stack": "system"
-    },
-    {
-      "type": "tun",
-      "tag": "tun-dl",
-      "interface_name": "tun-dl",
-      "inet4_address": "10.10.1.1/30",
-      "auto_route": false,
-      "strict_route": false,
-      "stack": "system"
-    },
-    {
-      "type": "tun",
-      "tag": "tun-static",
-      "interface_name": "tun-static",
-      "inet4_address": "10.10.2.1/30",
-      "auto_route": false,
-      "strict_route": false,
-      "stack": "system"
+      "tag": "tun-in",
+      "interface_name": "sentra-tun",
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+      "mtu": 9000,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "mixed"
     }
   ],
   "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "dns-direct",
     "rules": [
-      { "inbound": ["tun-web"], "outbound": "out-web-node" },
-      { "inbound": ["tun-dl"], "outbound": "out-dl-node" },
-      { "inbound": ["tun-static"], "outbound": "out-static-node" }
-    ]
+      { "action": "sniff", "timeout": "300ms" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "ip_is_private": true, "outbound": "direct" },
+      { "domain_suffix": [".ir", "shaparak.ir"], "outbound": "direct" }
+    ],
+    "final": "Sentra Select"
   }
 }
 ```
@@ -365,40 +351,18 @@
 
 جهت رفع کپچاهای مکرر موتورهای جستجو (گوگل)، دسترسی به سایت‌های حساس به IP دیتاسنتر و جلوگیری از بلاک شدن دامنه‌ها بدون تحمیل افت سرعت به تمام کاربران، مکانیزم **Cloudflare WARP** به صورت کاملاً اختیاری و سوئیچ‌پذیر توسط کاربر طراحی شده است.
 
-### ۵.۱. جریان داده در حالت فعال بودن WARP (`use_warp: true`)
-در این حالت، ترافیک کاربر مسیر زنجیره‌ای زیر را طی می‌کند:
+### ۵.۱. جریان داده در حالت اتصال مستقیم کلاینت (`Zero-VPS`)
+در معماری بدون سرور (Zero-VPS)، ترافیک کاربر بدون سرور واسط و مستقیماً از هسته `sing-box 1.14+` روی دستگاه کاربر به نودهای سالم و در صورت فعال‌سازی WARP از طریق Detour سمت کلاینت هدایت می‌شود:
 ```text
-[Sentra Client]
-      │ (OpenVPN / Stealth / IKEv2)
+[Sentra Client (sing-box 1.14+ TUN)]
+      │ (انتخاب خودکار بهترین نود از Sentra Auto / Sentra Select)
       ▼
-[Sentra Edge Server]
-      │ (مسیریابی به زیرشبکه WARP بر اساس IP کاربر)
-      ├─ Web WARP: 10.8.10.0/24 ──► tun-web-warp (10.10.10.1/30)
-      └─ Download WARP: 10.8.11.0/24 ──► tun-dl-warp (10.10.11.1/30)
-      │
-      ▼
-[Sing-box Server Engine]
-      │
-      ▼ (Detour Outbound)
-[WireGuard Outbound: out-web-warp / out-dl-warp]
-      │ (detour: "out-web-auto" / "out-dl-auto")
-      ▼
-[Upstream V2Ray Node (VLESS/VMess/Trojan)]
-      │ (عبور از فیلترینگ و دور زدن DPI)
-      ▼
-[Cloudflare WARP Anycast Edge (162.159.192.1 / 162.159.193.1)]
-      │ (تخصیص IP پاک و بدون بلک‌لیست کلادفلر)
+[Healthy Upstream Node (VLESS Reality / Hysteria2 / Trojan / ...)]
+      │ (عبور رمزنگاری‌شده با uTLS Chrome)
       ▼
 [Public Internet / Google / Destination Servers]
 ```
 
-### ۵.۲. تفکیک زیرشبکه‌ها و عدم تداخل
-1. **زیرشبکه مستقیم (بدون WARP):**
-   - وب‌گردی مستقیم: `10.8.0.0/24` ◄ هدایت به `tun-web` (`10.10.0.1/30`) ◄ `out-web-auto`
-   - دانلود مستقیم: `10.8.1.0/24` ◄ هدایت به `tun-dl` (`10.10.1.1/30`) ◄ `out-dl-auto`
-2. **زیرشبکه زنجیره‌ای (همراه با WARP):**
-   - وب‌گردی با WARP: `10.8.10.0/24` ◄ هدایت به `tun-web-warp` (`10.10.10.1/30`) ◄ `out-web-warp` با `detour: "out-web-auto"`
-   - دانلود با WARP: `10.8.11.0/24` ◄ هدایت به `tun-dl-warp` (`10.10.11.1/30`) ◄ `out-dl-warp` با `detour: "out-dl-auto"`
-3. **ایزولاسیون مطلق آی‌پی ثابت مسکونی (`static_ip`):**
-   - در حالت آی‌پی ثابت، WARP هم در سطح کلاینت (UI) و هم در سطح سرور (`sentra-core`) به طور قطعی رد و غیرفعال می‌شود (`use_warp = false`) تا آی‌پی مسکونی اختصاصی کاربر دست‌نخورده باقی بماند.
+### ۵.۲. ایزولاسیون حالت آی‌پی ثابت (`static_ip`)
+- در حالت آی‌پی ثابت (`static_ip`)، انتخاب نود منحصراً از بین نودهای تاییدشده با دسترسی پاک به Google Gemini و پلتفرم‌های ترید (`allow_static_ip = 1`) انجام شده و هرگونه تغییر مسیر اضافی غیرفعال می‌ماند تا هویت IP ثابت کاربر حفظ شود.
 

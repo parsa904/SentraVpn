@@ -22,10 +22,10 @@ PUBLIC_BASE_URL = "https://sentra-core.kziepr.workers.dev"
 ALLOWED_ORIGINS = ""
 WIREGUARD_PORT = "51820"
 
-# Configure the following secrets via `wrangler secret put <NAME>`:
-# - TELEGRAM_BOT_TOKEN        (Telegram Bot API token; TELOXIDE_TOKEN also supported as alias)
+# Configure the following secrets via `wrangler secret put <NAME>` (or synced automatically via GitHub Actions):
+# - TELEGRAM_BOT_TOKEN        (Telegram Bot API token)
 # - TELEGRAM_WEBHOOK_SECRET   (Random secret string set in setWebhook secret_token)
-# - ADMIN_CHAT_ID             (Telegram numeric admin chat ID; or comma-separated ADMIN_TELEGRAM_IDS)
 # - QUALITY_ENGINE_SECRET     (Shared secret for GitHub Actions QualityEngine endpoints)
+# - ADMIN_CHAT_ID             (Optional: Telegram numeric admin chat ID; or comma-separated ADMIN_TELEGRAM_IDS)
 # - WIREGUARD_SERVER_PUBLIC_KEY
 # - WIREGUARD_KEY_SALT

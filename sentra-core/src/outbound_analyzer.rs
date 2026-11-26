@@ -720,10 +720,6 @@ impl OutboundAnalyzer {
                 info!("Saved donated outbound #{} with status {} and tier {}", outbound.id, status, assigned_tier);
 
                 if status == "active" {
-                    // Immediately sync server sing-box bridge so OpenVPN / IKEv2 / Stealth / WARP also use this donated node
-                    if let Err(e) = crate::bridge_sync::sync_server_bridge_config(&pool).await {
-                        warn!("Bridge sync warning after donated outbound #{}: {}", outbound.id, e);
-                    }
                     if let Some(tid) = donor_telegram_id {
                         let tier_fa = match assigned_tier.as_str() {
                             "download" => "🚀 حالت دانلود و استریم پرسرعت",
@@ -1188,9 +1184,6 @@ impl OutboundAnalyzer {
         )
         .await
         .map_err(|e| format!("خطا در ذخیره منبع سابسکریپشن: {}", e))?;
-
-        // Re-sync server bridge sing-box
-        let _ = crate::bridge_sync::sync_server_bridge_config(pool).await;
 
         Ok(SubscriptionImportResult {
             source_id,

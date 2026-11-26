@@ -45,7 +45,6 @@ SentraVpn/
 │       ├── models.rs                # تعاریف ساختارهای داده (User, Subscription, Outbound, WarpAccount, ...)
 │       ├── db.rs                    # استخر اتصالات و توابع کار با پایگاه داده (CRUD، مهاجرت‌ها)
 │       ├── warp_gen.rs              # تولیدکننده خودکار کلیدهای Curve25519 و ثبت‌نام اکانت Cloudflare WARP
-│       ├── bridge_sync.rs           # تولیدکننده پویا و خودکار bridge-config.json برای موتور Sing-box سرور
 │       ├── outbound_analyzer.rs     # اسکنر امنیتی SSRF، پارسر انواع پروتکل‌ها و بنچمارک پینگ و سرعت
 │       ├── worker.rs                # ورکر دوره‌ای جهت بررسی سلامت نودها و ریست سهمیه‌های روزانه
 │       ├── api/
@@ -83,33 +82,25 @@ SentraVpn/
 
 ## ۳. نمودار جریان داده‌ها و معماری شبکه (Data Flow Diagrams)
 
-### ۳.۱. جریان اتصال کلاینت و عبور ترافیک از سرور پل
+### ۳.۱. جریان اتصال مستقیم کلاینت به نودها در معماری Zero-VPS
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor User as کاربر (ویندوز / اندروید / iOS)
-    participant Client as کلاینت سنترا (sentra-client)
-    participant CoreAPI as سرور مرکزی (sentra-core)
-    participant EdgeBridge as پل سرور (OpenVPN / Sing-box)
-    participant WARP as شبکه کلادفلر (WARP Anycast)
+    participant Client as کلاینت سنترا (sentra-client / sing-box 1.14+)
+    participant Worker as Cloudflare Worker (sentra-core + D1)
+    participant Nodes as نودهای سالم (donated_outbounds / outbounds)
     participant Web as اینترنت آزاد
 
-    User->>Client: کلیک روی دکمه اتصال (یا انتخاب پروتکل/لوکیشن)
-    Client->>CoreAPI: POST /api/v1/client/config (توکن، حالت، پروتکل، WARP، لوکیشن)
-    Note over CoreAPI: احراز هویت توکن، بررسی سهمیه و تخصیص زیرشبکه
-    CoreAPI-->>Client: پاسخ امن ۲.۰ (پروفایل OpenVPN/Stealth، بدون افشای سکرت‌های سرور)
-    Client->>EdgeBridge: برقراری تونل رمزنگاری‌شده (پورت 1194 یا 11940 Stealth)
-    
-    alt کاربر WARP را خاموش نگه داشته است
-        EdgeBridge->>Web: اتصال مستقیم به اوتباند لوکیشن انتخابی (آلمان، هلند و ...)
-    else کاربر گزینه WARP را روشن کرده است (Opt-in)
-        EdgeBridge->>WARP: هدایت ترافیک اوتباند از طریق WireGuard Detour
-        WARP->>Web: خروج به اینترنت با IP تمیز کلادفلر (بدون کپچا)
-    end
-    
-    Web-->>EdgeBridge: پاسخ بسته‌های داده
-    EdgeBridge-->>Client: ارسال از داخل تونل رمزنگاری‌شده
+    User->>Client: کلیک روی دکمه اتصال (یا انتخاب حالت/لوکیشن)
+    Client->>Worker: POST /api/v1/client/config یا GET /sub/{token}
+    Note over Worker: احراز هویت توکن، بررسی سهمیه و خواندن نودهای سالم از D1
+    Worker-->>Client: خروجی JSON استاندارد sing-box 1.14+ (fakeip + rule_actions + Split Tunneling)
+    Client->>Nodes: اتصال مستقیم و رمزنگاری‌شده به سریع‌ترین نود سالم
+    Nodes->>Web: دسترسی مستقیم به اینترنت آزاد (دامنه‌های .ir از مسیر direct)
+    Web-->>Nodes: پاسخ بسته‌های داده
+    Nodes-->>Client: ارسال مستقیم به کلاینت
     Client-->>User: نمایش ترافیک، سرعت لحظه‌ای و پینگ
 ```
 
