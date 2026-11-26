@@ -1,9 +1,0 @@
-com.sentra.plugin.vpn.tauri-plugin-sentra-vpn-pngs-0 C:\SentraVpn\sentra-client\src-tauri\plugins\sentra-vpn\android\build\generated\res\pngs\release
-com.sentra.plugin.vpn.tauri-plugin-sentra-vpn-updated_navigation_xml-1 C:\SentraVpn\sentra-client\src-tauri\plugins\sentra-vpn\android\build\generated\updated_navigation_xml\release
-com.sentra.plugin.vpn.tauri-plugin-sentra-vpn-mergeReleaseResources-2 C:\SentraVpn\sentra-client\src-tauri\plugins\sentra-vpn\android\build\intermediates\incremental\release\mergeReleaseResources\merged.dir
-com.sentra.plugin.vpn.tauri-plugin-sentra-vpn-mergeReleaseResources-3 C:\SentraVpn\sentra-client\src-tauri\plugins\sentra-vpn\android\build\intermediates\incremental\release\mergeReleaseResources\stripped.dir
-com.sentra.plugin.vpn.tauri-plugin-sentra-vpn-release-4 C:\SentraVpn\sentra-client\src-tauri\plugins\sentra-vpn\android\build\intermediates\merged_res\release\mergeReleaseResources
-com.sentra.plugin.vpn.tauri-plugin-sentra-vpn-release-5 C:\SentraVpn\sentra-client\src-tauri\plugins\sentra-vpn\android\build\intermediates\packaged_res\release\packageReleaseResources
-com.sentra.plugin.vpn.tauri-plugin-sentra-vpn-main-6 C:\SentraVpn\sentra-client\src-tauri\plugins\sentra-vpn\android\src\main\res
-com.sentra.plugin.vpn.tauri-plugin-sentra-vpn-release-7 C:\SentraVpn\sentra-client\src-tauri\plugins\sentra-vpn\android\src\release\res
-gradleHome-0 C:\Users\kziep\.gradle

@@ -334,7 +334,8 @@ export const App: React.FC = () => {
   };
 
   const pushLog = useCallback((level: LogEntry['level'], message: string) => {
-    setLogs((prev) => [...prev.slice(-199), makeLogEntry(level, message)]);
+    const nextEntry = makeLogEntry(level, message);
+    setLogs((prev) => (prev.length >= 50 ? [nextEntry] : [...prev, nextEntry]));
   }, []);
 
   const showToast = useCallback((kind: 'success' | 'error' | 'info', text: string) => {

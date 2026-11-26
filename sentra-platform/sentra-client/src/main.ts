@@ -60,7 +60,16 @@ let mockState: ClientState = {
   ],
 };
 
+const MAX_LOG_CONSOLE_ENTRIES = 50;
+let clearedLogOffset = 0;
 let mockInterval: number | null = null;
+
+function pushMockLog(entry: string): void {
+  if (mockState.logs.length >= MAX_LOG_CONSOLE_ENTRIES) {
+    mockState.logs = [];
+  }
+  mockState.logs.push(entry);
+}
 
 // ------------------------------------------------------------------------------
 // Tauri IPC Invocation Wrapper (Desktop & Android Plugin compatible)
@@ -83,19 +92,19 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
     mockState.is_authenticated = true;
     mockState.username = "تستر محلی سنترا";
     mockState.tier = code === '88888888' ? "Sentra Pro" : "Sentra Flow+";
-    mockState.logs.push(`[INFO] [Auth] Logged in with code ${code} (Tier: ${mockState.tier})`);
+    pushMockLog(`[INFO] [Auth] Logged in with code ${code} (Tier: ${mockState.tier})`);
     return { ...mockState } as unknown as T;
   }
   if (cmd === 'start_vpn' || cmd === 'connect_vpn') {
     mockState.status = 'Connecting';
-    mockState.logs.push(`[INFO] [Core] Requesting VpnService start in mode [${mockState.selected_mode}]...`);
+    pushMockLog(`[INFO] [Core] Requesting VpnService start in mode [${mockState.selected_mode}]...`);
     renderState();
 
     setTimeout(() => {
       mockState.status = 'Connected';
-      mockState.logs.push(`[INFO] [VpnService] TUN fd established (172.19.0.1/30)`);
-      mockState.logs.push(`[INFO] [Notification] Persistent status notification displayed`);
-      mockState.logs.push(`[INFO] [libbox] Sing-box kernel running (FakeIP 198.18.0.0/15)`);
+      pushMockLog(`[INFO] [VpnService] TUN fd established (172.19.0.1/30)`);
+      pushMockLog(`[INFO] [Notification] Persistent status notification displayed`);
+      pushMockLog(`[INFO] [libbox] Sing-box kernel running (FakeIP 198.18.0.0/15)`);
 
       if (mockInterval) clearInterval(mockInterval);
       mockInterval = window.setInterval(() => {
@@ -107,7 +116,7 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
           mockState.remaining_bytes = Math.max(0, mockState.remaining_bytes - 15_000_000);
 
           if (mockState.metrics.uptime_seconds % 10 === 0) {
-            mockState.logs.push(`[DEBUG] [Split] Route bypass active for domestic (.ir) domain`);
+            pushMockLog(`[DEBUG] [Split] Route bypass active for domestic (.ir) domain`);
           }
           renderState();
         }
@@ -124,7 +133,7 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
     mockState.metrics.upload_speed_bps = 0;
     mockState.metrics.uptime_seconds = 0;
     if (mockInterval) clearInterval(mockInterval);
-    mockState.logs.push(`[INFO] [VpnService] Service stopped and TUN closed.`);
+    pushMockLog(`[INFO] [VpnService] Service stopped and TUN closed.`);
     return { ...mockState } as unknown as T;
   }
   if (cmd === 'get_vpn_stats') {
@@ -140,22 +149,22 @@ async function invokeTauri<T>(cmd: string, args: Record<string, any> = {}): Prom
   }
   if (cmd === 'toggle_sandbox_mode') {
     mockState.sandbox_loopback = args.enabled;
-    mockState.logs.push(`[CONFIG] Sandbox Loopback set to ${args.enabled}`);
+    pushMockLog(`[CONFIG] Sandbox Loopback set to ${args.enabled}`);
     return { ...mockState } as unknown as T;
   }
   if (cmd === 'toggle_split_tunneling') {
     mockState.split_tunneling = args.enabled;
-    mockState.logs.push(`[CONFIG] Split Tunneling set to ${args.enabled}`);
+    pushMockLog(`[CONFIG] Split Tunneling set to ${args.enabled}`);
     return { ...mockState } as unknown as T;
   }
   if (cmd === 'toggle_kill_switch') {
     mockState.kill_switch = args.enabled;
-    mockState.logs.push(`[CONFIG] Kill-Switch set to ${args.enabled}`);
+    pushMockLog(`[CONFIG] Kill-Switch set to ${args.enabled}`);
     return { ...mockState } as unknown as T;
   }
   if (cmd === 'set_protocol_mode') {
     mockState.selected_mode = args.mode;
-    mockState.logs.push(`[CONFIG] Protocol Mode switched to [${args.mode}]`);
+    pushMockLog(`[CONFIG] Protocol Mode switched to [${args.mode}]`);
     return { ...mockState } as unknown as T;
   }
   if (cmd === 'get_logs') {
@@ -309,16 +318,33 @@ function renderState() {
   killSwitchToggle.checked = currentState.kill_switch;
   sandboxModeToggle.checked = currentState.sandbox_loopback;
 
-  logConsole.innerHTML = currentState.logs
-    .slice(-40)
-    .map(log => {
-      let color = 'text-[#8B949E]';
-      if (log.includes('[ERROR]')) color = 'text-[#F85149]';
-      else if (log.includes('[CONFIG]')) color = 'text-[#58A6FF]';
-      else if (log.includes('[INFO]')) color = 'text-[#2EA043]';
-      return `<div class="${color}">${log}</div>`;
-    })
-    .join('');
+  if (currentState.logs.length < clearedLogOffset) {
+    clearedLogOffset = 0;
+  }
+  let visibleLogs = currentState.logs.slice(clearedLogOffset);
+  if (visibleLogs.length > MAX_LOG_CONSOLE_ENTRIES) {
+    // Automatically clear log-console once entries exceed 50 to maintain UI performance
+    clearedLogOffset = currentState.logs.length;
+    if (currentState.logs === mockState.logs) {
+      mockState.logs = [];
+      currentState.logs = mockState.logs;
+      clearedLogOffset = 0;
+    }
+    visibleLogs = [];
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const log of visibleLogs) {
+    let color = 'text-[#8B949E]';
+    if (log.includes('[ERROR]')) color = 'text-[#F85149]';
+    else if (log.includes('[CONFIG]')) color = 'text-[#58A6FF]';
+    else if (log.includes('[INFO]')) color = 'text-[#2EA043]';
+    const row = document.createElement('div');
+    row.className = color;
+    row.textContent = log;
+    fragment.appendChild(row);
+  }
+  logConsole.replaceChildren(fragment);
   logConsole.scrollTop = logConsole.scrollHeight;
 }
 
@@ -394,7 +420,7 @@ sandboxModeToggle.addEventListener('change', async (e) => {
 });
 
 copyLogsBtn.addEventListener('click', () => {
-  navigator.clipboard.writeText(currentState.logs.join('\n'));
+  navigator.clipboard.writeText(currentState.logs.slice(clearedLogOffset).join('\n'));
   copyLogsBtn.textContent = "✅ کپی شد!";
   setTimeout(() => { copyLogsBtn.textContent = "📋 کپی لاگ‌ها"; }, 1500);
 });

@@ -1,7 +1,9 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Check, Copy, Trash2 } from 'lucide-react';
 import type { LogEntry } from '../types/sentra';
 import { type Language, t } from '../i18n/translations';
+
+const MAX_LOG_CONSOLE_ENTRIES = 50;
 
 interface LogsViewProps {
   lang: Language;
@@ -12,6 +14,12 @@ interface LogsViewProps {
 export const LogsView: React.FC<LogsViewProps> = ({ lang, logs, onClearLogs }) => {
   const [filter, setFilter] = useState<'ALL' | 'INFO' | 'SYNC' | 'WARN' | 'ERROR'>('ALL');
   const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (logs.length > MAX_LOG_CONSOLE_ENTRIES) {
+      onClearLogs();
+    }
+  }, [logs.length, onClearLogs]);
 
   const visibleLogs = useMemo(() => {
     if (filter === 'ALL') return logs;
@@ -80,6 +88,7 @@ export const LogsView: React.FC<LogsViewProps> = ({ lang, logs, onClearLogs }) =
         </div>
 
         <div
+          id="log-console"
           dir="ltr"
           className="flex-1 overflow-y-auto rounded-2xl border border-slate-200/90 dark:border-slate-800 bg-slate-950 p-4 font-mono text-xs leading-6 text-slate-200"
         >
