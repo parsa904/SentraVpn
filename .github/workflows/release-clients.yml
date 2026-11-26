@@ -418,7 +418,7 @@ jobs:
             "=================================",
             "1. Extract the entire folder before launching.",
             "2. Run SentraVPN.exe (keep sing-box.exe in the same folder).",
-            "3. Get your subscription / login code from Telegram: https://t.me/SentraVpnBot"
+            "3. Get your subscription / login code from Telegram: https://t.me/sentraconnect_bot"
           ) | Set-Content -Path (Join-Path $portableStage "README.txt") -Encoding UTF8
 
           $portableZip = Join-Path $outDir "SentraVPN-Windows-Portable-x64.zip"
@@ -501,7 +501,7 @@ jobs:
             ### 🔐 راستی‌آزمایی فایل‌ها
             فایل `SHA256SUMS.txt` جهت بررسی اصالت تمام فایل‌ها پیوست شده است.
 
-            ربات رسمی تلگرام جهت دریافت اشتراک: [@SentraVpnBot](https://t.me/SentraVpnBot)
+            ربات رسمی تلگرام جهت دریافت اشتراک: [@sentraconnect_bot](https://t.me/sentraconnect_bot)
           files: |
             release-dist/SentraVPN-Android-Universal.apk
             release-dist/SentraVPN-Android-ARMv8.apk

@@ -26,6 +26,7 @@ import type {
 import { type Language, type TranslationKey, t } from '../i18n/translations';
 import type { BatteryOptimizationStatus } from '../utils/reconnectPolicy';
 import { NetworkSpeedTestCard } from './NetworkSpeedTestCard';
+import { normalizeTelegramBotUsername } from '../constants';
 
 interface SettingsViewProps {
   lang: Language;
@@ -106,7 +107,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const isStaticIp = selectedMode === 'static_ip';
   const isGaming = selectedMode === 'gaming';
   const isWarpDisabled = isStaticIp || isGaming;
-  const cleanBot = botUsername?.replace(/^@/, '').trim();
+  const cleanBot = normalizeTelegramBotUsername(botUsername);
 
   const handleGenerateLinkCode = async () => {
     setLinkError(null);

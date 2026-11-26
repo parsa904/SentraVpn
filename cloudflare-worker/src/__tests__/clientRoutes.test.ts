@@ -188,7 +188,7 @@ function makeEnv(db: D1Database): Env {
     TELEGRAM_BOT_TOKEN: 'test-token',
     TELEGRAM_WEBHOOK_SECRET: 'test-secret',
     QUALITY_ENGINE_SECRET: 'quality-secret',
-    BOT_USERNAME: 'SentraVpnBot',
+    BOT_USERNAME: 'sentraconnect_bot',
     PUBLIC_BASE_URL: 'https://sentra-core.kziepr.workers.dev',
   };
 }
@@ -209,7 +209,7 @@ test('GET /api/v1/client/bootstrap returns user, subscription, devices, modes, o
   assert.equal(resp.status, 200);
   const body = (await resp.json()) as Record<string, any>;
   assert.equal(body.success, true);
-  assert.equal(body.bot_username, 'SentraVpnBot');
+  assert.equal(body.bot_username, 'sentraconnect_bot');
   assert.equal(body.user.username, 'ali_sentra');
   assert.equal(body.subscription.tier, 'Sentra Lite');
   assert.equal(body.devices.length, 1);

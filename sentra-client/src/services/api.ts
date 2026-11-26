@@ -24,31 +24,27 @@ import {
   validateSingbox114Config,
 } from '../utils/singboxConfig';
 
-const SESSION_STORAGE_KEY = 'sentra_session_v2';
-const PERSONAL_CONFIGS_KEY = 'sentra_personal_configs_v2';
-const DEVICE_ID_KEY = 'sentra_device_id_v2';
+import {
+  API_BASE_URL,
+  DEFAULT_API_BASE_URL,
+  DEVICE_ID_KEY,
+  PERSONAL_CONFIGS_KEY,
+  SESSION_STORAGE_KEY,
+} from '../constants';
 
-export const DEFAULT_API_BASE_URL = 'https://sentra-core.kziepr.workers.dev';
-
-function normalizeBaseUrl(url: string | undefined): string {
-  return (url || '').trim().replace(/\/+$/, '');
-}
-
-const CONFIGURED_API_BASE_URL =
-  normalizeBaseUrl(import.meta.env.VITE_API_BASE_URL as string | undefined) ||
-  DEFAULT_API_BASE_URL;
+export { API_BASE_URL, DEFAULT_API_BASE_URL };
 
 const REMOTE_BACKEND_URLS = Array.from(
-  new Set([CONFIGURED_API_BASE_URL, DEFAULT_API_BASE_URL].filter(Boolean))
+  new Set([API_BASE_URL, DEFAULT_API_BASE_URL].filter(Boolean))
 );
 
 export function getActiveBackendUrls(): string[] {
   if (!isTauriRuntime() && typeof window !== 'undefined' && window.location?.origin) {
     const sameOrigin = window.location.origin.replace(/\/+$/, '');
-    if (CONFIGURED_API_BASE_URL && CONFIGURED_API_BASE_URL !== sameOrigin) {
-      return [CONFIGURED_API_BASE_URL, ''];
+    if (API_BASE_URL && API_BASE_URL !== sameOrigin) {
+      return [API_BASE_URL, ''];
     }
-    return [CONFIGURED_API_BASE_URL || ''];
+    return [API_BASE_URL || ''];
   }
   return REMOTE_BACKEND_URLS;
 }

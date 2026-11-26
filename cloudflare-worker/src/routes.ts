@@ -1122,7 +1122,7 @@ export async function routeRequest(
     return jsonResponse({
       success: true,
       server_time: new Date().toISOString(),
-      bot_username: (env.BOT_USERNAME || 'SentraVpnBot').replace(/^@/, ''),
+      bot_username: (env.BOT_USERNAME || 'sentraconnect_bot').replace(/^@/, ''),
       user: {
         id: found.user.id,
         user_uuid: found.user.user_uuid,

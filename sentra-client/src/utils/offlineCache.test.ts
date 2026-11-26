@@ -35,7 +35,7 @@ function makeSampleBootstrap(username: string): BootstrapResponse {
   return {
     success: true,
     server_time: '2026-11-25T12:00:00Z',
-    bot_username: 'SentraVpnBot',
+    bot_username: '@sentraconnect_bot',
     user: {
       id: 1,
       user_uuid: 'uuid-1',

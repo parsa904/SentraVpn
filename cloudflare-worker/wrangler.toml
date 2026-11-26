@@ -16,7 +16,7 @@ database_id = "f1f48cc6-f965-4bf0-8670-8cb0248f8e99"
 migrations_dir = "migrations"
 
 [vars]
-BOT_USERNAME = "SentraVpnBot"
+BOT_USERNAME = "sentraconnect_bot"
 PRO_SUBSCRIPTION_PRICE = "150000"
 PUBLIC_BASE_URL = "https://sentra-core.kziepr.workers.dev"
 ALLOWED_ORIGINS = ""

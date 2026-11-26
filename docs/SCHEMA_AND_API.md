@@ -906,7 +906,7 @@ c29ja3M6Ly8xMjcuMC4wLjE6MTA4MDEjU2VudHJhJTIwSHlkcmEKc29ja3M6Ly8xMjcuMC4wLjE6MTA4
   "platform": "windows",
   "file_name": "SentraConnect-Setup.exe",
   "file_size_mb": 24.5,
-  "download_url": "https://t.me/SentraVpnBot",
+  "download_url": "https://t.me/sentraconnect_bot",
   "release_notes": "نسخه اولیه با پشتیبانی از حالت رایگان و سوییچ هوشمند",
   "release_date": "2026-11-20",
   "mandatory": false

@@ -23,6 +23,7 @@ import {
 import { validateCredentialsForm, validateOtpCode } from '../utils/proxyParser';
 import { SentraLogo } from './SentraLogo';
 import { WorldMapBackdrop } from './WorldMapBackdrop';
+import { normalizeTelegramBotUsername } from '../constants';
 
 interface AuthViewProps {
   lang: Language;
@@ -101,7 +102,7 @@ export const AuthView: React.FC<AuthViewProps> = ({
     }
   };
 
-  const cleanBot = botUsername?.replace(/^@/, '').trim();
+  const cleanBot = normalizeTelegramBotUsername(botUsername);
   const ArrowIcon = isRtl ? ArrowLeft : ArrowRight;
 
   return (

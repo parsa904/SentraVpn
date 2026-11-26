@@ -131,8 +131,12 @@ import {
   saveCachedBootstrapSnapshot,
   saveCachedDonationsSnapshot,
 } from './utils/offlineCache';
-
-const THEME_STORAGE_KEY = 'sentra_theme_v2';
+import {
+  API_BASE_URL,
+  DEFAULT_CUSTOM_DNS,
+  DEFAULT_TELEGRAM_BOT_USERNAME,
+  THEME_STORAGE_KEY,
+} from './constants';
 
 const EMPTY_TELEMETRY: TelemetrySnapshot = {
   download_speed_bps: 0,
@@ -226,7 +230,7 @@ export const App: React.FC = () => {
     getInitialBatteryWarningDismissed
   );
   const [useWarp, setUseWarp] = useState(false);
-  const [customDns, setCustomDns] = useState('1.1.1.1');
+  const [customDns, setCustomDns] = useState(DEFAULT_CUSTOM_DNS);
 
   const [personalConfigs, setPersonalConfigs] = useState<PersonalConfigItem[]>([]);
   const [activeServer, setActiveServer] = useState<ActiveServerSelection | null>(null);
@@ -390,7 +394,7 @@ export const App: React.FC = () => {
       if (!silent) {
         setSyncing(true);
         setSyncError(null);
-        pushLog('SYNC', 'Requesting live subscription and outbounds from core...');
+        pushLog('SYNC', `Requesting live subscription and outbounds from ${API_BASE_URL}...`);
       }
       try {
         const data = await fetchBootstrap(activeSession.subscription_token);
@@ -1712,7 +1716,7 @@ export const App: React.FC = () => {
           onToggleTheme={toggleTheme}
           onAuthenticated={handleAuthenticated}
           initialNotice={authNotice}
-          botUsername={bootstrap?.bot_username}
+          botUsername={bootstrap?.bot_username || DEFAULT_TELEGRAM_BOT_USERNAME}
         />
         <OfflineIndicator lang={lang} />
       </>
@@ -1874,7 +1878,7 @@ export const App: React.FC = () => {
               customDns={customDns}
               devices={bootstrap?.devices || []}
               maxDevices={bootstrap?.subscription.max_concurrent_devices || 0}
-              botUsername={bootstrap?.bot_username || ''}
+              botUsername={bootstrap?.bot_username || DEFAULT_TELEGRAM_BOT_USERNAME}
               username={bootstrap?.user.username || session.username || ''}
               onLogout={handleLogout}
               onChangeRoutingMode={(m) => {

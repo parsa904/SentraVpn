@@ -1690,7 +1690,7 @@ export class SentraStore {
     return {
       success: true,
       server_time: new Date().toISOString(),
-      bot_username: process.env.TELEGRAM_BOT_USERNAME || process.env.BOT_USERNAME || 'SentraVpnBot',
+      bot_username: process.env.TELEGRAM_BOT_USERNAME || process.env.BOT_USERNAME || 'sentraconnect_bot',
       user: {
         id: user.id,
         user_uuid: user.user_uuid,
