@@ -3,6 +3,10 @@ import ReactDOM from 'react-dom/client';
 import { registerSW } from 'virtual:pwa-register';
 import './index.css';
 import App from './App';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { installGlobalErrorHandlers } from './utils/errorReporter';
+
+installGlobalErrorHandlers();
 
 const isNativeTauri =
   typeof window !== 'undefined' &&
@@ -31,7 +35,9 @@ const rootEl = document.getElementById('root');
 if (rootEl) {
   ReactDOM.createRoot(rootEl).render(
     <React.StrictMode>
-      <App />
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
     </React.StrictMode>
   );
 }

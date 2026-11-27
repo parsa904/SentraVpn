@@ -17,6 +17,11 @@ import {
 } from './singboxCompiler.ts';
 import { handleTelegramWebhook } from './telegramWebhook.ts';
 import { dispatchErrorAlert } from './telegramTopics.ts';
+import {
+  checkIngestionRateAndDedup,
+  dispatchUnifiedError,
+  parseExternalErrorPayload,
+} from './errorReporter.ts';
 import type {
   ConnectionMode,
   DonatedOutboundRow,
@@ -195,6 +200,105 @@ export async function routeRequest(
   // 2. Telegram Webhook (await full processing + Telegram API replies before returning 200 OK)
   if (method === 'POST' && path === '/api/v1/telegram/webhook') {
     return await handleTelegramWebhook(request, env, ctx);
+  }
+
+  // 2b. Unified AI-Ready Error Telemetry Ingestion (GitHub Actions, Android, Windows)
+  if (
+    method === 'POST' &&
+    (path === '/api/v1/telemetry/error' || path === '/api/v1/errors/report')
+  ) {
+    let rawBody = '';
+    try {
+      rawBody = await request.text();
+    } catch {
+      return errorResponse(400, 'خواندن بدنه درخواست ناموفق بود.');
+    }
+
+    if (rawBody.length > 16_384) {
+      return errorResponse(413, 'حجم گزارش خطا بیش از حد مجاز (۱۶ کیلوبایت) است.');
+    }
+
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(rawBody);
+    } catch {
+      return errorResponse(400, 'فرمت JSON گزارش خطا نامعتبر است.');
+    }
+
+    const parsed = parseExternalErrorPayload(parsedJson);
+    if (!parsed.ok) {
+      return errorResponse(400, parsed.error);
+    }
+
+    const report = parsed.report;
+
+    // GitHub Actions / QualityEngine reports require QUALITY_ENGINE_SECRET
+    if (report.platform === 'github-actions') {
+      if (!env.QUALITY_ENGINE_SECRET) {
+        return errorResponse(503, 'کلید امنیتی QualityEngine پیکربندی نشده است.');
+      }
+      const provided = extractBearerOrHeaderSecret(request, 'X-Quality-Secret');
+      if (!provided || !(await constantTimeEquals(provided, env.QUALITY_ENGINE_SECRET))) {
+        return errorResponse(401, 'دسترسی ارسال گزارش خطای QualityEngine مجاز نیست.', 'UNAUTHORIZED_QUALITY_ENGINE');
+      }
+    }
+
+    // Optional subscription tier enrichment for Android/Windows (without ever logging the token)
+    let authStatus = report.platform === 'github-actions' ? 'quality_secret_verified' : 'anonymous';
+    if (report.platform === 'android' || report.platform === 'windows') {
+      const subToken = extractAuthToken(request);
+      if (subToken) {
+        try {
+          const found = await getSubscriptionWithUser(env.DB, subToken);
+          if (found) {
+            authStatus = `authenticated (${found.sub.tier})`;
+          }
+        } catch {
+          // Never fail error ingestion if D1 lookup fails
+        }
+      }
+    }
+
+    const clientIp =
+      request.headers.get('CF-Connecting-IP') ||
+      request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
+      request.headers.get('X-Device-Id') ||
+      report.platform;
+    const throttleKey = `${report.platform}:${clientIp}`;
+
+    const verdict = checkIngestionRateAndDedup(report, throttleKey);
+    if (!verdict.allowed) {
+      if (verdict.reason === 'rate_limited') {
+        return errorResponse(429, 'تعداد گزارش‌های خطا در دقیقه بیش از حد مجاز است.', 'RATE_LIMITED');
+      }
+      return jsonResponse(
+        {
+          success: true,
+          accepted: true,
+          deduplicated: true,
+        },
+        202
+      );
+    }
+
+    const enrichedReport = {
+      ...report,
+      context: {
+        ...(report.context || {}),
+        auth_status: authStatus,
+      },
+    };
+
+    await dispatchUnifiedError(env, ctx, enrichedReport);
+
+    return jsonResponse(
+      {
+        success: true,
+        accepted: true,
+        deduplicated: false,
+      },
+      202
+    );
   }
 
   // 3. QualityEngine — Fetch Active/Candidate Nodes (Protected by QUALITY_ENGINE_SECRET)

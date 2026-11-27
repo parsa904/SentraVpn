@@ -23,6 +23,7 @@ import {
   translateNetworkErrorToPersian,
   validateSingbox114Config,
 } from '../utils/singboxConfig';
+import { reportClientError } from '../utils/errorReporter';
 
 import {
   API_BASE_URL,
@@ -243,6 +244,14 @@ async function fetchBackendJson<T>(
           (typeof parsed.error === 'string' && parsed.error) ||
           (typeof parsed.message === 'string' && parsed.message) ||
           translateNetworkErrorToPersian(null, response.status);
+        if (response.status >= 500) {
+          void reportClientError({
+            moduleOrFile: 'sentra-client/src/services/api.ts',
+            actionOrRoute: `${options?.method || 'GET'} ${path}`,
+            error: new Error(msg),
+            context: { http_status: response.status },
+          });
+        }
         throw new Error(msg);
       }
 
@@ -332,7 +341,15 @@ export async function fetchSingboxSubscriptionConfig(
   const extracted = extractSingboxConfig(raw);
   const validated = validateSingbox114Config(extracted);
   if (!validated.valid) {
-    throw new Error(validated.errors[0] || 'پیکربندی لینک اشتراک با sing-box 1.14+ سازگار نیست.');
+    const err = new Error(validated.errors[0] || 'پیکربندی لینک اشتراک با sing-box 1.14+ سازگار نیست.');
+    void reportClientError({
+      moduleOrFile: 'sentra-client/src/services/api.ts',
+      actionOrRoute: 'fetchSingboxSubscriptionConfig',
+      error: err,
+      context: { mode, location_code: locationCode || 'auto', validation_errors: validated.errors },
+      subscriptionToken: token,
+    });
+    throw err;
   }
   return validated.config;
 }
@@ -848,12 +865,31 @@ export async function connectVpnNative(): Promise<void> {
       'تونل بومی VPN فقط در نسخه نصبی ویندوز یا اندروید اپلیکیشن Sentra Connect در دسترس است.'
     );
   }
-  await invokeTauri('connect_vpn');
+  try {
+    await invokeTauri('connect_vpn');
+  } catch (err) {
+    void reportClientError({
+      moduleOrFile: 'sentra-client/src/services/api.ts',
+      actionOrRoute: 'invoke(connect_vpn)',
+      error: err,
+    });
+    throw err;
+  }
 }
 
 export async function reconnectVpnNative(reason: 'network_switch' | 'device_wake'): Promise<void> {
   if (!isTauriRuntime()) return;
-  await invokeTauri('reconnect_vpn', { reason });
+  try {
+    await invokeTauri('reconnect_vpn', { reason });
+  } catch (err) {
+    void reportClientError({
+      moduleOrFile: 'sentra-client/src/services/api.ts',
+      actionOrRoute: `invoke(reconnect_vpn:${reason})`,
+      error: err,
+      context: { reason },
+    });
+    throw err;
+  }
 }
 
 export async function getBatteryOptimizationStatusNative(): Promise<BatteryOptimizationStatus> {
@@ -1042,8 +1078,17 @@ export async function subscribeNativeTelemetry(
       const raw = (ev.payload?.status || '').toLowerCase();
       if (raw === 'connected') onStatus('connected');
       else if (raw === 'connecting') onStatus('connecting');
-      else if (raw === 'error') onStatus('error', ev.payload?.error || undefined);
-      else if (raw === 'disconnected') onStatus('disconnected', ev.payload?.error || undefined);
+      else if (raw === 'error') {
+        if (ev.payload?.error) {
+          void reportClientError({
+            moduleOrFile: 'sentra-client/src/services/api.ts',
+            actionOrRoute: 'tauri:connection-status-changed',
+            error: new Error(ev.payload.error),
+            context: { native_status: raw },
+          });
+        }
+        onStatus('error', ev.payload?.error || undefined);
+      } else if (raw === 'disconnected') onStatus('disconnected', ev.payload?.error || undefined);
     };
 
     const handleSubscriptionSynced = () => {

@@ -217,6 +217,13 @@ class SentraVpnService : VpnService() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Exception creating TUN interface: ${e.message}", e)
+            SentraErrorReporter.reportError(
+                context = applicationContext,
+                moduleOrFile = "android/SentraVpnService.kt",
+                actionOrRoute = "establishTunInterface",
+                throwable = e,
+                extraContext = mapOf("mtu" to safeMtu, "detach_for_libbox" to detachForLibbox)
+            )
             -1
         }
     }
@@ -414,6 +421,13 @@ class SentraVpnService : VpnService() {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start VPN tunnel: ${e.message}", e)
             writeCoreLog("[ERROR] Failed to start Android VPN tunnel: ${e.message}")
+            SentraErrorReporter.reportError(
+                context = applicationContext,
+                moduleOrFile = "android/SentraVpnService.kt",
+                actionOrRoute = "startVpnTunnel",
+                throwable = e,
+                extraContext = mapOf("mode" to mode, "server_name" to serverName, "split_tunnel" to split)
+            )
             stopVpnTunnel()
         }
     }
@@ -534,6 +548,14 @@ class SentraVpnService : VpnService() {
                 if (!reconnected && !userDisconnected.get()) {
                     Log.e(TAG, "Failed to auto-reconnect VPN tunnel after ${retryDelaysMs.size} attempts.")
                     writeCoreLog("[AutoReconnect] Reconnect failed after ${retryDelaysMs.size} attempts.")
+                    SentraErrorReporter.reportError(
+                        context = applicationContext,
+                        moduleOrFile = "android/SentraVpnService.kt",
+                        actionOrRoute = "performAutoReconnect($reason)",
+                        errorName = "AndroidAutoReconnectFailed",
+                        errorMessage = "Failed to auto-reconnect VPN tunnel after ${retryDelaysMs.size} attempts.",
+                        extraContext = mapOf("reason" to reason, "mode" to activeMode)
+                    )
                     isServiceRunning.set(false)
                     isVpnActive = false
                     SentraVpnPlugin.broadcastStatus("Disconnected", "None")

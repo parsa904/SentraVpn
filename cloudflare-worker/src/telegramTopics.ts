@@ -1,3 +1,7 @@
+import {
+  formatAiReadyErrorMessage,
+  normalizeUnknownError,
+} from './errorReporter.ts';
 import type { Env } from './types.ts';
 
 export type TopicType = 'logs' | 'backups' | 'support';
@@ -321,38 +325,45 @@ export async function sendMediaToTopic(
   }
 }
 
-function formatErrorDetails(errorDetails: unknown): string {
-  if (errorDetails instanceof Error) {
-    const stackOrMsg = errorDetails.stack || errorDetails.message || String(errorDetails);
-    return stackOrMsg.slice(0, 2500);
-  }
-  if (typeof errorDetails === 'string') {
-    return errorDetails.slice(0, 2500);
-  }
-  try {
-    return JSON.stringify(errorDetails).slice(0, 2500);
-  } catch {
-    return String(errorDetails).slice(0, 2500);
-  }
-}
-
 /**
  * Error-Only Alert helper: immediately dispatches unexpected errors, D1/Telegram failures,
- * and critical QualityEngine outages to `topic_logs_id`.
+ * and critical QualityEngine outages to `topic_logs_id` using the Unified AI-Ready format
+ * with automatic secret sanitization.
  * Fully wrapped in try/catch and logs only to console.error on failure to prevent infinite loops.
  */
 export async function sendErrorAlert(
   env: Env,
   source: string,
-  errorDetails: unknown
+  errorDetails: unknown,
+  context?: Record<string, unknown>
 ): Promise<boolean> {
   try {
-    const detailsText = formatErrorDetails(errorDetails);
-    const alertText =
-      `🚨 <b>هشدار خطای سیستم SentraVPN</b>\n\n` +
-      `📍 <b>بخش:</b> <code>${escapeTelegramHtml(source)}</code>\n` +
-      `🕒 <b>زمان:</b> <code>${escapeTelegramHtml(formatLogTimestamp())}</code>\n\n` +
-      `❌ <b>جزئیات خطا:</b>\n<pre>${escapeTelegramHtml(detailsText)}</pre>`;
+    const normalized = normalizeUnknownError(errorDetails);
+    const parsedSource = /^([^()]+?)\s*\((.+)\)\s*$/.exec(source.trim());
+    const moduleOrFile = parsedSource ? parsedSource[1].trim() : source.trim();
+    const actionOrRoute = parsedSource ? parsedSource[2].trim() : source.trim();
+
+    const extraSecrets = [
+      env.TELEGRAM_BOT_TOKEN,
+      env.QUALITY_ENGINE_SECRET,
+      env.TELEGRAM_WEBHOOK_SECRET,
+      env.WIREGUARD_KEY_SALT,
+    ];
+
+    const alertText = formatAiReadyErrorMessage(
+      {
+        platform: 'worker',
+        appVersion: 'worker-v1',
+        moduleOrFile,
+        actionOrRoute,
+        errorName: normalized.errorName,
+        errorMessage: normalized.errorMessage,
+        stackTrace: normalized.stackTrace,
+        context,
+        timestamp: new Date().toISOString(),
+      },
+      extraSecrets
+    );
 
     return await sendToTopic(env, 'logs', alertText);
   } catch (err) {

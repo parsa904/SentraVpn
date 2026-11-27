@@ -40,7 +40,7 @@ function applySecurityAndCorsHeaders(
     headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     headers.set(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-Subscription-Token, X-Device-Id, X-Quality-Secret'
+      'Content-Type, Authorization, X-Subscription-Token, X-Device-Id, X-Quality-Secret, X-App-Version'
     );
   }
 

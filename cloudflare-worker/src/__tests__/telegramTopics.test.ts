@@ -634,7 +634,9 @@ test('sendErrorAlert, dispatchErrorAlert (waitUntil), Telegram API ok:false aler
       (c) => c.body.chat_id === -100444555 && c.body.message_thread_id === 88
     );
     assert.equal(tgErrorAlerts.length, 1);
-    assert.match(String(tgErrorAlerts[0].body.text), /Telegram API \(sendMessage\)/);
+    assert.match(String(tgErrorAlerts[0].body.text), /moduleOrFile: Telegram API/);
+    assert.match(String(tgErrorAlerts[0].body.text), /actionOrRoute: sendMessage/);
+    assert.match(String(tgErrorAlerts[0].body.text), /<pre><code>/);
     assert.match(String(tgErrorAlerts[0].body.text), /403/);
 
     // 4. Malformed config_json in singboxCompiler triggers sendErrorAlert via /sub/:token?format=singbox

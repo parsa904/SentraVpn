@@ -1000,6 +1000,17 @@ impl VpnManager {
                     TelemetryService::emit_status_change(&app_handle, "Connected", &mode, None);
                 }
                 Err(e) => {
+                    let mut ctx = serde_json::Map::new();
+                    ctx.insert("mode".to_string(), json!(mode));
+                    ctx.insert("protocol".to_string(), json!(protocol));
+                    crate::error_reporter::report_native_error(
+                        "sentra-client/src-tauri/src/vpn_manager.rs",
+                        "android_vpn_service_start",
+                        "AndroidVpnStartError",
+                        &e,
+                        None,
+                        ctx,
+                    );
                     let mut state = app_state.lock().await;
                     state.status = ConnectionStatus::Disconnected;
                     state.logs.push(format!("[ERROR] [Android] VpnService failed: {}", e));
@@ -1055,6 +1066,17 @@ impl VpnManager {
                     }
                     Err(e) => {
                         let err_msg = format!("خطا در اجرای هسته sing-box: {}", e);
+                        let mut ctx = serde_json::Map::new();
+                        ctx.insert("mode".to_string(), json!(mode));
+                        ctx.insert("binary".to_string(), json!(bin_path.to_string_lossy().to_string()));
+                        crate::error_reporter::report_native_error(
+                            "sentra-client/src-tauri/src/vpn_manager.rs",
+                            "windows_singbox_spawn",
+                            "SingboxSpawnError",
+                            &err_msg,
+                            None,
+                            ctx,
+                        );
                         self.is_running.store(false, Ordering::SeqCst);
                         {
                             let mut state = app_state.lock().await;
@@ -1121,6 +1143,17 @@ impl VpnManager {
                 self.is_running.store(false, Ordering::SeqCst);
                 let _ = sysproxy::disable_system_proxy();
                 let err_msg = "هسته بومی sing-box در پوشه برنامه یافت نشد. لطفاً نسخه رسمی Windows را مجدداً نصب یا اکسترکت کنید.".to_string();
+                let mut ctx = serde_json::Map::new();
+                ctx.insert("mode".to_string(), json!(mode));
+                ctx.insert("protocol".to_string(), json!(protocol));
+                crate::error_reporter::report_native_error(
+                    "sentra-client/src-tauri/src/vpn_manager.rs",
+                    "windows_singbox_locate",
+                    "MissingSingboxBinary",
+                    &err_msg,
+                    None,
+                    ctx,
+                );
                 {
                     let mut state = app_state.lock().await;
                     state.status = ConnectionStatus::Disconnected;
@@ -1149,6 +1182,16 @@ impl VpnManager {
                 if routing_mode == "system_proxy" {
                     if let Err(e) = sysproxy::enable_system_proxy("127.0.0.1:10809") {
                         warn!("Failed to set Windows system proxy: {}", e);
+                        let mut ctx = serde_json::Map::new();
+                        ctx.insert("routing_mode".to_string(), json!(routing_mode));
+                        crate::error_reporter::report_native_error(
+                            "sentra-client/src-tauri/src/vpn_manager.rs",
+                            "windows_enable_system_proxy",
+                            "WindowsSystemProxyError",
+                            &e.to_string(),
+                            None,
+                            ctx,
+                        );
                     } else {
                         let mut s = app_state.lock().await;
                         s.logs.push("[INFO] [SystemProxy] Windows system proxy enabled (127.0.0.1:10809).".to_string());

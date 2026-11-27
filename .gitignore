@@ -1,11 +1,66 @@
-target/
+# Dependencies
 node_modules/
+
+# Build outputs & caches
+dist/
+dev-dist/
+build/
+target/
+.wrangler/
+.vite/
+*.timestamp-*.mjs
+*.tsbuildinfo
+
+# Release staging outputs
+release-dist/
+release-android/
+release-windows/
+
+# Sidecar binaries & native cores (fetched during CI/build)
 **/binaries/*.exe
 **/binaries/*.aar
 **/sing-box*
 !**/sing-box*.json
 !**/sing-box*.template.json
+sentra-client/src-tauri/gen/android/app/libs/*.aar
+
+# Android / Gradle / Keystores (never commit signing keys!)
+.gradle/
+local.properties
+keystore/
+keystore.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+*.ap_
+
+# Environment files & secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+
+# Local runtime databases & data
+data/
 *.db
 *.db*
 *.sqlite
-.env
+*.sqlite*
+
+# Logs & temporary files
+*.log
+npm-debug.log*
+*err*.txt
+*.bak
+*.tmp
+.playwright-cli/
+public/assets/aistudio/
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

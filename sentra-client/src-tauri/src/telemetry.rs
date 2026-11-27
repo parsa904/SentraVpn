@@ -71,6 +71,19 @@ impl TelemetryService {
                             };
                             let _ = handle_clone.emit("telemetry-log", &payload);
                             warn!("[Sing-box stderr] {}", line);
+                            let upper = line.to_uppercase();
+                            if upper.contains("FATAL") || upper.contains("ERROR[") || upper.contains("PANIC") {
+                                let mut ctx = serde_json::Map::new();
+                                ctx.insert("source".to_string(), serde_json::json!("sing-box-stderr"));
+                                crate::error_reporter::report_native_error(
+                                    "sentra-client/src-tauri/src/telemetry.rs",
+                                    "singbox_sidecar_stderr",
+                                    "SingboxKernelError",
+                                    &line,
+                                    None,
+                                    ctx,
+                                );
+                            }
                         }
                         Ok(None) => break,
                         Err(e) => {

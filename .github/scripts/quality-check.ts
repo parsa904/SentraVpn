@@ -82,6 +82,53 @@ const QUALITY_SECRET = (process.env.QUALITY_ENGINE_SECRET || '').trim();
 const CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.QUALITY_CONCURRENCY || 6)));
 const SINGBOX_BIN = (process.env.SINGBOX_BIN || 'sing-box').trim();
 const MAX_NODES_PER_SUB_SOURCE = 25;
+const RUNNER_VERSION =
+  (process.env.GITHUB_SHA || '').trim().slice(0, 7) ||
+  (process.env.GITHUB_RUN_NUMBER ? `run-${process.env.GITHUB_RUN_NUMBER}` : 'quality-engine-ci');
+
+/**
+ * Reports QualityEngine runtime/CI errors to the Cloudflare Worker unified
+ * AI-ready telemetry endpoint (`POST /api/v1/telemetry/error`). Never throws.
+ */
+async function reportQualityEngineError(
+  actionOrRoute: string,
+  err: unknown,
+  context: Record<string, unknown> = {}
+): Promise<void> {
+  if (!WORKER_URL || !QUALITY_SECRET) return;
+  try {
+    const isErr = err instanceof Error;
+    const payload = {
+      platform: 'github-actions',
+      appVersion: RUNNER_VERSION,
+      moduleOrFile: '.github/scripts/quality-check.ts',
+      actionOrRoute,
+      errorName: isErr ? err.name || 'Error' : 'RuntimeError',
+      errorMessage: isErr ? err.message : String(err),
+      stackTrace: isErr ? err.stack : undefined,
+      context: {
+        node_version: process.version,
+        os: `${os.platform()}-${os.arch()}`,
+        workflow: process.env.GITHUB_WORKFLOW || 'quality-engine',
+        run_id: process.env.GITHUB_RUN_ID || 'local',
+        ...context,
+      },
+      timestamp: new Date().toISOString(),
+    };
+
+    await fetch(`${WORKER_URL}/api/v1/telemetry/error`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Quality-Secret': QUALITY_SECRET,
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch (reportErr) {
+    console.error('[QualityEngine] Failed to transmit error report:', reportErr);
+  }
+}
 
 function isPrivateIp(ip: string): boolean {
   const clean = ip.trim().toLowerCase().replace(/^::ffff:/, '');
@@ -367,6 +414,12 @@ async function probeGeminiAndTrading(
     }
 
     return { gemini_ok, trading_safe };
+  } catch (probeErr) {
+    await reportQualityEngineError('probeGeminiAndTrading', probeErr, {
+      socks_port: socksPort,
+      singbox_bin: SINGBOX_BIN,
+    });
+    return { gemini_ok: false, trading_safe: false };
   } finally {
     child.kill('SIGTERM');
     await fs.unlink(tmpFile).catch(() => undefined);
@@ -736,7 +789,22 @@ async function main(): Promise<void> {
   console.log('[QualityEngine] Health report accepted:', JSON.stringify(summary));
 }
 
-main().catch((err) => {
+process.on('unhandledRejection', (reason) => {
+  console.error('[QualityEngine] Unhandled rejection:', reason);
+  void reportQualityEngineError('process.unhandledRejection', reason).finally(() => {
+    process.exit(1);
+  });
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[QualityEngine] Uncaught exception:', err);
+  void reportQualityEngineError('process.uncaughtException', err).finally(() => {
+    process.exit(1);
+  });
+});
+
+main().catch(async (err) => {
   console.error('[QualityEngine] Fatal error:', err);
+  await reportQualityEngineError('main()', err, { worker_url: WORKER_URL });
   process.exit(1);
 });

@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod commands;
 pub mod error;
+pub mod error_reporter;
 pub mod local_proxy;
 pub mod sandbox;
 pub mod state;
@@ -110,6 +111,7 @@ pub fn run() {
         .init();
 
     info!("Initializing Sentra Connect Tauri v2 Application...");
+    error_reporter::install_panic_hook();
 
     // Safe startup reset: Ensure System Proxy is clean if prior run terminated abnormally
     let _ = sysproxy::disable_system_proxy();
