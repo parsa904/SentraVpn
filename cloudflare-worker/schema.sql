@@ -293,3 +293,11 @@ CREATE TABLE IF NOT EXISTS telegram_states (
     payload_json            TEXT NOT NULL DEFAULT '{}',
     updated_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 10. SYSTEM_SETTINGS (Telegram Forum Group & Topic IDs + Runtime Config)
+CREATE TABLE IF NOT EXISTS system_settings (
+    key                     TEXT PRIMARY KEY,
+    value                   TEXT NOT NULL,
+    updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+

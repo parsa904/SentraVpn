@@ -138,6 +138,7 @@ export interface CompileClientOptions {
   mode?: ConnectionMode;
   preferFirstAsDefault?: boolean;
   includeClashApi?: boolean;
+  onError?: (source: string, errorDetails: string) => void;
 }
 
 /**
@@ -190,8 +191,12 @@ export function compileClientSingboxConfig(
       normalized.tag = tag;
       outboundTags.push(tag);
       concreteOutbounds.push(normalized);
-    } catch {
-      // Skip malformed stored config_json
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      options.onError?.(
+        'singboxCompiler.ts',
+        `Malformed outbound config_json (id=${dob.id}, tag=${dob.tag}): ${detail}`
+      );
     }
   }
 

@@ -16,10 +16,23 @@ import {
   tierHasGaming,
   tierHasStaticIp,
 } from './singboxCompiler.ts';
+import {
+  dispatchErrorAlert,
+  extractSupportUid,
+  formatLogTimestamp,
+  getTopicRoutingConfig,
+  saveTopicRoute,
+  sendDatabaseBackup,
+  sendErrorAlert,
+  sendMediaToTopic,
+  sendToTopic,
+  type TopicType,
+} from './telegramTopics.ts';
 import type { Env, SubscriptionRow, UserRow } from './types.ts';
 
 interface TelegramUser {
   id: number;
+  is_bot?: boolean;
   first_name?: string;
   last_name?: string;
   username?: string;
@@ -38,14 +51,25 @@ interface TelegramDocument {
   file_name?: string;
 }
 
+interface TelegramReplyMessage {
+  message_id?: number;
+  message_thread_id?: number;
+  from?: TelegramUser;
+  text?: string;
+  caption?: string;
+}
+
 interface TelegramMessage {
   message_id: number;
+  message_thread_id?: number;
+  is_topic_message?: boolean;
   from?: TelegramUser;
-  chat: { id: number; type: string };
+  chat: { id: number; type: string; title?: string };
   text?: string;
   caption?: string;
   photo?: TelegramPhotoSize[];
   document?: TelegramDocument;
+  reply_to_message?: TelegramReplyMessage;
 }
 
 interface TelegramCallbackQuery {
@@ -291,18 +315,25 @@ async function tgApi(
     }
 
     if (!resp.ok || !parsed || parsed.ok !== true) {
+      const desc = parsed?.description ?? rawText.slice(0, 500);
       console.error('[Telegram API Error]', {
         method,
         http_status: resp.status,
         error_code: parsed?.error_code ?? null,
-        description: parsed?.description ?? rawText.slice(0, 500),
+        description: desc,
       });
+      await sendErrorAlert(
+        env,
+        `Telegram API (${method})`,
+        `HTTP ${resp.status} | code=${parsed?.error_code ?? 'unknown'} | ${desc}`
+      );
       return false;
     }
 
     return true;
   } catch (err) {
     console.error('[Telegram API Fetch Error]', method, err);
+    await sendErrorAlert(env, `Telegram API Fetch (${method})`, err);
     return false;
   }
 }
@@ -311,7 +342,8 @@ async function tgSendMessage(
   env: Env,
   chatId: number,
   text: string,
-  replyMarkup?: Record<string, unknown>
+  replyMarkup?: Record<string, unknown>,
+  extra?: Record<string, unknown>
 ): Promise<boolean> {
   return await tgApi(env, 'sendMessage', {
     chat_id: chatId,
@@ -319,6 +351,7 @@ async function tgSendMessage(
     parse_mode: 'HTML',
     disable_web_page_preview: true,
     ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    ...(extra || {}),
   });
 }
 
@@ -382,17 +415,24 @@ async function tgSendTextDocument(
       parsed = null;
     }
     if (!resp.ok || !parsed || parsed.ok !== true) {
+      const desc = parsed?.description ?? rawText.slice(0, 500);
       console.error('[Telegram API Error]', {
         method: 'sendDocument',
         http_status: resp.status,
         error_code: parsed?.error_code ?? null,
-        description: parsed?.description ?? rawText.slice(0, 500),
+        description: desc,
       });
+      await sendErrorAlert(
+        env,
+        'Telegram API (sendDocument)',
+        `HTTP ${resp.status} | code=${parsed?.error_code ?? 'unknown'} | ${desc}`
+      );
       return false;
     }
     return true;
   } catch (err) {
     console.error('[Telegram API Fetch Error]', 'sendDocument', err);
+    await sendErrorAlert(env, 'Telegram API Fetch (sendDocument)', err);
     return false;
   }
 }
@@ -825,8 +865,9 @@ function buildAdminPanelHomeView(): { text: string; replyMarkup: Record<string, 
         ],
         [
           { text: '📊 آمار سیستم', callback_data: 'adm_stats' },
-          { text: '🏠 بازگشت به منوی اصلی', callback_data: 'user_menu_home' },
+          { text: '💾 دریافت بکاپ فوری', callback_data: 'adm_backup_now' },
         ],
+        [{ text: '🏠 بازگشت به منوی اصلی', callback_data: 'user_menu_home' }],
       ],
     },
   };
@@ -1828,7 +1869,11 @@ async function buildUserSupportView(
 // Callback Query Handler (Inline Keyboards)
 // ==============================================================================
 
-async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<void> {
+async function handleCallbackQuery(
+  env: Env,
+  q: TelegramCallbackQuery,
+  ctx?: ExecutionContext
+): Promise<void> {
   const chatId = q.message?.chat.id || q.from.id;
   const messageId = q.message?.message_id;
   const telegramId = q.from.id;
@@ -2530,6 +2575,29 @@ async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<
         return;
       }
 
+      if (data === 'adm_backup_now') {
+        const backupRes = await sendDatabaseBackup(env);
+        if (backupRes.ok) {
+          await tgSendMessage(
+            env,
+            chatId,
+            `✅ <b>بکاپ فوری دیتابیس D1 با موفقیت در تاپیک بکاپ منتشر شد!</b>\n\n` +
+              `📄 فایل: <code>${escapeHtml(backupRes.filename || '')}</code>\n` +
+              `🗂 تعداد جداول: <b>${backupRes.tablesCount ?? 0}</b>\n` +
+              `📊 مجموع رکوردها: <b>${backupRes.totalRows ?? 0}</b>`,
+            { inline_keyboard: [[{ text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' }]] }
+          );
+        } else {
+          await tgSendMessage(
+            env,
+            chatId,
+            `⚠️ <b>ارسال بکاپ انجام نشد:</b>\n${escapeHtml(backupRes.error || 'خطای نامشخص')}`,
+            { inline_keyboard: [[{ text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' }]] }
+          );
+        }
+        return;
+      }
+
       if (data.startsWith('adm_ob_alloc_')) {
         const alloc = data.slice('adm_ob_alloc_'.length);
         if (!['free_only', 'gaming_only', 'static_only', 'all', 'auto', 'both'].includes(alloc)) {
@@ -2564,6 +2632,12 @@ async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<
       error: errMsg,
       err,
     });
+    await dispatchErrorAlert(
+      env,
+      ctx,
+      `telegramWebhook.ts (callback_query: ${data}, uid=${telegramId})`,
+      err
+    );
     const showDetail = isEnvAdmin(env, telegramId) || (await resolveIsAdmin(env, telegramId));
     await tgSendMessage(
       env,
@@ -2579,9 +2653,162 @@ async function handleCallbackQuery(env: Env, q: TelegramCallbackQuery): Promise<
 // Incoming Message Handler (Commands, Reply Keyboard Buttons & FSM States)
 // ==============================================================================
 
-async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> {
+async function handleGroupMessage(env: Env, msg: TelegramMessage): Promise<void> {
+  const from = msg.from;
+  if (!from || from.is_bot) return;
+
+  const chatId = msg.chat.id;
+  const telegramId = from.id;
+  const threadId =
+    typeof msg.message_thread_id === 'number'
+      ? msg.message_thread_id
+      : typeof msg.reply_to_message?.message_thread_id === 'number'
+      ? msg.reply_to_message.message_thread_id
+      : undefined;
+  const text = (msg.text || msg.caption || '').trim();
+  const largestPhoto =
+    Array.isArray(msg.photo) && msg.photo.length > 0
+      ? msg.photo[msg.photo.length - 1]
+      : null;
+  const attachedDoc = msg.document || null;
+  const threadExtra: Record<string, unknown> = {
+    ...(threadId ? { message_thread_id: threadId } : {}),
+    reply_to_message_id: msg.message_id,
+  };
+
+  // 1. Admin topic-binding commands: /set_logs, /set_backups, /set_support (with or without @BotUsername)
+  const cmdMatch = /^\/(set_logs|set_backups|set_support)(?:@[A-Za-z0-9_]+)?(?:\s|$)/i.exec(text);
+  if (cmdMatch) {
+    const isAdmin = await resolveIsAdmin(env, telegramId);
+    if (!isAdmin) {
+      await tgSendMessage(env, chatId, '⛔ دسترسی غیرمجاز', undefined, threadExtra);
+      return;
+    }
+
+    const cmd = cmdMatch[1].toLowerCase();
+    const mapping: Record<string, { type: TopicType; label: string }> = {
+      set_logs: { type: 'logs', label: 'لاگ خطاهای سیستم' },
+      set_backups: { type: 'backups', label: 'بکاپ‌های دیتابیس D1' },
+      set_support: { type: 'support', label: 'پشتیبانی کاربران' },
+    };
+    const target = mapping[cmd];
+    await saveTopicRoute(env.DB, target.type, chatId, threadId);
+
+    const threadLabel = threadId ? String(threadId) : 'عمومی (General / 0)';
+    await tgSendMessage(
+      env,
+      chatId,
+      `✅ <b>این تاپیک با موفقیت به عنوان تاپیک ${target.label} ثبت شد.</b>\n\n` +
+        `👥 آیدی گروه: <code>${chatId}</code>\n` +
+        `🧵 آیدی تاپیک: <code>${escapeHtml(threadLabel)}</code>`,
+      undefined,
+      threadExtra
+    );
+    return;
+  }
+
+  // 2. Admin Reply inside configured Support Topic -> forward directly to user's private chat
+  if (msg.reply_to_message && (text || largestPhoto || attachedDoc)) {
+    const topicConfig = await getTopicRoutingConfig(env.DB);
+    const currentThreadKey = String(threadId ?? 0);
+    if (
+      topicConfig.logGroupId === String(chatId) &&
+      topicConfig.topicSupportId !== null &&
+      String(topicConfig.topicSupportId) === currentThreadKey
+    ) {
+      const isAdmin = await resolveIsAdmin(env, telegramId);
+      if (!isAdmin) return;
+
+      const repliedText = msg.reply_to_message.text || msg.reply_to_message.caption || '';
+      const targetUserId = extractSupportUid(repliedText);
+      if (!targetUserId) return;
+
+      let delivered = false;
+      const replyCaption = text
+        ? `💬 <b>پاسخ تیم پشتیبانی SentraVPN:</b>\n\n${escapeHtml(text)}`
+        : '💬 <b>پاسخ تیم پشتیبانی SentraVPN:</b>';
+
+      if (largestPhoto) {
+        delivered = await tgApi(env, 'sendPhoto', {
+          chat_id: targetUserId,
+          photo: largestPhoto.file_id,
+          caption: replyCaption.slice(0, 1020),
+          parse_mode: 'HTML',
+        });
+      } else if (attachedDoc) {
+        delivered = await tgApi(env, 'sendDocument', {
+          chat_id: targetUserId,
+          document: attachedDoc.file_id,
+          caption: replyCaption.slice(0, 1020),
+          parse_mode: 'HTML',
+        });
+      } else {
+        delivered = await tgSendMessage(env, targetUserId, replyCaption);
+      }
+
+      if (delivered) {
+        try {
+          await env.DB.prepare(
+            `UPDATE support_tickets
+             SET status = 'awaiting_user', updated_at = CURRENT_TIMESTAMP
+             WHERE id = (
+               SELECT st.id FROM support_tickets st
+               JOIN users u ON u.id = st.user_id
+               WHERE u.telegram_id = ? AND st.status IN ('open', 'investigating')
+               ORDER BY st.id DESC LIMIT 1
+             )`
+          )
+            .bind(targetUserId)
+            .run();
+        } catch {
+          // Non-critical status sync failure should never block support reply confirmation
+        }
+
+        await tgSendMessage(
+          env,
+          chatId,
+          '✅ پاسخ به کاربر ارسال شد',
+          undefined,
+          threadExtra
+        );
+      } else {
+        await tgSendMessage(
+          env,
+          chatId,
+          '⚠️ ارسال پاسخ به کاربر ناموفق بود (ممکن است کاربر ربات را مسدود کرده باشد).',
+          undefined,
+          threadExtra
+        );
+      }
+    }
+  }
+
+  // Ignore all other normal group messages so private /start menus are never triggered in groups
+}
+
+async function handleTextMessage(
+  env: Env,
+  msg: TelegramMessage,
+  ctx?: ExecutionContext
+): Promise<void> {
   const from = msg.from;
   if (!from) return;
+
+  if (msg.chat.type === 'group' || msg.chat.type === 'supergroup') {
+    try {
+      await handleGroupMessage(env, msg);
+    } catch (err) {
+      console.error('[Sentra Group Message Error]', err);
+      await dispatchErrorAlert(
+        env,
+        ctx,
+        `telegramWebhook.ts (group chat=${msg.chat.id})`,
+        err
+      );
+    }
+    return;
+  }
+
   const chatId = msg.chat.id;
   const telegramId = from.id;
   const text = (msg.text || msg.caption || '').trim();
@@ -2608,9 +2835,12 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
             `💎 <b>پلن فعال:</b> ${escapeHtml(sub.tier)}`;
         await tgSendMessage(env, chatId, welcome, buildMainKeyboard(true, isAdmin));
       } catch (err) {
-        console.error(
-          '[Sentra D1 Error] /start failed:',
-          err instanceof Error ? err.message : String(err),
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.error('[Sentra D1 Error] /start failed:', errMsg, err);
+        await dispatchErrorAlert(
+          env,
+          ctx,
+          `telegramWebhook.ts (/start D1, uid=${telegramId})`,
           err
         );
         await tgSendMessage(
@@ -2629,6 +2859,12 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
       console.error(
         '[Sentra D1 Error] Failed to query user:',
         err instanceof Error ? err.message : String(err),
+        err
+      );
+      await dispatchErrorAlert(
+        env,
+        ctx,
+        `telegramWebhook.ts (D1 user lookup, uid=${telegramId})`,
         err
       );
       await tgSendMessage(
@@ -2829,11 +3065,18 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
 
       if (state.state_type === 'awaiting_support_ticket') {
         const payload = JSON.parse(state.payload_json || '{}') as { category?: string };
-        if (text.length < 5) {
+        const largestPhoto =
+          Array.isArray(msg.photo) && msg.photo.length > 0
+            ? msg.photo[msg.photo.length - 1]
+            : null;
+        const attachedDoc = msg.document || null;
+        const hasMedia = Boolean(largestPhoto || attachedDoc);
+
+        if (!hasMedia && text.length < 5) {
           await tgSendMessage(
             env,
             chatId,
-            '❌ لطفاً توضیح مشکل خود را حداقل در ۵ کاراکتر بنویسید تا قابل پیگیری باشد:',
+            '❌ لطفاً توضیح مشکل خود را حداقل در ۵ کاراکتر (یا همراه با تصویر/فایل) ارسال کنید تا قابل پیگیری باشد:',
             buildCancelStateInlineMarkup()
           );
           return;
@@ -2849,7 +3092,12 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
             ? payload.category
             : 'other';
         const ticketNumber = `TKT-${generateNumericCode(6)}`;
-        const subject = text.split('\n')[0].slice(0, 80);
+        const effectiveBody =
+          text ||
+          (largestPhoto
+            ? '[تصویر پیوست‌شده توسط کاربر]'
+            : `[فایل پیوست‌شده: ${attachedDoc?.file_name || 'document'}]`);
+        const subject = effectiveBody.split('\n')[0].slice(0, 80);
 
         await env.DB.prepare(
           `INSERT INTO support_tickets (ticket_number, user_id, subscription_id, category, subject, description, priority, status)
@@ -2861,7 +3109,7 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
             ensured.sub?.id ?? null,
             category,
             subject,
-            text.slice(0, 2000)
+            effectiveBody.slice(0, 2000)
           )
           .run();
 
@@ -2875,6 +3123,53 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
             `تیم پشتیبانی در کوتاه‌ترین زمان درخواست شما را بررسی خواهد کرد.`,
           buildMainKeyboard(true, isAdmin)
         );
+
+        const fullName =
+          [from.first_name, from.last_name].filter(Boolean).join(' ').trim() ||
+          ensured.user.first_name;
+        const usernameLine = from.username
+          ? `@${escapeHtml(from.username)}`
+          : ensured.user.username
+          ? `@${escapeHtml(ensured.user.username)}`
+          : 'ندارد';
+        const supportHeader =
+          `🎫 <b>پیام پشتیبانی جدید (${escapeHtml(ticketNumber)})</b>\n\n` +
+          `🕒 زمان: <code>${escapeHtml(formatLogTimestamp())}</code>\n` +
+          `👤 نام: <b>${escapeHtml(fullName)}</b>\n` +
+          `🔗 یوزرنیم: ${usernameLine}\n` +
+          `🆔 شناسه کاربر: #UID_${telegramId}\n` +
+          `📂 دسته‌بندی: <code>${escapeHtml(category)}</code>\n\n`;
+
+        if (largestPhoto) {
+          const mediaCaption =
+            supportHeader +
+            `📝 <b>توضیحات:</b> ${escapeHtml(effectiveBody.slice(0, 500))}\n\n` +
+            `↩️ <i>برای پاسخ مستقیم به کاربر، روی همین پیام Reply کنید.</i>`;
+          await sendMediaToTopic(env, 'support', {
+            kind: 'photo',
+            fileId: largestPhoto.file_id,
+            caption: mediaCaption,
+          });
+        } else if (attachedDoc) {
+          const mediaCaption =
+            supportHeader +
+            `📎 <b>فایل:</b> <code>${escapeHtml(attachedDoc.file_name || 'document')}</code>\n` +
+            `📝 <b>توضیحات:</b> ${escapeHtml(effectiveBody.slice(0, 450))}\n\n` +
+            `↩️ <i>برای پاسخ مستقیم به کاربر، روی همین پیام Reply کنید.</i>`;
+          await sendMediaToTopic(env, 'support', {
+            kind: 'document',
+            fileId: attachedDoc.file_id,
+            caption: mediaCaption,
+          });
+        } else {
+          await sendToTopic(
+            env,
+            'support',
+            supportHeader +
+              `📝 <b>متن پیام:</b>\n${escapeHtml(effectiveBody.slice(0, 2000))}\n\n` +
+              `↩️ <i>برای پاسخ مستقیم به کاربر، روی همین پیام Reply کنید.</i>`
+          );
+        }
         return;
       }
 
@@ -3047,6 +3342,12 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
       error: errMsg,
       err,
     });
+    await dispatchErrorAlert(
+      env,
+      ctx,
+      `telegramWebhook.ts (message handler, uid=${telegramId})`,
+      err
+    );
     const showDetail = envAdmin || (await resolveIsAdmin(env, telegramId));
     await tgSendMessage(
       env,
@@ -3064,7 +3365,8 @@ async function handleTextMessage(env: Env, msg: TelegramMessage): Promise<void> 
  */
 export async function handleTelegramWebhook(
   request: Request,
-  env: Env
+  env: Env,
+  ctx?: ExecutionContext
 ): Promise<Response> {
   if (env.TELEGRAM_WEBHOOK_SECRET) {
     const incomingSecret = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
@@ -3089,17 +3391,20 @@ export async function handleTelegramWebhook(
 
   try {
     if (update.callback_query) {
-      await handleCallbackQuery(env, update.callback_query);
+      await handleCallbackQuery(env, update.callback_query, ctx);
     } else if (update.message) {
-      await handleTextMessage(env, update.message);
+      await handleTextMessage(env, update.message, ctx);
     }
   } catch (err) {
     console.error('[Sentra Webhook Error]', err);
+    await dispatchErrorAlert(env, ctx, 'telegramWebhook.ts (webhook root)', err);
     const fallbackChatId =
       update.message?.chat.id ||
       update.callback_query?.message?.chat.id ||
       update.callback_query?.from.id;
-    if (fallbackChatId) {
+    const isGroup =
+      update.message?.chat.type === 'group' || update.message?.chat.type === 'supergroup';
+    if (fallbackChatId && !isGroup) {
       await tgSendMessage(
         env,
         fallbackChatId,

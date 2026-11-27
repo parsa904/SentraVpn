@@ -30,3 +30,7 @@ WIREGUARD_PORT = "51820"
 # - ADMIN_CHAT_ID             (Optional: Legacy Telegram numeric admin chat ID; or comma-separated ADMIN_TELEGRAM_IDS)
 # - WIREGUARD_SERVER_PUBLIC_KEY
 # - WIREGUARD_KEY_SALT
+
+[triggers]
+crons = ["0 */12 * * *"]
+

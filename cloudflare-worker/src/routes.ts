@@ -16,6 +16,7 @@ import {
   tierHasStaticIp,
 } from './singboxCompiler.ts';
 import { handleTelegramWebhook } from './telegramWebhook.ts';
+import { dispatchErrorAlert } from './telegramTopics.ts';
 import type {
   ConnectionMode,
   DonatedOutboundRow,
@@ -167,7 +168,7 @@ function normalizeMode(raw: string | null | undefined): ConnectionMode {
 export async function routeRequest(
   request: Request,
   env: Env,
-  _ctx?: ExecutionContext
+  ctx?: ExecutionContext
 ): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, '') || '/';
@@ -184,14 +185,16 @@ export async function routeRequest(
         singbox_schema: '1.14+',
         timestamp: new Date().toISOString(),
       });
-    } catch {
+    } catch (err) {
+      console.error('[Sentra Health D1 Error]', err);
+      await dispatchErrorAlert(env, ctx, 'routes.ts (/health D1)', err);
       return errorResponse(503, 'اتصال به دیتابیس D1 برقرار نشد.');
     }
   }
 
   // 2. Telegram Webhook (await full processing + Telegram API replies before returning 200 OK)
   if (method === 'POST' && path === '/api/v1/telegram/webhook') {
-    return await handleTelegramWebhook(request, env);
+    return await handleTelegramWebhook(request, env, ctx);
   }
 
   // 3. QualityEngine — Fetch Active/Candidate Nodes (Protected by QUALITY_ENGINE_SECRET)
@@ -280,16 +283,31 @@ export async function routeRequest(
     let geminiReady = 0;
     let subscriptionSourcesUpdated = 0;
     let discoveredNodesAdded = 0;
+    const offlineAlerts: Array<{
+      id: number;
+      tag: string;
+      protocol: string;
+      status: string;
+      failCount: number;
+      reason?: string;
+    }> = [];
 
     for (const item of nodeResults.slice(0, 250)) {
       const nodeId = Number(item.outbound_id);
       if (!Number.isInteger(nodeId) || nodeId <= 0) continue;
 
       const existing = await env.DB.prepare(
-        'SELECT id, fail_count, offline_since, allocation_mode FROM donated_outbounds WHERE id = ? LIMIT 1'
+        'SELECT id, tag, protocol, fail_count, offline_since, allocation_mode FROM donated_outbounds WHERE id = ? LIMIT 1'
       )
         .bind(nodeId)
-        .first<{ id: number; fail_count: number; offline_since: string | null; allocation_mode: string }>();
+        .first<{
+          id: number;
+          tag: string;
+          protocol: string;
+          fail_count: number;
+          offline_since: string | null;
+          allocation_mode: string;
+        }>();
       if (!existing) continue;
 
       const latencyMs = Math.max(0, Math.min(9999, Math.round(Number(item.latency_ms) || 9999)));
@@ -301,16 +319,25 @@ export async function routeRequest(
       const tradingSafe = item.trading_safe ? 1 : 0;
 
       if (!item.security_passed) {
+        const rejectReason = String(item.error_msg || 'Failed security audit');
         await env.DB.prepare(
           `UPDATE donated_outbounds
            SET status = 'rejected', rejection_reason = ?, health_score = 0,
                last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
            WHERE id = ?`
         )
-          .bind(String(item.error_msg || 'Failed security audit'), nodeId)
+          .bind(rejectReason, nodeId)
           .run();
         deactivated += 1;
         updated += 1;
+        offlineAlerts.push({
+          id: nodeId,
+          tag: existing.tag,
+          protocol: existing.protocol,
+          status: 'rejected',
+          failCount: (existing.fail_count || 0) + 1,
+          reason: rejectReason,
+        });
         continue;
       }
 
@@ -365,6 +392,15 @@ export async function routeRequest(
             nodeId
           )
           .run();
+
+        offlineAlerts.push({
+          id: nodeId,
+          tag: existing.tag,
+          protocol: existing.protocol,
+          status: nextStatus,
+          failCount: nextFailCount,
+          reason: item.error_msg ? String(item.error_msg) : undefined,
+        });
       }
 
       updated += 1;
@@ -475,6 +511,58 @@ export async function routeRequest(
       }
     }
 
+    const subSourceAlerts: string[] = [];
+    for (const srcReport of subReports.slice(0, 50)) {
+      const sourceId = Number(srcReport.source_id);
+      if (!Number.isInteger(sourceId) || sourceId <= 0) continue;
+      const totalNodes = Math.max(0, Math.round(Number(srcReport.total_nodes) || 0));
+      const healthyNodes = Math.max(0, Math.round(Number(srcReport.healthy_nodes) || 0));
+      if (srcReport.error_msg) {
+        subSourceAlerts.push(
+          `SubSource #${sourceId} (${srcReport.category || 'unknown'}): ${String(srcReport.error_msg).slice(0, 120)}`
+        );
+      } else if (totalNodes > 0 && healthyNodes === 0) {
+        subSourceAlerts.push(
+          `SubSource #${sourceId} (${srcReport.category || 'unknown'}): 0/${totalNodes} healthy nodes`
+        );
+      }
+    }
+
+    let activePoolCount = 1;
+    try {
+      const poolRow = await env.DB.prepare(
+        `SELECT COUNT(*) AS cnt FROM donated_outbounds WHERE status = 'active'`
+      ).first<{ cnt: number }>();
+      activePoolCount = Number(poolRow?.cnt ?? 0);
+    } catch {
+      activePoolCount = 1;
+    }
+
+    const criticalPoolDepleted = activePoolCount === 0 && (updated > 0 || subscriptionSourcesUpdated > 0);
+
+    if (offlineAlerts.length > 0 || subSourceAlerts.length > 0 || criticalPoolDepleted) {
+      const summaryLines: string[] = [
+        `Checked: ${updated} | Deactivated/Rejected: ${deactivated} | Failed: ${offlineAlerts.length} | Active Pool: ${activePoolCount}`,
+      ];
+      if (criticalPoolDepleted) {
+        summaryLines.push('CRITICAL: Active healthy node pool reached 0!');
+      }
+      for (const n of offlineAlerts.slice(0, 10)) {
+        const reasonPart = n.reason ? ` — ${n.reason.slice(0, 80)}` : '';
+        summaryLines.push(
+          `- #${n.id} [${n.protocol}] ${n.tag.slice(0, 32)} (fails=${n.failCount}, status=${n.status})${reasonPart}`
+        );
+      }
+      if (offlineAlerts.length > 10) {
+        summaryLines.push(`... and ${offlineAlerts.length - 10} more failing nodes`);
+      }
+      for (const sAlert of subSourceAlerts.slice(0, 5)) {
+        summaryLines.push(`- ${sAlert}`);
+      }
+
+      await dispatchErrorAlert(env, ctx, 'QualityEngine (health-report)', summaryLines.join('\n'));
+    }
+
     return jsonResponse({
       success: true,
       updated,
@@ -533,10 +621,19 @@ export async function routeRequest(
     const subUserInfo = buildSubscriptionUserInfoHeader(found.sub);
 
     if (wantsSingbox) {
-      const config = compileClientSingboxConfig(core, donated, {
-        mode,
-        includeClashApi: false,
-      });
+      let config: Record<string, unknown>;
+      try {
+        config = compileClientSingboxConfig(core, donated, {
+          mode,
+          includeClashApi: false,
+          onError: (source, details) => {
+            void dispatchErrorAlert(env, ctx, source, details);
+          },
+        });
+      } catch (err) {
+        await dispatchErrorAlert(env, ctx, 'singboxCompiler.ts (/sub)', err);
+        throw err;
+      }
       return new Response(JSON.stringify(config, null, 2), {
         status: 200,
         headers: {
@@ -549,7 +646,13 @@ export async function routeRequest(
       });
     }
 
-    const base64Body = compileV2RaySubscriptionBase64(donated, core);
+    let base64Body: string;
+    try {
+      base64Body = compileV2RaySubscriptionBase64(donated, core);
+    } catch (err) {
+      await dispatchErrorAlert(env, ctx, 'singboxCompiler.ts (/sub base64)', err);
+      throw err;
+    }
     return new Response(base64Body, {
       status: 200,
       headers: {
@@ -618,11 +721,20 @@ export async function routeRequest(
     }
 
     const { donated, core } = await queryOutboundsForMode(env.DB, mode, locationCode);
-    const singboxConfig = compileClientSingboxConfig(core, donated, {
-      mode,
-      preferFirstAsDefault: Boolean(body.selected_outbound_id),
-      includeClashApi: true,
-    });
+    let singboxConfig: Record<string, unknown>;
+    try {
+      singboxConfig = compileClientSingboxConfig(core, donated, {
+        mode,
+        preferFirstAsDefault: Boolean(body.selected_outbound_id),
+        includeClashApi: true,
+        onError: (source, details) => {
+          void dispatchErrorAlert(env, ctx, source, details);
+        },
+      });
+    } catch (err) {
+      await dispatchErrorAlert(env, ctx, 'singboxCompiler.ts (/api/v1/client/config)', err);
+      throw err;
+    }
 
     return jsonResponse({
       success: true,

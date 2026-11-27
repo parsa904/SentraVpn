@@ -1,4 +1,9 @@
 import { routeRequest } from './routes.ts';
+import {
+  dispatchErrorAlert,
+  sendDatabaseBackup,
+  sendErrorAlert,
+} from './telegramTopics.ts';
 import type { Env } from './types.ts';
 
 function resolveAllowedOrigin(request: Request, env: Env): string | null {
@@ -59,6 +64,14 @@ export default {
       return applySecurityAndCorsHeaders(response, allowedOrigin);
     } catch (err) {
       console.error('[Sentra Worker Unhandled Error]', err);
+      const pathname = (() => {
+        try {
+          return new URL(request.url).pathname;
+        } catch {
+          return 'unknown';
+        }
+      })();
+      await dispatchErrorAlert(env, ctx, `index.ts (${request.method} ${pathname})`, err);
       const errResp = new Response(
         JSON.stringify({
           success: false,
@@ -73,4 +86,29 @@ export default {
       return applySecurityAndCorsHeaders(errResp, allowedOrigin);
     }
   },
+
+  async scheduled(
+    _controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<void> {
+    const runBackup = async (): Promise<void> => {
+      try {
+        const res = await sendDatabaseBackup(env);
+        if (!res.ok) {
+          console.error('[Sentra Scheduled Backup Failed]', res.error);
+        }
+      } catch (err) {
+        console.error('[Sentra Scheduled Handler Crash]', err);
+        await sendErrorAlert(env, 'index.ts (scheduled cron)', err);
+      }
+    };
+
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(runBackup());
+    } else {
+      await runBackup();
+    }
+  },
 } satisfies ExportedHandler<Env>;
+
