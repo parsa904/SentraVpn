@@ -5,23 +5,42 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { parseSubscriptionPayload } from '../../cloudflare-worker/src/outboundAnalyzer.ts';
+import {
+  parseSubscriptionPayload,
+  validateSingboxOutboundStrict,
+} from '../../cloudflare-worker/src/outboundAnalyzer.ts';
+import {
+  compilePlanTierSingboxConfig,
+  compileSingleNodeCheckConfig,
+} from '../../cloudflare-worker/src/singboxCompiler.ts';
+import type {
+  BundleCheckSummary,
+  DonatedOutboundRow,
+  PlanTier,
+} from '../../cloudflare-worker/src/types.ts';
 
 const execFileAsync = promisify(execFile);
 
-interface RemoteNode {
+export interface RemoteNode {
   id: number;
   tag: string;
   protocol: string;
   server_address: string;
   server_port: number;
   config_json: string;
+  compiled_outbound_json?: string | null;
   country_code: string;
   status: string;
   fail_count: number;
   is_official: boolean;
   allocation_mode: string;
+  assigned_tier?: string;
+  allow_web?: number;
+  allow_download?: number;
+  allow_gaming?: number;
+  allow_static_ip?: number;
   fingerprint_sha256?: string | null;
 }
 
@@ -32,7 +51,7 @@ interface RemoteSubscriptionSource {
   tag: string | null;
 }
 
-interface NodeHealthResult {
+export interface NodeHealthResult {
   outbound_id: number;
   latency_ms: number;
   jitter_ms: number;
@@ -43,6 +62,9 @@ interface NodeHealthResult {
   trading_safe: boolean;
   is_healthy: boolean;
   security_passed: boolean;
+  quarantined: boolean;
+  validation_error: string | null;
+  compiled_outbound_json: string | null;
   error_msg: string | null;
 }
 
@@ -52,6 +74,7 @@ interface DiscoveredSubNodeReport {
   server_address: string;
   server_port: number;
   config_json: string;
+  compiled_outbound_json: string;
   raw_link: string;
   fingerprint_sha256: string;
   country_code: string;
@@ -70,6 +93,7 @@ interface SubscriptionSourceHealthReport {
   category: string;
   total_nodes: number;
   healthy_nodes: number;
+  quarantined_nodes: number;
   error_msg: string | null;
   discovered_nodes: DiscoveredSubNodeReport[];
 }
@@ -299,6 +323,132 @@ async function hasSingboxBinary(): Promise<boolean> {
   }
 }
 
+export type SingboxCheckExecutor = (
+  bin: string,
+  args: string[]
+) => Promise<{ stdout: string; stderr: string }>;
+
+const defaultSingboxCheckExecutor: SingboxCheckExecutor = async (bin, args) => {
+  const res = await execFileAsync(bin, args, { timeout: 6000, maxBuffer: 512 * 1024 });
+  return { stdout: String(res.stdout || ''), stderr: String(res.stderr || '') };
+};
+
+const SINGBOX_WARNING_OR_ERROR_RE =
+  /(^|\s)(WARN|WARNING|ERROR|FATAL|PANIC)\b|deprecated|unknown field|invalid\s+/i;
+
+/**
+ * Runs real `sing-box check -c <temp.json>` against a generated sing-box 1.14+ config.
+ * Treats both non-zero exit codes AND any WARN/DEPRECATED/ERROR lines as failures
+ * so incompatible schemas are quarantined before ever reaching client apps.
+ */
+export async function runSingboxCheck(
+  configObj: Record<string, unknown>,
+  options: {
+    singboxAvailable?: boolean;
+    singboxBin?: string;
+    executor?: SingboxCheckExecutor;
+  } = {}
+): Promise<{ ok: boolean; error: string | null }> {
+  if (options.singboxAvailable === false) {
+    return { ok: true, error: null };
+  }
+
+  const tmpFile = path.join(
+    os.tmpdir(),
+    `sentra-sbcheck-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`
+  );
+  const bin = options.singboxBin || SINGBOX_BIN;
+  const executor = options.executor || defaultSingboxCheckExecutor;
+
+  try {
+    await fs.writeFile(tmpFile, JSON.stringify(configObj), { mode: 0o600 });
+    const { stdout, stderr } = await executor(bin, ['check', '-c', tmpFile]);
+    const combined = `${stdout}\n${stderr}`.trim();
+    if (combined && SINGBOX_WARNING_OR_ERROR_RE.test(combined)) {
+      return {
+        ok: false,
+        error: `sing-box check warning/error: ${combined.slice(0, 320)}`,
+      };
+    }
+    return { ok: true, error: null };
+  } catch (err) {
+    const e = err as { stderr?: string; stdout?: string; message?: string };
+    const detail = (e.stderr || e.stdout || e.message || String(err)).trim();
+    return {
+      ok: false,
+      error: `sing-box check failed: ${detail.slice(0, 320)}`,
+    };
+  } finally {
+    await fs.unlink(tmpFile).catch(() => undefined);
+  }
+}
+
+/**
+ * Stage 1 (Isolation Check): Strictly validates a single outbound against the
+ * sing-box 1.14+ protocol/transport whitelist AND executes real `sing-box check`
+ * on a minimal skeleton containing only this node.
+ */
+export async function validateNodeStage1(
+  rawConfigObj: unknown,
+  options: {
+    singboxAvailable?: boolean;
+    singboxBin?: string;
+    executor?: SingboxCheckExecutor;
+  } = {}
+): Promise<
+  | { ok: true; compiledJson: string; outbound: Record<string, unknown> }
+  | { ok: false; error: string }
+> {
+  const strict = validateSingboxOutboundStrict(rawConfigObj);
+  if (!strict.ok) {
+    return { ok: false, error: strict.error };
+  }
+
+  const skeleton = compileSingleNodeCheckConfig(strict.outbound);
+  const checkRes = await runSingboxCheck(skeleton, options);
+  if (!checkRes.ok) {
+    return { ok: false, error: checkRes.error || 'Stage-1 sing-box check failed' };
+  }
+
+  return {
+    ok: true,
+    compiledJson: strict.compiledJson,
+    outbound: strict.outbound as unknown as Record<string, unknown>,
+  };
+}
+
+/**
+ * Stage 2 (Full Bundle Check): Builds complete sing-box 1.14+ JSON configs for
+ * every plan tier (`free`, `pro`, `flow_plus`) from all verified healthy nodes
+ * and validates each full bundle with `sing-box check` before reporting to Worker.
+ */
+export async function validatePlanBundlesStage2(
+  healthyDonatedRows: DonatedOutboundRow[],
+  options: {
+    singboxAvailable?: boolean;
+    singboxBin?: string;
+    executor?: SingboxCheckExecutor;
+  } = {}
+): Promise<BundleCheckSummary[]> {
+  const tiers: PlanTier[] = ['free', 'pro', 'flow_plus'];
+  const summaries: BundleCheckSummary[] = [];
+
+  for (const planTier of tiers) {
+    const bundle = compilePlanTierSingboxConfig([], healthyDonatedRows, planTier, {
+      includeClashApi: true,
+    });
+    const checkRes = await runSingboxCheck(bundle.config, options);
+    summaries.push({
+      plan_tier: planTier,
+      passed: checkRes.ok,
+      node_count: bundle.nodeCount,
+      error: checkRes.error,
+    });
+  }
+
+  return summaries;
+}
+
 function getFreeLoopbackPort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -432,7 +582,10 @@ async function evaluateNode(
 ): Promise<NodeHealthResult> {
   let parsedConfig: Record<string, unknown>;
   try {
-    parsedConfig = JSON.parse(node.config_json) as Record<string, unknown>;
+    parsedConfig = JSON.parse(node.compiled_outbound_json || node.config_json) as Record<
+      string,
+      unknown
+    >;
   } catch {
     return {
       outbound_id: node.id,
@@ -445,11 +598,35 @@ async function evaluateNode(
       trading_safe: false,
       is_healthy: false,
       security_passed: false,
+      quarantined: true,
+      validation_error: 'Invalid JSON in stored config_json',
+      compiled_outbound_json: null,
       error_msg: 'Invalid JSON in stored config_json',
     };
   }
 
-  const security = auditSecurity(node.protocol, parsedConfig);
+  // Stage 1: Strict protocol/transport whitelist + isolated `sing-box check`
+  const stage1 = await validateNodeStage1(parsedConfig, { singboxAvailable });
+  if (!stage1.ok) {
+    return {
+      outbound_id: node.id,
+      latency_ms: 9999,
+      jitter_ms: 9999,
+      speed_mbps: 0,
+      speed_score: 0,
+      health_score: 0,
+      gemini_ok: false,
+      trading_safe: false,
+      is_healthy: false,
+      security_passed: false,
+      quarantined: true,
+      validation_error: stage1.error,
+      compiled_outbound_json: null,
+      error_msg: stage1.error,
+    };
+  }
+
+  const security = auditSecurity(node.protocol, stage1.outbound);
   if (!security.passed) {
     return {
       outbound_id: node.id,
@@ -462,6 +639,9 @@ async function evaluateNode(
       trading_safe: false,
       is_healthy: false,
       security_passed: false,
+      quarantined: true,
+      validation_error: security.reason,
+      compiled_outbound_json: null,
       error_msg: security.reason,
     };
   }
@@ -476,6 +656,7 @@ async function evaluateNode(
       resolvedIp = lookup.address;
     }
     if (isPrivateIp(resolvedIp)) {
+      const errMsg = `Blocked private/restricted IP: ${resolvedIp}`;
       return {
         outbound_id: node.id,
         latency_ms: 9999,
@@ -487,7 +668,10 @@ async function evaluateNode(
         trading_safe: false,
         is_healthy: false,
         security_passed: false,
-        error_msg: `Blocked private/restricted IP: ${resolvedIp}`,
+        quarantined: true,
+        validation_error: errMsg,
+        compiled_outbound_json: null,
+        error_msg: errMsg,
       };
     }
   } catch (err) {
@@ -502,6 +686,9 @@ async function evaluateNode(
       trading_safe: false,
       is_healthy: false,
       security_passed: true,
+      quarantined: false,
+      validation_error: null,
+      compiled_outbound_json: stage1.compiledJson,
       error_msg: `DNS lookup failed: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
@@ -515,12 +702,15 @@ async function evaluateNode(
       gemini_ok: false,
       trading_safe: false,
       security_passed: true,
+      quarantined: false,
+      validation_error: null,
+      compiled_outbound_json: stage1.compiledJson,
       error_msg: 'Node unreachable or latency exceeded threshold',
     };
   }
 
   const targetReadiness = await probeGeminiAndTrading(
-    parsedConfig,
+    stage1.outbound,
     netStats.jitter_ms,
     singboxAvailable
   );
@@ -539,6 +729,9 @@ async function evaluateNode(
     trading_safe: targetReadiness.trading_safe,
     is_healthy: true,
     security_passed: true,
+    quarantined: false,
+    validation_error: null,
+    compiled_outbound_json: stage1.compiledJson,
     error_msg: null,
   };
 }
@@ -564,16 +757,127 @@ async function runWithConcurrency<T, R>(
   return results;
 }
 
-async function validatePublicSubscriptionUrl(rawUrl: string): Promise<URL> {
-  const parsed = new URL(rawUrl.trim());
-  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    throw new Error('Unsupported subscription protocol');
+export const MAX_SUBLINK_RESPONSE_BYTES = 1_048_576; // 1 MB hard cap
+export const MAX_SUBLINK_URL_LENGTH = 512;
+
+export const ALLOWED_SUBLINK_PROTOCOLS = new Set([
+  'vless',
+  'vmess',
+  'trojan',
+  'hysteria2',
+  'hy2',
+  'shadowsocks',
+  'ss',
+  'tuic',
+]);
+
+const ALLOWED_SUBLINK_CONTENT_TYPES = new Set([
+  'text/plain',
+  'application/octet-stream',
+  'application/json',
+  'text/yaml',
+  'application/yaml',
+  'application/x-yaml',
+]);
+
+export function isAllowedSubscriptionContentType(contentType: string | null): boolean {
+  if (!contentType || !contentType.trim()) return true;
+  const mime = contentType.split(';')[0].trim().toLowerCase();
+  if (!mime) return true;
+  return ALLOWED_SUBLINK_CONTENT_TYPES.has(mime);
+}
+
+export async function readResponseTextWithLimit(
+  resp: Response,
+  maxBytes: number = MAX_SUBLINK_RESPONSE_BYTES
+): Promise<string> {
+  const declaredLen = resp.headers.get('content-length');
+  if (declaredLen !== null) {
+    const parsedLen = Number.parseInt(declaredLen, 10);
+    if (Number.isFinite(parsedLen) && parsedLen > maxBytes) {
+      throw new Error(`Subscription payload exceeds ${maxBytes} bytes limit`);
+    }
   }
-  const host = parsed.hostname.toLowerCase();
-  if (!host || host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) {
+
+  if (!resp.body) {
+    const text = await resp.text();
+    const byteLen = new TextEncoder().encode(text).byteLength;
+    if (byteLen > maxBytes) {
+      throw new Error(`Subscription payload exceeds ${maxBytes} bytes limit`);
+    }
+    return text;
+  }
+
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error(`Subscription payload exceeds ${maxBytes} bytes limit`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder('utf-8').decode(merged);
+}
+
+export function filterAllowedSublinkNodes<T extends { protocol: string }>(nodes: T[]): T[] {
+  return nodes.filter((node) =>
+    ALLOWED_SUBLINK_PROTOCOLS.has(String(node.protocol || '').trim().toLowerCase())
+  );
+}
+
+export async function validatePublicSubscriptionUrl(
+  rawUrl: string,
+  lookupFn: (hostname: string) => Promise<{ address: string }> = (h) => dns.lookup(h)
+): Promise<URL> {
+  const trimmed = rawUrl.trim();
+  if (!trimmed || trimmed.length > MAX_SUBLINK_URL_LENGTH) {
+    throw new Error(`Subscription URL exceeds ${MAX_SUBLINK_URL_LENGTH} characters limit`);
+  }
+  const parsed = new URL(trimmed);
+  if (parsed.protocol !== 'https:') {
+    throw new Error('Only HTTPS subscription URLs are permitted');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('Subscription URL must not contain embedded credentials');
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (
+    !host ||
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host.endsWith('.lan') ||
+    host.endsWith('.home') ||
+    host.endsWith('.arpa') ||
+    host === 'metadata.google.internal' ||
+    host.endsWith('.metadata.google.internal') ||
+    host === 'cloudflare.internal' ||
+    host.endsWith('.cloudflare.internal') ||
+    host === 'workers.internal' ||
+    host.endsWith('.workers.internal')
+  ) {
     throw new Error(`Blocked internal host: ${host}`);
   }
-  const resolvedIp = net.isIP(host) ? host : (await dns.lookup(host)).address;
+  const resolvedIp = net.isIP(host) ? host : (await lookupFn(host)).address;
   if (isPrivateIp(resolvedIp)) {
     throw new Error(`Blocked private subscription IP: ${resolvedIp}`);
   }
@@ -594,6 +898,7 @@ async function evaluateSubscriptionSource(
       category: source.category,
       total_nodes: 0,
       healthy_nodes: 0,
+      quarantined_nodes: 0,
       error_msg: err instanceof Error ? err.message : 'Invalid subscription URL',
       discovered_nodes: [],
     };
@@ -611,37 +916,54 @@ async function evaluateSubscriptionSource(
         category: source.category,
         total_nodes: 0,
         healthy_nodes: 0,
+        quarantined_nodes: 0,
         error_msg: `HTTP ${resp.status}`,
         discovered_nodes: [],
       };
     }
-    bodyText = await resp.text();
+    const contentType = resp.headers.get('content-type');
+    if (!isAllowedSubscriptionContentType(contentType)) {
+      return {
+        source_id: source.id,
+        category: source.category,
+        total_nodes: 0,
+        healthy_nodes: 0,
+        quarantined_nodes: 0,
+        error_msg: `Blocked Content-Type: ${contentType || 'unknown'}`,
+        discovered_nodes: [],
+      };
+    }
+    bodyText = await readResponseTextWithLimit(resp, MAX_SUBLINK_RESPONSE_BYTES);
   } catch (err) {
     return {
       source_id: source.id,
       category: source.category,
       total_nodes: 0,
       healthy_nodes: 0,
+      quarantined_nodes: 0,
       error_msg: err instanceof Error ? err.message : 'Subscription fetch failed',
       discovered_nodes: [],
     };
   }
 
   const parsedSub = await parseSubscriptionPayload(bodyText);
-  const candidates = parsedSub.nodes.slice(0, MAX_NODES_PER_SUB_SOURCE);
+  const allowedNodes = filterAllowedSublinkNodes(parsedSub.nodes);
+  const candidates = allowedNodes.slice(0, MAX_NODES_PER_SUB_SOURCE);
   if (candidates.length === 0) {
     return {
       source_id: source.id,
       category: source.category,
       total_nodes: 0,
       healthy_nodes: 0,
-      error_msg: 'No valid proxy nodes found in subscription payload',
+      quarantined_nodes: parsedSub.skipped,
+      error_msg: 'No valid allowed proxy nodes found in subscription payload',
       discovered_nodes: [],
     };
   }
 
   const discoveredHealthy: DiscoveredSubNodeReport[] = [];
   let healthyCount = 0;
+  let quarantinedNodes = parsedSub.skipped;
 
   await runWithConcurrency(candidates, CONCURRENCY, async (parsedNode) => {
     const pseudoRemote: RemoteNode = {
@@ -650,7 +972,8 @@ async function evaluateSubscriptionSource(
       protocol: parsedNode.protocol,
       server_address: parsedNode.server_address,
       server_port: parsedNode.server_port,
-      config_json: JSON.stringify(parsedNode.config_json),
+      config_json: parsedNode.compiled_outbound_json,
+      compiled_outbound_json: parsedNode.compiled_outbound_json,
       country_code: parsedNode.country_code,
       status: 'active',
       fail_count: 0,
@@ -659,7 +982,11 @@ async function evaluateSubscriptionSource(
     };
 
     const res = await evaluateNode(pseudoRemote, singboxAvailable);
-    if (res.is_healthy && res.security_passed) {
+    if (res.quarantined) {
+      quarantinedNodes += 1;
+      return;
+    }
+    if (res.is_healthy && res.security_passed && res.compiled_outbound_json) {
       healthyCount += 1;
       if (existingFingerprints.has(parsedNode.fingerprint_sha256)) {
         return;
@@ -670,7 +997,8 @@ async function evaluateSubscriptionSource(
         protocol: parsedNode.protocol,
         server_address: parsedNode.server_address,
         server_port: parsedNode.server_port,
-        config_json: JSON.stringify(parsedNode.config_json),
+        config_json: res.compiled_outbound_json,
+        compiled_outbound_json: res.compiled_outbound_json,
         raw_link: parsedNode.raw_link,
         fingerprint_sha256: parsedNode.fingerprint_sha256,
         country_code: parsedNode.country_code,
@@ -691,6 +1019,7 @@ async function evaluateSubscriptionSource(
     category: source.category,
     total_nodes: parsedSub.nodes.length,
     healthy_nodes: healthyCount,
+    quarantined_nodes: quarantinedNodes,
     error_msg: null,
     discovered_nodes: discoveredHealthy,
   };
@@ -705,7 +1034,7 @@ async function main(): Promise<void> {
 
   const singboxAvailable = await hasSingboxBinary();
   console.log(
-    `[QualityEngine] Starting cycle against ${WORKER_URL} (sing-box available: ${singboxAvailable})`
+    `[QualityEngine] Starting 2-stage validation cycle against ${WORKER_URL} (sing-box available: ${singboxAvailable})`
   );
 
   const listResp = await fetch(`${WORKER_URL}/api/v1/nodes/active`, {
@@ -753,17 +1082,119 @@ async function main(): Promise<void> {
     const report = await evaluateSubscriptionSource(src, existingFingerprints, singboxAvailable);
     subscriptionReports.push(report);
     console.log(
-      `[QualityEngine] Subscription source #${src.id} (${src.category}): healthy=${report.healthy_nodes}/${report.total_nodes}${
+      `[QualityEngine] Subscription source #${src.id} (${src.category}): healthy=${report.healthy_nodes}/${report.total_nodes}, quarantined=${report.quarantined_nodes}${
         report.error_msg ? ` (err: ${report.error_msg})` : ''
       }`
     );
   }
 
+  // Stage 2: Assemble full per-plan sing-box 1.14+ configs and run `sing-box check` on each bundle
+  const nodeById = new Map<number, RemoteNode>(nodes.map((n) => [n.id, n]));
+  const verifiedHealthyForBundle: DonatedOutboundRow[] = [];
+
+  for (const res of results) {
+    if (!res.is_healthy || !res.security_passed || res.quarantined || !res.compiled_outbound_json) {
+      continue;
+    }
+    const srcNode = nodeById.get(res.outbound_id);
+    if (!srcNode) continue;
+    verifiedHealthyForBundle.push({
+      id: srcNode.id,
+      donor_user_id: null,
+      tag: srcNode.tag,
+      protocol: srcNode.protocol,
+      server_address: srcNode.server_address,
+      server_port: srcNode.server_port,
+      config_json: res.compiled_outbound_json,
+      compiled_outbound_json: res.compiled_outbound_json,
+      validation_error: null,
+      latency_ms: res.latency_ms,
+      speed_mbps: res.speed_mbps,
+      assigned_tier: srcNode.assigned_tier || 'web_browsing',
+      health_score: res.health_score,
+      status: 'active',
+      fail_count: 0,
+      raw_link: null,
+      rejection_reason: null,
+      fingerprint_sha256: srcNode.fingerprint_sha256 || null,
+      offline_since: null,
+      is_official: srcNode.is_official ? 1 : 0,
+      label: srcNode.tag,
+      country_code: srcNode.country_code,
+      country_name: srcNode.country_code,
+      allow_web: srcNode.allow_web ?? 1,
+      allow_download: srcNode.allow_download ?? 1,
+      allow_gaming: srcNode.allow_gaming ?? 0,
+      allow_static_ip: srcNode.allow_static_ip ?? 0,
+      gemini_ok: res.gemini_ok ? 1 : 0,
+      trading_safe: res.trading_safe ? 1 : 0,
+      speed_score: res.speed_score,
+      jitter_ms: res.jitter_ms,
+      last_online_at: null,
+      allocation_mode: srcNode.allocation_mode,
+      last_checked_at: new Date().toISOString(),
+    });
+  }
+
+  for (const subRep of subscriptionReports) {
+    const cat = (subRep.category || 'web_browsing').toLowerCase();
+    for (const disc of subRep.discovered_nodes) {
+      verifiedHealthyForBundle.push({
+        id: 0,
+        donor_user_id: null,
+        tag: disc.tag,
+        protocol: disc.protocol,
+        server_address: disc.server_address,
+        server_port: disc.server_port,
+        config_json: disc.compiled_outbound_json,
+        compiled_outbound_json: disc.compiled_outbound_json,
+        validation_error: null,
+        latency_ms: disc.latency_ms,
+        speed_mbps: disc.speed_mbps,
+        assigned_tier: cat,
+        health_score: disc.health_score,
+        status: 'active',
+        fail_count: 0,
+        raw_link: disc.raw_link,
+        rejection_reason: null,
+        fingerprint_sha256: disc.fingerprint_sha256,
+        offline_since: null,
+        is_official: 1,
+        label: disc.tag,
+        country_code: disc.country_code,
+        country_name: disc.country_name,
+        allow_web: cat === 'web_browsing' || cat === 'download' ? 1 : 0,
+        allow_download: cat === 'download' || cat === 'web_browsing' ? 1 : 0,
+        allow_gaming: cat === 'gaming' ? 1 : 0,
+        allow_static_ip: cat === 'static_ip' ? 1 : 0,
+        gemini_ok: disc.gemini_ok ? 1 : 0,
+        trading_safe: disc.trading_safe ? 1 : 0,
+        speed_score: disc.speed_score,
+        jitter_ms: disc.jitter_ms,
+        last_online_at: null,
+        allocation_mode: cat,
+        last_checked_at: new Date().toISOString(),
+      });
+    }
+  }
+
+  const bundleChecks = await validatePlanBundlesStage2(verifiedHealthyForBundle, {
+    singboxAvailable,
+  });
+  for (const bc of bundleChecks) {
+    console.log(
+      `[QualityEngine] Stage-2 Bundle Check [${bc.plan_tier}]: passed=${bc.passed} nodes=${bc.node_count}${
+        bc.error ? ` err=${bc.error}` : ''
+      }`
+    );
+  }
+
   const healthyCount = results.filter((r) => r.is_healthy).length;
+  const quarantinedCount = results.filter((r) => r.quarantined).length;
   const geminiCount = results.filter((r) => r.gemini_ok).length;
   const tradingCount = results.filter((r) => r.trading_safe).length;
   console.log(
-    `[QualityEngine] Evaluated ${results.length} DB nodes (healthy=${healthyCount}, gemini_ok=${geminiCount}, trading_safe=${tradingCount}) and ${subscriptionReports.length} subscription sources.`
+    `[QualityEngine] Evaluated ${results.length} DB nodes (healthy=${healthyCount}, quarantined=${quarantinedCount}, gemini_ok=${geminiCount}, trading_safe=${tradingCount}) and ${subscriptionReports.length} subscription sources.`
   );
 
   const reportResp = await fetch(`${WORKER_URL}/api/v1/nodes/health-report`, {
@@ -777,6 +1208,7 @@ async function main(): Promise<void> {
       runner: 'github-actions-quality-engine',
       results,
       subscription_reports: subscriptionReports,
+      bundle_checks: bundleChecks,
     }),
     signal: AbortSignal.timeout(20_000),
   });
@@ -790,22 +1222,30 @@ async function main(): Promise<void> {
   console.log('[QualityEngine] Health report accepted:', JSON.stringify(summary));
 }
 
-process.on('unhandledRejection', (reason) => {
-  console.error('[QualityEngine] Unhandled rejection:', reason);
-  void reportQualityEngineError('process.unhandledRejection', reason).finally(() => {
+const isDirectMainExecution =
+  typeof process !== 'undefined' &&
+  Array.isArray(process.argv) &&
+  Boolean(process.argv[1]) &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (isDirectMainExecution) {
+  process.on('unhandledRejection', (reason) => {
+    console.error('[QualityEngine] Unhandled rejection:', reason);
+    void reportQualityEngineError('process.unhandledRejection', reason).finally(() => {
+      process.exit(1);
+    });
+  });
+
+  process.on('uncaughtException', (err) => {
+    console.error('[QualityEngine] Uncaught exception:', err);
+    void reportQualityEngineError('process.uncaughtException', err).finally(() => {
+      process.exit(1);
+    });
+  });
+
+  main().catch(async (err) => {
+    console.error('[QualityEngine] Fatal error:', err);
+    await reportQualityEngineError('main()', err, { worker_url: WORKER_URL });
     process.exit(1);
   });
-});
-
-process.on('uncaughtException', (err) => {
-  console.error('[QualityEngine] Uncaught exception:', err);
-  void reportQualityEngineError('process.uncaughtException', err).finally(() => {
-    process.exit(1);
-  });
-});
-
-main().catch(async (err) => {
-  console.error('[QualityEngine] Fatal error:', err);
-  await reportQualityEngineError('main()', err, { worker_url: WORKER_URL });
-  process.exit(1);
-});
+}

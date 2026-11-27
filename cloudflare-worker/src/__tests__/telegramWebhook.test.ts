@@ -475,18 +475,22 @@ test('User panel reply buttons, inline callbacks, and multi-step telegram_states
       message: { message_id: 1, chat: { id: 555001, type: 'private' }, from: user, text: '/start' },
     });
 
-    // 2. Reply buttons: Account, Get Sub, iOS, Upgrade, Guide, Download App, Support
+    // 2. Reply buttons: Account (shows 8-digit code, zero /sub/ links), Upgrade, Guide, Download App, Support
     const accountCalls = await sendUpdate({
       update_id: 402,
       message: { message_id: 2, chat: { id: 555001, type: 'private' }, from: user, text: '👤 حساب کاربری' },
     });
-    assert.ok(String(accountCalls[0].body.text).includes('حجم باقیمانده'));
+    assert.ok(String(accountCalls[0].body.text).includes('کد اتصال ۸ رقمی'));
+    assert.ok(String(accountCalls[0].body.text).includes('باقیمانده'));
+    assert.equal(String(accountCalls[0].body.text).includes('/sub/'), false);
 
+    // Deprecated button text gently redirects to account view (never sends /sub/ links)
     const subCalls = await sendUpdate({
       update_id: 403,
       message: { message_id: 3, chat: { id: 555001, type: 'private' }, from: user, text: '🔑 دریافت کانفیگ و کد اتصال' },
     });
-    assert.ok(String(subCalls[0].body.text).includes('https://sentra-core.kziepr.workers.dev/sub/'));
+    assert.equal(String(subCalls[0].body.text).includes('/sub/'), false);
+    assert.ok(String(subCalls[0].body.text).includes('کد اتصال ۸ رقمی'));
 
     const guideCalls = await sendUpdate({
       update_id: 404,
@@ -496,24 +500,24 @@ test('User panel reply buttons, inline callbacks, and multi-step telegram_states
 
     const dlCalls = await sendUpdate({
       update_id: 405,
-      message: { message_id: 5, chat: { id: 555001, type: 'private' }, from: user, text: '📥 دانلود اپلیکیشن Sentra Connect' },
+      message: { message_id: 5, chat: { id: 555001, type: 'private' }, from: user, text: '📥 دانلود اپلیکیشن' },
     });
-    assert.ok(String(dlCalls[0].body.text).includes('دانلود اپلیکیشن رسمی Sentra Connect'));
+    assert.ok(String(dlCalls[0].body.text).includes('دانلود اپلیکیشن رسمی SentraVPN'));
 
     // 3. Inline callback: answerCallbackQuery MUST be called first
     const cbGuide = await sendUpdate({
       update_id: 406,
       callback_query: {
-        id: 'cb_guide_ios',
+        id: 'cb_guide_android',
         from: user,
         message: { message_id: 70, chat: { id: 555001, type: 'private' } },
-        data: 'user_guide_ios',
+        data: 'user_guide_android',
       },
     });
     assert.equal(cbGuide[0].method, 'answerCallbackQuery');
-    assert.equal(cbGuide[0].body.callback_query_id, 'cb_guide_ios');
+    assert.equal(cbGuide[0].body.callback_query_id, 'cb_guide_android');
     assert.equal(cbGuide[1].method, 'editMessageText');
-    assert.ok(String(cbGuide[1].body.text).includes('راهنمای اتصال در iOS'));
+    assert.ok(String(cbGuide[1].body.text).includes('راهنمای اتصال در اندروید'));
 
     // 4. Support ticket multi-step FSM -> inserts into support_tickets
     const cbTicket = await sendUpdate({
@@ -545,7 +549,7 @@ test('User panel reply buttons, inline callbacks, and multi-step telegram_states
     assert.equal(ticketRow.category, 'connection');
     assert.equal(ticketRow.status, 'open');
 
-    // 5. Payment receipt multi-step FSM (photo upload) -> inserts into donations
+    // 5. Payment receipt multi-step FSM (photo upload) -> inserts into donations with 120,000 Toman Pro price
     const cbReceipt = await sendUpdate({
       update_id: 409,
       callback_query: {
@@ -556,7 +560,7 @@ test('User panel reply buttons, inline callbacks, and multi-step telegram_states
       },
     });
     assert.equal(cbReceipt[0].method, 'answerCallbackQuery');
-    assert.ok(String(cbReceipt[1].body.text).includes('180,000'));
+    assert.ok(String(cbReceipt[1].body.text).includes('120,000'));
 
     const receiptReply = await sendUpdate({
       update_id: 410,
@@ -572,7 +576,7 @@ test('User panel reply buttons, inline callbacks, and multi-step telegram_states
       .prepare('SELECT amount, receipt_file_id, status FROM donations LIMIT 1')
       .get() as { amount: number; receipt_file_id: string; status: string };
     assert.ok(donationRow);
-    assert.equal(donationRow.amount, 180000);
+    assert.equal(donationRow.amount, 120000);
     assert.equal(donationRow.receipt_file_id, 'AgAC_RECEIPT_123');
     assert.equal(donationRow.status, 'pending');
 
@@ -583,7 +587,7 @@ test('User panel reply buttons, inline callbacks, and multi-step telegram_states
         id: 'cb_donate',
         from: user,
         message: { message_id: 70, chat: { id: 555001, type: 'private' } },
-        data: 'user_donate_outbound',
+        data: 'user_donate_single_node',
       },
     });
     const escapeFsmCalls = await sendUpdate({
@@ -872,14 +876,14 @@ test('Admin panel guard, official node ingestion, subscription sources CRUD, pen
       .prepare('SELECT id FROM users WHERE telegram_id = ?')
       .get(999002) as { id: number };
 
-    // User donates a node via FSM -> inserted as status = 'pending'
+    // User selects single-node donation via FSM -> inserted as status = 'pending'
     await sendUpdate({
       update_id: 614,
       callback_query: {
         id: 'cb_user_donate_ob',
         from: regularUser,
         message: { message_id: 120, chat: { id: 999002, type: 'private' } },
-        data: 'user_donate_outbound',
+        data: 'user_donate_single_node',
       },
     });
     await sendUpdate({
@@ -974,7 +978,7 @@ test('Admin panel guard, official node ingestion, subscription sources CRUD, pen
     sqlite
       .prepare(
         `INSERT INTO donations (user_id, amount, receipt_file_id, file_unique_id, status)
-         VALUES (?, 180000, 'file_approve_1', 'uniq_approve_1', 'pending')`
+         VALUES (?, 120000, 'file_approve_1', 'uniq_approve_1', 'pending')`
       )
       .run(regularUserRow.id);
     const donApprove = sqlite

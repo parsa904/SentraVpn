@@ -344,12 +344,200 @@ class SentraVpnService : VpnService() {
         return true
     }
 
-    private fun startCoreEngine(configJson: String) {
-        val configFile = File(cacheDir, "singbox_active_config.json")
-        FileOutputStream(configFile).use { it.write(configJson.toByteArray(Charsets.UTF_8)) }
+    private fun candidateConfigFile(): File = File(filesDir, "candidate_config.json")
+    private fun lastKnownGoodConfigFile(): File = File(filesDir, "last_known_good_config.json")
 
+    private fun validateSingboxConfigJson(configJson: String): String? {
+        return try {
+            val root = org.json.JSONObject(configJson)
+            val inbounds = root.optJSONArray("inbounds")
+            if (inbounds == null || inbounds.length() == 0) {
+                return "بخش الزامی inbounds در candidate_config.json یافت نشد یا خالی است."
+            }
+            val outbounds = root.optJSONArray("outbounds")
+            if (outbounds == null || outbounds.length() == 0) {
+                return "بخش الزامی outbounds در candidate_config.json یافت نشد یا خالی است."
+            }
+            if (root.optJSONObject("route") == null) {
+                return "بخش الزامی route در candidate_config.json یافت نشد."
+            }
+            var hasUsable = false
+            for (i in 0 until outbounds.length()) {
+                val ob = outbounds.optJSONObject(i) ?: continue
+                val t = ob.optString("type", "").lowercase()
+                if (t.isNotEmpty() && t !in setOf("selector", "urltest", "block", "dns")) {
+                    hasUsable = true
+                    break
+                }
+            }
+            if (!hasUsable) {
+                return "هیچ نود اوتباند معتبری در candidate_config.json وجود ندارد."
+            }
+            null
+        } catch (e: Exception) {
+            "خطای نحوی JSON در candidate_config.json: ${e.message}"
+        }
+    }
+
+    private fun runAndroidSingboxPreCheck(configJson: String, configFile: File): String? {
+        // 1. Try Libbox.checkConfig(configJson) via reflection if libbox.aar is packaged
+        try {
+            val libboxClass = Class.forName("io.nekohasekai.libbox.Libbox")
+            val checkMethod = libboxClass.methods.firstOrNull {
+                it.name == "checkConfig" && it.parameterCount == 1
+            }
+            if (checkMethod != null) {
+                checkMethod.invoke(null, configJson)
+                return null
+            }
+        } catch (e: java.lang.reflect.InvocationTargetException) {
+            val cause = e.targetException?.message ?: e.message ?: "Libbox.checkConfig failed"
+            return "Libbox.checkConfig failed: $cause"
+        } catch (_: ClassNotFoundException) {
+            // Fall through to native sing-box binary check
+        } catch (_: Exception) {
+            // Fall through to native sing-box binary check
+        }
+
+        // 2. Try native `sing-box check -c candidate_config.json`
+        val nativeDir = applicationInfo.nativeLibraryDir
+        val binary = listOf(File(nativeDir, "libsingbox.so"), File(nativeDir, "sing-box"))
+            .firstOrNull { it.exists() }
+        if (binary != null) {
+            try {
+                if (!binary.canExecute()) binary.setExecutable(true, true)
+                val proc = ProcessBuilder(binary.absolutePath, "check", "-c", configFile.absolutePath)
+                    .directory(cacheDir)
+                    .redirectErrorStream(true)
+                    .start()
+                val output = BufferedReader(InputStreamReader(proc.inputStream)).use { it.readText() }.trim()
+                val exitCode = proc.waitFor()
+                if (exitCode != 0) {
+                    return "sing-box check failed (exit=$exitCode): ${output.take(400)}"
+                }
+            } catch (e: Exception) {
+                return "sing-box check invocation error: ${e.message}"
+            }
+        }
+        return null
+    }
+
+    private fun launchCoreWithConfig(configJson: String, configFile: File) {
         if (!tryStartLibboxEngine(configJson)) {
             startNativeSingboxBinary(configFile)
+        }
+    }
+
+    private fun promoteCandidateToLastKnownGood(candidateJson: String) {
+        try {
+            FileOutputStream(lastKnownGoodConfigFile()).use {
+                it.write(candidateJson.toByteArray(Charsets.UTF_8))
+            }
+            writeCoreLog("[Core] Candidate config passed 5s stability check -> promoted to last_known_good_config.json")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to promote last_known_good_config.json: ${e.message}")
+        }
+    }
+
+    private fun performAutoRollback(reason: String, mode: String, stage: String): Boolean {
+        val lastGoodFile = lastKnownGoodConfigFile()
+        if (!lastGoodFile.exists()) {
+            SentraErrorReporter.reportRollbackError(
+                context = applicationContext,
+                singboxError = reason,
+                rolledBackToGoodConfig = false,
+                extraContext = mapOf("mode" to mode, "stage" to stage)
+            )
+            return false
+        }
+
+        return try {
+            val goodJson = lastGoodFile.readText(Charsets.UTF_8)
+            val structuralErr = validateSingboxConfigJson(goodJson)
+            if (structuralErr != null) {
+                throw IllegalStateException(structuralErr)
+            }
+            stopCoreEngine()
+            launchCoreWithConfig(goodJson, lastGoodFile)
+            activeConfig = goodJson
+            writeCoreLog("[Auto-Rollback] Restored last_known_good_config.json after candidate failure ($stage): $reason")
+            SentraErrorReporter.reportRollbackError(
+                context = applicationContext,
+                singboxError = reason,
+                rolledBackToGoodConfig = true,
+                extraContext = mapOf("mode" to mode, "stage" to stage)
+            )
+            true
+        } catch (rbErr: Exception) {
+            Log.e(TAG, "Auto-Rollback to last_known_good_config.json failed: ${rbErr.message}", rbErr)
+            SentraErrorReporter.reportRollbackError(
+                context = applicationContext,
+                singboxError = "$reason | rollback failed: ${rbErr.message}",
+                rolledBackToGoodConfig = false,
+                extraContext = mapOf("mode" to mode, "stage" to stage)
+            )
+            false
+        }
+    }
+
+    private fun startCoreEngine(configJson: String, mode: String) {
+        val candidateFile = candidateConfigFile()
+        FileOutputStream(candidateFile).use { it.write(configJson.toByteArray(Charsets.UTF_8)) }
+
+        // 1. Pre-validate JSON structure + `Libbox.checkConfig` / `sing-box check`
+        val preCheckError = validateSingboxConfigJson(configJson)
+            ?: runAndroidSingboxPreCheck(configJson, candidateFile)
+
+        if (preCheckError != null) {
+            Log.w(TAG, "Candidate config pre-check failed: $preCheckError")
+            if (performAutoRollback(preCheckError, mode, "precheck")) {
+                return
+            }
+            throw IllegalStateException(preCheckError)
+        }
+
+        // 2. Launch candidate config; rollback immediately if startup throws
+        try {
+            launchCoreWithConfig(configJson, candidateFile)
+        } catch (startErr: Exception) {
+            val reason = startErr.message ?: startErr.toString()
+            if (performAutoRollback(reason, mode, "startup")) {
+                return
+            }
+            throw startErr
+        }
+
+        // 3. 5-second stability monitor: promote ONLY after 5s healthy run; rollback on early crash
+        val candidateSnapshot = configJson
+        Thread {
+            try {
+                var elapsedMs = 0L
+                val stepMs = 250L
+                val stabilityWindowMs = 5_000L
+                while (elapsedMs < stabilityWindowMs) {
+                    Thread.sleep(stepMs)
+                    elapsedMs += stepMs
+                    if (!isServiceRunning.get()) return@Thread
+
+                    val proc = singboxProcess
+                    if (proc != null && !proc.isAlive) {
+                        val exitCode = try { proc.exitValue() } catch (_: Exception) { -1 }
+                        val crashReason = "sing-box process crashed within ${elapsedMs}ms (exit=$exitCode)"
+                        if (!performAutoRollback(crashReason, mode, "stability_5s")) {
+                            stopVpnTunnel()
+                        }
+                        return@Thread
+                    }
+                }
+                if (isServiceRunning.get()) {
+                    promoteCandidateToLastKnownGood(candidateSnapshot)
+                }
+            } catch (_: InterruptedException) {
+                // Service stopped during stability check
+            }
+        }.apply {
+            isDaemon = true
+            start()
         }
     }
 
@@ -406,9 +594,9 @@ class SentraVpnService : VpnService() {
         startForeground(NOTIFICATION_ID, notification)
 
         try {
-            startCoreEngine(configJson)
-
             isServiceRunning.set(true)
+            startCoreEngine(configJson, mode)
+
             isVpnActive = true
 
             registerNetworkCallback()
@@ -419,6 +607,7 @@ class SentraVpnService : VpnService() {
             SentraVpnPlugin.broadcastStatus("Connected", mode)
             writeCoreLog("[Core] Sentra Connect Android VpnService online (mode: $mode)")
         } catch (e: Exception) {
+            isServiceRunning.set(false)
             Log.e(TAG, "Failed to start VPN tunnel: ${e.message}", e)
             writeCoreLog("[ERROR] Failed to start Android VPN tunnel: ${e.message}")
             SentraErrorReporter.reportError(

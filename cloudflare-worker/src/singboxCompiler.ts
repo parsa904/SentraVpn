@@ -1,8 +1,13 @@
-import { enforceRealityUtls, type SingboxOutboundConfig } from './outboundAnalyzer.ts';
+import {
+  enforceRealityUtls,
+  validateSingboxOutboundStrict,
+  type SingboxOutboundConfig,
+} from './outboundAnalyzer.ts';
 import type {
   ConnectionMode,
   DonatedOutboundRow,
   OutboundRow,
+  PlanTier,
   SubscriptionRow,
 } from './types.ts';
 
@@ -27,7 +32,26 @@ export const IR_SPLIT_TUNNEL_DOMAINS = [
   'samanbank.ir',
 ] as const;
 
-export function tierHasStaticIp(tier: string): boolean {
+export function resolvePlanTier(sub: Pick<SubscriptionRow, 'tier' | 'plan_tier'>): 'free' | 'pro' | 'flow_plus' {
+  const explicit = (sub.plan_tier || '').trim().toLowerCase();
+  if (explicit === 'flow_plus') return 'flow_plus';
+  if (explicit === 'pro') return 'pro';
+  if (explicit === 'free') {
+    const legacy = (sub.tier || '').trim().toLowerCase();
+    if (legacy.includes('flow')) return 'flow_plus';
+    if (legacy.includes('pro') || legacy.includes('static')) return 'pro';
+    return 'free';
+  }
+  const legacy = (sub.tier || '').trim().toLowerCase();
+  if (legacy.includes('flow')) return 'flow_plus';
+  if (legacy.includes('pro') || legacy.includes('static') || legacy.includes('gaming')) return 'pro';
+  return 'free';
+}
+
+export function tierHasStaticIp(tier: string, planTier?: string | null): boolean {
+  const normalizedPlan = (planTier || '').trim().toLowerCase();
+  if (normalizedPlan === 'pro' || normalizedPlan === 'flow_plus') return true;
+
   const lower = tier.trim().toLowerCase();
   if (!lower || lower === 'sentra lite' || lower === 'lite' || lower === 'free') {
     return false;
@@ -42,15 +66,18 @@ export function tierHasStaticIp(tier: string): boolean {
   );
 }
 
-export function tierHasGaming(tier: string): boolean {
+export function tierHasGaming(tier: string, planTier?: string | null): boolean {
+  const normalizedPlan = (planTier || '').trim().toLowerCase();
+  if (normalizedPlan === 'flow_plus') return true;
+  if (normalizedPlan === 'pro') return false;
+
   const lower = tier.trim().toLowerCase();
-  if (!lower || lower === 'sentra lite' || lower === 'lite' || lower === 'free') {
+  if (!lower || lower === 'sentra lite' || lower === 'lite' || lower === 'free' || lower === 'sentra pro' || lower === 'pro') {
     return false;
   }
   return (
     lower.includes('gaming') ||
     lower.includes('game') ||
-    lower.includes('pro') ||
     lower.includes('flow') ||
     lower.includes('ultra') ||
     lower.includes('vip') ||
@@ -58,7 +85,45 @@ export function tierHasGaming(tier: string): boolean {
   );
 }
 
-function buildCoreOutboundNode(ob: OutboundRow, tag: string): SingboxOutboundConfig {
+export function subscriptionHasSpecialTrialCredit(
+  sub: Pick<SubscriptionRow, 'special_quota_bytes' | 'special_used_bytes'>
+): boolean {
+  const quota = Number(sub.special_quota_bytes || 0);
+  const used = Number(sub.special_used_bytes || 0);
+  return quota > 0 && used < quota;
+}
+
+export function subscriptionCanAccessSpecialMode(
+  sub: Pick<SubscriptionRow, 'tier' | 'plan_tier' | 'special_quota_bytes' | 'special_used_bytes'>,
+  mode: 'static_ip' | 'gaming'
+): { allowed: boolean; isTrial: boolean; quotaExceeded: boolean } {
+  const plan = resolvePlanTier(sub);
+  const specialQuota = Number(sub.special_quota_bytes || 0);
+  const specialUsed = Number(sub.special_used_bytes || 0);
+
+  if (plan === 'flow_plus') {
+    const quotaExceeded = specialQuota > 0 && specialUsed >= specialQuota;
+    return { allowed: !quotaExceeded, isTrial: false, quotaExceeded };
+  }
+
+  if (plan === 'pro') {
+    if (mode !== 'static_ip') {
+      return { allowed: false, isTrial: false, quotaExceeded: false };
+    }
+    const quotaExceeded = specialQuota > 0 && specialUsed >= specialQuota;
+    return { allowed: !quotaExceeded, isTrial: false, quotaExceeded };
+  }
+
+  // Free plan: allowed ONLY when one-time 1GB special trial credit is active & remaining
+  if (specialQuota > 0) {
+    const quotaExceeded = specialUsed >= specialQuota;
+    return { allowed: !quotaExceeded, isTrial: true, quotaExceeded };
+  }
+
+  return { allowed: false, isTrial: false, quotaExceeded: false };
+}
+
+function buildCoreOutboundNode(ob: OutboundRow, tag: string): SingboxOutboundConfig | null {
   switch (ob.protocol.toLowerCase()) {
     case 'vless': {
       const node: SingboxOutboundConfig = {
@@ -67,7 +132,6 @@ function buildCoreOutboundNode(ob: OutboundRow, tag: string): SingboxOutboundCon
         server: ob.server_address,
         server_port: ob.server_port,
         uuid: ob.uuid || '00000000-0000-0000-0000-000000000000',
-        flow: '',
         packet_encoding: 'xudp',
       };
       if (ob.tls_enabled === 1) {
@@ -91,6 +155,16 @@ function buildCoreOutboundNode(ob: OutboundRow, tag: string): SingboxOutboundCon
       }
       return enforceRealityUtls(node);
     }
+    case 'vmess':
+      return {
+        type: 'vmess',
+        tag,
+        server: ob.server_address,
+        server_port: ob.server_port,
+        uuid: ob.uuid || '00000000-0000-0000-0000-000000000000',
+        security: 'auto',
+        alter_id: 0,
+      };
     case 'trojan':
       return {
         type: 'trojan',
@@ -116,21 +190,31 @@ function buildCoreOutboundNode(ob: OutboundRow, tag: string): SingboxOutboundCon
           server_name: ob.tls_sni || ob.server_address,
         },
       };
-    case 'http':
+    case 'tuic':
       return {
-        type: 'http',
+        type: 'tuic',
         tag,
         server: ob.server_address,
         server_port: ob.server_port,
+        uuid: ob.uuid || '00000000-0000-0000-0000-000000000000',
+        password: ob.password || 'sentra_pass',
+        congestion_control: 'bbr',
+        tls: {
+          enabled: true,
+          server_name: ob.tls_sni || ob.server_address,
+        },
+      };
+    case 'shadowsocks':
+      return {
+        type: 'shadowsocks',
+        tag,
+        server: ob.server_address,
+        server_port: ob.server_port,
+        method: 'aes-256-gcm',
+        password: ob.password || 'sentra_pass',
       };
     default:
-      return {
-        type: 'socks',
-        tag,
-        server: ob.server_address,
-        server_port: ob.server_port,
-        version: '5',
-      };
+      return null;
   }
 }
 
@@ -143,6 +227,9 @@ export interface CompileClientOptions {
 
 /**
  * Compiles a strict sing-box 1.12+ / 1.14+ compliant client configuration JSON:
+ * - Reads ONLY precompiled `compiled_outbound_json` (legacy fallback: `config_json`)
+ *   and never re-parses raw proxy links at request time
+ * - Validates every outbound against the strict sing-box 1.14+ protocol/transport whitelist
  * - Uses typed `dns.servers` with `{ type: "fakeip", tag: "dns-fakeip", ... }`
  * - Uses modern `route.rules` actions (`{ action: "sniff" }`, `{ protocol: "dns", action: "hijack-dns" }`)
  *   instead of deprecated `dns-out` outbound and inbound `sniff` fields
@@ -178,29 +265,41 @@ export function compileClientSingboxConfig(
     return candidate;
   };
 
-  // 1. Healthy official & community donated outbounds (direct client-to-node)
+  // 1. Healthy precompiled official & community donated outbounds (never re-parses raw_link)
   for (const dob of donatedOutbounds) {
     if (dob.status && dob.status !== 'active') continue;
+    const rawJson =
+      dob.compiled_outbound_json && dob.compiled_outbound_json.trim().length > 0
+        ? dob.compiled_outbound_json
+        : dob.config_json;
     try {
-      const parsed = JSON.parse(dob.config_json) as SingboxOutboundConfig;
-      const normalized = enforceRealityUtls(parsed);
+      const parsed = JSON.parse(rawJson) as Record<string, unknown>;
+      const validated = validateSingboxOutboundStrict(parsed);
+      if (!validated.ok) {
+        options.onError?.(
+          'singboxCompiler.ts',
+          `Skipped non-compliant outbound (id=${dob.id}, tag=${dob.tag}): ${validated.error}`
+        );
+        continue;
+      }
+      const normalized = validated.outbound;
       const displayBase =
         dob.label && dob.label.trim().length > 0 ? dob.label.trim() : dob.tag;
       const prefix = dob.is_official === 1 ? '👑 ' : '🤝 ';
       const tag = makeUniqueTag(`${prefix}${displayBase}`);
       normalized.tag = tag;
       outboundTags.push(tag);
-      concreteOutbounds.push(normalized);
+      concreteOutbounds.push(normalized as unknown as Record<string, unknown>);
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       options.onError?.(
         'singboxCompiler.ts',
-        `Malformed outbound config_json (id=${dob.id}, tag=${dob.tag}): ${detail}`
+        `Malformed precompiled outbound JSON (id=${dob.id}, tag=${dob.tag}): ${detail}`
       );
     }
   }
 
-  // 2. Active non-loopback core outbounds
+  // 2. Active non-loopback core outbounds (strictly whitelisted protocols)
   const activeCoreOutbounds = outbounds.filter((ob) => ob.is_active !== 0);
   const hasRealNodes =
     outboundTags.length > 0 ||
@@ -208,9 +307,12 @@ export function compileClientSingboxConfig(
 
   for (const ob of activeCoreOutbounds) {
     if (hasRealNodes && ob.server_address === '127.0.0.1') continue;
+    const built = buildCoreOutboundNode(ob, ob.tag);
+    if (!built) continue;
     const tag = makeUniqueTag(ob.tag);
+    built.tag = tag;
     outboundTags.push(tag);
-    concreteOutbounds.push(buildCoreOutboundNode(ob, tag));
+    concreteOutbounds.push(built as unknown as Record<string, unknown>);
   }
 
   // Fallback node only if pool is completely empty
@@ -504,5 +606,123 @@ export async function generateWireguardGamingProfile(params: {
   return {
     filename: `sentra-gaming-${shortId}.conf`,
     config,
+  };
+}
+
+/**
+ * Wraps a single validated outbound inside a minimal sing-box 1.14+ skeleton
+ * suitable for Stage-1 isolated `sing-box check -c <file>` validation in QualityEngine.
+ */
+export function compileSingleNodeCheckConfig(
+  outbound: SingboxOutboundConfig
+): Record<string, unknown> {
+  const safeOutbound = {
+    ...outbound,
+    tag: 'node-check',
+  };
+  return {
+    log: { level: 'warn' },
+    dns: {
+      servers: [
+        {
+          type: 'local',
+          tag: 'dns-local',
+        },
+      ],
+      final: 'dns-local',
+    },
+    inbounds: [
+      {
+        type: 'socks',
+        tag: 'socks-in',
+        listen: '127.0.0.1',
+        listen_port: 10808,
+      },
+    ],
+    outbounds: [
+      safeOutbound,
+      {
+        type: 'direct',
+        tag: 'direct',
+      },
+    ],
+    route: {
+      default_domain_resolver: 'dns-local',
+      final: 'node-check',
+    },
+  };
+}
+
+/**
+ * Filters healthy active donated outbounds for a given plan tier:
+ * - `free`: web_browsing / download nodes
+ * - `pro`: web_browsing / download + static_ip nodes
+ * - `flow_plus`: all active nodes (web_browsing, download, static_ip, gaming)
+ */
+export function filterDonatedForPlanTier(
+  donated: DonatedOutboundRow[],
+  planTier: PlanTier
+): DonatedOutboundRow[] {
+  const active = donated.filter((row) => !row.status || row.status === 'active');
+  if (planTier === 'flow_plus') {
+    return active;
+  }
+  if (planTier === 'pro') {
+    return active.filter(
+      (row) =>
+        row.allow_web === 1 ||
+        row.allow_download === 1 ||
+        row.allow_static_ip === 1 ||
+        row.assigned_tier === 'web_browsing' ||
+        row.assigned_tier === 'download' ||
+        row.assigned_tier === 'static_ip'
+    );
+  }
+  return active.filter(
+    (row) =>
+      row.allow_web === 1 ||
+      row.allow_download === 1 ||
+      row.assigned_tier === 'web_browsing' ||
+      row.assigned_tier === 'download'
+  );
+}
+
+/**
+ * Compiles the canonical prebuilt sing-box 1.14+ JSON bundle for a plan tier
+ * (`free`, `pro`, `flow_plus`), stored in L1 RAM + L2 Cloudflare KV
+ * (`cache:compiled_cfg_free_v1`, `cache:compiled_cfg_pro_v1`, `cache:compiled_cfg_flow_plus_v1`)
+ * and verified end-to-end by QualityEngine Stage-2 `sing-box check`.
+ */
+export function compilePlanTierSingboxConfig(
+  coreOutbounds: OutboundRow[],
+  donatedOutbounds: DonatedOutboundRow[],
+  planTier: PlanTier,
+  options: Omit<CompileClientOptions, 'mode'> = {}
+): { config: Record<string, unknown>; json: string; nodeCount: number } {
+  const tierDonated = filterDonatedForPlanTier(donatedOutbounds, planTier);
+  const tierCore = coreOutbounds.filter((ob) => {
+    if (ob.is_active === 0) return false;
+    if (planTier === 'flow_plus') return true;
+    if (planTier === 'pro') return ob.mode_category !== 'gaming';
+    return ob.mode_category === 'web_browsing' || ob.mode_category === 'download' || ob.mode_category === 'all';
+  });
+
+  const config = compileClientSingboxConfig(tierCore, tierDonated, {
+    ...options,
+    mode: 'web_browsing',
+    includeClashApi: options.includeClashApi ?? true,
+  });
+
+  const outboundsArr = Array.isArray(config.outbounds)
+    ? (config.outbounds as Array<Record<string, unknown>>)
+    : [];
+  const concreteCount = outboundsArr.filter(
+    (o) => o.type !== 'selector' && o.type !== 'urltest' && o.type !== 'direct'
+  ).length;
+
+  return {
+    config,
+    json: JSON.stringify(config),
+    nodeCount: concreteCount,
   };
 }

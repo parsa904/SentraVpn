@@ -419,13 +419,13 @@ export function validateOtpCode(
   const cleaned = code.trim();
   if (!cleaned) {
     return lang === 'fa'
-      ? 'لطفاً کد ورود ۸ رقمی را وارد کنید.'
-      : 'Enter the 8-digit Telegram code.';
+      ? 'لطفاً کد اتصال ۸ رقمی SentraVPN را وارد کنید.'
+      : 'Enter your 8-digit SentraVPN Connect Code.';
   }
   if (!/^\d{8}$/.test(cleaned)) {
     return lang === 'fa'
-      ? 'کد ورود تلگرام باید دقیقاً ۸ رقم عددی باشد.'
-      : 'Telegram code must be exactly 8 digits.';
+      ? 'کد اتصال باید دقیقاً ۸ رقم عددی باشد.'
+      : 'Connect code must be exactly 8 digits.';
   }
   return null;
 }
@@ -506,6 +506,8 @@ export interface RawAuthApiResponse {
   auth_token?: string;
   subscription_token?: string;
   token?: string;
+  connect_code?: string | null;
+  plan_tier?: string;
   username?: string;
   tier?: string;
   expires_at?: string | null;
@@ -515,6 +517,8 @@ export interface RawAuthApiResponse {
   };
   subscription?: {
     token?: string;
+    connect_code?: string | null;
+    plan_tier?: string;
     tier?: string;
     expires_at?: string | null;
   };
@@ -530,6 +534,8 @@ export function parseAuthSessionResponse(
 ): {
   auth_token: string;
   subscription_token: string;
+  connect_code: string | null;
+  plan_tier: string;
   username: string;
   tier: string;
   expires_at: string | null;
@@ -546,6 +552,8 @@ export function parseAuthSessionResponse(
   }
 
   const authToken = data.access_token || data.auth_token || subToken;
+  const connectCode = data.subscription?.connect_code ?? data.connect_code ?? null;
+  const planTier = data.subscription?.plan_tier || data.plan_tier || 'free';
   const username =
     data.user?.username ||
     data.user?.first_name ||
@@ -557,6 +565,8 @@ export function parseAuthSessionResponse(
   return {
     auth_token: authToken,
     subscription_token: subToken,
+    connect_code: connectCode,
+    plan_tier: planTier,
     username,
     tier,
     expires_at: expiresAt,

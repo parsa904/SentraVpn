@@ -4,17 +4,24 @@ import {
   extractBearerOrHeaderSecret,
   generateNumericCode,
   generateSubscriptionToken,
+  generateUniqueConnectCode,
   hashPassword,
+  isValidEightDigitConnectCode,
+  validateExternalHttpsUrl,
+  validateSentraClientRequest,
   verifyPassword,
 } from './security.ts';
-import { auditOutboundSecurity, parseOutboundInput } from './outboundAnalyzer.ts';
 import {
-  buildSubscriptionUserInfoHeader,
-  tierHasGaming,
-  tierHasStaticIp,
+  auditOutboundSecurity,
+  parseOutboundInput,
+  validateSingboxOutboundStrict,
+} from './outboundAnalyzer.ts';
+import {
+  resolvePlanTier,
+  subscriptionCanAccessSpecialMode,
 } from './singboxCompiler.ts';
 import { handleTelegramWebhook } from './telegramWebhook.ts';
-import { dispatchErrorAlert } from './telegramTopics.ts';
+import { dispatchErrorAlert, getFreeQuotaSettings } from './telegramTopics.ts';
 import {
   checkIngestionRateAndDedup,
   dispatchUnifiedError,
@@ -30,7 +37,7 @@ import {
   getCachedCompiledSingbox,
   getCachedHasActiveGaming,
   getCachedLocations,
-  getCachedV2RayBase64,
+  getCachedPrecompiledPlanConfig,
   invalidateNodesCache,
   matchesIfNoneMatch,
 } from './workerCache.ts';
@@ -44,9 +51,9 @@ import type {
   UserRow,
 } from './types.ts';
 
-const LITE_WEB_QUOTA_MB = 2048;
-const LITE_DL_QUOTA_MB = 3072;
 const STATIC_IP_MONTHLY_QUOTA_MB = 30720;
+const GIB_BYTES = 1024 * 1024 * 1024;
+const MIB_BYTES = 1024 * 1024;
 
 function jsonResponse(
   data: unknown,
@@ -76,7 +83,7 @@ function errorResponse(status: number, message: string, code?: string): Response
 }
 
 const SUB_SELECT_COLS =
-  'id, user_id, tier, token, status, upload_bytes, download_bytes, traffic_limit_bytes, speed_limit_bps, max_concurrent_devices, web_browsing_used_mb, download_used_mb, static_ip_used_mb, expires_at';
+  'id, user_id, tier, plan_tier, connect_code, token, status, upload_bytes, download_bytes, traffic_limit_bytes, speed_limit_bps, max_concurrent_devices, web_browsing_used_mb, download_used_mb, static_ip_used_mb, web_used_bytes, download_used_bytes, special_quota_bytes, special_used_bytes, has_used_special_trial, expires_at';
 const USER_SELECT_COLS =
   'id, user_uuid, telegram_id, username, email, password_hash, first_name, last_name, role, status, outbound_reward_banned';
 
@@ -97,10 +104,41 @@ async function getSubscriptionWithUser(
   return { user, sub };
 }
 
+async function getSubscriptionWithUserByConnectCode(
+  db: D1Database,
+  connectCode: string
+): Promise<{ user: UserRow; sub: SubscriptionRow } | null> {
+  const cleanCode = connectCode.trim();
+  if (!isValidEightDigitConnectCode(cleanCode)) return null;
+  const sub = await db
+    .prepare(`SELECT ${SUB_SELECT_COLS} FROM subscriptions WHERE connect_code = ? LIMIT 1`)
+    .bind(cleanCode)
+    .first<SubscriptionRow>();
+  if (!sub) return null;
+  const user = await db
+    .prepare(`SELECT ${USER_SELECT_COLS} FROM users WHERE id = ? LIMIT 1`)
+    .bind(sub.user_id)
+    .first<UserRow>();
+  if (!user) return null;
+  return { user, sub };
+}
+
 function normalizeMode(raw: string | null | undefined): ConnectionMode {
   const m = (raw || 'web_browsing').trim().toLowerCase();
   if (m === 'download' || m === 'gaming' || m === 'static_ip') return m;
   return 'web_browsing';
+}
+
+function getEffectiveWebUsedBytes(sub: SubscriptionRow): number {
+  return Math.max(Number(sub.web_used_bytes || 0), Number(sub.web_browsing_used_mb || 0) * MIB_BYTES);
+}
+
+function getEffectiveDownloadUsedBytes(sub: SubscriptionRow): number {
+  return Math.max(Number(sub.download_used_bytes || 0), Number(sub.download_used_mb || 0) * MIB_BYTES);
+}
+
+function getEffectiveSpecialUsedBytes(sub: SubscriptionRow): number {
+  return Math.max(Number(sub.special_used_bytes || 0), Number(sub.static_ip_used_mb || 0) * MIB_BYTES);
 }
 
 export async function routeRequest(
@@ -263,7 +301,10 @@ export async function routeRequest(
     const [rowsRes, subSourcesRes] = await executeD1Batch<Record<string, unknown>>(env.DB, [
       env.DB.prepare(
         `SELECT id, tag, protocol, server_address, server_port, config_json,
-                country_code, status, fail_count, is_official, allocation_mode, fingerprint_sha256
+                compiled_outbound_json, validation_error,
+                country_code, status, fail_count, is_official, allocation_mode,
+                assigned_tier, allow_web, allow_download, allow_gaming, allow_static_ip,
+                fingerprint_sha256
          FROM donated_outbounds
          WHERE status IN ('active', 'inactive')
          ORDER BY is_official DESC, id ASC
@@ -272,6 +313,7 @@ export async function routeRequest(
       env.DB.prepare(
         `SELECT id, category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at
          FROM subscription_sources
+         WHERE status = 'active'
          ORDER BY id ASC
          LIMIT 50`
       ),
@@ -289,12 +331,18 @@ export async function routeRequest(
         protocol: row.protocol,
         server_address: row.server_address,
         server_port: row.server_port,
-        config_json: row.config_json,
+        config_json: row.compiled_outbound_json || row.config_json,
+        compiled_outbound_json: row.compiled_outbound_json || null,
         country_code: row.country_code,
         status: row.status,
         fail_count: row.fail_count,
         is_official: row.is_official === 1,
         allocation_mode: row.allocation_mode,
+        assigned_tier: row.assigned_tier,
+        allow_web: row.allow_web,
+        allow_download: row.allow_download,
+        allow_gaming: row.allow_gaming,
+        allow_static_ip: row.allow_static_ip,
         fingerprint_sha256: row.fingerprint_sha256,
       })),
       subscription_sources: subSourceRows.map((src) => ({
@@ -372,7 +420,8 @@ export async function routeRequest(
       readStmts.push(
         env.DB.prepare(
           `SELECT id, tag, protocol, status, health_score, fail_count,
-                  gemini_ok, trading_safe, allow_static_ip, offline_since, allocation_mode
+                  gemini_ok, trading_safe, allow_static_ip, offline_since, allocation_mode,
+                  compiled_outbound_json, validation_error
            FROM donated_outbounds
            WHERE id IN (${placeholders})`
         ).bind(...nodeIds)
@@ -396,7 +445,8 @@ export async function routeRequest(
       const placeholders = discoveredFps.map(() => '?').join(', ');
       readStmts.push(
         env.DB.prepare(
-          `SELECT id, status, health_score, fail_count, gemini_ok, trading_safe, fingerprint_sha256
+          `SELECT id, status, health_score, fail_count, gemini_ok, trading_safe,
+                  fingerprint_sha256, compiled_outbound_json
            FROM donated_outbounds
            WHERE fingerprint_sha256 IN (${placeholders})`
         ).bind(...discoveredFps)
@@ -417,6 +467,8 @@ export async function routeRequest(
       allow_static_ip: number;
       offline_since: string | null;
       allocation_mode: string;
+      compiled_outbound_json: string | null;
+      validation_error: string | null;
     }
     interface ExistingSubSource {
       id: number;
@@ -431,6 +483,7 @@ export async function routeRequest(
       gemini_ok: number;
       trading_safe: number;
       fingerprint_sha256: string;
+      compiled_outbound_json: string | null;
     }
 
     const existingNodesById = new Map<number, ExistingHealthNode>();
@@ -460,17 +513,17 @@ export async function routeRequest(
     let updated = 0;
     let writesSkipped = 0;
     let deactivated = 0;
+    let quarantinedCount = 0;
     let geminiReady = 0;
     let subscriptionSourcesUpdated = 0;
     let discoveredNodesAdded = 0;
-    const offlineAlerts: Array<{
+    const quarantinedNodesSummary: Array<{
       id: number;
       tag: string;
       protocol: string;
-      status: string;
-      failCount: number;
-      reason?: string;
+      reason: string;
     }> = [];
+    const deactivatedNodeTags: string[] = [];
 
     let nodesChanged = false;
 
@@ -490,31 +543,69 @@ export async function routeRequest(
       const geminiOk = item.gemini_ok ? 1 : 0;
       const tradingSafe = item.trading_safe ? 1 : 0;
 
-      if (!item.security_passed) {
-        const rejectReason = String(item.error_msg || 'Failed security audit');
-        if (existing.status !== 'rejected' || Number(existing.health_score) !== 0) {
+      // Stage-1 sing-box check / strict schema failure -> Quarantine (logged to Turso, zero Telegram spam)
+      if (item.quarantined) {
+        const validationError = String(
+          item.validation_error || item.error_msg || 'Failed sing-box 1.14+ schema validation'
+        ).slice(0, 500);
+        if (
+          existing.status !== 'quarantined' ||
+          existing.validation_error !== validationError ||
+          Number(existing.health_score) !== 0
+        ) {
           writeStatements.push(
             env.DB.prepare(
               `UPDATE donated_outbounds
-               SET status = 'rejected', rejection_reason = ?, health_score = 0,
+               SET status = 'quarantined', validation_error = ?, rejection_reason = ?,
+                   health_score = 0, gemini_ok = 0, trading_safe = 0,
                    last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
                WHERE id = ?`
-            ).bind(rejectReason, nodeId)
+            ).bind(validationError, validationError, nodeId)
           );
           nodesChanged = true;
           deactivated += 1;
         } else {
           writesSkipped += 1;
         }
-        updated += 1;
-        offlineAlerts.push({
+        quarantinedCount += 1;
+        quarantinedNodesSummary.push({
           id: nodeId,
           tag: existing.tag,
           protocol: existing.protocol,
-          status: 'rejected',
-          failCount: (existing.fail_count || 0) + 1,
+          reason: validationError,
+        });
+        updated += 1;
+        continue;
+      }
+
+      if (!item.security_passed) {
+        const rejectReason = String(item.validation_error || item.error_msg || 'Failed security audit').slice(0, 500);
+        if (
+          existing.status !== 'rejected' ||
+          existing.validation_error !== rejectReason ||
+          Number(existing.health_score) !== 0
+        ) {
+          writeStatements.push(
+            env.DB.prepare(
+              `UPDATE donated_outbounds
+               SET status = 'rejected', rejection_reason = ?, validation_error = ?, health_score = 0,
+                   last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?`
+            ).bind(rejectReason, rejectReason, nodeId)
+          );
+          nodesChanged = true;
+          deactivated += 1;
+        } else {
+          writesSkipped += 1;
+        }
+        quarantinedCount += 1;
+        quarantinedNodesSummary.push({
+          id: nodeId,
+          tag: existing.tag,
+          protocol: existing.protocol,
           reason: rejectReason,
         });
+        updated += 1;
         continue;
       }
 
@@ -523,6 +614,11 @@ export async function routeRequest(
         const autoStatic =
           existing.allocation_mode === 'auto' && geminiOk === 1 && tradingSafe === 1 ? 1 : null;
         const nextAllowStatic = autoStatic ?? Number(existing.allow_static_ip || 0);
+        const compiledJson =
+          typeof item.compiled_outbound_json === 'string' &&
+          item.compiled_outbound_json.trim().startsWith('{')
+            ? item.compiled_outbound_json.trim()
+            : null;
 
         const changed =
           existing.status !== 'active' ||
@@ -530,7 +626,9 @@ export async function routeRequest(
           Number(existing.fail_count || 0) !== 0 ||
           Number(existing.gemini_ok || 0) !== geminiOk ||
           Number(existing.trading_safe || 0) !== tradingSafe ||
-          Number(existing.allow_static_ip || 0) !== nextAllowStatic;
+          Number(existing.allow_static_ip || 0) !== nextAllowStatic ||
+          existing.validation_error !== null ||
+          (compiledJson !== null && existing.compiled_outbound_json !== compiledJson);
 
         if (changed) {
           writeStatements.push(
@@ -539,6 +637,8 @@ export async function routeRequest(
                SET latency_ms = ?, jitter_ms = ?, speed_mbps = ?, speed_score = ?,
                    health_score = ?, gemini_ok = ?, trading_safe = ?,
                    status = 'active', fail_count = 0, offline_since = NULL,
+                   validation_error = NULL,
+                   compiled_outbound_json = COALESCE(?, compiled_outbound_json),
                    allow_static_ip = COALESCE(?, allow_static_ip),
                    last_online_at = CURRENT_TIMESTAMP, last_checked_at = CURRENT_TIMESTAMP,
                    updated_at = CURRENT_TIMESTAMP
@@ -551,6 +651,7 @@ export async function routeRequest(
               healthScore,
               geminiOk,
               tradingSafe,
+              compiledJson,
               autoStatic,
               nodeId
             )
@@ -565,6 +666,11 @@ export async function routeRequest(
         const nextHealthScore = Math.max(0, 100 - nextFailCount * 35);
         if (nextStatus === 'inactive' && existing.status !== 'inactive') {
           deactivated += 1;
+          if (deactivatedNodeTags.length < 8) {
+            deactivatedNodeTags.push(
+              `${existing.tag} (${String(item.error_msg || 'offline').slice(0, 60)})`
+            );
+          }
         }
 
         const changed =
@@ -597,15 +703,6 @@ export async function routeRequest(
         } else {
           writesSkipped += 1;
         }
-
-        offlineAlerts.push({
-          id: nodeId,
-          tag: existing.tag,
-          protocol: existing.protocol,
-          status: nextStatus,
-          failCount: nextFailCount,
-          reason: item.error_msg ? String(item.error_msg) : undefined,
-        });
       }
 
       updated += 1;
@@ -659,6 +756,26 @@ export async function routeRequest(
         const fp = String(node.fingerprint_sha256 || '').trim();
         if (!fp || !node.server_address || !node.protocol) continue;
 
+        let compiledJson = String(node.compiled_outbound_json || node.config_json || '{}');
+        try {
+          const parsedCandidate = JSON.parse(compiledJson) as Record<string, unknown>;
+          const checked = validateSingboxOutboundStrict(parsedCandidate);
+          if (!checked.ok) {
+            quarantinedCount += 1;
+            quarantinedNodesSummary.push({
+              id: 0,
+              tag: String(node.tag || 'SubNode').slice(0, 64),
+              protocol: String(node.protocol),
+              reason: checked.error,
+            });
+            continue;
+          }
+          compiledJson = checked.compiledJson;
+        } catch {
+          quarantinedCount += 1;
+          continue;
+        }
+
         const existingNode = existingNodesByFp.get(fp);
         const lat = Math.max(0, Math.min(9999, Math.round(Number(node.latency_ms) || 120)));
         const jit = Math.max(0, Math.min(9999, Math.round(Number(node.jitter_ms) || 0)));
@@ -675,18 +792,20 @@ export async function routeRequest(
             Number(existingNode.health_score) !== hScore ||
             Number(existingNode.fail_count || 0) !== 0 ||
             Number(existingNode.gemini_ok || 0) !== gOk ||
-            Number(existingNode.trading_safe || 0) !== tSafe;
+            Number(existingNode.trading_safe || 0) !== tSafe ||
+            existingNode.compiled_outbound_json !== compiledJson;
           if (changed) {
             writeStatements.push(
               env.DB.prepare(
                 `UPDATE donated_outbounds
                  SET latency_ms = ?, jitter_ms = ?, speed_mbps = ?, speed_score = ?,
                      health_score = ?, gemini_ok = ?, trading_safe = ?, status = 'active',
-                     fail_count = 0, offline_since = NULL,
+                     fail_count = 0, offline_since = NULL, validation_error = NULL,
+                     compiled_outbound_json = ?,
                      last_online_at = CURRENT_TIMESTAMP, last_checked_at = CURRENT_TIMESTAMP,
                      updated_at = CURRENT_TIMESTAMP
                  WHERE id = ?`
-              ).bind(lat, jit, spd, spdScore, hScore, gOk, tSafe, existingNode.id)
+              ).bind(lat, jit, spd, spdScore, hScore, gOk, tSafe, compiledJson, existingNode.id)
             );
             nodesChanged = true;
           } else {
@@ -698,17 +817,19 @@ export async function routeRequest(
             env.DB.prepare(
               `INSERT INTO donated_outbounds (
                  donor_user_id, tag, protocol, server_address, server_port, config_json,
+                 compiled_outbound_json, validation_error,
                  latency_ms, jitter_ms, speed_mbps, speed_score, assigned_tier, health_score,
                  status, fail_count, raw_link, fingerprint_sha256, is_official, label,
                  country_code, country_name, allow_web, allow_download, allow_gaming, allow_static_ip,
                  gemini_ok, trading_safe, allocation_mode, last_online_at, last_checked_at
-               ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+               ) VALUES (NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
             ).bind(
               String(node.tag || 'SubNode').slice(0, 64),
               String(node.protocol),
               String(node.server_address),
               Math.max(1, Math.min(65535, Math.round(Number(node.server_port) || 443))),
-              String(node.config_json || '{}'),
+              compiledJson,
+              compiledJson,
               lat,
               jit,
               spd,
@@ -743,64 +864,82 @@ export async function routeRequest(
       }
     }
 
-    const subSourceAlerts: string[] = [];
-    for (const srcReport of subReports) {
-      const sourceId = Number(srcReport.source_id);
-      if (!Number.isInteger(sourceId) || sourceId <= 0) continue;
-      const totalNodes = Math.max(0, Math.round(Number(srcReport.total_nodes) || 0));
-      const healthyNodes = Math.max(0, Math.round(Number(srcReport.healthy_nodes) || 0));
-      if (srcReport.error_msg) {
-        subSourceAlerts.push(
-          `SubSource #${sourceId} (${srcReport.category || 'unknown'}): ${String(srcReport.error_msg).slice(0, 120)}`
-        );
-      } else if (totalNodes > 0 && healthyNodes === 0) {
-        subSourceAlerts.push(
-          `SubSource #${sourceId} (${srcReport.category || 'unknown'}): 0/${totalNodes} healthy nodes`
-        );
-      }
-    }
-
+    // 5. Inspect remaining healthy capacity per plan tier (single lightweight aggregate query)
     let activePoolCount = 1;
-    if (writeStatements.length > 0 || offlineAlerts.length > 0 || subSourceAlerts.length > 0) {
+    let freeTierActive = 1;
+    let proTierActive = 1;
+    let flowPlusTierActive = 1;
+    if (writeStatements.length > 0 || quarantinedCount > 0 || updated > 0 || subscriptionSourcesUpdated > 0) {
       try {
-        const poolRow = await env.DB.prepare(
-          `SELECT COUNT(*) AS cnt FROM donated_outbounds WHERE status = 'active'`
-        ).first<{ cnt: number }>();
-        activePoolCount = Number(poolRow?.cnt ?? 0);
+        const capRow = await env.DB.prepare(
+          `SELECT
+             COUNT(*) AS cnt,
+             COALESCE(SUM(CASE WHEN allow_web = 1 OR allow_download = 1 THEN 1 ELSE 0 END), 0) AS free_cnt,
+             COALESCE(SUM(CASE WHEN allow_web = 1 OR allow_download = 1 OR allow_static_ip = 1 THEN 1 ELSE 0 END), 0) AS pro_cnt,
+             COALESCE(SUM(CASE WHEN allow_web = 1 OR allow_download = 1 OR allow_static_ip = 1 OR allow_gaming = 1 THEN 1 ELSE 0 END), 0) AS flow_cnt
+           FROM donated_outbounds
+           WHERE status = 'active'`
+        ).first<{
+          cnt: number;
+          free_cnt: number;
+          pro_cnt: number;
+          flow_cnt: number;
+        }>();
+        activePoolCount = Number(capRow?.cnt ?? 0);
+        freeTierActive = Number(capRow?.free_cnt ?? 0);
+        proTierActive = Number(capRow?.pro_cnt ?? 0);
+        flowPlusTierActive = Number(capRow?.flow_cnt ?? 0);
       } catch {
         activePoolCount = 1;
       }
     }
 
-    const criticalPoolDepleted = activePoolCount === 0 && (updated > 0 || subscriptionSourcesUpdated > 0);
-
-    if (offlineAlerts.length > 0 || subSourceAlerts.length > 0 || criticalPoolDepleted) {
-      const summaryLines: string[] = [
-        `Checked: ${updated} | Writes: ${writeStatements.length} | Skipped: ${writesSkipped} | Deactivated/Rejected: ${deactivated} | Failed: ${offlineAlerts.length} | Active Pool: ${activePoolCount}`,
-      ];
-      if (criticalPoolDepleted) {
-        summaryLines.push('CRITICAL: Active healthy node pool reached 0!');
-      }
-      for (const n of offlineAlerts.slice(0, 10)) {
-        const reasonPart = n.reason ? ` — ${n.reason.slice(0, 80)}` : '';
-        summaryLines.push(
-          `- #${n.id} [${n.protocol}] ${n.tag.slice(0, 32)} (fails=${n.failCount}, status=${n.status})${reasonPart}`
-        );
-      }
-      if (offlineAlerts.length > 10) {
-        summaryLines.push(`... and ${offlineAlerts.length - 10} more failing nodes`);
-      }
-      for (const sAlert of subSourceAlerts.slice(0, 5)) {
-        summaryLines.push(`- ${sAlert}`);
-      }
-
-      await dispatchErrorAlert(env, ctx, 'QualityEngine (health-report)', summaryLines.join('\n'));
+    const bundleChecks = Array.isArray(payload.bundle_checks) ? payload.bundle_checks : [];
+    const failedBundles = bundleChecks.filter((b) => b && b.passed === false);
+    const depletedPlans: string[] = [];
+    if (updated > 0 || subscriptionSourcesUpdated > 0) {
+      if (freeTierActive === 0) depletedPlans.push('Free');
+      if (proTierActive === 0) depletedPlans.push('Pro');
+      if (flowPlusTierActive === 0) depletedPlans.push('Flow+');
     }
 
-    // Offload QualityEngine health history to Turso telemetry_logs (zero D1 Row Writes)
+    // Alert Telegram topic_logs_id ONLY on complete plan capacity depletion or Stage-2 bundle check failure
+    // (Individual quarantined nodes are recorded in Turso telemetry_logs without spamming Telegram)
+    if (depletedPlans.length > 0 || failedBundles.length > 0) {
+      const summaryLines: string[] = [
+        `Checked: ${updated} | Writes: ${writeStatements.length} | Skipped: ${writesSkipped} | Quarantined: ${quarantinedCount} | Active Pool: ${activePoolCount}`,
+      ];
+      if (depletedPlans.length > 0) {
+        summaryLines.push(
+          `CRITICAL: Plan capacity reached 0 healthy nodes for: ${depletedPlans.join(', ')}`
+        );
+      }
+      if (deactivatedNodeTags.length > 0) {
+        summaryLines.push(`Affected Nodes: ${deactivatedNodeTags.slice(0, 5).join(', ')}`);
+      }
+      if (quarantinedNodesSummary.length > 0) {
+        summaryLines.push(
+          `Quarantined Nodes: ${quarantinedNodesSummary
+            .slice(0, 5)
+            .map((q) => `${q.tag} (${q.reason.slice(0, 60)})`)
+            .join(', ')}`
+        );
+      }
+      for (const b of failedBundles) {
+        summaryLines.push(
+          `CRITICAL: Stage-2 sing-box check failed for plan "${b.plan_tier}" (${b.node_count} nodes): ${String(
+            b.error || 'unknown error'
+          ).slice(0, 180)}`
+        );
+      }
+
+      await dispatchErrorAlert(env, ctx, 'QualityEngine (plan-capacity-alert)', summaryLines.join('\n'));
+    }
+
+    // Offload QualityEngine health + quarantine history to Turso telemetry_logs (zero D1 Row Writes, zero Telegram noise)
     const tursoHealthWrite = logTelemetryToTurso(env, {
       platform: 'github-actions',
-      eventType: 'node_health_report',
+      eventType: quarantinedCount > 0 ? 'node_quarantine_and_health_report' : 'node_health_report',
       details: {
         runner: payload.runner || 'quality-engine',
         checked_at: payload.checked_at || new Date().toISOString(),
@@ -808,14 +947,22 @@ export async function routeRequest(
         d1_writes: writeStatements.length,
         d1_writes_skipped: writesSkipped,
         deactivated,
+        quarantined_count: quarantinedCount,
+        quarantined_nodes: quarantinedNodesSummary.slice(0, 40),
+        bundle_checks: bundleChecks,
+        tier_capacity: {
+          total_active: activePoolCount,
+          free: freeTierActive,
+          pro: proTierActive,
+          flow_plus: flowPlusTierActive,
+        },
         gemini_ready: geminiReady,
-        active_pool: activePoolCount,
         subscription_sources_updated: subscriptionSourcesUpdated,
         discovered_nodes_added: discoveredNodesAdded,
-        offline_count: offlineAlerts.length,
         nodes_sample: nodeResults.slice(0, 30).map((n) => ({
           id: Number(n.outbound_id),
           healthy: Boolean(n.is_healthy),
+          quarantined: Boolean(n.quarantined),
           latency_ms: Math.round(Number(n.latency_ms) || 0),
           health_score: Math.round(Number(n.health_score) || 0),
           gemini_ok: Boolean(n.gemini_ok),
@@ -835,170 +982,179 @@ export async function routeRequest(
       db_writes: writeStatements.length,
       writes_skipped: writesSkipped,
       deactivated,
+      quarantined: quarantinedCount,
       gemini_ready: geminiReady,
       subscription_sources_updated: subscriptionSourcesUpdated,
       discovered_nodes_added: discoveredNodesAdded,
+      tier_capacity: {
+        total_active: activePoolCount,
+        free: freeTierActive,
+        pro: proTierActive,
+        flow_plus: flowPlusTierActive,
+      },
       recorded_at: new Date().toISOString(),
     });
   }
 
-  // 6. Subscription Endpoint: GET /sub/:token & GET /api/v1/sub/:token (Zero-Write + Isolate Cache + ETag/304)
-  const subMatch = /^\/(?:api\/v1\/)?sub\/([^/]+)$/.exec(path);
-  if (method === 'GET' && subMatch) {
-    const ipLimit = checkPublicIpRateLimit('sub', extractClientIp(request));
-    if (!ipLimit.allowed) {
-      return jsonResponse(
-        {
-          success: false,
-          error: 'تعداد درخواست‌های دریافت اشتراک بیش از حد مجاز است. لطفاً دقایقی دیگر تلاش کنید.',
-          message: 'Rate limit exceeded',
-          code: 'RATE_LIMITED',
-        },
-        429,
-        { 'Retry-After': String(ipLimit.retryAfterSec) }
-      );
+  // 5b. Automated GitHub Releases Sync Endpoint: POST /api/v1/releases/sync (Protected by QUALITY_ENGINE_SECRET)
+  if (method === 'POST' && path === '/api/v1/releases/sync') {
+    if (!env.QUALITY_ENGINE_SECRET) {
+      return errorResponse(503, 'کلید امنیتی QualityEngine پیکربندی نشده است.');
+    }
+    const provided = extractBearerOrHeaderSecret(request, 'X-Quality-Secret');
+    if (!provided || !(await constantTimeEquals(provided, env.QUALITY_ENGINE_SECRET))) {
+      return errorResponse(401, 'دسترسی همگام‌سازی انتشار مجاز نیست.', 'UNAUTHORIZED_RELEASE_SYNC');
     }
 
-    const token = decodeURIComponent(subMatch[1]).trim();
-    const found = await getSubscriptionWithUser(env.DB, token);
-    if (!found) {
-      return errorResponse(404, 'توکن اشتراک یافت نشد.', 'SUBSCRIPTION_NOT_FOUND');
-    }
-    if (found.user.status !== 'active' || found.sub.status !== 'active') {
-      return errorResponse(403, 'اشتراک شما غیرفعال یا منقضی شده است.', 'SUBSCRIPTION_INACTIVE');
-    }
-
-    const mode = normalizeMode(url.searchParams.get('mode'));
-    const pool = await getCachedActiveNodesPool(env.DB, env.SENTRA_KV);
-
-    if (mode === 'gaming') {
-      if (!pool.hasActiveGaming) {
-        return errorResponse(400, 'بخش گیمینگ به‌زودی راه‌اندازی می‌شود.', 'GAMING_COMING_SOON');
-      }
-      if (!tierHasGaming(found.sub.tier)) {
-        return errorResponse(403, 'حالت گیمینگ نیازمند اشتراک گیمینگ یا ویژه است.', 'TIER_REQUIRED');
-      }
-    }
-    if (mode === 'static_ip' && !tierHasStaticIp(found.sub.tier)) {
-      return errorResponse(403, 'حالت آی‌پی ثابت نیازمند پلن ویژه است.', 'TIER_REQUIRED');
-    }
-
-    const locationParam = url.searchParams.get('location') || undefined;
-    const userAgent = (request.headers.get('User-Agent') || '').toLowerCase();
-    const formatParam = (url.searchParams.get('format') || '').toLowerCase();
-    const wantsSingbox =
-      formatParam === 'singbox' ||
-      formatParam === 'sing-box' ||
-      formatParam === 'json' ||
-      userAgent.includes('sing-box') ||
-      userAgent.includes('sentra') ||
-      userAgent.includes('sfa') ||
-      userAgent.includes('sfi') ||
-      userAgent.includes('hiddify');
-
-    const subUserInfo = buildSubscriptionUserInfoHeader(found.sub);
-    const etag = computeWeakEtag([
-      'sub',
-      pool.version,
-      mode,
-      (locationParam || 'auto').toUpperCase(),
-      wantsSingbox ? 'singbox' : 'v2ray',
-      found.sub.tier,
-      found.sub.status,
-      found.sub.expires_at,
-      found.sub.traffic_limit_bytes,
-      found.sub.upload_bytes + found.sub.download_bytes,
-    ]);
-
-    if (matchesIfNoneMatch(request.headers.get('If-None-Match'), etag)) {
-      return new Response(null, {
-        status: 304,
-        headers: {
-          ETag: etag,
-          'Cache-Control': 'private, max-age=1800',
-          'Subscription-Userinfo': subUserInfo,
-          'Profile-Title': 'Sentra Connect',
-          'Profile-Update-Interval': '8',
-        },
-      });
-    }
-
-    if (wantsSingbox) {
-      let compiledJson: string;
-      try {
-        const compiled = await getCachedCompiledSingbox(env.DB, {
-          mode,
-          locationCode: locationParam,
-          includeClashApi: false,
-          kv: env.SENTRA_KV,
-          onError: (source, details) => {
-            void dispatchErrorAlert(env, ctx, source, details);
-          },
-        });
-        compiledJson = compiled.json;
-      } catch (err) {
-        await dispatchErrorAlert(env, ctx, 'singboxCompiler.ts (/sub)', err);
-        throw err;
-      }
-      return new Response(compiledJson, {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/json; charset=utf-8',
-          'Subscription-Userinfo': subUserInfo,
-          'Profile-Title': 'Sentra Connect',
-          'Profile-Update-Interval': '8',
-          ETag: etag,
-          'Cache-Control': 'private, max-age=1800',
-        },
-      });
-    }
-
-    let base64Body: string;
-    try {
-      const compiled = await getCachedV2RayBase64(env.DB, mode, locationParam, env.SENTRA_KV);
-      base64Body = compiled.base64;
-    } catch (err) {
-      await dispatchErrorAlert(env, ctx, 'singboxCompiler.ts (/sub base64)', err);
-      throw err;
-    }
-    return new Response(base64Body, {
-      status: 200,
-      headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Subscription-Userinfo': subUserInfo,
-        'Profile-Update-Interval': '8',
-        'Content-Disposition': 'attachment; filename="sentra-sub.txt"',
-        ETag: etag,
-        'Cache-Control': 'private, max-age=1800',
-      },
-    });
-  }
-
-  // 7. Client Sing-box 1.14+ Config Endpoint: POST /api/v1/client/config & /connect (Zero-Write + ETag/304)
-  if (method === 'POST' && (path === '/api/v1/client/config' || path === '/api/v1/client/connect')) {
-    let body: Record<string, unknown> = {};
+    let body: Record<string, unknown>;
     try {
       body = (await request.json()) as Record<string, unknown>;
     } catch {
-      body = {};
+      return errorResponse(400, 'بدنه JSON همگام‌سازی نسخه معتبر نیست.');
     }
 
-    const token = extractAuthToken(request, body.token);
-    if (!token) {
-      return errorResponse(401, 'توکن احراز هویت ارسال نشده است.', 'MISSING_TOKEN');
+    const platformRaw = String(body.platform || '').trim().toLowerCase();
+    if (platformRaw !== 'android' && platformRaw !== 'windows') {
+      return errorResponse(400, 'فیلد platform باید android یا windows باشد.');
     }
 
-    const found = await getSubscriptionWithUser(env.DB, token);
-    if (!found) {
-      return errorResponse(401, 'توکن اشتراک معتبر نیست.', 'INVALID_TOKEN');
+    const version = String(body.version || '').trim().slice(0, 48);
+    if (!version) {
+      return errorResponse(400, 'فیلد version الزامی است.');
     }
+
+    const rawGithubUrl = String(body.github_url || '').trim();
+    let parsedUrl: URL;
+    try {
+      parsedUrl = validateExternalHttpsUrl(rawGithubUrl);
+      if (parsedUrl.protocol !== 'https:') {
+        return errorResponse(400, 'آدرس github_url باید با https:// شروع شود.');
+      }
+    } catch {
+      return errorResponse(400, 'آدرس github_url نامعتبر است.');
+    }
+
+    const telegramFileId =
+      typeof body.telegram_file_id === 'string' && body.telegram_file_id.trim().length > 0
+        ? body.telegram_file_id.trim().slice(0, 256)
+        : null;
+
+    await env.DB.prepare(
+      `INSERT INTO app_release_files (platform, version, github_url, telegram_file_id, updated_at)
+       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(platform) DO UPDATE SET
+         version = excluded.version,
+         github_url = excluded.github_url,
+         telegram_file_id = COALESCE(excluded.telegram_file_id, app_release_files.telegram_file_id),
+         updated_at = CURRENT_TIMESTAMP`
+    )
+      .bind(platformRaw, version, parsedUrl.toString(), telegramFileId)
+      .run();
+
+    return jsonResponse({
+      success: true,
+      platform: platformRaw,
+      version,
+      github_url: parsedUrl.toString(),
+      has_telegram_file_id: Boolean(telegramFileId),
+      updated_at: new Date().toISOString(),
+    });
+  }
+
+  // 6. Public V2Ray/Subscription Routes Permanently Disabled (403 Forbidden)
+  const subMatch = /^\/(?:api\/v1\/)?sub(?:\/.*)?$/.exec(path);
+  if (subMatch) {
+    return errorResponse(
+      403,
+      'دریافت لینک اشتراک عمومی (V2Ray/Subscription) غیرفعال شده است. لطفاً کد اتصال ۸ رقمی خود را از ربات تلگرام دریافت کرده و فقط در اپلیکیشن رسمی SentraVPN وارد کنید.',
+      'PUBLIC_SUB_DISABLED'
+    );
+  }
+
+  // 7. Official SentraVPN Client Config & Connect Endpoint:
+  //    GET/POST /api/v1/client/config & POST /api/v1/client/connect
+  //    Strictly requires `X-Sentra-Client` header, blocks V2Ray/Clash/browser UAs,
+  //    and authenticates via 8-digit `connect_code` (or authenticated client token).
+  if (
+    (method === 'POST' || method === 'GET') &&
+    (path === '/api/v1/client/config' || path === '/api/v1/client/connect')
+  ) {
+    const rate = checkPublicIpRateLimit('sub', extractClientIp(request));
+    if (!rate.allowed) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          code: 'RATE_LIMITED',
+          error: 'تعداد درخواست‌های شما بیش از حد مجاز است. لطفاً کمی بعد تلاش کنید.',
+        }),
+        {
+          status: 429,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Retry-After': String(rate.retryAfterSeconds),
+          },
+        }
+      );
+    }
+
+    const clientCheck = validateSentraClientRequest(request);
+    if (!clientCheck.ok) {
+      return errorResponse(403, clientCheck.reason || 'کلاینت مجاز نیست.', 'UNSUPPORTED_CLIENT');
+    }
+
+    let body: Record<string, unknown> = {};
+    if (method === 'POST') {
+      try {
+        body = (await request.json()) as Record<string, unknown>;
+      } catch {
+        body = {};
+      }
+    }
+
+    const rawConnectCode =
+      (typeof body.connect_code === 'string' && body.connect_code.trim()) ||
+      (typeof body.code === 'string' && body.code.trim()) ||
+      (url.searchParams.get('connect_code') || url.searchParams.get('code') || '').trim() ||
+      (request.headers.get('X-Connect-Code') || '').trim() ||
+      '';
+
+    let found: { user: UserRow; sub: SubscriptionRow } | null = null;
+    if (rawConnectCode) {
+      if (!isValidEightDigitConnectCode(rawConnectCode)) {
+        return errorResponse(400, 'کد اتصال باید دقیقاً ۸ رقم عددی باشد.', 'INVALID_CONNECT_CODE');
+      }
+      found = await getSubscriptionWithUserByConnectCode(env.DB, rawConnectCode);
+      if (!found) {
+        return errorResponse(401, 'کد اتصال ۸ رقمی نامعتبر است.', 'INVALID_CONNECT_CODE');
+      }
+    } else {
+      const token = extractAuthToken(request, body.token);
+      if (!token) {
+        return errorResponse(
+          401,
+          'کد اتصال ۸ رقمی (connect_code) یا توکن احراز هویت ارسال نشده است.',
+          'MISSING_CREDENTIALS'
+        );
+      }
+      found = await getSubscriptionWithUser(env.DB, token);
+      if (!found) {
+        return errorResponse(401, 'توکن اشتراک معتبر نیست.', 'INVALID_TOKEN');
+      }
+    }
+
     if (found.user.status !== 'active' || found.sub.status !== 'active') {
       return errorResponse(403, 'حساب یا اشتراک شما غیرفعال است.', 'ACCOUNT_SUSPENDED');
     }
 
-    const mode = normalizeMode(typeof body.mode === 'string' ? body.mode : 'web_browsing');
-    const locationCode = typeof body.location_code === 'string' ? body.location_code : undefined;
+    const mode = normalizeMode(
+      typeof body.mode === 'string' ? body.mode : url.searchParams.get('mode') || 'web_browsing'
+    );
+    const locationCode =
+      typeof body.location_code === 'string'
+        ? body.location_code
+        : url.searchParams.get('location_code') || url.searchParams.get('location') || undefined;
     const pool = await getCachedActiveNodesPool(env.DB, env.SENTRA_KV);
+    const planTier = resolvePlanTier(found.sub);
 
     if (mode === 'gaming') {
       if (!pool.hasActiveGaming) {
@@ -1008,35 +1164,77 @@ export async function routeRequest(
           'GAMING_COMING_SOON'
         );
       }
-      if (!tierHasGaming(found.sub.tier)) {
-        return errorResponse(403, 'دسترسی به حالت گیمینگ نیازمند اشتراک ویژه است.', 'TIER_REQUIRED');
+      const specialCheck = subscriptionCanAccessSpecialMode(found.sub, 'gaming');
+      if (!specialCheck.allowed) {
+        if (specialCheck.quotaExceeded) {
+          return errorResponse(
+            402,
+            'حجم بخش ویژه (آی‌پی ثابت + گیمینگ) شما به پایان رسیده است.',
+            'SPECIAL_QUOTA_EXCEEDED'
+          );
+        }
+        return errorResponse(
+          403,
+          'دسترسی به حالت گیمینگ نیازمند پلن Sentra Flow+ یا تست رایگان ۱ گیگابایتی است.',
+          'TIER_REQUIRED'
+        );
       }
     }
 
     if (mode === 'static_ip') {
-      if (!tierHasStaticIp(found.sub.tier)) {
-        return errorResponse(403, 'دسترسی به حالت آی‌پی ثابت نیازمند پلن Pro یا Flow+ است.', 'TIER_REQUIRED');
-      }
-      if (found.sub.static_ip_used_mb >= STATIC_IP_MONTHLY_QUOTA_MB) {
-        return errorResponse(402, 'سقف ماهانه ۳۰ گیگابایت آی‌پی ثابت به پایان رسیده است.', 'STATIC_IP_QUOTA_EXCEEDED');
+      const specialCheck = subscriptionCanAccessSpecialMode(found.sub, 'static_ip');
+      if (!specialCheck.allowed) {
+        if (specialCheck.quotaExceeded) {
+          return errorResponse(
+            402,
+            'حجم بخش ویژه (آی‌پی ثابت) شما به پایان رسیده است.',
+            'STATIC_IP_QUOTA_EXCEEDED'
+          );
+        }
+        return errorResponse(
+          403,
+          'دسترسی به حالت آی‌پی ثابت نیازمند پلن Sentra Pro، Sentra Flow+ یا تست رایگان ۱ گیگابایتی است.',
+          'TIER_REQUIRED'
+        );
       }
     }
 
-    const isLite = found.sub.tier.toLowerCase() === 'sentra lite';
-    if (isLite && mode === 'web_browsing' && found.sub.web_browsing_used_mb >= LITE_WEB_QUOTA_MB) {
-      return errorResponse(429, 'سهمیه روزانه ۲ گیگابایت وب‌گردی پلن رایگان به پایان رسیده است.', 'QUOTA_EXCEEDED');
-    }
-    if (isLite && mode === 'download' && found.sub.download_used_mb >= LITE_DL_QUOTA_MB) {
-      return errorResponse(429, 'سهمیه روزانه ۳ گیگابایت دانلود پلن رایگان به پایان رسیده است.', 'QUOTA_EXCEEDED');
+    if (planTier === 'free' && (mode === 'web_browsing' || mode === 'download')) {
+      const freeQuotas = await getFreeQuotaSettings(env.DB, env.SENTRA_KV);
+      if (
+        mode === 'web_browsing' &&
+        getEffectiveWebUsedBytes(found.sub) >= freeQuotas.webQuotaBytes
+      ) {
+        return errorResponse(
+          429,
+          `سهمیه وبگردی پلن رایگان (${freeQuotas.webQuotaGb} گیگابایت) به پایان رسیده است.`,
+          'QUOTA_EXCEEDED'
+        );
+      }
+      if (
+        mode === 'download' &&
+        getEffectiveDownloadUsedBytes(found.sub) >= freeQuotas.downloadQuotaBytes
+      ) {
+        return errorResponse(
+          429,
+          `سهمیه دانلود پلن رایگان (${freeQuotas.downloadQuotaGb} گیگابایت) به پایان رسیده است.`,
+          'QUOTA_EXCEEDED'
+        );
+      }
     }
 
     const preferFirst = Boolean(body.selected_outbound_id);
+    const normalizedLocation = (locationCode || 'auto').trim().toLowerCase() || 'auto';
+    const usePrecompiledPlanCache =
+      mode === 'web_browsing' && normalizedLocation === 'auto' && !preferFirst;
+
     const etag = computeWeakEtag([
       'cfg',
       pool.version,
       mode,
-      (locationCode || 'auto').toUpperCase(),
+      normalizedLocation.toUpperCase(),
       preferFirst ? 1 : 0,
+      planTier,
       found.sub.tier,
       found.sub.status,
       found.sub.expires_at,
@@ -1052,51 +1250,84 @@ export async function routeRequest(
       });
     }
 
-    let singboxConfig: Record<string, unknown>;
+    let precompiledConfigJson: string;
+    let cacheSource: string = 'isolate';
     try {
-      const compiled = await getCachedCompiledSingbox(env.DB, {
-        mode,
-        locationCode,
-        preferFirstAsDefault: preferFirst,
-        includeClashApi: true,
-        kv: env.SENTRA_KV,
-        onError: (source, details) => {
-          void dispatchErrorAlert(env, ctx, source, details);
-        },
-      });
-      singboxConfig = compiled.config;
+      if (usePrecompiledPlanCache) {
+        const ready = await getCachedPrecompiledPlanConfig(env.DB, planTier, {
+          kv: env.SENTRA_KV,
+          onError: (source, details) => {
+            void dispatchErrorAlert(env, ctx, source, details);
+          },
+        });
+        precompiledConfigJson = ready.configJson;
+        cacheSource = ready.source;
+      } else {
+        const compiled = await getCachedCompiledSingbox(env.DB, {
+          mode,
+          locationCode,
+          preferFirstAsDefault: preferFirst,
+          includeClashApi: true,
+          kv: env.SENTRA_KV,
+          onError: (source, details) => {
+            void dispatchErrorAlert(env, ctx, source, details);
+          },
+        });
+        precompiledConfigJson = compiled.json;
+      }
     } catch (err) {
       await dispatchErrorAlert(env, ctx, 'singboxCompiler.ts (/api/v1/client/config)', err);
       throw err;
     }
 
-    return jsonResponse(
-      {
-        success: true,
-        mode,
-        location_code: locationCode || 'auto',
-        singbox_schema: '1.14+',
-        config: singboxConfig,
-        singbox_config: singboxConfig,
-      },
-      200,
-      {
+    // Zero-parse / zero-re-stringify response assembly (<1ms CPU)
+    const responseBody =
+      `{"success":true,` +
+      `"mode":${JSON.stringify(mode)},` +
+      `"plan_tier":${JSON.stringify(planTier)},` +
+      `"connect_code":${JSON.stringify(found.sub.connect_code || null)},` +
+      `"location_code":${JSON.stringify(locationCode || 'auto')},` +
+      `"singbox_schema":"1.14+",` +
+      `"config":${precompiledConfigJson},` +
+      `"singbox_config":${precompiledConfigJson}}`;
+
+    return new Response(responseBody, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
         ETag: etag,
         'Cache-Control': 'private, max-age=1800',
-      }
-    );
+        'X-Sentra-Cache': cacheSource,
+      },
+    });
   }
 
   // 8. Client Modes Catalog: GET /api/v1/client/modes (Served from L1 RAM / L2 KV Cache)
   if (method === 'GET' && path === '/api/v1/client/modes') {
     const token = extractAuthToken(request);
     const found = token ? await getSubscriptionWithUser(env.DB, token) : null;
-    const tier = found?.sub.tier || 'Sentra Lite';
+    const planTier = found ? resolvePlanTier(found.sub) : 'free';
+    const isFree = planTier === 'free';
     const gamingLive = await getCachedHasActiveGaming(env.DB, env.SENTRA_KV);
-    const isLite = tier.toLowerCase() === 'sentra lite';
+    const freeQuotas = await getFreeQuotaSettings(env.DB, env.SENTRA_KV);
+
+    const staticAccess = found
+      ? subscriptionCanAccessSpecialMode(found.sub, 'static_ip')
+      : { allowed: false, isTrial: false, quotaExceeded: false };
+    const gamingAccess = found
+      ? subscriptionCanAccessSpecialMode(found.sub, 'gaming')
+      : { allowed: false, isTrial: false, quotaExceeded: false };
+
+    const webUsedMb = found ? Math.round(getEffectiveWebUsedBytes(found.sub) / MIB_BYTES) : 0;
+    const dlUsedMb = found ? Math.round(getEffectiveDownloadUsedBytes(found.sub) / MIB_BYTES) : 0;
+    const specialQuotaMb = found && Number(found.sub.special_quota_bytes || 0) > 0
+      ? Math.round(Number(found.sub.special_quota_bytes || 0) / MIB_BYTES)
+      : STATIC_IP_MONTHLY_QUOTA_MB;
+    const specialUsedMb = found ? Math.round(getEffectiveSpecialUsedBytes(found.sub) / MIB_BYTES) : 0;
 
     return jsonResponse({
       success: true,
+      plan_tier: planTier,
       gaming_enabled: gamingLive,
       modes: [
         {
@@ -1105,8 +1336,8 @@ export async function routeRequest(
           status: 'available',
           is_locked: false,
           is_coming_soon: false,
-          daily_quota_mb: isLite ? LITE_WEB_QUOTA_MB : 0,
-          daily_used_mb: found?.sub.web_browsing_used_mb || 0,
+          daily_quota_mb: isFree ? Math.round(freeQuotas.webQuotaGb * 1024) : 0,
+          daily_used_mb: webUsedMb,
         },
         {
           id: 'download',
@@ -1114,26 +1345,26 @@ export async function routeRequest(
           status: 'available',
           is_locked: false,
           is_coming_soon: false,
-          daily_quota_mb: isLite ? LITE_DL_QUOTA_MB : 0,
-          daily_used_mb: found?.sub.download_used_mb || 0,
+          daily_quota_mb: isFree ? Math.round(freeQuotas.downloadQuotaGb * 1024) : 0,
+          daily_used_mb: dlUsedMb,
         },
         {
           id: 'gaming',
           title: 'گیمینگ',
-          status: !gamingLive ? 'coming_soon' : tierHasGaming(tier) ? 'available' : 'locked',
-          is_locked: gamingLive && !tierHasGaming(tier),
+          status: !gamingLive ? 'coming_soon' : gamingAccess.allowed ? 'available' : 'locked',
+          is_locked: gamingLive && !gamingAccess.allowed,
           is_coming_soon: !gamingLive,
-          daily_quota_mb: 0,
-          daily_used_mb: 0,
+          daily_quota_mb: specialQuotaMb,
+          daily_used_mb: specialUsedMb,
         },
         {
           id: 'static_ip',
           title: 'آی‌پی ثابت',
-          status: tierHasStaticIp(tier) ? 'available' : 'locked',
-          is_locked: !tierHasStaticIp(tier),
+          status: staticAccess.allowed ? 'available' : 'locked',
+          is_locked: !staticAccess.allowed,
           is_coming_soon: false,
-          daily_quota_mb: STATIC_IP_MONTHLY_QUOTA_MB,
-          daily_used_mb: found?.sub.static_ip_used_mb || 0,
+          daily_quota_mb: specialQuotaMb,
+          daily_used_mb: specialUsedMb,
         },
       ],
     });
@@ -1197,6 +1428,7 @@ export async function routeRequest(
     const userUuid = crypto.randomUUID();
     const passwordHash = await hashPassword(password);
     const token = generateSubscriptionToken();
+    const connectCode = await generateUniqueConnectCode(env.DB);
     const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
     const userRes = await env.DB.prepare(
@@ -1208,10 +1440,10 @@ export async function routeRequest(
 
     const userId = userRes.meta.last_row_id;
     await env.DB.prepare(
-      `INSERT INTO subscriptions (user_id, tier, token, status, traffic_limit_bytes, max_concurrent_devices, expires_at)
-       VALUES (?, 'Sentra Lite', ?, 'active', ?, 3, ?)`
+      `INSERT INTO subscriptions (user_id, tier, plan_tier, connect_code, token, status, traffic_limit_bytes, max_concurrent_devices, expires_at)
+       VALUES (?, 'Sentra Lite', 'free', ?, ?, 'active', ?, 3, ?)`
     )
-      .bind(userId, token, 10 * 1024 * 1024 * 1024, expiresAt)
+      .bind(userId, connectCode, token, 10 * GIB_BYTES, expiresAt)
       .run();
 
     return jsonResponse(
@@ -1229,9 +1461,11 @@ export async function routeRequest(
         },
         subscription: {
           tier: 'Sentra Lite',
+          plan_tier: 'free',
+          connect_code: connectCode,
           token,
           status: 'active',
-          remaining_bytes: 10 * 1024 * 1024 * 1024,
+          remaining_bytes: 10 * GIB_BYTES,
           max_concurrent_devices: 3,
           expires_at: expiresAt,
         },
@@ -1287,6 +1521,8 @@ export async function routeRequest(
       },
       subscription: {
         tier: sub.tier,
+        plan_tier: resolvePlanTier(sub),
+        connect_code: sub.connect_code || null,
         token: sub.token,
         status: sub.status,
         remaining_bytes: Math.max(0, sub.traffic_limit_bytes - (sub.upload_bytes + sub.download_bytes)),
@@ -1296,7 +1532,7 @@ export async function routeRequest(
     });
   }
 
-  // 12. Auth: Exchange 8-digit Telegram OTP code
+  // 12. Auth: Login with Permanent 8-Digit Connect Code (or legacy OTP code)
   if (
     method === 'POST' &&
     (path === '/api/v1/auth/exchange-code' || path === '/api/v1/auth/code-login')
@@ -1308,11 +1544,48 @@ export async function routeRequest(
       return errorResponse(400, 'بدنه درخواست معتبر نیست.');
     }
 
-    const code = String(body.code || '').trim();
+    const code = String(body.connect_code || body.code || '').trim();
     if (!/^\d{6,8}$/.test(code)) {
-      return errorResponse(400, 'کد ورود معتبر نیست.');
+      return errorResponse(400, 'کد اتصال ۸ رقمی معتبر نیست.');
     }
 
+    // 12a. First check permanent 8-digit subscriptions.connect_code (zero D1 writes!)
+    if (isValidEightDigitConnectCode(code)) {
+      const byCode = await getSubscriptionWithUserByConnectCode(env.DB, code);
+      if (byCode) {
+        if (byCode.user.status !== 'active' || byCode.sub.status !== 'active') {
+          return errorResponse(403, 'حساب کاربری یا اشتراک شما غیرفعال است.');
+        }
+        return jsonResponse({
+          success: true,
+          access_token: `jwt_sentra_${byCode.sub.token}`,
+          token_type: 'Bearer',
+          user: {
+            id: byCode.user.id,
+            user_uuid: byCode.user.user_uuid,
+            telegram_id: byCode.user.telegram_id,
+            username: byCode.user.username,
+            first_name: byCode.user.first_name,
+            role: byCode.user.role,
+          },
+          subscription: {
+            tier: byCode.sub.tier,
+            plan_tier: resolvePlanTier(byCode.sub),
+            connect_code: byCode.sub.connect_code,
+            token: byCode.sub.token,
+            status: byCode.sub.status,
+            remaining_bytes: Math.max(
+              0,
+              byCode.sub.traffic_limit_bytes - (byCode.sub.upload_bytes + byCode.sub.download_bytes)
+            ),
+            max_concurrent_devices: byCode.sub.max_concurrent_devices,
+            expires_at: byCode.sub.expires_at,
+          },
+        });
+      }
+    }
+
+    // 12b. Fallback: legacy ephemeral auth_code
     const user = await env.DB.prepare(
       `SELECT ${USER_SELECT_COLS} FROM users
        WHERE auth_code = ? AND auth_code_expires_at > datetime('now')
@@ -1322,7 +1595,7 @@ export async function routeRequest(
       .first<UserRow>();
 
     if (!user) {
-      return errorResponse(401, 'کد ورود نامعتبر یا منقضی شده است.');
+      return errorResponse(401, 'کد اتصال ۸ رقمی نامعتبر یا منقضی شده است.');
     }
 
     const [, subBatchRes] = await executeD1Batch<Record<string, unknown>>(env.DB, [
@@ -1353,6 +1626,8 @@ export async function routeRequest(
       },
       subscription: {
         tier: sub.tier,
+        plan_tier: resolvePlanTier(sub),
+        connect_code: sub.connect_code || null,
         token: sub.token,
         status: sub.status,
         remaining_bytes: Math.max(0, sub.traffic_limit_bytes - (sub.upload_bytes + sub.download_bytes)),
@@ -1408,12 +1683,17 @@ export async function routeRequest(
 
     const deltaUp = Math.max(0, Math.round(Number(body.delta_upload_bytes) || 0));
     const deltaDown = Math.max(0, Math.round(Number(body.delta_download_bytes) || 0));
-    const deltaMb = Math.floor((deltaUp + deltaDown) / (1024 * 1024));
+    const deltaBytes = deltaUp + deltaDown;
+    const deltaMb = Math.floor(deltaBytes / MIB_BYTES);
     const mode = normalizeMode(typeof body.mode === 'string' ? body.mode : 'web_browsing');
+    const planTier = resolvePlanTier(found.sub);
 
-    const webAdd = mode === 'web_browsing' ? deltaMb : 0;
-    const dlAdd = mode === 'download' ? deltaMb : 0;
-    const staticAdd = mode === 'static_ip' ? deltaMb : 0;
+    const webAddMb = mode === 'web_browsing' ? deltaMb : 0;
+    const dlAddMb = mode === 'download' ? deltaMb : 0;
+    const staticAddMb = mode === 'static_ip' || mode === 'gaming' ? deltaMb : 0;
+    const webAddBytes = mode === 'web_browsing' ? deltaBytes : 0;
+    const dlAddBytes = mode === 'download' ? deltaBytes : 0;
+    const specialAddBytes = mode === 'static_ip' || mode === 'gaming' ? deltaBytes : 0;
 
     await env.DB.prepare(
       `UPDATE subscriptions
@@ -1422,32 +1702,81 @@ export async function routeRequest(
            web_browsing_used_mb = web_browsing_used_mb + ?,
            download_used_mb = download_used_mb + ?,
            static_ip_used_mb = static_ip_used_mb + ?,
+           web_used_bytes = web_used_bytes + ?,
+           download_used_bytes = download_used_bytes + ?,
+           special_used_bytes = special_used_bytes + ?,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`
     )
-      .bind(deltaUp, deltaDown, webAdd, dlAdd, staticAdd, found.sub.id)
+      .bind(
+        deltaUp,
+        deltaDown,
+        webAddMb,
+        dlAddMb,
+        staticAddMb,
+        webAddBytes,
+        dlAddBytes,
+        specialAddBytes,
+        found.sub.id
+      )
       .run();
 
-    const totalUsed = found.sub.upload_bytes + found.sub.download_bytes + deltaUp + deltaDown;
-    const remaining = Math.max(0, found.sub.traffic_limit_bytes - totalUsed);
+    const nextWebBytes = getEffectiveWebUsedBytes(found.sub) + webAddBytes;
+    const nextDlBytes = getEffectiveDownloadUsedBytes(found.sub) + dlAddBytes;
+    const nextSpecialBytes = getEffectiveSpecialUsedBytes(found.sub) + specialAddBytes;
+    const specialQuotaBytes = Number(found.sub.special_quota_bytes || 0);
 
-    if (remaining <= 0) {
+    if (planTier === 'free') {
+      const freeQuotas = await getFreeQuotaSettings(env.DB, env.SENTRA_KV);
+      if (mode === 'web_browsing' && nextWebBytes >= freeQuotas.webQuotaBytes) {
+        return jsonResponse({
+          action: 'disconnect',
+          code: 'QUOTA_EXCEEDED',
+          message: `سهمیه وبگردی پلن رایگان (${freeQuotas.webQuotaGb} گیگابایت) به پایان رسیده است.`,
+        });
+      }
+      if (mode === 'download' && nextDlBytes >= freeQuotas.downloadQuotaBytes) {
+        return jsonResponse({
+          action: 'disconnect',
+          code: 'QUOTA_EXCEEDED',
+          message: `سهمیه دانلود پلن رایگان (${freeQuotas.downloadQuotaGb} گیگابایت) به پایان رسیده است.`,
+        });
+      }
+    }
+
+    if (
+      (mode === 'static_ip' || mode === 'gaming') &&
+      specialQuotaBytes > 0 &&
+      nextSpecialBytes >= specialQuotaBytes
+    ) {
       return jsonResponse({
         action: 'disconnect',
-        code: 'QUOTA_EXCEEDED',
-        message: 'حجم کل اشتراک شما به پایان رسیده است.',
+        code: 'SPECIAL_QUOTA_EXCEEDED',
+        message: 'حجم بخش ویژه (آی‌پی ثابت / گیمینگ) شما به پایان رسیده است.',
       });
     }
 
+    const totalUsed = found.sub.upload_bytes + found.sub.download_bytes + deltaBytes;
+    const remaining =
+      planTier === 'free'
+        ? Math.max(0, found.sub.traffic_limit_bytes - totalUsed)
+        : Math.max(0, specialQuotaBytes - nextSpecialBytes);
+
     return jsonResponse({
       action: 'continue',
+      plan_tier: planTier,
       remaining_bytes: remaining,
-      web_browsing_used_mb: found.sub.web_browsing_used_mb + webAdd,
-      download_used_mb: found.sub.download_used_mb + dlAdd,
-      static_ip_used_mb: found.sub.static_ip_used_mb + staticAdd,
+      web_used_bytes: nextWebBytes,
+      download_used_bytes: nextDlBytes,
+      special_quota_bytes: specialQuotaBytes,
+      special_used_bytes: nextSpecialBytes,
+      web_browsing_used_mb: found.sub.web_browsing_used_mb + webAddMb,
+      download_used_mb: found.sub.download_used_mb + dlAddMb,
+      static_ip_used_mb: found.sub.static_ip_used_mb + staticAddMb,
       static_ip_remaining_mb: Math.max(
         0,
-        STATIC_IP_MONTHLY_QUOTA_MB - (found.sub.static_ip_used_mb + staticAdd)
+        (specialQuotaBytes > 0 ? Math.round(specialQuotaBytes / MIB_BYTES) : STATIC_IP_MONTHLY_QUOTA_MB) -
+          Math.round(nextSpecialBytes / MIB_BYTES)
       ),
     });
   }
@@ -1587,8 +1916,24 @@ export async function routeRequest(
     const remainingDays = Number.isFinite(expiresMs)
       ? Math.max(0, Math.ceil((expiresMs - Date.now()) / (24 * 60 * 60 * 1000)))
       : 30;
-    const isLite = found.sub.tier.toLowerCase() === 'sentra lite';
+    const planTier = resolvePlanTier(found.sub);
+    const isFree = planTier === 'free';
     const gamingLive = pool.hasActiveGaming;
+    const freeQuotas = await getFreeQuotaSettings(env.DB, env.SENTRA_KV);
+    const webUsedBytes = getEffectiveWebUsedBytes(found.sub);
+    const dlUsedBytes = getEffectiveDownloadUsedBytes(found.sub);
+    const specialQuotaBytes = Number(found.sub.special_quota_bytes || 0);
+    const specialUsedBytes = getEffectiveSpecialUsedBytes(found.sub);
+    const staticAccess = subscriptionCanAccessSpecialMode(found.sub, 'static_ip');
+    const gamingAccess = subscriptionCanAccessSpecialMode(found.sub, 'gaming');
+
+    const freeWebMb = Math.round(freeQuotas.webQuotaGb * 1024);
+    const freeDlMb = Math.round(freeQuotas.downloadQuotaGb * 1024);
+    const webUsedMb = Math.round(webUsedBytes / MIB_BYTES);
+    const dlUsedMb = Math.round(dlUsedBytes / MIB_BYTES);
+    const specialQuotaMb =
+      specialQuotaBytes > 0 ? Math.round(specialQuotaBytes / MIB_BYTES) : STATIC_IP_MONTHLY_QUOTA_MB;
+    const specialUsedMb = Math.round(specialUsedBytes / MIB_BYTES);
 
     return jsonResponse({
       success: true,
@@ -1605,6 +1950,8 @@ export async function routeRequest(
       },
       subscription: {
         tier: found.sub.tier,
+        plan_tier: planTier,
+        connect_code: found.sub.connect_code || null,
         token: found.sub.token,
         status: found.sub.status,
         upload_bytes: found.sub.upload_bytes,
@@ -1612,9 +1959,14 @@ export async function routeRequest(
         used_bytes: usedBytes,
         traffic_limit_bytes: found.sub.traffic_limit_bytes,
         remaining_bytes: remainingBytes,
-        web_browsing_used_mb: found.sub.web_browsing_used_mb,
-        download_used_mb: found.sub.download_used_mb,
-        static_ip_used_mb: found.sub.static_ip_used_mb,
+        web_used_bytes: webUsedBytes,
+        download_used_bytes: dlUsedBytes,
+        special_quota_bytes: specialQuotaBytes,
+        special_used_bytes: specialUsedBytes,
+        has_used_special_trial: Number(found.sub.has_used_special_trial || 0) === 1,
+        web_browsing_used_mb: webUsedMb,
+        download_used_mb: dlUsedMb,
+        static_ip_used_mb: specialUsedMb,
         active_devices_count: activeDevices.length,
         max_concurrent_devices: found.sub.max_concurrent_devices,
         remaining_days: remainingDays,
@@ -1625,37 +1977,37 @@ export async function routeRequest(
         {
           id: 'web_browsing',
           name: 'وب‌گردی',
-          status: isLite && found.sub.web_browsing_used_mb >= LITE_WEB_QUOTA_MB ? 'depleted' : 'active',
-          daily_limit_mb: isLite ? LITE_WEB_QUOTA_MB : 0,
-          used_today_mb: found.sub.web_browsing_used_mb,
-          remaining_today_mb: isLite ? Math.max(0, LITE_WEB_QUOTA_MB - found.sub.web_browsing_used_mb) : 0,
+          status: isFree && webUsedBytes >= freeQuotas.webQuotaBytes ? 'depleted' : 'active',
+          daily_limit_mb: isFree ? freeWebMb : 0,
+          used_today_mb: webUsedMb,
+          remaining_today_mb: isFree ? Math.max(0, freeWebMb - webUsedMb) : 0,
           description: 'مناسب وب‌گردی، تلگرام، اینستاگرام و شبکه‌های اجتماعی',
         },
         {
           id: 'download',
           name: 'دانلود و استریم',
-          status: isLite && found.sub.download_used_mb >= LITE_DL_QUOTA_MB ? 'depleted' : 'active',
-          daily_limit_mb: isLite ? LITE_DL_QUOTA_MB : 0,
-          used_today_mb: found.sub.download_used_mb,
-          remaining_today_mb: isLite ? Math.max(0, LITE_DL_QUOTA_MB - found.sub.download_used_mb) : 0,
+          status: isFree && dlUsedBytes >= freeQuotas.downloadQuotaBytes ? 'depleted' : 'active',
+          daily_limit_mb: isFree ? freeDlMb : 0,
+          used_today_mb: dlUsedMb,
+          remaining_today_mb: isFree ? Math.max(0, freeDlMb - dlUsedMb) : 0,
           description: 'پهنای باند بهینه برای دانلود فایل و تماشای ویدیو',
         },
         {
           id: 'gaming',
           name: 'گیمینگ',
-          status: !gamingLive ? 'locked' : tierHasGaming(found.sub.tier) ? 'active' : 'locked',
-          daily_limit_mb: 0,
-          used_today_mb: 0,
-          remaining_today_mb: 0,
+          status: !gamingLive ? 'locked' : gamingAccess.allowed ? 'active' : 'locked',
+          daily_limit_mb: specialQuotaMb,
+          used_today_mb: specialUsedMb,
+          remaining_today_mb: Math.max(0, specialQuotaMb - specialUsedMb),
           description: 'پینگ پایدار و بهینه برای بازی‌های آنلاین',
         },
         {
           id: 'static_ip',
           name: 'آی‌پی ثابت',
-          status: tierHasStaticIp(found.sub.tier) ? 'active' : 'locked',
-          daily_limit_mb: STATIC_IP_MONTHLY_QUOTA_MB,
-          used_today_mb: found.sub.static_ip_used_mb,
-          remaining_today_mb: Math.max(0, STATIC_IP_MONTHLY_QUOTA_MB - found.sub.static_ip_used_mb),
+          status: staticAccess.allowed ? 'active' : 'locked',
+          daily_limit_mb: specialQuotaMb,
+          used_today_mb: specialUsedMb,
+          remaining_today_mb: Math.max(0, specialQuotaMb - specialUsedMb),
           description: 'آی‌پی ثابت و ایمن مناسب ترید و حساب‌های بین‌المللی',
         },
       ],
@@ -1850,9 +2202,10 @@ export async function routeRequest(
     const insertRes = await env.DB.prepare(
       `INSERT INTO donated_outbounds (
          donor_user_id, tag, protocol, server_address, server_port, config_json,
+         compiled_outbound_json, validation_error,
          latency_ms, assigned_tier, health_score, status, raw_link, fingerprint_sha256,
          is_official, label, country_code, country_name, allow_web, allow_download
-       ) VALUES (?, ?, ?, ?, ?, ?, 0, 'web_browsing', 100, ?, ?, ?, ?, ?, ?, ?, 1, 1)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, 'web_browsing', 100, ?, ?, ?, ?, ?, ?, ?, 1, 1)`
     )
       .bind(
         found.user.id,
@@ -1860,7 +2213,8 @@ export async function routeRequest(
         parsed.protocol,
         parsed.server_address,
         parsed.server_port,
-        JSON.stringify(parsed.config_json),
+        parsed.compiled_outbound_json,
+        parsed.compiled_outbound_json,
         status,
         parsed.raw_link,
         parsed.fingerprint_sha256,

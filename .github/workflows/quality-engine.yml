@@ -1,4 +1,4 @@
-name: Sentra QualityEngine (Node Health & Gemini/Trading Probe)
+name: Sentra QualityEngine (Node Health & sing-box 1.14+ Verification)
 
 on:
   schedule:
@@ -13,9 +13,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  SINGBOX_VERSION: '1.14.0'
+  SINGBOX_CACHE_DIR: /tmp/sentra-singbox-cache
+
 jobs:
   quality-check:
-    name: Probe Active Nodes & Report to Cloudflare D1
+    name: Probe Active Nodes & Run 2-Stage sing-box 1.14+ Check
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -28,17 +32,38 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install sing-box for real Gemini & Trading proxy verification
+      - name: Cache official sing-box 1.14+ binary
+        id: cache-singbox
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SINGBOX_CACHE_DIR }}
+          key: sentra-singbox-${{ runner.os }}-amd64-v${{ env.SINGBOX_VERSION }}
+
+      - name: Install sing-box 1.14+ (from cache or official release)
         run: |
           set -euo pipefail
-          SINGBOX_VERSION="1.11.8"
-          ARCHIVE="sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
-          curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${ARCHIVE}" -o "/tmp/${ARCHIVE}"
-          tar -xzf "/tmp/${ARCHIVE}" -C /tmp
-          sudo install -m 0755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          mkdir -p "${SINGBOX_CACHE_DIR}"
+          CACHED_BIN="${SINGBOX_CACHE_DIR}/sing-box"
+          if [ ! -x "${CACHED_BIN}" ]; then
+            TARGET_VER="${SINGBOX_VERSION}"
+            ARCHIVE="sing-box-${TARGET_VER}-linux-amd64.tar.gz"
+            URL="https://github.com/SagerNet/sing-box/releases/download/v${TARGET_VER}/${ARCHIVE}"
+            if ! curl -fsSL "${URL}" -o "/tmp/${ARCHIVE}"; then
+              echo "Version v${TARGET_VER} archive not found; resolving latest 1.14+ release from GitHub API..."
+              LATEST_TAG="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases \
+                | node -e "const d = JSON.parse(require('fs').readFileSync(0,'utf8')); const r = d.find(x => /^v1\.1[4-9]\./.test(x.tag_name) && !x.draft) || d.find(x => !x.draft && !x.prerelease); console.log((r?.tag_name || 'v1.14.0').replace(/^v/, ''));")"
+              TARGET_VER="${LATEST_TAG}"
+              ARCHIVE="sing-box-${TARGET_VER}-linux-amd64.tar.gz"
+              curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${TARGET_VER}/${ARCHIVE}" -o "/tmp/${ARCHIVE}"
+            fi
+            tar -xzf "/tmp/${ARCHIVE}" -C /tmp
+            install -m 0755 "/tmp/sing-box-${TARGET_VER}-linux-amd64/sing-box" "${CACHED_BIN}"
+            rm -rf "/tmp/${ARCHIVE}" "/tmp/sing-box-${TARGET_VER}-linux-amd64"
+          fi
+          sudo install -m 0755 "${CACHED_BIN}" /usr/local/bin/sing-box
           sing-box version
 
-      - name: Execute QualityEngine check script
+      - name: Execute QualityEngine 2-Stage Validation & Health Check
         env:
           SENTRA_WORKER_URL: ${{ secrets.SENTRA_WORKER_URL || 'https://sentra-core.kziepr.workers.dev' }}
           QUALITY_ENGINE_SECRET: ${{ secrets.QUALITY_ENGINE_SECRET }}

@@ -34,10 +34,11 @@ import {
   DEFAULT_API_BASE_URL,
   DEVICE_ID_KEY,
   PERSONAL_CONFIGS_KEY,
+  SENTRA_CLIENT_HEADER_VALUE,
   SESSION_STORAGE_KEY,
 } from '../constants';
 
-export { API_BASE_URL, DEFAULT_API_BASE_URL };
+export { API_BASE_URL, DEFAULT_API_BASE_URL, SENTRA_CLIENT_HEADER_VALUE };
 
 const REMOTE_BACKEND_URLS = Array.from(
   new Set([API_BASE_URL, DEFAULT_API_BASE_URL].filter(Boolean))
@@ -126,6 +127,8 @@ function loadLocalSession(): PersistedSession | null {
     return {
       auth_token: parsed.auth_token || parsed.subscription_token,
       subscription_token: parsed.subscription_token,
+      connect_code: parsed.connect_code ?? null,
+      plan_tier: parsed.plan_tier,
       username: parsed.username || '',
       tier: parsed.tier || '',
       expires_at: parsed.expires_at ?? null,
@@ -215,6 +218,7 @@ async function fetchBackendJson<T>(
         signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
+          'X-Sentra-Client': SENTRA_CLIENT_HEADER_VALUE,
           ...(options?.headers || {}),
         },
       });
@@ -299,6 +303,7 @@ async function fetchBackendConfigWithEtag(
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
+        'X-Sentra-Client': SENTRA_CLIENT_HEADER_VALUE,
         ...((options.headers as Record<string, string>) || {}),
       };
       if (cachedEtag) {
@@ -385,16 +390,20 @@ async function fetchBackendConfigWithEtag(
 }
 
 /**
- * Fetches and validates a sing-box 1.14+ configuration from POST /api/v1/client/config,
- * using ETag / 304 Not Modified + local device cache for offline resilience and
- * automatically falling back to GET /sub/{token}?format=singbox if needed.
+ * Fetches and validates a sing-box 1.14+ configuration exclusively from
+ * POST /api/v1/client/config with X-Sentra-Client header, ETag / 304 Not Modified,
+ * and local device cache for offline resilience. Public /sub/* endpoints are disabled.
  */
 export async function fetchSingboxClientConfig(
   token: string,
   mode: ConnectionModeId = 'web_browsing',
-  locationCode?: string
+  locationCode?: string,
+  connectCode?: string | null
 ): Promise<Record<string, unknown>> {
   const cached = loadCachedSingboxConfig(token, mode, locationCode);
+  const persisted = loadLocalSession();
+  const effectiveConnectCode = connectCode ?? persisted?.connect_code ?? null;
+
   try {
     const res = await fetchBackendConfigWithEtag(
       '/api/v1/client/config',
@@ -403,9 +412,11 @@ export async function fetchSingboxClientConfig(
         headers: {
           'X-Subscription-Token': token,
           'X-Device-Id': getOrCreateWebDeviceId(),
+          ...(effectiveConnectCode ? { 'X-Connect-Code': effectiveConnectCode } : {}),
         },
         body: JSON.stringify({
           token,
+          ...(effectiveConnectCode ? { connect_code: effectiveConnectCode } : {}),
           mode,
           ...(locationCode && locationCode !== 'auto' ? { location_code: locationCode } : {}),
         }),
@@ -422,74 +433,25 @@ export async function fetchSingboxClientConfig(
     const extracted = extractSingboxConfig(res.data);
     const validated = validateSingbox114Config(extracted);
     if (!validated.valid) {
-      throw new Error(validated.errors[0] || 'پیکربندی دریافتی با sing-box 1.14+ سازگار نیست.');
+      const err = new Error(validated.errors[0] || 'پیکربندی دریافتی با sing-box 1.14+ سازگار نیست.');
+      void reportClientError({
+        moduleOrFile: 'sentra-client/src/services/api.ts',
+        actionOrRoute: 'fetchSingboxClientConfig',
+        error: err,
+        context: { mode, location_code: locationCode || 'auto', validation_errors: validated.errors },
+        subscriptionToken: token,
+      });
+      throw err;
     }
     saveCachedSingboxConfig(token, mode, locationCode, validated.config, res.etag);
     return validated.config;
   } catch (primaryErr) {
     const msg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
-    if (msg.startsWith('AUTH_EXPIRED:')) {
-      throw primaryErr;
+    if (!msg.startsWith('AUTH_EXPIRED:') && cached?.config) {
+      return cached.config;
     }
-    try {
-      return await fetchSingboxSubscriptionConfig(token, mode, locationCode);
-    } catch (fallbackErr) {
-      const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-      if (!fbMsg.startsWith('AUTH_EXPIRED:') && cached?.config) {
-        return cached.config;
-      }
-      throw fallbackErr;
-    }
+    throw primaryErr;
   }
-}
-
-/**
- * Fetches a sing-box 1.14+ configuration directly from GET /sub/{token}?format=singbox
- * with ETag / 304 Not Modified and local cache persistence.
- */
-export async function fetchSingboxSubscriptionConfig(
-  token: string,
-  mode: ConnectionModeId = 'web_browsing',
-  locationCode?: string
-): Promise<Record<string, unknown>> {
-  const cached = loadCachedSingboxConfig(token, mode, locationCode);
-  const params = new URLSearchParams({ format: 'singbox', mode });
-  if (locationCode && locationCode !== 'auto') {
-    params.set('location', locationCode);
-  }
-  const path = `/sub/${encodeURIComponent(token.trim())}?${params.toString()}`;
-  const res = await fetchBackendConfigWithEtag(
-    path,
-    {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-      },
-      timeoutMs: 12000,
-    },
-    cached?.etag ?? null
-  );
-  if (res.notModified && cached?.config) {
-    return cached.config;
-  }
-  if (res.notModified) {
-    throw new Error('پیکربندی کش‌شده روی دستگاه یافت نشد.');
-  }
-  const extracted = extractSingboxConfig(res.data);
-  const validated = validateSingbox114Config(extracted);
-  if (!validated.valid) {
-    const err = new Error(validated.errors[0] || 'پیکربندی لینک اشتراک با sing-box 1.14+ سازگار نیست.');
-    void reportClientError({
-      moduleOrFile: 'sentra-client/src/services/api.ts',
-      actionOrRoute: 'fetchSingboxSubscriptionConfig',
-      error: err,
-      context: { mode, location_code: locationCode || 'auto', validation_errors: validated.errors },
-      subscriptionToken: token,
-    });
-    throw err;
-  }
-  saveCachedSingboxConfig(token, mode, locationCode, validated.config, res.etag);
-  return validated.config;
 }
 
 export async function restorePersistedSession(): Promise<PersistedSession | null> {
@@ -648,10 +610,12 @@ export async function loginWithOtpCode(code: string): Promise<PersistedSession> 
     return session;
   }
 
+  const trimmed = code.trim();
   const data = await fetchBackendJson<RawAuthApiResponse>('/api/v1/auth/code-login', {
     method: 'POST',
     body: JSON.stringify({
-      code,
+      connect_code: trimmed,
+      code: trimmed,
       device_identifier: getOrCreateWebDeviceId(),
       device_name: navigator.userAgent.slice(0, 48),
       os: 'web',
@@ -660,10 +624,14 @@ export async function loginWithOtpCode(code: string): Promise<PersistedSession> 
 
   const session = parseAuthSessionResponse(data);
   if (!session) {
-    throw new Error('کد واردشده معتبر نیست یا منقضی شده است.');
+    throw new Error('کد اتصال ۸ رقمی واردشده معتبر نیست.');
   }
-  saveLocalSession(session);
-  return session;
+  const withCode: PersistedSession = {
+    ...session,
+    connect_code: session.connect_code || trimmed,
+  };
+  saveLocalSession(withCode);
+  return withCode;
 }
 
 export async function logoutSession(): Promise<void> {
@@ -716,6 +684,8 @@ export async function fetchBootstrap(token: string): Promise<BootstrapResponse> 
   if (existing && existing.subscription_token === token && raw.subscription) {
     const refreshed: PersistedSession = {
       ...existing,
+      connect_code: raw.subscription.connect_code ?? existing.connect_code ?? null,
+      plan_tier: raw.subscription.plan_tier ?? existing.plan_tier,
       username: raw.user?.username || raw.user?.first_name || existing.username,
       tier: raw.subscription.tier || existing.tier,
       expires_at: raw.subscription.expires_at ?? existing.expires_at,
@@ -723,7 +693,9 @@ export async function fetchBootstrap(token: string): Promise<BootstrapResponse> 
     if (
       refreshed.username !== existing.username ||
       refreshed.tier !== existing.tier ||
-      refreshed.expires_at !== existing.expires_at
+      refreshed.expires_at !== existing.expires_at ||
+      refreshed.connect_code !== existing.connect_code ||
+      refreshed.plan_tier !== existing.plan_tier
     ) {
       saveLocalSession(refreshed);
       void saveAndroidEncryptedSession(refreshed);

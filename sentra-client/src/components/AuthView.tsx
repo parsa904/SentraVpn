@@ -46,7 +46,7 @@ export const AuthView: React.FC<AuthViewProps> = ({
   initialNotice,
   botUsername,
 }) => {
-  const [tab, setTab] = useState<AuthTab>('login');
+  const [tab, setTab] = useState<AuthTab>('otp');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [otpCode, setOtpCode] = useState('');
@@ -133,7 +133,10 @@ export const AuthView: React.FC<AuthViewProps> = ({
             role="radio"
             aria-checked={lang === 'en'}
             data-testid="auth-lang-en"
-            onClick={() => onChangeLanguage('en')}
+            onClick={() => {
+              setError(null);
+              onChangeLanguage('en');
+            }}
             className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition duration-150 active:scale-95 ${
               lang === 'en'
                 ? 'bg-emerald-600 text-white shadow-sm'
@@ -147,7 +150,10 @@ export const AuthView: React.FC<AuthViewProps> = ({
             role="radio"
             aria-checked={lang === 'fa'}
             data-testid="auth-lang-fa"
-            onClick={() => onChangeLanguage('fa')}
+            onClick={() => {
+              setError(null);
+              onChangeLanguage('fa');
+            }}
             className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition duration-150 active:scale-95 ${
               lang === 'fa'
                 ? 'bg-emerald-600 text-white shadow-sm'
@@ -253,16 +259,35 @@ export const AuthView: React.FC<AuthViewProps> = ({
             <h1 className="sr-only">{t(lang, 'brand')}</h1>
           </div>
 
-          {/* Auth Mode Tabs */}
+          {/* Auth Mode Tabs — 8-Digit Connect Code Primary */}
           <div
             role="tablist"
             aria-label={t(lang, 'authMethodAria')}
-            className="mt-5 grid grid-cols-[1fr_1fr_1.35fr] gap-1 rounded-xl bg-slate-100/90 dark:bg-slate-800/80 p-1 animate-sentra-stagger-1"
+            className="mt-5 grid grid-cols-[1.35fr_1fr_1fr] gap-1 rounded-xl bg-slate-100/90 dark:bg-slate-800/80 p-1 animate-sentra-stagger-1"
           >
             <button
               type="button"
               role="tab"
+              aria-selected={tab === 'otp'}
+              data-testid="auth-tab-connect-code"
+              onClick={() => {
+                setTab('otp');
+                setError(null);
+              }}
+              className={`inline-flex items-center justify-center gap-1.5 rounded-lg py-2 px-2 text-xs font-semibold whitespace-nowrap transition duration-150 active:scale-[0.98] ${
+                tab === 'otp'
+                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+              }`}
+            >
+              <KeyRound size={13} className="shrink-0" />
+              <span>{t(lang, 'telegramCode')}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
               aria-selected={tab === 'login'}
+              data-testid="auth-tab-login"
               onClick={() => {
                 setTab('login');
                 setError(null);
@@ -280,6 +305,7 @@ export const AuthView: React.FC<AuthViewProps> = ({
               type="button"
               role="tab"
               aria-selected={tab === 'register'}
+              data-testid="auth-tab-register"
               onClick={() => {
                 setTab('register');
                 setError(null);
@@ -292,23 +318,6 @@ export const AuthView: React.FC<AuthViewProps> = ({
             >
               <UserPlus size={13} className="shrink-0" />
               <span>{t(lang, 'signUp')}</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={tab === 'otp'}
-              onClick={() => {
-                setTab('otp');
-                setError(null);
-              }}
-              className={`inline-flex items-center justify-center gap-1.5 rounded-lg py-2 px-2 text-xs font-semibold whitespace-nowrap transition duration-150 active:scale-[0.98] ${
-                tab === 'otp'
-                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-              }`}
-            >
-              <KeyRound size={13} className="shrink-0" />
-              <span>{t(lang, 'telegramCode')}</span>
             </button>
           </div>
 

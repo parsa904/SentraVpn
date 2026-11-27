@@ -87,8 +87,8 @@ test('parseOutboundInput blocks SSRF / loopback / RFC1918 / metadata addresses',
 
 test('parseSubscriptionPayload decodes Base64 subscriptions and deduplicates nodes', async () => {
   const rawList = [
-    'vless://u1@203.0.113.1:443?security=reality&pbk=PK1#DE-One',
-    'vless://u1@203.0.113.1:443?security=reality&pbk=PK1#DE-Duplicate',
+    'vless://u1@203.0.113.1:443?security=reality&sni=www.microsoft.com&pbk=PK1#DE-One',
+    'vless://u1@203.0.113.1:443?security=reality&sni=www.microsoft.com&pbk=PK1#DE-Duplicate',
     'trojan://pass123@203.0.113.2:443?sni=example.org&fp=safari#FI-Two',
     'invalid-line',
   ].join('\n');

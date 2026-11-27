@@ -59,8 +59,15 @@ test('GET /api/v1/nodes/active returns both donated/official nodes and subscript
 
     sqlite
       .prepare(
-        `INSERT INTO subscription_sources (category, sub_url, tag, total_nodes, healthy_nodes)
-         VALUES ('gaming', 'https://example.com/gaming-sub.txt', 'Gaming Sub', 10, 4)`
+        `INSERT INTO subscription_sources (category, sub_url, tag, status, total_nodes, healthy_nodes)
+         VALUES ('gaming', 'https://example.com/gaming-sub.txt', 'Gaming Sub', 'active', 10, 4)`
+      )
+      .run();
+
+    sqlite
+      .prepare(
+        `INSERT INTO subscription_sources (category, sub_url, tag, status, total_nodes, healthy_nodes)
+         VALUES ('web_browsing', 'https://example.com/pending-user-sub.txt', 'Pending User Sub', 'pending', 0, 0)`
       )
       .run();
 
@@ -171,8 +178,9 @@ test('POST /api/v1/nodes/health-report updates donated_outbounds, subscription_s
                   protocol: 'vless',
                   server_address: '203.0.113.44',
                   server_port: 443,
-                  config_json: '{"type":"vless","server":"203.0.113.44","server_port":443}',
-                  raw_link: 'vless://11111111-1111-4111-8111-111111111111@203.0.113.44:443?security=tls#Gaming-Sub-NL',
+                  config_json:
+                    '{"type":"vless","tag":"Gaming-Sub-NL","server":"203.0.113.44","server_port":443,"uuid":"11111111-1111-4111-8111-111111111111","tls":{"enabled":true,"server_name":"gaming.example.com"}}',
+                  raw_link: 'vless://11111111-1111-4111-8111-111111111111@203.0.113.44:443?security=tls&sni=gaming.example.com#Gaming-Sub-NL',
                   fingerprint_sha256: 'fp_sub_gaming_nl_001',
                   country_code: 'NL',
                   country_name: 'Netherlands 🇳🇱',

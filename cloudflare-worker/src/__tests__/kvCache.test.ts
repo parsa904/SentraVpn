@@ -6,6 +6,9 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   KV_KEY_ACTIVE_NODES,
+  KV_KEY_COMPILED_CFG_FLOW_PLUS,
+  KV_KEY_COMPILED_CFG_FREE,
+  KV_KEY_COMPILED_CFG_PRO,
   KV_KEY_SYSTEM_SETTINGS,
   L1_ACTIVE_NODES_TTL_MS,
   L1_SYSTEM_SETTINGS_TTL_MS,
@@ -237,10 +240,18 @@ test('L1 RAM (5m) -> L2 KV (1h) -> L3 D1 flow for cache:active_nodes_v1 and cros
     assert.equal(kv.getCount, 1);
     assert.equal(kv.putCount, 0, 'L2 KV hit must perform ZERO KV writes');
 
-    // 4. End-to-end /sub/:token returns ETag, and after Worker Cold Start another isolate returns 304 from KV with 0 nodes D1 reads
+    // 4. End-to-end /api/v1/client/config returns ETag, and after Worker Cold Start another isolate returns 304 from KV with 0 nodes D1 reads
     const env: Env = { DB: db, SENTRA_KV: kvNs };
     const r1 = await routeRequest(
-      new Request('https://sentra-core.kziepr.workers.dev/sub/kv-sub-token-001?format=singbox'),
+      new Request('https://sentra-core.kziepr.workers.dev/api/v1/client/config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Sentra-Client': 'SentraVPN/1.0.0',
+          'X-Subscription-Token': 'kv-sub-token-001',
+        },
+        body: JSON.stringify({ mode: 'web_browsing' }),
+      }),
       env
     );
     assert.equal(r1.status, 200);
@@ -252,8 +263,15 @@ test('L1 RAM (5m) -> L2 KV (1h) -> L3 D1 flow for cache:active_nodes_v1 and cros
     d1.resetCounters();
     kv.resetCounters();
     const r2 = await routeRequest(
-      new Request('https://sentra-core.kziepr.workers.dev/sub/kv-sub-token-001?format=singbox', {
-        headers: { 'If-None-Match': etag! },
+      new Request('https://sentra-core.kziepr.workers.dev/api/v1/client/config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Sentra-Client': 'SentraVPN/1.0.0',
+          'X-Subscription-Token': 'kv-sub-token-001',
+          'If-None-Match': etag!,
+        },
+        body: JSON.stringify({ mode: 'web_browsing' }),
       }),
       env
     );
@@ -265,9 +283,15 @@ test('L1 RAM (5m) -> L2 KV (1h) -> L3 D1 flow for cache:active_nodes_v1 and cros
     assert.equal(
       d1.sqlLog.some((q) => q.includes('donated_outbounds') || q.includes('FROM outbounds')),
       false,
-      'Cold-start /sub request must load active nodes from L2 KV with ZERO node-table D1 reads'
+      'Cold-start /api/v1/client/config request must load active nodes from L2 KV with ZERO node-table D1 reads'
     );
-    assert.deepEqual(Array.from(kv.store.keys()), [KV_KEY_ACTIVE_NODES]);
+    assert.ok(kv.store.has(KV_KEY_ACTIVE_NODES));
+    assert.ok(
+      kv.store.has(KV_KEY_COMPILED_CFG_FREE) ||
+        kv.store.has(KV_KEY_COMPILED_CFG_PRO) ||
+        kv.store.has(KV_KEY_COMPILED_CFG_FLOW_PLUS),
+      'Per-plan precompiled sing-box KV cache should be populated'
+    );
   } finally {
     d1.sqlite.close();
   }
@@ -396,8 +420,13 @@ test('Strict Write Guard: unchanged QualityEngine health-report does ZERO KV wri
       env
     );
     assert.equal(changedResp.status, 200);
-    assert.equal(kv.deleteCount, 1);
-    assert.equal(kv.deletes[0], KV_KEY_ACTIVE_NODES);
+    assert.equal(kv.deleteCount, 4);
+    assert.deepEqual(kv.deletes, [
+      KV_KEY_ACTIVE_NODES,
+      KV_KEY_COMPILED_CFG_FREE,
+      KV_KEY_COMPILED_CFG_PRO,
+      KV_KEY_COMPILED_CFG_FLOW_PLUS,
+    ]);
     assert.equal(kv.store.has(KV_KEY_ACTIVE_NODES), false);
   } finally {
     d1.sqlite.close();
@@ -433,7 +462,15 @@ test('Graceful Fallback: missing SENTRA_KV or KV quota errors never crash and fa
 
     // End-to-end HTTP request succeeds even when KV is failing
     const resp = await routeRequest(
-      new Request('https://sentra-core.kziepr.workers.dev/sub/kv-sub-token-001?format=singbox'),
+      new Request('https://sentra-core.kziepr.workers.dev/api/v1/client/config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Sentra-Client': 'SentraVPN/1.0.0',
+          'X-Subscription-Token': 'kv-sub-token-001',
+        },
+        body: JSON.stringify({ mode: 'web_browsing' }),
+      }),
       { DB: db, SENTRA_KV: failingKvNs }
     );
     assert.equal(resp.status, 200);

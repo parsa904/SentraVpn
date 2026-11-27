@@ -3,6 +3,8 @@ import {
   reportUnifiedError,
 } from './errorReporter.ts';
 import {
+  DEFAULT_FREE_DOWNLOAD_QUOTA_GB,
+  DEFAULT_FREE_WEB_QUOTA_GB,
   getOrLoadSystemSettingsCache,
   updateSystemSettingsKvCache,
 } from './kvCache.ts';
@@ -20,6 +22,8 @@ export const SYSTEM_SETTING_KEYS = {
   TOPIC_LOGS_ID: 'topic_logs_id',
   TOPIC_BACKUPS_ID: 'topic_backups_id',
   TOPIC_SUPPORT_ID: 'topic_support_id',
+  FREE_WEB_QUOTA_GB: 'free_web_quota_gb',
+  FREE_DOWNLOAD_QUOTA_GB: 'free_download_quota_gb',
 } as const;
 
 export type SystemSettingKey =
@@ -30,6 +34,15 @@ export interface TopicRoutingConfig {
   topicLogsId: string | null;
   topicBackupsId: string | null;
   topicSupportId: string | null;
+  freeWebQuotaGb?: number;
+  freeDownloadQuotaGb?: number;
+}
+
+export interface FreeQuotaSettings {
+  webQuotaGb: number;
+  downloadQuotaGb: number;
+  webQuotaBytes: number;
+  downloadQuotaBytes: number;
 }
 
 export interface DatabaseBackupResult {
@@ -105,17 +118,28 @@ export function extractSupportUid(text?: string | null): number | null {
   return parsed;
 }
 
+function parsePositiveQuotaGb(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 10000) {
+    return fallback;
+  }
+  return parsed;
+}
+
 async function fetchTopicRoutingFromD1(db: D1Database): Promise<TopicRoutingConfig> {
   const rows = await db
     .prepare(
       `SELECT key, value FROM system_settings
-       WHERE key IN (?, ?, ?, ?)`
+       WHERE key IN (?, ?, ?, ?, ?, ?)`
     )
     .bind(
       SYSTEM_SETTING_KEYS.LOG_GROUP_ID,
       SYSTEM_SETTING_KEYS.TOPIC_LOGS_ID,
       SYSTEM_SETTING_KEYS.TOPIC_BACKUPS_ID,
-      SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID
+      SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID,
+      SYSTEM_SETTING_KEYS.FREE_WEB_QUOTA_GB,
+      SYSTEM_SETTING_KEYS.FREE_DOWNLOAD_QUOTA_GB
     )
     .all<{ key: string; value: string }>();
 
@@ -129,6 +153,36 @@ async function fetchTopicRoutingFromD1(db: D1Database): Promise<TopicRoutingConf
     topicLogsId: map.get(SYSTEM_SETTING_KEYS.TOPIC_LOGS_ID) ?? null,
     topicBackupsId: map.get(SYSTEM_SETTING_KEYS.TOPIC_BACKUPS_ID) ?? null,
     topicSupportId: map.get(SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID) ?? null,
+    freeWebQuotaGb: parsePositiveQuotaGb(
+      map.get(SYSTEM_SETTING_KEYS.FREE_WEB_QUOTA_GB),
+      DEFAULT_FREE_WEB_QUOTA_GB
+    ),
+    freeDownloadQuotaGb: parsePositiveQuotaGb(
+      map.get(SYSTEM_SETTING_KEYS.FREE_DOWNLOAD_QUOTA_GB),
+      DEFAULT_FREE_DOWNLOAD_QUOTA_GB
+    ),
+  };
+}
+
+export async function getFreeQuotaSettings(
+  db: D1Database,
+  kv?: KVNamespace
+): Promise<FreeQuotaSettings> {
+  const cached = await getTopicRoutingConfig(db, kv);
+  const webQuotaGb =
+    typeof cached.freeWebQuotaGb === 'number' && cached.freeWebQuotaGb > 0
+      ? cached.freeWebQuotaGb
+      : DEFAULT_FREE_WEB_QUOTA_GB;
+  const downloadQuotaGb =
+    typeof cached.freeDownloadQuotaGb === 'number' && cached.freeDownloadQuotaGb > 0
+      ? cached.freeDownloadQuotaGb
+      : DEFAULT_FREE_DOWNLOAD_QUOTA_GB;
+  const GIB = 1024 * 1024 * 1024;
+  return {
+    webQuotaGb,
+    downloadQuotaGb,
+    webQuotaBytes: Math.round(webQuotaGb * GIB),
+    downloadQuotaBytes: Math.round(downloadQuotaGb * GIB),
   };
 }
 
@@ -142,6 +196,12 @@ export async function getSystemSetting(
   if (key === SYSTEM_SETTING_KEYS.TOPIC_LOGS_ID) return cached.topicLogsId;
   if (key === SYSTEM_SETTING_KEYS.TOPIC_BACKUPS_ID) return cached.topicBackupsId;
   if (key === SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID) return cached.topicSupportId;
+  if (key === SYSTEM_SETTING_KEYS.FREE_WEB_QUOTA_GB) {
+    return String(cached.freeWebQuotaGb ?? DEFAULT_FREE_WEB_QUOTA_GB);
+  }
+  if (key === SYSTEM_SETTING_KEYS.FREE_DOWNLOAD_QUOTA_GB) {
+    return String(cached.freeDownloadQuotaGb ?? DEFAULT_FREE_DOWNLOAD_QUOTA_GB);
+  }
   const row = await db
     .prepare('SELECT value FROM system_settings WHERE key = ? LIMIT 1')
     .bind(key)

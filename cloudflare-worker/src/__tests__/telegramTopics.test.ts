@@ -709,8 +709,14 @@ test('sendErrorAlert, dispatchErrorAlert (waitUntil), Telegram API ok:false aler
 
     const subQueued: Promise<unknown>[] = [];
     const subResp = await routeRequest(
-      new Request('https://sentra-core.kziepr.workers.dev/sub/tok_corrupt_check?format=singbox', {
-        method: 'GET',
+      new Request('https://sentra-core.kziepr.workers.dev/api/v1/client/config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Sentra-Client': 'SentraVPN/1.0.0',
+          'X-Subscription-Token': 'tok_corrupt_check',
+        },
+        body: JSON.stringify({ mode: 'web_browsing' }),
       }),
       env,
       { waitUntil: (p: Promise<unknown>) => subQueued.push(p) } as unknown as ExecutionContext

@@ -259,4 +259,112 @@ export function installGlobalErrorHandlers(): void {
       error: event.reason ?? 'Unhandled promise rejection',
     });
   });
+
+  // Forward native Rust/Android sing-box Auto-Rollback events to Sentry (zero secrets)
+  const tauriListen = (
+    window as unknown as {
+      __TAURI__?: {
+        event?: {
+          listen?: (
+            event: string,
+            handler: (evt: { payload?: Record<string, unknown> }) => void
+          ) => Promise<unknown>;
+        };
+      };
+    }
+  ).__TAURI__?.event?.listen;
+
+  if (typeof tauriListen === 'function') {
+    void tauriListen('singbox-rollback', (evt) => {
+      const payload = evt?.payload ?? {};
+      const cleanErr = sanitizeClientSecrets(
+        String(payload.error || payload.singboxError || 'Native sing-box rollback triggered')
+      ).slice(0, 1000);
+      captureClientSentryException({
+        platform: detectClientPlatform(),
+        appVersion: APP_VERSION,
+        moduleOrFile: 'sentra-client/native-vpn',
+        actionOrRoute: 'singbox_auto_rollback',
+        errorName: 'SingboxAutoRollback',
+        errorMessage: cleanErr,
+        context: {
+          singbox_auto_rollback: true,
+          rollback_performed: payload.rolled_back !== false,
+          source: 'tauri_native_event',
+        },
+      });
+    }).catch(() => undefined);
+  }
+}
+
+export interface ReportRollbackErrorInput {
+  singboxError: string;
+  rolledBackToGoodConfig: boolean;
+  platform?: ClientErrorPlatform;
+  context?: Record<string, unknown>;
+}
+
+/**
+ * Transmits a sanitized sing-box Auto-Rollback incident (zero secrets/tokens)
+ * directly to Sentry AND Cloudflare Worker `POST /api/v1/logs/report`.
+ */
+export async function reportClientRollbackError(
+  input: ReportRollbackErrorInput
+): Promise<boolean> {
+  try {
+    const platform = input.platform ?? detectClientPlatform();
+    const cleanError = sanitizeClientSecrets(input.singboxError || 'Unknown sing-box crash').slice(
+      0,
+      1000
+    );
+    const context: Record<string, unknown> = {
+      rollback_performed: Boolean(input.rolledBackToGoodConfig),
+      singbox_auto_rollback: true,
+      ...(input.context || {}),
+    };
+
+    const payload: ClientErrorReportPayload = {
+      platform,
+      appVersion: APP_VERSION,
+      moduleOrFile: 'sentra-client/configRollback',
+      actionOrRoute: 'singbox_auto_rollback',
+      errorName: 'SingboxAutoRollback',
+      errorMessage: cleanError,
+      context,
+      timestamp: new Date().toISOString(),
+    };
+
+    // 1. Report sanitized exception to Sentry (zero subscription tokens / secrets)
+    captureClientSentryException({
+      platform: payload.platform,
+      appVersion: payload.appVersion,
+      moduleOrFile: payload.moduleOrFile,
+      actionOrRoute: payload.actionOrRoute,
+      errorName: payload.errorName,
+      errorMessage: payload.errorMessage,
+      context: payload.context,
+    });
+
+    // 2. Report to Worker `POST /api/v1/logs/report` (no user token required, sanitized)
+    const endpoint = `${API_BASE_URL.replace(/\/+$/, '')}/api/v1/logs/report`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-App-Version': APP_VERSION,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+        keepalive: true,
+      });
+      return resp.ok;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return false;
+  }
 }

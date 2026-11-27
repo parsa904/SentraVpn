@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     user_id                 INTEGER NOT NULL,
     tier                    TEXT NOT NULL DEFAULT 'Sentra Lite'
                             CHECK(tier IN ('Sentra Lite', 'Sentra Gaming', 'Sentra Static IP', 'Sentra Pro', 'Sentra Flow+')),
+    plan_tier               TEXT NOT NULL DEFAULT 'free'
+                            CHECK(plan_tier IN ('free', 'pro', 'flow_plus')),
+    connect_code            TEXT UNIQUE,
     token                   TEXT NOT NULL UNIQUE,
     status                  TEXT NOT NULL DEFAULT 'active'
                             CHECK(status IN ('active', 'expired', 'depleted', 'disabled')),
@@ -49,6 +52,11 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     web_browsing_used_mb    INTEGER NOT NULL DEFAULT 0,
     download_used_mb        INTEGER NOT NULL DEFAULT 0,
     static_ip_used_mb       INTEGER NOT NULL DEFAULT 0,
+    web_used_bytes          INTEGER NOT NULL DEFAULT 0,
+    download_used_bytes     INTEGER NOT NULL DEFAULT 0,
+    special_quota_bytes     INTEGER NOT NULL DEFAULT 0,
+    special_used_bytes      INTEGER NOT NULL DEFAULT 0,
+    has_used_special_trial  INTEGER NOT NULL DEFAULT 0,
     last_quota_reset        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     starts_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     expires_at              TEXT NOT NULL,
@@ -58,9 +66,11 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_subscriptions_token ON subscriptions(token);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_connect_code ON subscriptions(connect_code);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_user_status ON subscriptions(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_tier ON subscriptions(tier);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_plan_tier ON subscriptions(plan_tier);
 
 -- 3. DEVICE_SESSIONS
 CREATE TABLE IF NOT EXISTS device_sessions (
@@ -123,13 +133,15 @@ CREATE TABLE IF NOT EXISTS donated_outbounds (
     server_address          TEXT NOT NULL,
     server_port             INTEGER NOT NULL,
     config_json             TEXT NOT NULL,
+    compiled_outbound_json  TEXT,
+    validation_error        TEXT,
     latency_ms              INTEGER NOT NULL DEFAULT 9999,
     speed_mbps              REAL NOT NULL DEFAULT 0.0,
     assigned_tier           TEXT NOT NULL DEFAULT 'web_browsing'
                             CHECK(assigned_tier IN ('web_browsing', 'download', 'gaming', 'static_ip', 'rejected')),
     health_score            INTEGER NOT NULL DEFAULT 100,
     status                  TEXT NOT NULL DEFAULT 'active'
-                            CHECK(status IN ('pending', 'active', 'inactive', 'rejected')),
+                            CHECK(status IN ('pending', 'active', 'inactive', 'rejected', 'quarantined')),
     fail_count              INTEGER NOT NULL DEFAULT 0,
     reward_granted          INTEGER NOT NULL DEFAULT 0,
     raw_link                TEXT,
@@ -175,19 +187,24 @@ CREATE INDEX IF NOT EXISTS idx_donated_status_official_health ON donated_outboun
 CREATE INDEX IF NOT EXISTS idx_donated_status_updated_at ON donated_outbounds(status, updated_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_donated_fingerprint ON donated_outbounds(fingerprint_sha256);
 
--- 4.2. SUBSCRIPTION_SOURCES (Admin Subscription URLs)
+-- 4.2. SUBSCRIPTION_SOURCES (Admin & Community-Submitted Subscription URLs)
 CREATE TABLE IF NOT EXISTS subscription_sources (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     category                TEXT NOT NULL CHECK(category IN ('web_browsing', 'download', 'gaming', 'static_ip')),
     sub_url                 TEXT NOT NULL,
     tag                     TEXT,
+    submitted_by_user_id    INTEGER,
+    status                  TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'active', 'rejected')),
     total_nodes             INTEGER NOT NULL DEFAULT 0,
     healthy_nodes           INTEGER NOT NULL DEFAULT 0,
     last_sync_at            TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    created_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (submitted_by_user_id) REFERENCES users(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sub_sources_category ON subscription_sources(category);
+CREATE INDEX IF NOT EXISTS idx_sub_sources_status ON subscription_sources(status);
+CREATE INDEX IF NOT EXISTS idx_sub_sources_user_created ON subscription_sources(submitted_by_user_id, created_at);
 
 -- 4.3. DONATIONS (Financial Receipts)
 CREATE TABLE IF NOT EXISTS donations (
@@ -305,10 +322,23 @@ CREATE TABLE IF NOT EXISTS telegram_states (
 CREATE INDEX IF NOT EXISTS idx_telegram_states_telegram_id ON telegram_states(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_telegram_states_updated_at ON telegram_states(updated_at);
 
--- 10. SYSTEM_SETTINGS (Telegram Forum Group & Topic IDs + Runtime Config)
+-- 10. SYSTEM_SETTINGS (Telegram Forum Group & Topic IDs + Dynamic Free Quota Config)
 CREATE TABLE IF NOT EXISTS system_settings (
     key                     TEXT PRIMARY KEY,
     value                   TEXT NOT NULL,
     updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+INSERT OR IGNORE INTO system_settings (key, value) VALUES ('free_web_quota_gb', '2');
+INSERT OR IGNORE INTO system_settings (key, value) VALUES ('free_download_quota_gb', '3');
+
+-- 11. APP_RELEASE_FILES (Automated GitHub Release + Telegram file_id Sync)
+CREATE TABLE IF NOT EXISTS app_release_files (
+    platform                TEXT PRIMARY KEY CHECK(platform IN ('android', 'windows')),
+    version                 TEXT NOT NULL,
+    github_url              TEXT NOT NULL,
+    telegram_file_id        TEXT,
+    updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 

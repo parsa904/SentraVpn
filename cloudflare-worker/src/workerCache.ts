@@ -1,10 +1,12 @@
 import {
   compileClientSingboxConfig,
+  compilePlanTierSingboxConfig,
   compileV2RaySubscriptionBase64,
 } from './singboxCompiler.ts';
 import {
   computeActiveNodesVersionHash,
   getOrLoadActiveNodesCache,
+  getOrLoadCompiledPlanConfigCache,
   invalidateActiveNodesKvCache,
   invalidateSystemSettingsKvCache,
   L1_ACTIVE_NODES_TTL_MS,
@@ -12,17 +14,20 @@ import {
   type ActiveNodesPoolSnapshot,
   type CachedLocationSummary,
   type CachedTopicRoutingConfig,
+  type CompiledPlanConfigSnapshot,
 } from './kvCache.ts';
 import type {
   ConnectionMode,
   DonatedOutboundRow,
   OutboundRow,
+  PlanTier,
 } from './types.ts';
 
 export type {
   ActiveNodesPoolSnapshot,
   CachedLocationSummary,
   CachedTopicRoutingConfig,
+  CompiledPlanConfigSnapshot,
 };
 
 export const ISOLATE_CACHE_TTL_MS = L1_ACTIVE_NODES_TTL_MS; // 5 minutes per Worker isolate
@@ -164,6 +169,7 @@ export async function getCachedActiveNodesPool(
     async () => {
       const donatedStmt = db.prepare(
         `SELECT id, tag, protocol, server_address, server_port, config_json,
+                compiled_outbound_json,
                 latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
                 raw_link, fingerprint_sha256, is_official, label, country_code, country_name,
                 allow_web, allow_download, allow_gaming, allow_static_ip,
@@ -358,6 +364,52 @@ export async function getCachedCompiledSingbox(
 
   setBoundedMap(store.compiledSingbox, cacheKey, { config, json }, MAX_COMPILED_VARIANTS);
   return { config, json, poolVersion: pool.version };
+}
+
+/**
+ * Serves the precompiled ready-to-use sing-box 1.14+ JSON string for a plan tier
+ * (`free`, `pro`, `flow_plus`) directly from L1 Isolate RAM or L2 Cloudflare KV
+ * (`cache:compiled_cfg_<tier>_v1`), achieving <1ms CPU with zero raw-link parsing.
+ */
+export async function getCachedPrecompiledPlanConfig(
+  db: D1Database,
+  planTier: PlanTier,
+  options: {
+    kv?: KVNamespace;
+    nowMs?: number;
+    onError?: (source: string, errorDetails: unknown) => void;
+  } = {}
+): Promise<{
+  configJson: string;
+  poolVersion: string;
+  nodeCount: number;
+  source: 'l1' | 'l2' | 'l3';
+}> {
+  const { snapshot, source } = await getOrLoadCompiledPlanConfigCache(
+    db,
+    options.kv,
+    planTier,
+    async () => {
+      const pool = await getCachedActiveNodesPool(db, options.kv, options.nowMs);
+      const compiled = compilePlanTierSingboxConfig(pool.core, pool.donated, planTier, {
+        includeClashApi: true,
+        onError: options.onError,
+      });
+      return {
+        poolVersion: pool.version,
+        configJson: compiled.json,
+        nodeCount: compiled.nodeCount,
+      };
+    },
+    options.nowMs
+  );
+
+  return {
+    configJson: snapshot.configJson,
+    poolVersion: snapshot.poolVersion,
+    nodeCount: snapshot.nodeCount,
+    source,
+  };
 }
 
 /**

@@ -4,6 +4,9 @@
 
 export const DEFAULT_TELEGRAM_BOT_USERNAME = '@sentraconnect_bot';
 
+export const SENTRA_CLIENT_VERSION = '1.0.0';
+export const SENTRA_CLIENT_HEADER_VALUE = `SentraVPN/${SENTRA_CLIENT_VERSION}`;
+
 export const DEFAULT_API_BASE_URL = 'https://sentra-core.kziepr.workers.dev';
 
 export const DEFAULT_CUSTOM_DNS = '1.1.1.1';

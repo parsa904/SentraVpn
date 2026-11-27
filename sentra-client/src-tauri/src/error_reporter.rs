@@ -219,3 +219,66 @@ pub fn install_panic_hook() {
         default_hook(panic_info);
     }));
 }
+
+/// Reports a sanitized sing-box Auto-Rollback event directly to `POST /api/v1/logs/report`
+/// with platform and appVersion metadata (zero tokens or sensitive secrets).
+pub fn report_rollback_error(singbox_error: &str, mode: &str, rolled_back: bool) {
+    let clean_msg = sanitize_text(singbox_error);
+    let mut ctx = Map::new();
+    ctx.insert("mode".to_string(), json!(mode));
+    ctx.insert("rollback_performed".to_string(), json!(rolled_back));
+    ctx.insert("singbox_auto_rollback".to_string(), json!(true));
+    ctx.insert("os".to_string(), json!(std::env::consts::OS));
+    ctx.insert("arch".to_string(), json!(std::env::consts::ARCH));
+    ctx.insert("runtime".to_string(), json!("tauri-rust"));
+
+    let payload = json!({
+        "platform": current_platform(),
+        "appVersion": env!("CARGO_PKG_VERSION"),
+        "moduleOrFile": "sentra-client/src-tauri/src/vpn_manager.rs",
+        "actionOrRoute": "singbox_auto_rollback",
+        "errorName": "SingboxAutoRollback",
+        "errorMessage": clean_msg.chars().take(1000).collect::<String>(),
+        "context": Value::Object(ctx),
+        "timestamp": Utc::now().to_rfc3339(),
+    });
+
+    let send_future = async move {
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(4))
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        for base_url in crate::auth::get_backend_urls() {
+            let url = format!("{}/api/v1/logs/report", base_url);
+            let req = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("X-App-Version", env!("CARGO_PKG_VERSION"))
+                .json(&payload);
+
+            if let Ok(resp) = req.send().await {
+                if resp.status().is_success() || resp.status().as_u16() == 202 {
+                    break;
+                }
+            }
+        }
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(send_future);
+    } else {
+        std::thread::spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                rt.block_on(send_future);
+            }
+        });
+    }
+}

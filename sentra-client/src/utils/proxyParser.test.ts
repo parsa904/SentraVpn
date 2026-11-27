@@ -192,6 +192,8 @@ test('parses nested Sentra Core auth responses and flat session payloads', () =>
     user: { username: 'ali_dev', first_name: 'Ali' },
     subscription: {
       token: 'sentra_sub_token_001',
+      connect_code: '87654321',
+      plan_tier: 'pro',
       tier: 'Sentra Pro',
       expires_at: '2026-12-31T00:00:00Z',
     },
@@ -199,6 +201,8 @@ test('parses nested Sentra Core auth responses and flat session payloads', () =>
   assert.deepEqual(nested, {
     auth_token: 'jwt_sentra_abc123',
     subscription_token: 'sentra_sub_token_001',
+    connect_code: '87654321',
+    plan_tier: 'pro',
     username: 'ali_dev',
     tier: 'Sentra Pro',
     expires_at: '2026-12-31T00:00:00Z',

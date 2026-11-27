@@ -326,6 +326,7 @@ impl VpnManager {
             let mut req_builder = client
                 .post(&url)
                 .header("X-Subscription-Token", token)
+                .header("X-Sentra-Client", format!("SentraVPN/{}", env!("CARGO_PKG_VERSION")))
                 .json(&request_body);
             if let Some(ref etag) = cached_etag {
                 req_builder = req_builder.header("If-None-Match", etag);
@@ -362,38 +363,6 @@ impl VpnManager {
                 Ok(resp) if resp.status().is_server_error() || resp.status().as_u16() == 404 => {
                     last_status = Some(resp.status());
                     last_err_body = resp.text().await.ok();
-                    // Fallback to direct sing-box 1.14+ subscription endpoint GET /sub/{token}?format=singbox
-                    let sub_url = format!("{}/sub/{}?format=singbox&mode={}", base_url, token, selected_mode);
-                    let mut sub_req = client.get(&sub_url);
-                    if let Some(ref etag) = cached_etag {
-                        sub_req = sub_req.header("If-None-Match", etag);
-                    }
-                    if let Ok(sub_resp) = sub_req.send().await {
-                        if sub_resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-                            if let Some((_, ref cached_cfg)) = cached_entry {
-                                config_val_opt = Some(cached_cfg.clone());
-                                break;
-                            }
-                        } else if sub_resp.status().is_success() {
-                            let resp_etag = sub_resp
-                                .headers()
-                                .get(reqwest::header::ETAG)
-                                .and_then(|v| v.to_str().ok())
-                                .map(|s| s.to_string());
-                            if let Ok(parsed) = sub_resp.json::<Value>().await {
-                                let cache_doc = json!({
-                                    "cache_key": cache_key,
-                                    "etag": resp_etag,
-                                    "config": parsed,
-                                });
-                                if let Ok(serialized) = serde_json::to_string(&cache_doc) {
-                                    let _ = std::fs::write(&cache_path, serialized);
-                                }
-                                config_val_opt = Some(parsed);
-                                break;
-                            }
-                        }
-                    }
                     warn!("Config endpoint {} returned {}; trying next fallback...", base_url, last_status.map(|s| s.as_u16()).unwrap_or(0));
                 }
                 Ok(resp) => {
@@ -1004,18 +973,19 @@ impl VpnManager {
         let _ = fs::create_dir_all(&app_dir);
 
         let ovpn_path = app_dir.join("active_sentra.ovpn");
-        let singbox_path = app_dir.join("active_singbox.json");
+        let candidate_singbox_path = crate::config_manager::ConfigManager::candidate_path(&app_dir);
+        let last_good_singbox_path = crate::config_manager::ConfigManager::last_known_good_path(&app_dir);
         let auth_path = app_dir.join("auth.txt");
 
         let sb_cfg = config_json
             .get("singbox_config")
             .or_else(|| config_json.get("config"))
             .unwrap_or(&config_json);
-        if sb_cfg.get("outbounds").is_some() {
-            if let Ok(sb_str) = serde_json::to_string_pretty(sb_cfg) {
-                let _ = fs::write(&singbox_path, sb_str);
-            }
-        }
+        let candidate_staged = if sb_cfg.get("outbounds").is_some() {
+            crate::config_manager::ConfigManager::stage_candidate_config(&app_dir, sb_cfg).is_ok()
+        } else {
+            false
+        };
 
         if let Some(ovpn_str) = config_json.get("ovpn_config").and_then(|v| v.as_str()) {
             let mut final_ovpn = ovpn_str.to_string();
@@ -1114,61 +1084,235 @@ impl VpnManager {
             let ovpn_bin = Self::locate_openvpn_binary(Some(&app_handle));
             let prefer_singbox = singbox_bin.is_some();
 
-            if prefer_singbox && singbox_bin.is_some() && singbox_path.exists() {
+            if prefer_singbox && singbox_bin.is_some() && (candidate_staged || last_good_singbox_path.exists()) {
                 let bin_path = singbox_bin.unwrap_or_else(|| PathBuf::from("sing-box.exe"));
-                info!("Launching native sing-box sidecar: {:?}", bin_path);
+                info!("Validating candidate sing-box 1.14+ config before launch: {:?}", bin_path);
+
+                // Stage 1: Structural JSON check + `sing-box check -c candidate_config.json`
+                let precheck_err: Option<String> = if !candidate_staged {
+                    Some("candidate_config.json was not staged".to_string())
+                } else if let Err(struct_err) = crate::config_manager::ConfigManager::validate_singbox_structure(sb_cfg) {
+                    Some(struct_err)
+                } else if let Err(check_err) = crate::config_manager::ConfigManager::run_singbox_check(&bin_path, &candidate_singbox_path) {
+                    Some(check_err)
+                } else {
+                    None
+                };
+
+                let (active_config_path, using_candidate) = if let Some(ref err_detail) = precheck_err {
+                    warn!("Candidate sing-box pre-check failed ({}); attempting Auto-Rollback to last_known_good_config.json", err_detail);
+                    TelemetryService::emit_log(
+                        &app_handle,
+                        "WARN",
+                        &format!("[Auto-Rollback] Candidate config failed pre-check: {}. Rolling back to last_known_good_config.json...", err_detail),
+                    );
+                    if last_good_singbox_path.exists() {
+                        crate::error_reporter::report_rollback_error(err_detail, &mode, true);
+                        let _ = app_handle.emit("singbox-rollback", json!({
+                            "error": crate::error_reporter::sanitize_text(err_detail),
+                            "mode": mode,
+                            "rolledBack": true,
+                            "stage": "precheck"
+                        }));
+                        (last_good_singbox_path.clone(), false)
+                    } else {
+                        crate::error_reporter::report_rollback_error(err_detail, &mode, false);
+                        let _ = app_handle.emit("singbox-rollback", json!({
+                            "error": crate::error_reporter::sanitize_text(err_detail),
+                            "mode": mode,
+                            "rolledBack": false,
+                            "stage": "precheck"
+                        }));
+                        self.is_running.store(false, Ordering::SeqCst);
+                        {
+                            let mut state = app_state.lock().await;
+                            state.status = ConnectionStatus::Disconnected;
+                            state.logs.push(format!("[ERROR] [Auto-Rollback] {}", err_detail));
+                        }
+                        TelemetryService::emit_status_change(&app_handle, "Disconnected", &mode, Some(err_detail));
+                        return Err(err_detail.clone());
+                    }
+                } else {
+                    (candidate_singbox_path.clone(), true)
+                };
+
+                let spawn_singbox = |cfg_path: &PathBuf| -> std::io::Result<std::process::Child> {
+                    let mut command = Command::new(&bin_path);
+                    command.arg("run").arg("-c").arg(cfg_path);
+                    command.stdout(Stdio::piped());
+                    command.stderr(Stdio::piped());
+                    #[cfg(target_os = "windows")]
+                    {
+                        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                    }
+                    command.spawn()
+                };
+
                 TelemetryService::emit_log(
                     &app_handle,
                     "INFO",
-                    &format!("[Sidecar] Spawning native sing-box engine from {:?}", bin_path),
+                    &format!(
+                        "[Sidecar] Spawning native sing-box engine from {:?} (config: {:?})",
+                        bin_path,
+                        active_config_path.file_name().unwrap_or_default()
+                    ),
                 );
-                let mut command = Command::new(&bin_path);
-                command.arg("run").arg("-c").arg(&singbox_path);
-                command.stdout(Stdio::piped());
-                command.stderr(Stdio::piped());
-                #[cfg(target_os = "windows")]
-                {
-                    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-                }
 
-                match command.spawn() {
+                match spawn_singbox(&active_config_path) {
                     Ok(mut child) => {
                         TelemetryService::spawn_process_log_streamer(
                             &mut child,
                             app_handle.clone(),
                             Arc::clone(&self.is_running),
                         );
-                        let mut child_lock = self.child_process.lock().await;
-                        *child_lock = Some(child);
+                        {
+                            let mut child_lock = self.child_process.lock().await;
+                            *child_lock = Some(child);
+                        }
                         {
                             let mut state = app_state.lock().await;
                             state.status = ConnectionStatus::Connected;
                             state.connected_since = Some(Utc::now());
-                            state.logs.push("[INFO] [Core] Native sing-box engine running.".to_string());
+                            state.logs.push(if using_candidate {
+                                "[INFO] [Core] Native sing-box started with candidate_config.json (5s stability verification active).".to_string()
+                            } else {
+                                "[WARN] [Auto-Rollback] Native sing-box connected via last_known_good_config.json.".to_string()
+                            });
                         }
                         TelemetryService::emit_status_change(&app_handle, "Connected", &mode, None);
+
+                        // Stage 2: 5-second stability watchdog -> promote candidate or auto-rollback on early crash
+                        if using_candidate {
+                            let child_arc = Arc::clone(&self.child_process);
+                            let running_arc = Arc::clone(&self.is_running);
+                            let state_arc = Arc::clone(&app_state);
+                            let handle_clone = app_handle.clone();
+                            let app_dir_clone = app_dir.clone();
+                            let bin_clone = bin_path.clone();
+                            let last_good_clone = last_good_singbox_path.clone();
+                            let mode_clone = mode.clone();
+
+                            tokio::spawn(async move {
+                                let checks = crate::config_manager::STABILITY_WINDOW_SECS * 4; // 250ms x 20 = 5s
+                                for _ in 0..checks {
+                                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                    if !running_arc.load(Ordering::SeqCst) {
+                                        return;
+                                    }
+                                    let crashed_status = {
+                                        let mut guard = child_arc.lock().await;
+                                        match guard.as_mut() {
+                                            Some(proc) => match proc.try_wait() {
+                                                Ok(Some(status)) => Some(format!("sing-box exited prematurely within 5s ({})", status)),
+                                                Err(e) => Some(format!("sing-box wait error within 5s: {}", e)),
+                                                Ok(None) => None,
+                                            },
+                                            None => return,
+                                        }
+                                    };
+
+                                    if let Some(crash_reason) = crashed_status {
+                                        warn!("[Auto-Rollback] {} — rolling back to last_known_good_config.json", crash_reason);
+                                        let mut rolled_back = false;
+                                        if last_good_clone.exists() {
+                                            let mut rb_cmd = Command::new(&bin_clone);
+                                            rb_cmd.arg("run").arg("-c").arg(&last_good_clone);
+                                            rb_cmd.stdout(Stdio::piped());
+                                            rb_cmd.stderr(Stdio::piped());
+                                            #[cfg(target_os = "windows")]
+                                            {
+                                                rb_cmd.creation_flags(0x08000000);
+                                            }
+                                            if let Ok(mut rb_child) = rb_cmd.spawn() {
+                                                TelemetryService::spawn_process_log_streamer(
+                                                    &mut rb_child,
+                                                    handle_clone.clone(),
+                                                    Arc::clone(&running_arc),
+                                                );
+                                                let mut guard = child_arc.lock().await;
+                                                *guard = Some(rb_child);
+                                                rolled_back = true;
+                                                TelemetryService::emit_log(
+                                                    &handle_clone,
+                                                    "WARN",
+                                                    "[Auto-Rollback] Core crashed within 5s; restored last_known_good_config.json cleanly.",
+                                                );
+                                            }
+                                        }
+
+                                        crate::error_reporter::report_rollback_error(&crash_reason, &mode_clone, rolled_back);
+                                        let _ = handle_clone.emit("singbox-rollback", json!({
+                                            "error": crate::error_reporter::sanitize_text(&crash_reason),
+                                            "mode": mode_clone,
+                                            "rolledBack": rolled_back,
+                                            "stage": "stability_5s"
+                                        }));
+
+                                        if !rolled_back {
+                                            running_arc.store(false, Ordering::SeqCst);
+                                            let mut state = state_arc.lock().await;
+                                            state.status = ConnectionStatus::Disconnected;
+                                            state.logs.push(format!("[ERROR] [Auto-Rollback] {}", crash_reason));
+                                            TelemetryService::emit_status_change(&handle_clone, "Disconnected", &mode_clone, Some(&crash_reason));
+                                        }
+                                        return;
+                                    }
+                                }
+
+                                // 5 seconds elapsed cleanly with core still running -> promote candidate -> last_known_good_config.json
+                                if running_arc.load(Ordering::SeqCst) {
+                                    if let Ok(_) = crate::config_manager::ConfigManager::promote_candidate_to_last_known_good(&app_dir_clone) {
+                                        TelemetryService::emit_log(
+                                            &handle_clone,
+                                            "INFO",
+                                            "[Core] Candidate sing-box config passed 5s stability check and promoted to last_known_good_config.json.",
+                                        );
+                                    }
+                                }
+                            });
+                        }
                     }
                     Err(e) => {
                         let err_msg = format!("خطا در اجرای هسته sing-box: {}", e);
-                        let mut ctx = serde_json::Map::new();
-                        ctx.insert("mode".to_string(), json!(mode));
-                        ctx.insert("binary".to_string(), json!(bin_path.to_string_lossy().to_string()));
-                        crate::error_reporter::report_native_error(
-                            "sentra-client/src-tauri/src/vpn_manager.rs",
-                            "windows_singbox_spawn",
-                            "SingboxSpawnError",
-                            &err_msg,
-                            None,
-                            ctx,
-                        );
-                        self.is_running.store(false, Ordering::SeqCst);
-                        {
-                            let mut state = app_state.lock().await;
-                            state.status = ConnectionStatus::Disconnected;
-                            state.logs.push(format!("[ERROR] [Sidecar] {}", err_msg));
+                        let mut rolled_back = false;
+                        if using_candidate && last_good_singbox_path.exists() {
+                            if let Ok(mut rb_child) = spawn_singbox(&last_good_singbox_path) {
+                                TelemetryService::spawn_process_log_streamer(
+                                    &mut rb_child,
+                                    app_handle.clone(),
+                                    Arc::clone(&self.is_running),
+                                );
+                                let mut child_lock = self.child_process.lock().await;
+                                *child_lock = Some(rb_child);
+                                rolled_back = true;
+                                {
+                                    let mut state = app_state.lock().await;
+                                    state.status = ConnectionStatus::Connected;
+                                    state.connected_since = Some(Utc::now());
+                                    state.logs.push("[WARN] [Auto-Rollback] Restored last_known_good_config.json after spawn failure.".to_string());
+                                }
+                                TelemetryService::emit_status_change(&app_handle, "Connected", &mode, None);
+                            }
                         }
-                        TelemetryService::emit_status_change(&app_handle, "Disconnected", &mode, Some(&err_msg));
-                        return Err(err_msg);
+
+                        crate::error_reporter::report_rollback_error(&err_msg, &mode, rolled_back);
+                        let _ = app_handle.emit("singbox-rollback", json!({
+                            "error": crate::error_reporter::sanitize_text(&err_msg),
+                            "mode": mode,
+                            "rolledBack": rolled_back,
+                            "stage": "spawn"
+                        }));
+
+                        if !rolled_back {
+                            self.is_running.store(false, Ordering::SeqCst);
+                            {
+                                let mut state = app_state.lock().await;
+                                state.status = ConnectionStatus::Disconnected;
+                                state.logs.push(format!("[ERROR] [Sidecar] {}", err_msg));
+                            }
+                            TelemetryService::emit_status_change(&app_handle, "Disconnected", &mode, Some(&err_msg));
+                            return Err(err_msg);
+                        }
                     }
                 }
             } else if ovpn_bin.is_some() && (protocol == "openvpn_udp" || protocol == "openvpn_tcp" || protocol == "stealth") {

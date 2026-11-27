@@ -201,4 +201,71 @@ object SentraErrorReporter {
             Log.w(TAG, "Could not transmit native Android error report: ${e.message}")
         }
     }
+
+    /**
+     * Reports a sanitized sing-box Auto-Rollback event directly to `/api/v1/logs/report`
+     * with `platform: "android"` and `appVersion` (zero user tokens/secrets).
+     */
+    fun reportRollbackError(
+        context: Context?,
+        singboxError: String,
+        rolledBackToGoodConfig: Boolean,
+        extraContext: Map<String, Any?> = emptyMap()
+    ) {
+        val thread = Thread {
+            try {
+                val cleanMsg = sanitize(singboxError).take(1000)
+                val ctxObj = JSONObject().apply {
+                    put("android_release", Build.VERSION.RELEASE ?: "unknown")
+                    put("android_sdk", Build.VERSION.SDK_INT)
+                    put("device_model", "${Build.MANUFACTURER} ${Build.MODEL}".trim())
+                    put("runtime", "android-kotlin")
+                    put("rollback_performed", rolledBackToGoodConfig)
+                    put("singbox_auto_rollback", true)
+                    for ((k, v) in extraContext) {
+                        if (v != null) {
+                            put(k, sanitize(v.toString()).take(240))
+                        }
+                    }
+                }
+
+                val body = JSONObject().apply {
+                    put("platform", "android")
+                    put("appVersion", resolveAppVersion(context))
+                    put("moduleOrFile", "android/SentraVpnService.kt")
+                    put("actionOrRoute", "singbox_auto_rollback")
+                    put("errorName", "SingboxAutoRollback")
+                    put("errorMessage", cleanMsg)
+                    put("context", ctxObj)
+                    put("timestamp", isoTimestampNow())
+                }
+
+                val logsUrl = "https://sentra-core.kziepr.workers.dev/api/v1/logs/report"
+                val conn = (URL(logsUrl).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 5000
+                    readTimeout = 5000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                    setRequestProperty("X-App-Version", resolveAppVersion(context))
+                }
+                try {
+                    OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
+                        writer.write(body.toString())
+                        writer.flush()
+                    }
+                    val code = conn.responseCode
+                    if (code !in 200..299) {
+                        Log.w(TAG, "Rollback log report returned HTTP $code")
+                    }
+                } finally {
+                    conn.disconnect()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not transmit Android rollback report: ${e.message}")
+            }
+        }
+        thread.isDaemon = true
+        thread.start()
+    }
 }

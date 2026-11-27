@@ -33,16 +33,16 @@ export const translations = {
     // Auth (clean, zero marketing copy)
     signIn: 'Sign In',
     signUp: 'Sign Up',
-    telegramCode: 'Telegram Code',
+    telegramCode: '8-Digit Code',
     username: 'Username',
     password: 'Password',
-    telegramCodeLabel: '8-digit Telegram code',
+    telegramCodeLabel: '8-digit SentraVPN Connect Code',
     continueBtn: 'Continue',
     connectingServer: 'Connecting...',
     authMethodAria: 'Authentication method',
-    getCodeFromBot: 'Get code from',
+    getCodeFromBot: 'Copy your code from Account in',
     authFailed: 'Authentication failed.',
-    otpFailed: 'Code verification failed.',
+    otpFailed: 'Connect code verification failed.',
 
     // Navigation
     mainMenuAria: 'Main navigation',
@@ -304,16 +304,16 @@ export const translations = {
     // Auth (clean, zero marketing copy)
     signIn: 'ورود',
     signUp: 'ثبت‌نام',
-    telegramCode: 'کد تلگرام',
+    telegramCode: 'کد اتصال ۸ رقمی',
     username: 'نام کاربری',
     password: 'رمز عبور',
-    telegramCodeLabel: 'کد ۸ رقمی تلگرام',
+    telegramCodeLabel: 'کد اتصال ۸ رقمی SentraVPN',
     continueBtn: 'ادامه',
     connectingServer: 'در حال ارتباط...',
     authMethodAria: 'روش احراز هویت',
-    getCodeFromBot: 'دریافت کد از',
+    getCodeFromBot: 'کپی کد از بخش حساب کاربری در',
     authFailed: 'احراز هویت ناموفق بود.',
-    otpFailed: 'تایید کد ناموفق بود.',
+    otpFailed: 'تایید کد اتصال ناموفق بود.',
 
     // Navigation
     mainMenuAria: 'منوی اصلی',

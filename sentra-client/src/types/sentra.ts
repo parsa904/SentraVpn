@@ -7,6 +7,8 @@ export type ThemeMode = 'dark' | 'light';
 export interface PersistedSession {
   auth_token: string;
   subscription_token: string;
+  connect_code?: string | null;
+  plan_tier?: 'free' | 'pro' | 'flow_plus' | string;
   username: string;
   tier: string;
   expires_at: string | null;
@@ -24,6 +26,8 @@ export interface BootstrapUser {
 
 export interface BootstrapSubscription {
   tier: string;
+  plan_tier?: 'free' | 'pro' | 'flow_plus' | string;
+  connect_code?: string | null;
   token: string;
   status: string;
   upload_bytes: number;
@@ -31,6 +35,11 @@ export interface BootstrapSubscription {
   used_bytes: number;
   traffic_limit_bytes: number;
   remaining_bytes: number;
+  web_used_bytes?: number;
+  download_used_bytes?: number;
+  special_quota_bytes?: number;
+  special_used_bytes?: number;
+  has_used_special_trial?: boolean;
   web_browsing_used_mb: number;
   download_used_mb: number;
   static_ip_used_mb: number;

@@ -20,6 +20,7 @@ export interface Env {
 }
 
 export type ConnectionMode = 'web_browsing' | 'download' | 'gaming' | 'static_ip';
+export type PlanTier = 'free' | 'pro' | 'flow_plus';
 
 export interface UserRow {
   id: number;
@@ -45,6 +46,8 @@ export interface SubscriptionRow {
   id: number;
   user_id: number;
   tier: string;
+  plan_tier?: PlanTier | null;
+  connect_code?: string | null;
   token: string;
   status: 'active' | 'expired' | 'depleted' | 'disabled';
   upload_bytes: number;
@@ -55,6 +58,11 @@ export interface SubscriptionRow {
   web_browsing_used_mb: number;
   download_used_mb: number;
   static_ip_used_mb: number;
+  web_used_bytes?: number;
+  download_used_bytes?: number;
+  special_quota_bytes?: number;
+  special_used_bytes?: number;
+  has_used_special_trial?: number;
   last_quota_reset: string;
   starts_at: string;
   expires_at: string;
@@ -90,11 +98,13 @@ export interface DonatedOutboundRow {
   server_address: string;
   server_port: number;
   config_json: string;
+  compiled_outbound_json?: string | null;
+  validation_error?: string | null;
   latency_ms: number;
   speed_mbps: number;
   assigned_tier: string;
   health_score: number;
-  status: 'pending' | 'active' | 'inactive' | 'rejected';
+  status: 'pending' | 'active' | 'inactive' | 'rejected' | 'quarantined';
   fail_count: number;
   raw_link: string | null;
   rejection_reason: string | null;
@@ -128,6 +138,9 @@ export interface HealthReportNodeResult {
   trading_safe: boolean;
   is_healthy: boolean;
   security_passed: boolean;
+  quarantined?: boolean;
+  validation_error?: string | null;
+  compiled_outbound_json?: string | null;
   error_msg?: string | null;
 }
 
@@ -136,9 +149,20 @@ export interface SubscriptionSourceRow {
   category: string;
   sub_url: string;
   tag: string | null;
+  submitted_by_user_id?: number | null;
+  status?: 'pending' | 'active' | 'rejected';
   total_nodes: number;
   healthy_nodes: number;
   last_sync_at: string | null;
+  created_at?: string | null;
+}
+
+export interface AppReleaseFileRow {
+  platform: 'android' | 'windows';
+  version: string;
+  github_url: string;
+  telegram_file_id: string | null;
+  updated_at: string | null;
 }
 
 export interface DiscoveredSubNodeReport {
@@ -147,6 +171,7 @@ export interface DiscoveredSubNodeReport {
   server_address: string;
   server_port: number;
   config_json: string;
+  compiled_outbound_json?: string | null;
   raw_link: string;
   fingerprint_sha256: string;
   country_code: string;
@@ -165,8 +190,16 @@ export interface SubscriptionSourceHealthReport {
   category: string;
   total_nodes: number;
   healthy_nodes: number;
+  quarantined_nodes?: number;
   error_msg?: string | null;
   discovered_nodes?: DiscoveredSubNodeReport[];
+}
+
+export interface BundleCheckSummary {
+  plan_tier: PlanTier;
+  passed: boolean;
+  node_count: number;
+  error?: string | null;
 }
 
 export interface HealthReportPayload {
@@ -174,4 +207,5 @@ export interface HealthReportPayload {
   runner?: string;
   results: HealthReportNodeResult[];
   subscription_reports?: SubscriptionSourceHealthReport[];
+  bundle_checks?: BundleCheckSummary[];
 }

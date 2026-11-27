@@ -206,50 +206,27 @@ test('/sub/:token and /api/v1/client/config use isolate RAM cache, ETag/304 Not 
       QUALITY_ENGINE_SECRET: 'qe-opt-secret',
     } as Env;
 
-    // 1. First GET /sub/:token populates isolate cache
+    // 1. Public /sub/:token is permanently disabled (403 Forbidden, 0 D1 reads/writes)
     inst.resetCounters();
-    const subResp1 = await routeRequest(
+    const disabledSubResp = await routeRequest(
       new Request('https://sentra-core.kziepr.workers.dev/sub/opt-sub-token-001?format=singbox', {
         headers: { 'CF-Connecting-IP': '198.51.100.1' },
       }),
       env
     );
-    assert.equal(subResp1.status, 200);
-    assert.equal(subResp1.headers.get('Cache-Control'), 'private, max-age=1800');
-    assert.equal(subResp1.headers.get('Profile-Update-Interval'), '8');
-    const etag1 = subResp1.headers.get('ETag');
-    assert.ok(etag1 && etag1.startsWith('W/"'), `Expected weak ETag, got ${etag1}`);
-    assert.equal(inst.writeCount, 0, 'GET /sub/:token must perform ZERO D1 writes');
-    assert.equal(inst.batchCalls, 1, 'Pool load should use 1 batched read');
-
-    // 2. Second GET /sub/:token with If-None-Match returns 304 and hits RAM cache (0 node reads, 0 writes)
-    inst.resetCounters();
-    const subResp2 = await routeRequest(
-      new Request('https://sentra-core.kziepr.workers.dev/sub/opt-sub-token-001?format=singbox', {
-        headers: {
-          'CF-Connecting-IP': '198.51.100.1',
-          'If-None-Match': etag1,
-        },
-      }),
-      env
-    );
-    assert.equal(subResp2.status, 304);
-    assert.equal(subResp2.headers.get('ETag'), etag1);
+    assert.equal(disabledSubResp.status, 403);
     assert.equal(inst.writeCount, 0);
-    assert.equal(
-      inst.sqlLog.some((q) => /FROM donated_outbounds/i.test(q)),
-      false,
-      'Repeat /sub request within 5 min must serve nodes from isolate RAM cache'
-    );
 
-    // 3. POST /api/v1/client/config also returns ETag, Cache-Control, 304, and 0 writes
+    // 2. First POST /api/v1/client/config with X-Sentra-Client populates isolate cache
     inst.resetCounters();
     const cfgResp1 = await routeRequest(
       new Request('https://sentra-core.kziepr.workers.dev/api/v1/client/config', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'X-Sentra-Client': 'SentraVPN/1.0.0',
           'X-Subscription-Token': 'opt-sub-token-001',
+          'CF-Connecting-IP': '198.51.100.1',
         },
         body: JSON.stringify({ mode: 'web_browsing' }),
       }),
@@ -258,27 +235,34 @@ test('/sub/:token and /api/v1/client/config use isolate RAM cache, ETag/304 Not 
     assert.equal(cfgResp1.status, 200);
     assert.equal(cfgResp1.headers.get('Cache-Control'), 'private, max-age=1800');
     const cfgEtag = cfgResp1.headers.get('ETag');
-    assert.ok(cfgEtag);
-    assert.equal(inst.writeCount, 0);
-    assert.equal(
-      inst.sqlLog.some((q) => /FROM donated_outbounds/i.test(q)),
-      false,
-      'POST /api/v1/client/config must reuse warm isolate nodes cache'
-    );
+    assert.ok(cfgEtag && cfgEtag.startsWith('W/"'), `Expected weak ETag, got ${cfgEtag}`);
+    assert.equal(inst.writeCount, 0, 'POST /api/v1/client/config must perform ZERO D1 writes');
+    assert.equal(inst.batchCalls, 1, 'Pool load should use 1 batched read');
 
+    // 3. Second POST /api/v1/client/config with If-None-Match returns 304 and hits RAM cache (0 node reads, 0 writes)
+    inst.resetCounters();
     const cfgResp2 = await routeRequest(
       new Request('https://sentra-core.kziepr.workers.dev/api/v1/client/config', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'X-Sentra-Client': 'SentraVPN/1.0.0',
           'X-Subscription-Token': 'opt-sub-token-001',
           'If-None-Match': cfgEtag,
+          'CF-Connecting-IP': '198.51.100.1',
         },
         body: JSON.stringify({ mode: 'web_browsing' }),
       }),
       env
     );
     assert.equal(cfgResp2.status, 304);
+    assert.equal(cfgResp2.headers.get('ETag'), cfgEtag);
+    assert.equal(inst.writeCount, 0);
+    assert.equal(
+      inst.sqlLog.some((q) => /FROM donated_outbounds/i.test(q)),
+      false,
+      'Repeat /api/v1/client/config request within 5 min must serve nodes from isolate RAM cache'
+    );
   } finally {
     sqlite.close();
   }
@@ -414,26 +398,38 @@ test('in-memory IP rate limiter protects /api/v1/logs/report and /sub/* with 429
     assert.ok(Number(blockedLogs.headers.get('Retry-After')) >= 1);
     assert.equal(inst.writeCount, 0);
 
-    // 30 allowed requests on /sub/*, 31st returns 429 immediately (0 D1 reads/writes)
+    // 30 allowed requests on /api/v1/client/config, 31st returns 429 immediately (0 D1 reads/writes)
     for (let i = 0; i < 30; i += 1) {
       const resp = await routeRequest(
-        new Request('https://sentra-core.kziepr.workers.dev/sub/nonexistent-token', {
-          headers: { 'CF-Connecting-IP': '203.0.113.88' },
+        new Request('https://sentra-core.kziepr.workers.dev/api/v1/client/config', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Sentra-Client': 'SentraVPN/1.0.0',
+            'CF-Connecting-IP': '203.0.113.88',
+          },
+          body: JSON.stringify({ connect_code: '99999999' }),
         }),
         env
       );
-      assert.equal(resp.status, 404);
+      assert.equal(resp.status, 401);
     }
 
     inst.resetCounters();
     const blockedSub = await routeRequest(
-      new Request('https://sentra-core.kziepr.workers.dev/sub/nonexistent-token', {
-        headers: { 'CF-Connecting-IP': '203.0.113.88' },
+      new Request('https://sentra-core.kziepr.workers.dev/api/v1/client/config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Sentra-Client': 'SentraVPN/1.0.0',
+          'CF-Connecting-IP': '203.0.113.88',
+        },
+        body: JSON.stringify({ connect_code: '99999999' }),
       }),
       env
     );
     assert.equal(blockedSub.status, 429);
-    assert.equal(inst.sqlLog.length, 0, 'Rate-limited /sub request must not touch D1');
+    assert.equal(inst.sqlLog.length, 0, 'Rate-limited /api/v1/client/config request must not touch D1');
   } finally {
     inst.sqlite.close();
   }

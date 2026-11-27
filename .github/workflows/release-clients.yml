@@ -514,3 +514,86 @@ jobs:
             release-dist/SentraVPN-Windows-Setup-x64.exe
             release-dist/SentraVPN-Windows-Portable-x64.zip
             release-dist/SHA256SUMS.txt
+
+      - name: Sync release binaries & Telegram file_id to Sentra Worker
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.health-checks.outputs.release_tag }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_RELEASE_CHANNEL_ID: ${{ secrets.TELEGRAM_RELEASE_CHANNEL_ID || secrets.ADMIN_TELEGRAM_ID }}
+          QUALITY_ENGINE_SECRET: ${{ secrets.QUALITY_ENGINE_SECRET }}
+          SENTRA_API_BASE_URL: ${{ vars.SENTRA_API_BASE_URL || 'https://sentra-core.kziepr.workers.dev' }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          MAX_TG_BYTES=50331648 # 48 MB safe cap under Telegram's 50 MB Bot API limit
+          WORKER_BASE="${SENTRA_API_BASE_URL%/}"
+
+          if [ -z "${QUALITY_ENGINE_SECRET:-}" ]; then
+            echo "::warning::QUALITY_ENGINE_SECRET is not configured; skipping Worker /api/v1/releases/sync."
+            exit 0
+          fi
+
+          sync_platform() {
+            local platform="$1"
+            local file_path="$2"
+            local file_name="$3"
+            local github_url="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}/${file_name}"
+            local tg_file_id=""
+
+            if [ -f "$file_path" ]; then
+              local file_size
+              file_size=$(stat -c%s "$file_path")
+              echo "[ReleaseSync] ${platform}: ${file_name} (${file_size} bytes)"
+
+              if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_RELEASE_CHANNEL_ID:-}" ]; then
+                if [ "$file_size" -lt "$MAX_TG_BYTES" ]; then
+                  local tg_resp
+                  tg_resp=$(curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+                    -F "chat_id=${TELEGRAM_RELEASE_CHANNEL_ID}" \
+                    -F "caption=SentraVPN ${RELEASE_TAG} (${platform})" \
+                    -F "document=@${file_path}" || true)
+                  if [ -n "$tg_resp" ]; then
+                    tg_file_id=$(node -e "
+                      try {
+                        const j = JSON.parse(process.argv[1]);
+                        if (j.ok && j.result && j.result.document && j.result.document.file_id) {
+                          process.stdout.write(j.result.document.file_id);
+                        }
+                      } catch {}
+                    " "$tg_resp")
+                  fi
+                  if [ -n "$tg_file_id" ]; then
+                    echo "[ReleaseSync] Uploaded ${platform} to Telegram (file_id captured)."
+                  else
+                    echo "::warning::Telegram sendDocument did not return a file_id for ${platform}."
+                  fi
+                else
+                  echo "::warning::${file_name} is >= 48 MB (${file_size} bytes); skipping Telegram upload and syncing GitHub URL only."
+                fi
+              else
+                echo "::warning::TELEGRAM_BOT_TOKEN or TELEGRAM_RELEASE_CHANNEL_ID not set; syncing GitHub URL without file_id."
+              fi
+            fi
+
+            local payload
+            payload=$(node -e "
+              const body = {
+                platform: process.argv[1],
+                version: process.argv[2],
+                github_url: process.argv[3],
+                telegram_file_id: process.argv[4] || null,
+              };
+              process.stdout.write(JSON.stringify(body));
+            " "$platform" "$RELEASE_TAG" "$github_url" "$tg_file_id")
+
+            curl -fsS -X POST "${WORKER_BASE}/api/v1/releases/sync" \
+              -H "Content-Type: application/json" \
+              -H "X-Quality-Secret: ${QUALITY_ENGINE_SECRET}" \
+              -d "$payload" >/dev/null && \
+              echo "[ReleaseSync] Synced ${platform} (${RELEASE_TAG}) to Worker D1." || \
+              echo "::warning::Worker /api/v1/releases/sync failed for ${platform}."
+          }
+
+          sync_platform "android" "release-dist/SentraVPN-Android-Universal.apk" "SentraVPN-Android-Universal.apk"
+          sync_platform "windows" "release-dist/SentraVPN-Windows-Setup-x64.exe" "SentraVPN-Windows-Setup-x64.exe"

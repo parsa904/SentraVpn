@@ -7,19 +7,18 @@ import {
   constantTimeEquals,
   generateNumericCode,
   generateSubscriptionToken,
+  generateUniqueConnectCode,
   sha256Hex,
   validateExternalHttpsUrl,
+  validateUserSubmittedSublink,
   verifyPassword,
 } from './security.ts';
-import {
-  generateWireguardGamingProfile,
-  tierHasGaming,
-  tierHasStaticIp,
-} from './singboxCompiler.ts';
+import { resolvePlanTier } from './singboxCompiler.ts';
 import {
   dispatchErrorAlert,
   extractSupportUid,
   formatLogTimestamp,
+  getFreeQuotaSettings,
   getTopicRoutingConfig,
   saveTopicRoute,
   sendDatabaseBackup,
@@ -30,10 +29,11 @@ import {
 } from './telegramTopics.ts';
 import {
   executeD1Batch,
+  getCachedActiveNodesPool,
   getCachedHasActiveGaming,
   invalidateNodesCache,
 } from './workerCache.ts';
-import type { Env, SubscriptionRow, UserRow } from './types.ts';
+import type { AppReleaseFileRow, Env, SubscriptionRow, UserRow } from './types.ts';
 
 interface TelegramUser {
   id: number;
@@ -111,15 +111,42 @@ function resolveBotToken(env: Env): string {
   return (env.TELEGRAM_BOT_TOKEN || '').trim();
 }
 
+const GIB_BYTES = 1024 * 1024 * 1024;
+const MIB_BYTES = 1024 * 1024;
+const SPECIAL_TRIAL_BYTES = 1 * GIB_BYTES; // 1 GB one-time trial for Free users
+const PRO_PLAN_PRICE_TOMAN = 120000;
+const FLOW_PLUS_PLAN_PRICE_TOMAN = 180000;
+const PRO_SPECIAL_QUOTA_BYTES = 30 * GIB_BYTES;
+const FLOW_PLUS_SPECIAL_QUOTA_BYTES = 50 * GIB_BYTES;
+const GITHUB_RELEASES_BASE_URL = 'https://github.com/parsa904/sentravpn/releases/latest/download';
+
+function buildProgressBar(used: number, total: number, length = 10): string {
+  const safeTotal = Math.max(1, total);
+  const ratio = Math.max(0, Math.min(1, used / safeTotal));
+  const filled = Math.round(ratio * length);
+  const empty = Math.max(0, length - filled);
+  const pct = Math.round(ratio * 100);
+  return `${'▓'.repeat(filled)}${'░'.repeat(empty)} ${pct}%`;
+}
+
+function getAdminTelegramIds(env: Env): number[] {
+  const raw = [
+    ...(env.ADMIN_TELEGRAM_ID ? env.ADMIN_TELEGRAM_ID.split(',') : []),
+    ...(env.ADMIN_CHAT_ID ? env.ADMIN_CHAT_ID.split(',') : []),
+    ...(env.ADMIN_TELEGRAM_IDS ? env.ADMIN_TELEGRAM_IDS.split(',') : []),
+  ]
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isSafeInteger(n) && n > 0);
+  return Array.from(new Set(raw));
+}
+
 const USER_BTN = {
   ACCOUNT: '👤 حساب کاربری',
   AUTH: '📝 ثبت‌نام / ورود',
-  GET_SUB: '🔑 دریافت کانفیگ و کد اتصال',
-  IOS_CONFIG: '🍏 دریافت کانفیگ iOS',
   UPGRADE: '💎 ارتقای اشتراک',
-  DONATE_OUTBOUND: '🤝 اهدای اوتباند (حمایت از Sentra)',
+  DONATE_OUTBOUND: '🤝 اهدای نود / سابلینک',
   GUIDE: '📖 راهنمای اتصال',
-  DOWNLOAD_APP: '📥 دانلود اپلیکیشن Sentra Connect',
+  DOWNLOAD_APP: '📥 دانلود اپلیکیشن',
   SUPPORT: '🎫 پشتیبانی',
   BACK: '🔙 بازگشت',
   CANCEL: '❌ انصراف',
@@ -193,19 +220,15 @@ function matchMenuAction(rawText: string): MenuAction | null {
     return 'account';
   }
   if (
-    text === USER_BTN.GET_SUB ||
     norm === '🔑 دریافت کانفیگ و کد اتصال' ||
     norm === 'دریافت لینک اشتراک' ||
     norm === '🔗 دریافت لینک اشتراک' ||
-    norm === 'دریافت کانفیگ'
+    norm === 'دریافت کانفیگ' ||
+    norm === 'کد اتصال'
   ) {
     return 'get_sub';
   }
-  if (
-    text === USER_BTN.IOS_CONFIG ||
-    norm === '🍏 دریافت کانفیگ iOS' ||
-    norm === 'دریافت کانفیگ iOS'
-  ) {
+  if (norm === '🍏 دریافت کانفیگ iOS' || norm === 'دریافت کانفیگ iOS') {
     return 'ios_menu';
   }
   if (
@@ -219,10 +242,13 @@ function matchMenuAction(rawText: string): MenuAction | null {
   }
   if (
     text === USER_BTN.DONATE_OUTBOUND ||
+    norm === '🤝 اهدای نود / سابلینک' ||
+    norm === 'اهدای نود / سابلینک' ||
     norm === '🤝 اهدای اوتباند (حمایت از Sentra)' ||
     norm === 'اهدای اوتباند' ||
     norm === 'اهدای نود' ||
     norm === '🤝 اهدای نود' ||
+    norm === 'اهدای سابلینک' ||
     norm === 'اهدای کانفیگ'
   ) {
     return 'donate_outbound';
@@ -388,60 +414,6 @@ async function tgAnswerCallbackQuery(
   });
 }
 
-async function tgSendTextDocument(
-  env: Env,
-  chatId: number,
-  filename: string,
-  content: string,
-  caption: string
-): Promise<boolean> {
-  const botToken = resolveBotToken(env);
-  if (!botToken) {
-    console.error('MISSING TELEGRAM_BOT_TOKEN');
-    return false;
-  }
-
-  const form = new FormData();
-  form.append('chat_id', String(chatId));
-  form.append('caption', caption);
-  form.append('parse_mode', 'HTML');
-  form.append('document', new Blob([content], { type: 'text/plain; charset=utf-8' }), filename);
-
-  try {
-    const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
-      method: 'POST',
-      body: form,
-    });
-    const rawText = await resp.text();
-    let parsed: TelegramApiResponse | null = null;
-    try {
-      parsed = JSON.parse(rawText) as TelegramApiResponse;
-    } catch {
-      parsed = null;
-    }
-    if (!resp.ok || !parsed || parsed.ok !== true) {
-      const desc = parsed?.description ?? rawText.slice(0, 500);
-      console.error('[Telegram API Error]', {
-        method: 'sendDocument',
-        http_status: resp.status,
-        error_code: parsed?.error_code ?? null,
-        description: desc,
-      });
-      await sendErrorAlert(
-        env,
-        'Telegram API (sendDocument)',
-        `HTTP ${resp.status} | code=${parsed?.error_code ?? 'unknown'} | ${desc}`
-      );
-      return false;
-    }
-    return true;
-  } catch (err) {
-    console.error('[Telegram API Fetch Error]', 'sendDocument', err);
-    await sendErrorAlert(env, 'Telegram API Fetch (sendDocument)', err);
-    return false;
-  }
-}
-
 async function tgSendDocumentByFileId(
   env: Env,
   chatId: number,
@@ -462,10 +434,9 @@ function buildMainKeyboard(isRegistered: boolean, isAdmin: boolean): Record<stri
     : { text: USER_BTN.AUTH };
 
   const rows: Array<Array<{ text: string }>> = [
-    [accountOrAuthBtn, { text: USER_BTN.GET_SUB }],
-    [{ text: USER_BTN.IOS_CONFIG }, { text: USER_BTN.UPGRADE }],
-    [{ text: USER_BTN.DONATE_OUTBOUND }, { text: USER_BTN.GUIDE }],
-    [{ text: USER_BTN.DOWNLOAD_APP }, { text: USER_BTN.SUPPORT }],
+    [accountOrAuthBtn, { text: USER_BTN.UPGRADE }],
+    [{ text: USER_BTN.DONATE_OUTBOUND }, { text: USER_BTN.DOWNLOAD_APP }],
+    [{ text: USER_BTN.GUIDE }, { text: USER_BTN.SUPPORT }],
   ];
   if (isAdmin) {
     rows.push([{ text: ADMIN_PANEL_BUTTON }]);
@@ -563,18 +534,20 @@ async function ensureTelegramUserAndSubscription(
   let sub = existing?.sub ?? null;
   if (!sub) {
     const token = generateSubscriptionToken();
+    const connectCode = await generateUniqueConnectCode(db);
     const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
     await db
       .prepare(
         `INSERT INTO subscriptions (
-           user_id, tier, token, status,
+           user_id, tier, plan_tier, connect_code, token, status,
            upload_bytes, download_bytes, traffic_limit_bytes, speed_limit_bps,
            max_concurrent_devices, web_browsing_used_mb, download_used_mb,
-           static_ip_used_mb, expires_at
-         ) VALUES (?, 'Sentra Lite', ?, 'active', 0, 0, ?, 0, 3, 0, 0, 0, ?)`
+           static_ip_used_mb, web_used_bytes, download_used_bytes,
+           special_quota_bytes, special_used_bytes, has_used_special_trial, expires_at
+         ) VALUES (?, 'Sentra Lite', 'free', ?, ?, 'active', 0, 0, ?, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, ?)`
       )
-      .bind(user.id, token, 10 * 1024 * 1024 * 1024, expiresAt)
+      .bind(user.id, connectCode, token, 10 * GIB_BYTES, expiresAt)
       .run();
 
     sub = await db
@@ -585,6 +558,13 @@ async function ensureTelegramUserAndSubscription(
     if (!sub) {
       throw new Error('Failed to load newly inserted subscription from D1');
     }
+  } else if (!sub.connect_code) {
+    const connectCode = await generateUniqueConnectCode(db);
+    await db
+      .prepare('UPDATE subscriptions SET connect_code = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .bind(connectCode, sub.id)
+      .run();
+    sub = { ...sub, connect_code: connectCode };
   }
 
   return { user, sub, isNewUser };
@@ -653,11 +633,12 @@ async function insertOfficialOutboundD1(
     .prepare(
       `INSERT INTO donated_outbounds (
          donor_user_id, tag, protocol, server_address, server_port, config_json,
+         compiled_outbound_json, validation_error,
          latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
          raw_link, fingerprint_sha256, is_official, label, country_code, country_name,
          allow_web, allow_download, allow_gaming, allow_static_ip, allocation_mode,
          last_online_at, last_checked_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'active', 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
     )
     .bind(
       null,
@@ -665,7 +646,8 @@ async function insertOfficialOutboundD1(
       parsed.protocol,
       parsed.server_address,
       parsed.server_port,
-      JSON.stringify(parsed.config_json),
+      parsed.compiled_outbound_json,
+      parsed.compiled_outbound_json,
       80,
       15.0,
       assignedTier,
@@ -735,11 +717,12 @@ async function batchInsertOfficialOutboundsD1(
 
   const insertSql = `INSERT INTO donated_outbounds (
        donor_user_id, tag, protocol, server_address, server_port, config_json,
+       compiled_outbound_json, validation_error,
        latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
        raw_link, fingerprint_sha256, is_official, label, country_code, country_name,
        allow_web, allow_download, allow_gaming, allow_static_ip, allocation_mode,
        last_online_at, last_checked_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'active', 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
 
   const insertStmts: D1PreparedStatement[] = [];
   let duplicates = 0;
@@ -759,7 +742,8 @@ async function batchInsertOfficialOutboundsD1(
           parsed.protocol,
           parsed.server_address,
           parsed.server_port,
-          JSON.stringify(parsed.config_json),
+          parsed.compiled_outbound_json,
+          parsed.compiled_outbound_json,
           80,
           15.0,
           assignedTier,
@@ -830,9 +814,16 @@ async function handleAdminOutboundSubmission(
     }
 
     const body = await resp.text();
-    const { nodes, skipped } = await parseSubscriptionPayload(body);
+    const { nodes, skipped, rejectionReasons } = await parseSubscriptionPayload(body);
     if (nodes.length === 0) {
-      await tgSendMessage(env, chatId, '❌ هیچ نود معتبری در این لینک سابسکریپشن یافت نشد.');
+      const sampleReason = rejectionReasons[0]
+        ? `\n\n📌 دلیل نمونه رد شدن:\n<i>${escapeHtml(rejectionReasons[0])}</i>`
+        : '';
+      await tgSendMessage(
+        env,
+        chatId,
+        `❌ هیچ نود سازگار با sing-box 1.14+ در این لینک سابسکریپشن یافت نشد.${sampleReason}`
+      );
       return;
     }
 
@@ -853,8 +844,8 @@ async function handleAdminOutboundSubmission(
         : 'web_browsing';
 
     await env.DB.prepare(
-      `INSERT INTO subscription_sources (category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at)
-       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+      `INSERT INTO subscription_sources (category, sub_url, tag, submitted_by_user_id, status, total_nodes, healthy_nodes, last_sync_at)
+       VALUES (?, ?, ?, NULL, 'active', ?, ?, CURRENT_TIMESTAMP)`
     )
       .bind(category, validUrl.toString(), `Sub (${category})`, nodes.length, added)
       .run();
@@ -926,23 +917,52 @@ async function handleAdminOutboundSubmission(
   );
 }
 
-const ADMIN_TIER_CONFIG: Record<string, { tier: string; limitBytes: number; label: string }> = {
-  lite: { tier: 'Sentra Lite', limitBytes: 10 * 1024 * 1024 * 1024, label: 'Lite (10GB)' },
-  gaming: { tier: 'Sentra Gaming', limitBytes: 100 * 1024 * 1024 * 1024, label: 'Gaming (100GB)' },
-  static: {
-    tier: 'Sentra Static IP',
-    limitBytes: 100 * 1024 * 1024 * 1024,
-    label: 'Static IP (100GB)',
+const ADMIN_TIER_CONFIG: Record<
+  string,
+  { tier: string; planTier: 'free' | 'pro' | 'flow_plus'; limitBytes: number; specialQuotaBytes: number; label: string }
+> = {
+  lite: {
+    tier: 'Sentra Lite',
+    planTier: 'free',
+    limitBytes: 10 * GIB_BYTES,
+    specialQuotaBytes: 0,
+    label: 'Free (رایگان)',
   },
-  pro: { tier: 'Sentra Pro', limitBytes: 200 * 1024 * 1024 * 1024, label: 'Pro (200GB)' },
-  flow: { tier: 'Sentra Flow+', limitBytes: 500 * 1024 * 1024 * 1024, label: 'Flow+ (500GB)' },
+  gaming: {
+    tier: 'Sentra Flow+',
+    planTier: 'flow_plus',
+    limitBytes: 500 * GIB_BYTES,
+    specialQuotaBytes: FLOW_PLUS_SPECIAL_QUOTA_BYTES,
+    label: 'Flow+ (50GB Special)',
+  },
+  static: {
+    tier: 'Sentra Pro',
+    planTier: 'pro',
+    limitBytes: 200 * GIB_BYTES,
+    specialQuotaBytes: PRO_SPECIAL_QUOTA_BYTES,
+    label: 'Pro (30GB Static IP)',
+  },
+  pro: {
+    tier: 'Sentra Pro',
+    planTier: 'pro',
+    limitBytes: 200 * GIB_BYTES,
+    specialQuotaBytes: PRO_SPECIAL_QUOTA_BYTES,
+    label: 'Pro (30GB Static IP)',
+  },
+  flow: {
+    tier: 'Sentra Flow+',
+    planTier: 'flow_plus',
+    limitBytes: 500 * GIB_BYTES,
+    specialQuotaBytes: FLOW_PLUS_SPECIAL_QUOTA_BYTES,
+    label: 'Flow+ (50GB Special)',
+  },
 };
 
 function buildAdminPanelHomeView(): { text: string; replyMarkup: Record<string, unknown> } {
   return {
     text:
       '🛠 <b>پنل مدیریت Sentra Platform (Cloudflare D1)</b>\n\n' +
-      'از منوی زیر بخش مورد نظر را برای مدیریت نودهای رسمی، منابع سابسکریپشن، بررسی نودهای اهدایی و فیش‌های مالی، مدیریت کاربران یا آمار سیستم انتخاب کنید:',
+      'از منوی زیر بخش مورد نظر را برای مدیریت نودهای رسمی، منابع سابسکریپشن، بررسی نودهای اهدایی و فیش‌های مالی، بروزرسانی فایل نصبی، مدیریت کاربران یا آمار سیستم انتخاب کنید:',
     replyMarkup: {
       inline_keyboard: [
         [
@@ -958,9 +978,10 @@ function buildAdminPanelHomeView(): { text: string; replyMarkup: Record<string, 
           { text: '💳 فیش‌های مالی (در انتظار)', callback_data: 'adm_pending_donations' },
         ],
         [
-          { text: '📊 آمار سیستم', callback_data: 'adm_stats' },
+          { text: '📦 بروزرسانی فایل نصبی ربات', callback_data: 'adm_update_release_file' },
           { text: '💾 دریافت بکاپ فوری', callback_data: 'adm_backup_now' },
         ],
+        [{ text: '📊 آمار سیستم', callback_data: 'adm_stats' }],
         [{ text: '🏠 بازگشت به منوی اصلی', callback_data: 'user_menu_home' }],
       ],
     },
@@ -974,15 +995,17 @@ async function buildAdminSubSourcesView(
   env: Env
 ): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
   const rows = await env.DB.prepare(
-    `SELECT id, category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at
+    `SELECT id, category, sub_url, tag, status, submitted_by_user_id, total_nodes, healthy_nodes, last_sync_at
      FROM subscription_sources
-     ORDER BY id DESC
+     ORDER BY CASE WHEN status = 'pending' THEN 0 ELSE 1 END, id DESC
      LIMIT 10`
   ).all<{
     id: number;
     category: string;
     sub_url: string;
     tag: string | null;
+    status: string | null;
+    submitted_by_user_id: number | null;
     total_nodes: number;
     healthy_nodes: number;
     last_sync_at: string;
@@ -991,22 +1014,34 @@ async function buildAdminSubSourcesView(
   const list = rows.results || [];
   const lines = list.map((s) => {
     const shortUrl = s.sub_url.length > 48 ? `${s.sub_url.slice(0, 48)}...` : s.sub_url;
+    const statusIcon =
+      s.status === 'pending' ? '⏳' : s.status === 'rejected' ? '❌' : '🟢';
+    const submitterTag = s.submitted_by_user_id ? ` | اهدایی کاربر #${s.submitted_by_user_id}` : '';
     return (
-      `🔹 <b>#${s.id}</b> [<code>${escapeHtml(s.category)}</code>] — نودها: <b>${s.healthy_nodes}/${s.total_nodes}</b>\n` +
+      `${statusIcon} <b>#${s.id}</b> [<code>${escapeHtml(s.category)}</code>] — نودها: <b>${s.healthy_nodes}/${s.total_nodes}</b>${submitterTag}\n` +
       `   🔗 <code>${escapeHtml(shortUrl)}</code>`
     );
   });
 
-  const deleteButtons: Array<Array<{ text: string; callback_data: string }>> = [];
-  for (let i = 0; i < list.length; i += 2) {
+  const actionButtons: Array<Array<{ text: string; callback_data: string }>> = [];
+  for (const src of list) {
+    if (src.status === 'pending') {
+      actionButtons.push([
+        { text: `✅ تأیید سابلینک #${src.id}`, callback_data: `adm_subsrc_approve_${src.id}` },
+        { text: `❌ رد سابلینک #${src.id}`, callback_data: `adm_subsrc_reject_${src.id}` },
+      ]);
+    }
+  }
+  const activeOrRejected = list.filter((s) => s.status !== 'pending');
+  for (let i = 0; i < activeOrRejected.length; i += 2) {
     const rowBtns: Array<{ text: string; callback_data: string }> = [];
-    for (const src of list.slice(i, i + 2)) {
+    for (const src of activeOrRejected.slice(i, i + 2)) {
       rowBtns.push({
         text: `🗑 حذف #${src.id} (${src.category})`,
         callback_data: `adm_subsrc_del_${src.id}`,
       });
     }
-    deleteButtons.push(rowBtns);
+    actionButtons.push(rowBtns);
   }
 
   return {
@@ -1016,7 +1051,7 @@ async function buildAdminSubSourcesView(
     replyMarkup: {
       inline_keyboard: [
         [{ text: '➕ افزودن لینک سابسکریپشن جدید', callback_data: 'adm_subsrc_add' }],
-        ...deleteButtons,
+        ...actionButtons,
         [
           { text: '🔄 بروزرسانی', callback_data: 'adm_sub_sources' },
           { text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' },
@@ -1103,8 +1138,8 @@ async function handleAdminSubSourceSubmission(
   }
 
   await env.DB.prepare(
-    `INSERT INTO subscription_sources (category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at)
-     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+    `INSERT INTO subscription_sources (category, sub_url, tag, submitted_by_user_id, status, total_nodes, healthy_nodes, last_sync_at)
+     VALUES (?, ?, ?, NULL, 'active', ?, ?, CURRENT_TIMESTAMP)`
   )
     .bind(category, validUrl.toString(), `Source (${category})`, totalNodes, addedNodes)
     .run();
@@ -1640,36 +1675,40 @@ function buildUserMenuHomeView(
   sub: SubscriptionRow | null,
   isAdmin: boolean
 ): { text: string; replyMarkup: Record<string, unknown> } {
+  const planTier = sub ? resolvePlanTier(sub) : 'free';
+  const planLabel =
+    planTier === 'flow_plus'
+      ? 'Sentra Flow+'
+      : planTier === 'pro'
+      ? 'Sentra Pro'
+      : 'رایگان (Free)';
+
   const greeting = user
-    ? `👋 <b>منوی سریع کاربری Sentra</b>\n\n` +
+    ? `👋 <b>منوی اصلی SentraVPN</b>\n\n` +
       `👤 کاربر: <b>${escapeHtml(user.first_name)}</b>\n` +
-      `💎 پلن فعال: <b>${escapeHtml(sub?.tier || 'Sentra Lite')}</b>\n\n` +
+      `💎 پلن فعال: <b>${escapeHtml(planLabel)}</b>\n\n` +
       `بخش مورد نظر خود را انتخاب کنید:`
-    : `👋 <b>به Sentra Platform خوش آمدید!</b>\n\nبرای دسترسی به اشتراک رایگان و کانفیگ‌ها ابتدا ثبت‌نام یا ورود انجام دهید:`;
+    : `👋 <b>به SentraVPN خوش آمدید!</b>\n\nبرای دریافت کد اتصال ۸ رقمی اختصاصی و استفاده از اپلیکیشن رسمی SentraVPN، ابتدا ثبت‌نام یا ورود انجام دهید:`;
 
   const inlineRows: Array<Array<{ text: string; callback_data: string }>> = user
     ? [
         [
-          { text: '👤 وضعیت حساب و حجم', callback_data: 'user_account' },
-          { text: '🔑 دریافت لینک اشتراک', callback_data: 'user_get_sub' },
-        ],
-        [
-          { text: '🍏 کانفیگ iOS', callback_data: 'user_ios_menu' },
+          { text: '👤 حساب کاربری', callback_data: 'user_account' },
           { text: '💎 ارتقای اشتراک', callback_data: 'user_upgrade' },
         ],
         [
-          { text: '🤝 اهدای نود / کانفیگ', callback_data: 'user_donate_outbound' },
-          { text: '📖 راهنمای اتصال', callback_data: 'user_guide' },
+          { text: '🤝 اهدای نود / سابلینک', callback_data: 'user_donate_outbound' },
+          { text: '📥 دانلود اپلیکیشن', callback_data: 'user_download_app' },
         ],
         [
-          { text: '📥 دانلود اپلیکیشن', callback_data: 'user_download_app' },
+          { text: '📖 راهنمای اتصال', callback_data: 'user_guide' },
           { text: '🎫 پشتیبانی و تیکت', callback_data: 'user_support' },
         ],
       ]
     : [
         [{ text: '✨ ثبت‌نام جدید (فوری)', callback_data: 'auth_register_new' }],
         [{ text: '🔑 ورود با حساب برنامه', callback_data: 'auth_login_app' }],
-        [{ text: '📖 راهنمای اتصال', callback_data: 'user_guide' }],
+        [{ text: '📥 دانلود اپلیکیشن', callback_data: 'user_download_app' }],
       ];
 
   if (isAdmin) {
@@ -1682,12 +1721,29 @@ function buildUserMenuHomeView(
   };
 }
 
-function buildUserAccountView(
+async function ensureSubscriptionConnectCode(
+  db: D1Database,
+  sub: SubscriptionRow
+): Promise<string> {
+  if (sub.connect_code && /^\d{8}$/.test(sub.connect_code)) {
+    return sub.connect_code;
+  }
+  const code = await generateUniqueConnectCode(db);
+  await db
+    .prepare('UPDATE subscriptions SET connect_code = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+    .bind(code, sub.id)
+    .run();
+  sub.connect_code = code;
+  return code;
+}
+
+async function buildUserAccountView(
+  env: Env,
   user: UserRow,
   sub: SubscriptionRow
-): { text: string; replyMarkup: Record<string, unknown> } {
-  const usedBytes = sub.upload_bytes + sub.download_bytes;
-  const remainingBytes = Math.max(0, sub.traffic_limit_bytes - usedBytes);
+): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
+  const connectCode = await ensureSubscriptionConnectCode(env.DB, sub);
+  const planTier = resolvePlanTier(sub);
   const statusLabel =
     sub.status === 'active'
       ? '🟢 فعال'
@@ -1697,131 +1753,154 @@ function buildUserAccountView(
       ? '🟠 اتمام حجم'
       : '🔴 غیرفعال';
 
-  return {
-    text:
-      `👤 <b>وضعیت حساب کاربری شما</b>\n\n` +
-      `🆔 شناسه یکتا: <code>${escapeHtml(user.user_uuid)}</code>\n` +
-      `💎 نوع اشتراک: <b>${escapeHtml(sub.tier)}</b>\n` +
-      `📌 وضعیت: ${statusLabel}\n` +
-      `📊 حجم مصرفی: <b>${formatGb(usedBytes)} GB</b> از <b>${formatGb(sub.traffic_limit_bytes)} GB</b>\n` +
-      `🔋 حجم باقیمانده: <b>${formatGb(remainingBytes)} GB</b>\n` +
-      `📱 حداکثر دستگاه هم‌زمان: <b>${sub.max_concurrent_devices}</b>\n` +
-      `📅 تاریخ انقضا: <code>${escapeHtml(sub.expires_at.slice(0, 10))}</code>`,
-    replyMarkup: {
-      inline_keyboard: [
-        [
-          { text: '🔑 دریافت لینک اشتراک و کد', callback_data: 'user_get_sub' },
-          { text: '💎 ارتقای اشتراک', callback_data: 'user_upgrade' },
-        ],
-        [
-          { text: '🎫 تیکت‌های من', callback_data: 'user_support' },
-          { text: '🔄 بروزرسانی', callback_data: 'user_account' },
-        ],
-        [{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }],
-      ],
-    },
-  };
-}
+  let planHeader = '🆓 <b>پلن فعلی:</b> رایگان (Free)';
+  let quotaSection = '';
+  const hasUsedTrial = Number(sub.has_used_special_trial || 0) === 1;
+  const specialQuotaBytes = Math.max(0, Number(sub.special_quota_bytes || 0));
+  const specialUsedBytes = Math.max(
+    Number(sub.special_used_bytes || 0),
+    Math.round(Number(sub.static_ip_used_mb || 0) * MIB_BYTES)
+  );
 
-async function buildUserSubscriptionView(
-  env: Env,
-  user: UserRow,
-  sub: SubscriptionRow
-): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
-  const otp = generateNumericCode(8);
-  const expires = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-  await env.DB.prepare(
-    'UPDATE users SET auth_code = ?, auth_code_expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
-  )
-    .bind(otp, expires, user.id)
-    .run();
+  if (planTier === 'free') {
+    const { webQuotaGb, downloadQuotaGb, webQuotaBytes, downloadQuotaBytes } =
+      await getFreeQuotaSettings(env.DB, env.SENTRA_KV);
+    const webUsedBytes = Math.max(
+      Number(sub.web_used_bytes || 0),
+      Math.round(Number(sub.web_browsing_used_mb || 0) * MIB_BYTES)
+    );
+    const dlUsedBytes = Math.max(
+      Number(sub.download_used_bytes || 0),
+      Math.round(Number(sub.download_used_mb || 0) * MIB_BYTES)
+    );
+    const webRemBytes = Math.max(0, webQuotaBytes - webUsedBytes);
+    const dlRemBytes = Math.max(0, downloadQuotaBytes - dlUsedBytes);
 
-  const baseUrl = (env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
-  const singboxUrl = baseUrl
-    ? `${baseUrl}/sub/${sub.token}?format=singbox`
-    : `/sub/${sub.token}?format=singbox`;
-  const v2rayUrl = baseUrl ? `${baseUrl}/sub/${sub.token}` : `/sub/${sub.token}`;
+    quotaSection =
+      `🌐 <b>وبگردی (سقف ${webQuotaGb} GB):</b>\n` +
+      `   • مصرف‌شده: <b>${formatGb(webUsedBytes)} GB</b> | باقیمانده: <b>${formatGb(webRemBytes)} GB</b>\n` +
+      `📥 <b>دانلود (سقف ${downloadQuotaGb} GB):</b>\n` +
+      `   • مصرف‌شده: <b>${formatGb(dlUsedBytes)} GB</b> | باقیمانده: <b>${formatGb(dlRemBytes)} GB</b>`;
 
-  return {
-    text:
-      `🔑 <b>اطلاعات اتصال و لینک اشتراک شما</b>\n\n` +
-      `🔢 <b>کد ورود ۸ رقمی اپلیکیشن Sentra Connect (اعتبار ۵ دقیقه):</b>\n<code>${otp}</code>\n\n` +
-      `🔗 <b>لینک سابسکریپشن Sing-box 1.14+ (پیشنهادی):</b>\n<code>${escapeHtml(singboxUrl)}</code>\n\n` +
-      `🌐 <b>لینک سابسکریپشن عمومی (V2Ray / Base64):</b>\n<code>${escapeHtml(v2rayUrl)}</code>\n\n` +
-      `💡 برای کپی، روی کد یا لینک بالا ضربه بزنید.`,
-    replyMarkup: {
-      inline_keyboard: [
-        [
-          { text: '🍏 کانفیگ اختصاصی iOS', callback_data: 'user_ios_menu' },
-          { text: '📖 راهنمای اتصال', callback_data: 'user_guide' },
-        ],
-        [
-          { text: '🔄 تولید کد جدید', callback_data: 'user_get_sub' },
-          { text: '👤 وضعیت حساب', callback_data: 'user_account' },
-        ],
-        [{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }],
-      ],
-    },
-  };
-}
-
-async function buildUserIosMenuView(
-  env: Env,
-  sub: SubscriptionRow
-): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
-  const gamingLive = await hasActiveGamingOutbounds(env.DB, env.SENTRA_KV);
-  const canStatic = tierHasStaticIp(sub.tier);
-  const canGaming = tierHasGaming(sub.tier);
-
-  const buttons: Array<Array<{ text: string; callback_data: string }>> = [
-    [
-      { text: '🌐 وب‌گردی (رایگان)', callback_data: 'ios_mode_web_browsing' },
-      { text: '📥 دانلود (رایگان)', callback_data: 'ios_mode_download' },
-    ],
-  ];
-  if (gamingLive && canGaming) {
-    buttons.push([{ text: '🎮 گیمینگ (WireGuard)', callback_data: 'ios_mode_gaming' }]);
+    if (specialQuotaBytes > 0) {
+      const trialRem = Math.max(0, specialQuotaBytes - specialUsedBytes);
+      quotaSection +=
+        `\n\n🎁 <b>تست ۱ گیگابایتی بخش ویژه (آیپی ثابت + گیمینگ):</b>\n` +
+        `   • مصرف: <b>${formatGb(specialUsedBytes)} GB</b> از <b>${formatGb(specialQuotaBytes)} GB</b> (باقیمانده: <b>${formatGb(trialRem)} GB</b>)\n` +
+        `   • <code>${buildProgressBar(specialUsedBytes, specialQuotaBytes)}</code>`;
+    }
+  } else if (planTier === 'pro') {
+    planHeader = '🚀 <b>پلن فعلی:</b> Sentra Pro';
+    const totalSpecial = specialQuotaBytes > 0 ? specialQuotaBytes : PRO_SPECIAL_QUOTA_BYTES;
+    const remSpecial = Math.max(0, totalSpecial - specialUsedBytes);
+    quotaSection =
+      `🌐 <b>وبگردی:</b> ♾️ نامحدود\n` +
+      `📥 <b>دانلود:</b> ♾️ نامحدود\n\n` +
+      `🛡 <b>بخش ویژه (آیپی ثابت):</b>\n` +
+      `   • کل حجم: <b>${formatGb(totalSpecial)} GB</b>\n` +
+      `   • مصرف‌شده: <b>${formatGb(specialUsedBytes)} GB</b> | باقیمانده: <b>${formatGb(remSpecial)} GB</b>\n` +
+      `   • <code>${buildProgressBar(specialUsedBytes, totalSpecial)}</code>`;
   } else {
-    buttons.push([{ text: '🎮 گیمینگ (به‌زودی)', callback_data: 'ios_mode_gaming' }]);
+    planHeader = '🔥 <b>پلن فعلی:</b> Sentra Flow+';
+    const totalSpecial = specialQuotaBytes > 0 ? specialQuotaBytes : FLOW_PLUS_SPECIAL_QUOTA_BYTES;
+    const remSpecial = Math.max(0, totalSpecial - specialUsedBytes);
+    quotaSection =
+      `🌐 <b>وبگردی:</b> ♾️ نامحدود\n` +
+      `📥 <b>دانلود:</b> ♾️ نامحدود\n\n` +
+      `🛡 <b>بخش ویژه (آیپی ثابت + 🎮 گیمینگ):</b>\n` +
+      `   • کل حجم: <b>${formatGb(totalSpecial)} GB</b>\n` +
+      `   • مصرف‌شده: <b>${formatGb(specialUsedBytes)} GB</b> | باقیمانده: <b>${formatGb(remSpecial)} GB</b>\n` +
+      `   • <code>${buildProgressBar(specialUsedBytes, totalSpecial)}</code>`;
   }
-  if (canStatic) {
-    buttons.push([{ text: '💎 آی‌پی ثابت اختصاصی', callback_data: 'ios_mode_static_ip' }]);
-  } else {
-    buttons.push([{ text: '🔒 آی‌پی ثابت (نیازمند ارتقا)', callback_data: 'ios_mode_static_ip' }]);
+
+  const inlineRows: Array<Array<{ text: string; callback_data: string }>> = [];
+  if (planTier === 'free' && !hasUsedTrial) {
+    inlineRows.push([
+      {
+        text: '🎁 فعال‌سازی تست رایگان ۱ گیگابایتی (آیپی ثابت + گیمینگ)',
+        callback_data: 'user_activate_special_trial',
+      },
+    ]);
   }
-  buttons.push([{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }]);
+  inlineRows.push([
+    { text: '💎 ارتقای اشتراک', callback_data: 'user_upgrade' },
+    { text: '📥 دانلود اپلیکیشن', callback_data: 'user_download_app' },
+  ]);
+  inlineRows.push([
+    { text: '🎫 تیکت‌های من', callback_data: 'user_support' },
+    { text: '🔄 بروزرسانی', callback_data: 'user_account' },
+  ]);
+  inlineRows.push([{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }]);
 
   return {
     text:
-      '🍏 <b>دریافت کانفیگ اختصاصی iOS</b>\n\n' +
-      'حالت اتصال مورد نظر خود را انتخاب کنید تا لینک سابسکریپشن SFI / Streisand یا پروفایل WireGuard برای شما ساخته شود:',
-    replyMarkup: { inline_keyboard: buttons },
+      `👤 <b>حساب کاربری SentraVPN</b>\n\n` +
+      `🔑 <b>کد اتصال ۸ رقمی اختصاصی شما (برای کپی ضربه بزنید):</b>\n` +
+      `<code>${escapeHtml(connectCode)}</code>\n\n` +
+      `${planHeader}\n` +
+      `📌 <b>وضعیت:</b> ${statusLabel}\n` +
+      `📅 <b>تاریخ انقضا:</b> <code>${escapeHtml(sub.expires_at.slice(0, 10))}</code>\n` +
+      `📱 <b>حداکثر دستگاه هم‌زمان:</b> <b>${sub.max_concurrent_devices}</b>\n\n` +
+      `${quotaSection}\n\n` +
+      `💡 <i>این کد ۸ رقمی را مستقیماً داخل اپلیکیشن رسمی SentraVPN وارد کنید.</i>`,
+    replyMarkup: { inline_keyboard: inlineRows },
   };
 }
 
 function buildUserUpgradeView(
-  env: Env,
   sub: SubscriptionRow | null
 ): { text: string; replyMarkup: Record<string, unknown> } {
-  const proPrice = Number(env.PRO_SUBSCRIPTION_PRICE || '150000') || 150000;
-  const flowPrice = Math.round(proPrice * 2);
+  const planTier = sub ? resolvePlanTier(sub) : 'free';
+  const currentLabel =
+    planTier === 'flow_plus'
+      ? 'Sentra Flow+'
+      : planTier === 'pro'
+      ? 'Sentra Pro'
+      : 'رایگان (Free)';
 
   return {
     text:
-      `💎 <b>ارتقای اشتراک و حمایت از Sentra</b>\n\n` +
-      `پلن فعلی شما: <b>${escapeHtml(sub?.tier || 'Sentra Lite')}</b>\n\n` +
-      `🚀 <b>Sentra Pro (۲۰۰ گیگابایت / ماهانه)</b>\n` +
-      `• دسترسی به نودهای پرسرعت + آی‌پی ثابت (ترید و جمنای)\n` +
-      `• مبلغ حمایت: <b>${proPrice.toLocaleString('en-US')} تومان</b>\n\n` +
-      `🔥 <b>Sentra Flow+ (۵۰۰ گیگابایت / ماهانه)</b>\n` +
-      `• تمام امکانات Pro + اولویت ترافیک و دسترسی کامل به گیمینگ پس از فعال‌سازی\n` +
-      `• مبلغ حمایت: <b>${flowPrice.toLocaleString('en-US')} تومان</b>\n\n` +
-      `💡 همچنین می‌توانید با <b>اهدای اوتباند فعال</b> به اکوسیستم کمک کنید.`,
+      `💎 <b>ارتقای اشتراک SentraVPN</b>\n\n` +
+      `پلن فعلی شما: <b>${escapeHtml(currentLabel)}</b>\n\n` +
+      `🚀 <b>پلن Sentra Pro — ۱۲۰,۰۰۰ تومان (ماهانه)</b>\n` +
+      `• 🌐 وبگردی و 📥 دانلود: <b>♾️ نامحدود</b>\n` +
+      `• 🛡 بخش ویژه: <b>۳۰ گیگابایت آیپی ثابت اختصاصی</b> (مناسب ترید، هوش مصنوعی و حساب‌های حساس)\n\n` +
+      `🔥 <b>پلن Sentra Flow+ — ۱۸۰,۰۰۰ تومان (ماهانه)</b>\n` +
+      `• 🌐 وبگردی و 📥 دانلود: <b>♾️ نامحدود</b>\n` +
+      `• 🛡 بخش ویژه: <b>۵۰ گیگابایت آیپی ثابت + 🎮 گیمینگ کم‌تاخیر</b>\n\n` +
+      `💡 پلن مورد نظر را انتخاب کنید تا فیش واریزی خود را ارسال نمایید:`,
     replyMarkup: {
       inline_keyboard: [
-        [{ text: '💳 ارسال فیش واریزی پلن Pro', callback_data: 'user_submit_receipt_pro' }],
-        [{ text: '💳 ارسال فیش واریزی پلن Flow+', callback_data: 'user_submit_receipt_flow' }],
-        [{ text: '🤝 اهدای نود / اوتباند', callback_data: 'user_donate_outbound' }],
+        [
+          {
+            text: `🚀 ارتقا به Sentra Pro (${PRO_PLAN_PRICE_TOMAN.toLocaleString('en-US')} تومان)`,
+            callback_data: 'user_submit_receipt_pro',
+          },
+        ],
+        [
+          {
+            text: `🔥 ارتقا به Sentra Flow+ (${FLOW_PLUS_PLAN_PRICE_TOMAN.toLocaleString('en-US')} تومان)`,
+            callback_data: 'user_submit_receipt_flow',
+          },
+        ],
+        [{ text: '🤝 اهدای نود / سابلینک (دریافت پلن هدیه)', callback_data: 'user_donate_outbound' }],
+        [{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }],
+      ],
+    },
+  };
+}
+
+function buildUserDonateMenuView(): { text: string; replyMarkup: Record<string, unknown> } {
+  return {
+    text:
+      `🤝 <b>اهدای نود یا سابلینک به اکوسیستم SentraVPN</b>\n\n` +
+      `با اشتراک‌گذاری سرور یا سابلینک سالم خود، به پایداری شبکه آزاد کمک کنید و اشتراک ویژه هدیه بگیرید:\n\n` +
+      `🎁 <b>توجه:</b> اگر کاربری سرور یا سابلینکی با حجم <b>۲۰۰ گیگابایت یا بیشتر</b> اهدا کند اشتراک <b>Sentra Pro</b>، و در صورت اهدای سرور با حجم <b>۳۰۰ گیگابایت یا بیشتر</b>، اشتراک <b>Sentra Flow+</b> به‌عنوان هدیه دریافت خواهد کرد.\n\n` +
+      `روش اهدا را انتخاب کنید:`,
+    replyMarkup: {
+      inline_keyboard: [
+        [{ text: '➕ اهدای نود (کانفیگ تکی)', callback_data: 'user_donate_single_node' }],
+        [{ text: '🔗 اهدای سابلینک (Subscription)', callback_data: 'user_donate_sublink' }],
         [{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }],
       ],
     },
@@ -1829,33 +1908,27 @@ function buildUserUpgradeView(
 }
 
 function buildUserGuideView(
-  platform: 'overview' | 'android' | 'ios' | 'windows' = 'overview'
+  platform: 'overview' | 'android' | 'windows' = 'overview'
 ): { text: string; replyMarkup: Record<string, unknown> } {
   let text =
-    '📖 <b>راهنمای اتصال به Sentra Platform</b>\n\n' +
-    'سیستم‌عامل خود را از دکمه‌های زیر انتخاب کنید تا مراحل اتصال نمایش داده شود:';
+    '📖 <b>راهنمای اتصال به SentraVPN</b>\n\n' +
+    'اتصال به سرویس SentraVPN به‌صورت اختصاصی از طریق <b>اپلیکیشن رسمی SentraVPN</b> و <b>کد اتصال ۸ رقمی</b> انجام می‌شود.\n\n' +
+    'سیستم‌عامل خود را انتخاب کنید:';
 
   if (platform === 'android') {
     text =
       '🤖 <b>راهنمای اتصال در اندروید</b>\n\n' +
-      '۱. اپلیکیشن <b>Sentra Connect</b> (یا Hiddify / sing-box SFA) را نصب کنید.\n' +
-      '۲. از بخش «🔑 دریافت کانفیگ و کد اتصال»، کد ۸ رقمی یا لینک Sing-box 1.14+ را کپی کنید.\n' +
-      '۳. در Sentra Connect کد ۸ رقمی را وارد کنید یا در sing-box لینک سابسکریپشن را Import نمایید.\n' +
-      '۴. روی دکمه اتصال بزنید و مجوز VPN را تأیید کنید.';
-  } else if (platform === 'ios') {
-    text =
-      '🍏 <b>راهنمای اتصال در iOS (آیفون و آیپد)</b>\n\n' +
-      '۱. یکی از اپلیکیشن‌های <b>sing-box (SFI)</b>، <b>Streisand</b> یا <b>Hiddify</b> را از App Store نصب کنید.\n' +
-      '۲. از بخش «🍏 دریافت کانفیگ iOS» حالت مورد نظر را انتخاب کرده و لینک اشتراک را کپی کنید.\n' +
-      '۳. در برنامه گزینه <b>Add Profile / Subscription</b> را بزنید و لینک را وارد کنید.\n' +
-      '۴. پروفایل را انتخاب کرده و اتصال را فعال کنید.';
+      '۱. از بخش «📥 دانلود اپلیکیشن»، نسخه رسمی اندروید <b>SentraVPN</b> را دانلود و نصب کنید.\n' +
+      '۲. وارد بخش «👤 حساب کاربری» در همین ربات شوید و روی <b>کد اتصال ۸ رقمی</b> خود ضربه بزنید تا کپی شود.\n' +
+      '۳. اپلیکیشن SentraVPN را باز کرده، کد ۸ رقمی را وارد کنید و روی دکمه ورود بزنید.\n' +
+      '۴. حالت دلخواه (وبگردی، دانلود، آیپی ثابت یا گیمینگ) را انتخاب کرده و متصل شوید.';
   } else if (platform === 'windows') {
     text =
-      '💻 <b>راهنمای اتصال در ویندوز / مک</b>\n\n' +
-      '۱. اپلیکیشن <b>Sentra Connect</b> یا <b>Hiddify / sing-box</b> نسخه دسکتاپ را دانلود و اجرا کنید.\n' +
-      '۲. از منوی ربات روی «🔑 دریافت کانفیگ و کد اتصال» بزنید.\n' +
-      '۳. کد ورود ۸ رقمی را در Sentra Connect وارد کنید (یا لینک Sing-box 1.14+ را در کلاینت اضافه نمایید).\n' +
-      '۴. حالت اتصال (وب‌گردی، دانلود یا آی‌پی ثابت) را انتخاب و متصل شوید.';
+      '🪟 <b>راهنمای اتصال در ویندوز</b>\n\n' +
+      '۱. از بخش «📥 دانلود اپلیکیشن»، نسخه <b>Setup x64</b> یا <b>Portable x64</b> ویندوز را دریافت کنید.\n' +
+      '۲. از بخش «👤 حساب کاربری» در ربات، <b>کد اتصال ۸ رقمی</b> اختصاصی خود را کپی کنید.\n' +
+      '۳. برنامه SentraVPN را اجرا کرده و با کد ۸ رقمی وارد حساب خود شوید.\n' +
+      '۴. سرور و حالت اتصال را انتخاب کرده و دکمه اتصال را بزنید.';
   }
 
   return {
@@ -1863,13 +1936,12 @@ function buildUserGuideView(
     replyMarkup: {
       inline_keyboard: [
         [
-          { text: '🤖 اندروید', callback_data: 'user_guide_android' },
-          { text: '🍏 iOS', callback_data: 'user_guide_ios' },
-          { text: '💻 ویندوز', callback_data: 'user_guide_windows' },
+          { text: '🤖 راهنمای اندروید', callback_data: 'user_guide_android' },
+          { text: '🪟 راهنمای ویندوز', callback_data: 'user_guide_windows' },
         ],
         [
           { text: '📥 دانلود اپلیکیشن', callback_data: 'user_download_app' },
-          { text: '🔑 دریافت لینک اشتراک', callback_data: 'user_get_sub' },
+          { text: '👤 مشاهده کد اتصال ۸ رقمی', callback_data: 'user_account' },
         ],
         [{ text: '🔙 منوی اصلی', callback_data: 'user_menu_home' }],
       ],
@@ -1880,54 +1952,143 @@ function buildUserGuideView(
 async function buildUserDownloadAppView(
   env: Env
 ): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
-  const releases = await env.DB.prepare(
-    'SELECT platform, version, file_name, file_size_mb, changelog, updated_at FROM app_releases ORDER BY platform ASC'
-  ).all<{
-    platform: string;
-    version: string;
-    file_name: string;
-    file_size_mb: number;
-    changelog: string;
-    updated_at: string;
-  }>();
+  let rows: AppReleaseFileRow[] = [];
+  try {
+    const res = await env.DB.prepare(
+      'SELECT platform, version, github_url, telegram_file_id, updated_at FROM app_release_files ORDER BY platform ASC'
+    ).all<AppReleaseFileRow>();
+    rows = res.results || [];
+  } catch {
+    rows = [];
+  }
 
-  const rows = releases.results || [];
-  const win = rows.find((r) => r.platform === 'windows');
   const andr = rows.find((r) => r.platform === 'android');
+  const win = rows.find((r) => r.platform === 'windows');
 
-  const lines: string[] = [];
-  if (andr) {
-    lines.push(
-      `🤖 <b>اندروید:</b> نسخه <code>${escapeHtml(andr.version)}</code> (${andr.file_size_mb.toFixed(1)} MB)` +
-        (andr.changelog ? `\n   📝 ${escapeHtml(andr.changelog.slice(0, 120))}` : '')
-    );
-  } else {
-    lines.push('🤖 <b>اندروید:</b> فایل نصبی به‌زودی بارگذاری می‌شود (فعلاً از sing-box SFA یا Hiddify استفاده کنید).');
-  }
-  if (win) {
-    lines.push(
-      `💻 <b>ویندوز:</b> نسخه <code>${escapeHtml(win.version)}</code> (${win.file_size_mb.toFixed(1)} MB)` +
-        (win.changelog ? `\n   📝 ${escapeHtml(win.changelog.slice(0, 120))}` : '')
-    );
-  } else {
-    lines.push('💻 <b>ویندوز:</b> فایل نصبی به‌زودی بارگذاری می‌شود (فعلاً از Hiddify یا sing-box 1.14+ استفاده کنید).');
-  }
+  const lines: string[] = [
+    `🤖 <b>اندروید (Android):</b> ` +
+      (andr
+        ? `نسخه <code>${escapeHtml(andr.version)}</code>${andr.telegram_file_id ? ' — فایل مستقیم تلگرام آماده ✅' : ' — دانلود مستقیم از گیتهاب'}`
+        : 'دانلود مستقیم آخرین نسخه از گیتهاب (Universal / ARMv8 / ARMv7 / x64)'),
+    `🪟 <b>ویندوز (Windows):</b> ` +
+      (win
+        ? `نسخه <code>${escapeHtml(win.version)}</code>${win.telegram_file_id ? ' — فایل مستقیم تلگرام آماده ✅' : ' — دانلود مستقیم از گیتهاب'}`
+        : 'دانلود مستقیم آخرین نسخه از گیتهاب (Setup x64 / Portable x64)'),
+  ];
 
   return {
     text:
-      `📥 <b>دانلود اپلیکیشن رسمی Sentra Connect</b>\n\n` +
+      `📥 <b>دانلود اپلیکیشن رسمی SentraVPN</b>\n\n` +
       `${lines.join('\n\n')}\n\n` +
-      `پلتفرم مورد نظر خود را برای دریافت فایل انتخاب کنید:`,
+      `سیستم‌عامل خود را انتخاب کنید تا هم لینک مستقیم گیتهاب و هم فایل نصبی درون تلگرام برای شما ارسال شود:`,
     replyMarkup: {
       inline_keyboard: [
         [
-          { text: '🤖 دانلود نسخه اندروید', callback_data: 'user_dl_android' },
-          { text: '💻 دانلود نسخه ویندوز', callback_data: 'user_dl_windows' },
+          { text: '🤖 اندروید (Android)', callback_data: 'user_dl_android' },
+          { text: '🪟 ویندوز (Windows)', callback_data: 'user_dl_windows' },
         ],
         [
-          { text: '📖 راهنمای اتصال', callback_data: 'user_guide' },
+          { text: '👤 مشاهده کد اتصال ۸ رقمی', callback_data: 'user_account' },
           { text: '🔙 منوی اصلی', callback_data: 'user_menu_home' },
         ],
+      ],
+    },
+  };
+}
+
+async function sendPlatformReleaseDownload(
+  env: Env,
+  chatId: number,
+  platform: 'android' | 'windows'
+): Promise<void> {
+  let relFile: AppReleaseFileRow | null = null;
+  try {
+    relFile = await env.DB.prepare(
+      'SELECT platform, version, github_url, telegram_file_id, updated_at FROM app_release_files WHERE platform = ? LIMIT 1'
+    )
+      .bind(platform)
+      .first<AppReleaseFileRow>();
+  } catch {
+    relFile = null;
+  }
+
+  let fileId = relFile?.telegram_file_id || null;
+  let version = relFile?.version || 'latest';
+
+  if (!fileId) {
+    try {
+      const legacy = await env.DB.prepare(
+        'SELECT version, telegram_file_id FROM app_releases WHERE platform = ? LIMIT 1'
+      )
+        .bind(platform)
+        .first<{ version: string; telegram_file_id: string }>();
+      if (legacy?.telegram_file_id) {
+        fileId = legacy.telegram_file_id;
+        if (!relFile?.version && legacy.version) {
+          version = legacy.version;
+        }
+      }
+    } catch {
+      // ignore if legacy table is empty
+    }
+  }
+
+  const base = GITHUB_RELEASES_BASE_URL;
+  const isAndroid = platform === 'android';
+  const urlButtons: Array<Array<{ text: string; url?: string; callback_data?: string }>> = isAndroid
+    ? [
+        [{ text: '📱 دانلود Universal APK (پیشنهادی)', url: `${base}/SentraVPN-Android-Universal.apk` }],
+        [
+          { text: '📱 ARMv8 (۶۴ بیتی)', url: `${base}/SentraVPN-Android-ARMv8.apk` },
+          { text: '📱 ARMv7 (۳۲ بیتی)', url: `${base}/SentraVPN-Android-ARMv7.apk` },
+        ],
+        [{ text: '📱 x64 (شبیه‌ساز / تبلت)', url: `${base}/SentraVPN-Android-x64.apk` }],
+        [{ text: '👤 مشاهده کد اتصال ۸ رقمی', callback_data: 'user_account' }],
+      ]
+    : [
+        [{ text: '💿 دانلود Windows Setup x64 (.exe)', url: `${base}/SentraVPN-Windows-Setup-x64.exe` }],
+        [{ text: '📦 دانلود Windows Portable x64 (.zip)', url: `${base}/SentraVPN-Windows-Portable-x64.zip` }],
+        [{ text: '👤 مشاهده کد اتصال ۸ رقمی', callback_data: 'user_account' }],
+      ];
+
+  await tgSendMessage(
+    env,
+    chatId,
+    `📥 <b>دانلود نسخه رسمی ${isAndroid ? 'اندروید (Android)' : 'ویندوز (Windows)'} SentraVPN</b>\n\n` +
+      `🔹 نسخه: <code>${escapeHtml(version)}</code>\n` +
+      `🌐 لینک‌های مستقیم آخرین نسخه از GitHub Releases:\n` +
+      (fileId
+        ? `\n📎 فایل نصبی مستقیم نیز هم‌اکنون در پیام بعدی داخل تلگرام برای شما ارسال می‌شود.`
+        : `\nℹ️ برای نصب، روی دکمه معماری مناسب دستگاه خود در زیر بزنید.`),
+    { inline_keyboard: urlButtons }
+  );
+
+  if (fileId) {
+    await tgSendDocumentByFileId(
+      env,
+      chatId,
+      fileId,
+      `📦 <b>SentraVPN (${isAndroid ? 'Android' : 'Windows'}) — نسخه <code>${escapeHtml(version)}</code></b>\n` +
+        `پس از نصب، کد اتصال ۸ رقمی خود را از بخش «👤 حساب کاربری» در برنامه وارد کنید.`
+    );
+  }
+}
+
+function buildAdminUpdateReleaseFileView(): {
+  text: string;
+  replyMarkup: Record<string, unknown>;
+} {
+  return {
+    text:
+      '📦 <b>بروزرسانی فایل نصبی ربات (Telegram file_id)</b>\n\n' +
+      'پلتفرم مورد نظر را انتخاب کنید تا فایل نصبی (APK یا EXE/ZIP) را فوروارد یا ارسال کرده و در دیتابیس D1 ثبت نمایید:',
+    replyMarkup: {
+      inline_keyboard: [
+        [
+          { text: '🤖 فایل نصبی اندروید (APK)', callback_data: 'adm_rel_pick_android' },
+          { text: '🪟 فایل نصبی ویندوز (EXE / ZIP)', callback_data: 'adm_rel_pick_windows' },
+        ],
+        [{ text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' }],
       ],
     },
   };
@@ -2084,140 +2245,105 @@ async function handleCallbackQuery(
         q.from,
         isEnvAdmin(env, telegramId)
       );
-      await sendOrEditView(env, chatId, messageId, buildUserAccountView(user, sub));
+      const view = await buildUserAccountView(env, user, sub);
+      await sendOrEditView(env, chatId, messageId, view);
       return;
     }
 
-    // --- User Subscription Link & OTP Code ---
-    if (data === 'user_get_sub') {
+    // --- One-time 1 GB Special Trial Activation (Atomic Double-Click Guard) ---
+    if (data === 'user_activate_special_trial') {
       const { user, sub } = await ensureTelegramUserAndSubscription(
         env.DB,
         q.from,
         isEnvAdmin(env, telegramId)
       );
-      const view = await buildUserSubscriptionView(env, user, sub);
-      await sendOrEditView(env, chatId, messageId, view);
-      return;
-    }
-
-    // --- User iOS Menu & Mode Selection ---
-    if (data === 'user_ios_menu') {
-      const { sub } = await ensureTelegramUserAndSubscription(
-        env.DB,
-        q.from,
-        isEnvAdmin(env, telegramId)
-      );
-      const view = await buildUserIosMenuView(env, sub);
-      await sendOrEditView(env, chatId, messageId, view);
-      return;
-    }
-
-    if (data.startsWith('ios_mode_')) {
-      const mode = data.slice('ios_mode_'.length);
-      const { sub } = await ensureTelegramUserAndSubscription(
-        env.DB,
-        q.from,
-        isEnvAdmin(env, telegramId)
-      );
-
-      if (mode === 'gaming') {
-        const gamingLive = await hasActiveGamingOutbounds(env.DB, env.SENTRA_KV);
-        if (!gamingLive) {
-          await tgSendMessage(
-            env,
-            chatId,
-            '🎮 <b>بخش گیمینگ به‌زودی راه‌اندازی می‌شود!</b>\n\nبه‌محض افزودن سرور اختصاصی گیمینگ، کانفیگ WireGuard کم‌تاخیر iOS به صورت خودکار فعال خواهد شد.',
-            { inline_keyboard: [[{ text: '🔙 بازگشت به منوی iOS', callback_data: 'user_ios_menu' }]] }
-          );
-          return;
-        }
-        if (!tierHasGaming(sub.tier)) {
-          await tgSendMessage(
-            env,
-            chatId,
-            '🔒 دسترسی به کانفیگ گیمینگ WireGuard نیازمند اشتراک گیمینگ یا ویژه است.',
-            {
-              inline_keyboard: [
-                [{ text: '💎 ارتقای اشتراک', callback_data: 'user_upgrade' }],
-                [{ text: '🔙 بازگشت', callback_data: 'user_ios_menu' }],
-              ],
-            }
-          );
-          return;
-        }
-        const serverHost = env.PUBLIC_BASE_URL
-          ? new URL(env.PUBLIC_BASE_URL).hostname
-          : 'vpn.sentra.local';
-        const wg = await generateWireguardGamingProfile({
-          subscription: sub,
-          serverHost,
-          serverPublicKey: env.WIREGUARD_SERVER_PUBLIC_KEY || 'REPLACE_SERVER_WG_PUBLIC_KEY',
-          port: Number(env.WIREGUARD_PORT || 51820),
-          keySalt: env.WIREGUARD_KEY_SALT || 'sentra-wg-salt',
-        });
-        await tgSendTextDocument(
-          env,
-          chatId,
-          wg.filename,
-          wg.config,
-          `🍏 <b>کانفیگ اختصاصی WireGuard گیمینگ (iOS)</b>\n\n` +
-            `🔹 پروتکل: <b>WireGuard UDP (MTU 1280)</b>\n` +
-            `🔹 پلن: <b>${escapeHtml(sub.tier)}</b>\n\n` +
-            `فایل بالا را با اپلیکیشن رسمی WireGuard در iOS باز و فعال کنید.`
-        );
+      const planTier = resolvePlanTier(sub);
+      if (planTier !== 'free') {
+        const view = await buildUserAccountView(env, user, sub);
+        await sendOrEditView(env, chatId, messageId, view);
         return;
       }
 
-      if (mode === 'static_ip' && !tierHasStaticIp(sub.tier)) {
+      const updateRes = await env.DB.prepare(
+        `UPDATE subscriptions
+         SET has_used_special_trial = 1,
+             special_quota_bytes = CASE
+               WHEN COALESCE(special_quota_bytes, 0) < ? THEN ?
+               ELSE special_quota_bytes
+             END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND COALESCE(has_used_special_trial, 0) = 0`
+      )
+        .bind(SPECIAL_TRIAL_BYTES, SPECIAL_TRIAL_BYTES, sub.id)
+        .run();
+
+      const changes = updateRes.meta?.changes ?? 0;
+      if (changes === 0) {
+        const refreshed = await getUserAndSubByTelegramId(env.DB, telegramId);
         await tgSendMessage(
           env,
           chatId,
-          '🔒 حالت آی‌پی ثابت مخصوص پلن‌های ویژه (Pro / Flow+ / Static IP) است.',
-          {
-            inline_keyboard: [
-              [{ text: '💎 ارتقای اشتراک', callback_data: 'user_upgrade' }],
-              [{ text: '🔙 بازگشت به منوی iOS', callback_data: 'user_ios_menu' }],
-            ],
-          }
+          'ℹ️ شما پیش‌تر از تست رایگان ۱ گیگابایتی بخش ویژه استفاده کرده‌اید.'
         );
+        if (refreshed?.sub) {
+          const view = await buildUserAccountView(env, refreshed.user, refreshed.sub);
+          await sendOrEditView(env, chatId, messageId, view);
+        }
         return;
       }
 
-      const baseUrl = (env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
-      const subUrl = baseUrl
-        ? `${baseUrl}/sub/${sub.token}?format=singbox&mode=${encodeURIComponent(mode)}`
-        : `/sub/${sub.token}?format=singbox&mode=${encodeURIComponent(mode)}`;
-      await sendOrEditView(env, chatId, messageId, {
-        text:
-          `🍏 <b>پروفایل iOS (${escapeHtml(mode)}) آماده است</b>\n\n` +
-          `لینک زیر را در اپلیکیشن‌های سازگار با Sing-box 1.14+ (مانند SFI / Streisand / Hiddify) ایمپورت کنید:\n` +
-          `<code>${escapeHtml(subUrl)}</code>`,
-        replyMarkup: {
-          inline_keyboard: [
-            [{ text: '📖 راهنمای اتصال iOS', callback_data: 'user_guide_ios' }],
-            [
-              { text: '🔙 انتخاب حالت دیگر', callback_data: 'user_ios_menu' },
-              { text: '🏠 منوی اصلی', callback_data: 'user_menu_home' },
-            ],
-          ],
-        },
-      });
+      // Check cached active nodes pool (zero extra D1 cost on cache hit) for active special servers
+      const activePool = await getCachedActiveNodesPool(env.DB, env.SENTRA_KV);
+      const hasSpecialServers =
+        activePool.hasActiveGaming ||
+        activePool.donated.some(
+          (n) =>
+            n.allow_static_ip === 1 ||
+            n.allow_gaming === 1 ||
+            n.assigned_tier === 'static_ip' ||
+            n.assigned_tier === 'gaming'
+        ) ||
+        activePool.core.some(
+          (c) => c.category === 'static_ip' || c.category === 'gaming'
+        );
+
+      sub.has_used_special_trial = 1;
+      sub.special_quota_bytes = Math.max(Number(sub.special_quota_bytes || 0), SPECIAL_TRIAL_BYTES);
+
+      const notice = hasSpecialServers
+        ? '🎁 <b>تست رایگان ۱ گیگابایتی بخش ویژه (آیپی ثابت + گیمینگ) با موفقیت برای حساب شما فعال شد!</b>\n\nهم‌اکنون می‌توانید با کد ۸ رقمی خود داخل اپلیکیشن SentraVPN از حالت‌های آیپی ثابت و گیمینگ استفاده کنید.'
+        : '🎁 <b>تست رایگان ۱ گیگابایتی بخش ویژه برای حساب شما ثبت و ذخیره شد!</b>\n\nℹ️ سرورهای اختصاصی آیپی ثابت و گیمینگ هم‌اکنون در حال آماده‌سازی هستند؛ به محض فعال شدن سرورهای ویژه، ۱ گیگابایت هدیه شما به‌صورت خودکار در اپلیکیشن قابل استفاده خواهد بود.';
+
+      await tgSendMessage(env, chatId, notice);
+      const view = await buildUserAccountView(env, user, sub);
+      await sendOrEditView(env, chatId, messageId, view);
+      return;
+    }
+
+    // --- Deprecated V2Ray / iOS sublink callbacks -> gently redirect to 8-digit account view ---
+    if (data === 'user_get_sub' || data === 'user_ios_menu' || data.startsWith('ios_mode_')) {
+      const { user, sub } = await ensureTelegramUserAndSubscription(
+        env.DB,
+        q.from,
+        isEnvAdmin(env, telegramId)
+      );
+      const view = await buildUserAccountView(env, user, sub);
+      await sendOrEditView(env, chatId, messageId, view);
       return;
     }
 
     // --- User Upgrade & Payment Receipt ---
     if (data === 'user_upgrade') {
       const record = await getUserAndSubByTelegramId(env.DB, telegramId);
-      await sendOrEditView(env, chatId, messageId, buildUserUpgradeView(env, record?.sub || null));
+      await sendOrEditView(env, chatId, messageId, buildUserUpgradeView(record?.sub || null));
       return;
     }
 
     if (data === 'user_submit_receipt_pro' || data === 'user_submit_receipt_flow') {
       await ensureTelegramUserAndSubscription(env.DB, q.from, isEnvAdmin(env, telegramId));
-      const basePrice = Number(env.PRO_SUBSCRIPTION_PRICE || '150000') || 150000;
       const isFlow = data === 'user_submit_receipt_flow';
       const plan = isFlow ? 'Sentra Flow+' : 'Sentra Pro';
-      const amount = isFlow ? Math.round(basePrice * 2) : basePrice;
+      const amount = isFlow ? FLOW_PLUS_PLAN_PRICE_TOMAN : PRO_PLAN_PRICE_TOMAN;
 
       await setBotState(env.DB, telegramId, 'awaiting_donation_receipt', { plan, amount });
       await tgSendMessage(
@@ -2231,31 +2357,47 @@ async function handleCallbackQuery(
       return;
     }
 
-    // --- User Donate Outbound ---
+    // --- User Donate Outbound / Sublink ---
     if (data === 'user_donate_outbound') {
+      await ensureTelegramUserAndSubscription(env.DB, q.from, isEnvAdmin(env, telegramId));
+      await sendOrEditView(env, chatId, messageId, buildUserDonateMenuView());
+      return;
+    }
+
+    if (data === 'user_donate_single_node') {
       await ensureTelegramUserAndSubscription(env.DB, q.from, isEnvAdmin(env, telegramId));
       await setBotState(env.DB, telegramId, 'awaiting_donate_outbound');
       await tgSendMessage(
         env,
         chatId,
-        '🤝 <b>اهدای اوتباند (حمایت از Sentra)</b>\n\n' +
-          'لینک پروکسی خود (<code>vless://</code>, <code>vmess://</code>, <code>trojan://</code>, <code>hy2://</code>, <code>ss://</code>, <code>wg://</code>) یا کانفیگ JSON سینگ‌باکس را ارسال کنید تا پس از بررسی امنیتی در اکوسیستم ثبت شود:',
+        '➕ <b>اهدای نود (کانفیگ تکی)</b>\n\n' +
+          'لینک پروکسی خود (<code>vless://</code>, <code>vmess://</code>, <code>trojan://</code>, <code>hy2://</code>, <code>ss://</code>, <code>tuic://</code>) یا کانفیگ JSON سینگ‌باکس را ارسال کنید تا پس از بررسی امنیتی و تأیید مدیریت در اکوسیستم ثبت شود:',
+        buildCancelStateInlineMarkup()
+      );
+      return;
+    }
+
+    if (data === 'user_donate_sublink') {
+      await ensureTelegramUserAndSubscription(env.DB, q.from, isEnvAdmin(env, telegramId));
+      await setBotState(env.DB, telegramId, 'awaiting_donate_sublink');
+      await tgSendMessage(
+        env,
+        chatId,
+        '🔗 <b>اهدای سابلینک (Subscription)</b>\n\n' +
+          'لطفاً لینک اشتراک معتبر با پروتکل <code>https://</code> (حداکثر ۵۱۲ کاراکتر و بدون نام کاربری/رمز در آدرس) را ارسال کنید.\n' +
+          'سابلینک شما پس از بررسی امنیتی و تأیید ادمین، به‌صورت خودکار توسط QualityEngine پایش و به شبکه اضافه خواهد شد:',
         buildCancelStateInlineMarkup()
       );
       return;
     }
 
     // --- User Connection Guide ---
-    if (data === 'user_guide') {
+    if (data === 'user_guide' || data === 'user_guide_ios') {
       await sendOrEditView(env, chatId, messageId, buildUserGuideView('overview'));
       return;
     }
     if (data === 'user_guide_android') {
       await sendOrEditView(env, chatId, messageId, buildUserGuideView('android'));
-      return;
-    }
-    if (data === 'user_guide_ios') {
-      await sendOrEditView(env, chatId, messageId, buildUserGuideView('ios'));
       return;
     }
     if (data === 'user_guide_windows') {
@@ -2272,42 +2414,7 @@ async function handleCallbackQuery(
 
     if (data === 'user_dl_android' || data === 'user_dl_windows') {
       const platform = data === 'user_dl_android' ? 'android' : 'windows';
-      const rel = await env.DB.prepare(
-        'SELECT platform, version, telegram_file_id, file_name, file_size_mb, changelog FROM app_releases WHERE platform = ? LIMIT 1'
-      )
-        .bind(platform)
-        .first<{
-          platform: string;
-          version: string;
-          telegram_file_id: string;
-          file_name: string;
-          file_size_mb: number;
-          changelog: string;
-        }>();
-
-      if (rel && rel.telegram_file_id) {
-        await tgSendDocumentByFileId(
-          env,
-          chatId,
-          rel.telegram_file_id,
-          `📥 <b>Sentra Connect (${escapeHtml(platform === 'android' ? 'Android' : 'Windows')})</b>\n` +
-            `🔹 نسخه: <code>${escapeHtml(rel.version)}</code> (${rel.file_size_mb.toFixed(1)} MB)\n` +
-            (rel.changelog ? `📝 ${escapeHtml(rel.changelog)}` : '')
-        );
-      } else {
-        await tgSendMessage(
-          env,
-          chatId,
-          `📥 نسخه رسمی <b>${platform === 'android' ? 'اندروید' : 'ویندوز'} Sentra Connect</b> هنوز روی ربات بارگذاری نشده است.\n\n` +
-            `در حال حاضر می‌توانید لینک اشتراک Sing-box 1.14+ خود را از بخش «🔑 دریافت کانفیگ و کد اتصال» دریافت کرده و در اپلیکیشن‌های <b>Hiddify</b> یا <b>sing-box</b> استفاده کنید.`,
-          {
-            inline_keyboard: [
-              [{ text: '🔑 دریافت لینک اشتراک', callback_data: 'user_get_sub' }],
-              [{ text: '📖 راهنمای اتصال', callback_data: platform === 'android' ? 'user_guide_android' : 'user_guide_windows' }],
-            ],
-          }
-        );
-      }
+      await sendPlatformReleaseDownload(env, chatId, platform);
       return;
     }
 
@@ -2398,6 +2505,56 @@ async function handleCallbackQuery(
             `لطفاً آدرس کامل سابسکریپشن (<code>https://...</code>) را ارسال کنید:`,
           buildCancelStateInlineMarkup()
         );
+        return;
+      }
+
+      if (data.startsWith('adm_subsrc_approve_') || data.startsWith('adm_subsrc_reject_')) {
+        const isApprove = data.startsWith('adm_subsrc_approve_');
+        const srcId = Number(
+          data.slice(isApprove ? 'adm_subsrc_approve_'.length : 'adm_subsrc_reject_'.length)
+        );
+        if (!Number.isInteger(srcId) || srcId <= 0) return;
+
+        const srcRow = await env.DB.prepare(
+          `SELECT s.id, s.sub_url, s.status, u.telegram_id AS submitter_telegram_id
+           FROM subscription_sources s
+           LEFT JOIN users u ON u.id = s.submitted_by_user_id
+           WHERE s.id = ?
+           LIMIT 1`
+        )
+          .bind(srcId)
+          .first<{
+            id: number;
+            sub_url: string;
+            status: string | null;
+            submitter_telegram_id: number | null;
+          }>();
+
+        if (!srcRow) {
+          await tgSendMessage(env, chatId, '❌ منبع سابسکریپشن مورد نظر یافت نشد.');
+          return;
+        }
+
+        const nextStatus = isApprove ? 'active' : 'rejected';
+        await env.DB.prepare(
+          'UPDATE subscription_sources SET status = ?, last_sync_at = CURRENT_TIMESTAMP WHERE id = ?'
+        )
+          .bind(nextStatus, srcId)
+          .run();
+        await invalidateNodesCache(env.DB, env.SENTRA_KV);
+
+        if (srcRow.submitter_telegram_id) {
+          await tgSendMessage(
+            env,
+            srcRow.submitter_telegram_id,
+            isApprove
+              ? `✅ <b>سابلینک اهدایی شما (#${srcRow.id}) توسط مدیریت تأیید و فعال شد!</b>\n\n🤝 از حمایت ارزشمند شما از شبکه SentraVPN سپاسگزاریم.`
+              : `❌ <b>سابلینک اهدایی شما (#${srcRow.id}) توسط مدیریت رد شد.</b>\n\nدر صورت تمایل می‌توانید سابلینک معتبر دیگری ارسال کنید.`
+          );
+        }
+
+        const view = await buildAdminSubSourcesView(env);
+        await sendOrEditView(env, chatId, messageId, view);
         return;
       }
 
@@ -2524,12 +2681,13 @@ async function handleCallbackQuery(
         }
 
         if (isApprove) {
-          const basePrice = Number(env.PRO_SUBSCRIPTION_PRICE || '150000') || 150000;
-          const isFlow = donRow.amount >= Math.round(basePrice * 1.8);
+          const isFlow = donRow.amount >= 170000;
           const targetTier = isFlow ? 'Sentra Flow+' : 'Sentra Pro';
-          const targetLimit = isFlow
-            ? 500 * 1024 * 1024 * 1024
-            : 200 * 1024 * 1024 * 1024;
+          const targetPlanTier = isFlow ? 'flow_plus' : 'pro';
+          const targetSpecialQuota = isFlow
+            ? FLOW_PLUS_SPECIAL_QUOTA_BYTES
+            : PRO_SPECIAL_QUOTA_BYTES;
+          const targetLimit = isFlow ? 500 * GIB_BYTES : 200 * GIB_BYTES;
 
           const userSub = await env.DB.prepare(
             'SELECT id, expires_at FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1'
@@ -2549,10 +2707,18 @@ async function handleCallbackQuery(
             approveBatch.push(
               env.DB.prepare(
                 `UPDATE subscriptions
-                 SET tier = ?, traffic_limit_bytes = ?, status = 'active',
-                     expires_at = ?, updated_at = CURRENT_TIMESTAMP
+                 SET tier = ?, plan_tier = ?, traffic_limit_bytes = ?,
+                     special_quota_bytes = ?, special_used_bytes = 0,
+                     status = 'active', expires_at = ?, updated_at = CURRENT_TIMESTAMP
                  WHERE id = ?`
-              ).bind(targetTier, targetLimit, nextExpires, userSub.id)
+              ).bind(
+                targetTier,
+                targetPlanTier,
+                targetLimit,
+                targetSpecialQuota,
+                nextExpires,
+                userSub.id
+              )
             );
           }
           await executeD1Batch(env.DB, approveBatch);
@@ -2623,10 +2789,12 @@ async function handleCallbackQuery(
         const cfg = ADMIN_TIER_CONFIG[match[2]];
         await env.DB.prepare(
           `UPDATE subscriptions
-           SET tier = ?, traffic_limit_bytes = ?, status = 'active', updated_at = CURRENT_TIMESTAMP
+           SET tier = ?, plan_tier = ?, traffic_limit_bytes = ?,
+               special_quota_bytes = ?, special_used_bytes = 0,
+               status = 'active', updated_at = CURRENT_TIMESTAMP
            WHERE id = ?`
         )
-          .bind(cfg.tier, cfg.limitBytes, subId)
+          .bind(cfg.tier, cfg.planTier, cfg.limitBytes, cfg.specialQuotaBytes, subId)
           .run();
         const view = await buildAdminSubscriptionDetailView(env, subId);
         if (view) {
@@ -2664,9 +2832,11 @@ async function handleCallbackQuery(
         if (!Number.isInteger(subId) || subId <= 0) return;
         await env.DB.prepare(
           `UPDATE subscriptions
-           SET upload_bytes = 0, download_bytes = 0, web_browsing_used_mb = 0,
-               download_used_mb = 0, static_ip_used_mb = 0, status = 'active',
-               last_quota_reset = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+           SET upload_bytes = 0, download_bytes = 0,
+               web_used_bytes = 0, download_used_bytes = 0, special_used_bytes = 0,
+               web_browsing_used_mb = 0, download_used_mb = 0, static_ip_used_mb = 0,
+               status = 'active', last_quota_reset = CURRENT_TIMESTAMP,
+               updated_at = CURRENT_TIMESTAMP
            WHERE id = ?`
         )
           .bind(subId)
@@ -2725,6 +2895,25 @@ async function handleCallbackQuery(
             { inline_keyboard: [[{ text: '🔙 بازگشت به پنل مدیریت', callback_data: 'adm_panel_home' }]] }
           );
         }
+        return;
+      }
+
+      if (data === 'adm_update_release_file') {
+        await clearBotState(env.DB, telegramId);
+        await sendOrEditView(env, chatId, messageId, buildAdminUpdateReleaseFileView());
+        return;
+      }
+
+      if (data === 'adm_rel_pick_android' || data === 'adm_rel_pick_windows') {
+        const platform = data === 'adm_rel_pick_android' ? 'android' : 'windows';
+        await setBotState(env.DB, telegramId, 'admin_awaiting_release_file', { platform });
+        await tgSendMessage(
+          env,
+          chatId,
+          `📦 <b>بروزرسانی فایل نصبی ${platform === 'android' ? 'اندروید (APK)' : 'ویندوز (EXE / ZIP)'}</b>\n\n` +
+            `فایل نصبی جدید را همینجا ارسال یا فوروارد کنید (می‌توانید شماره نسخه مثل <code>v1.0.5</code> را در کپشن فایل بنویسید):`,
+          buildCancelStateInlineMarkup()
+        );
         return;
       }
 
@@ -2954,15 +3143,16 @@ async function handleTextMessage(
           envAdmin
         );
         const isAdmin = envAdmin || user.role === 'admin';
+        const connectCode = await ensureSubscriptionConnectCode(env.DB, sub);
         const welcome = isNewUser
-          ? `👋 به <b>Sentra Platform</b> خوش آمدید <b>${escapeHtml(user.first_name)}</b>!\n\n` +
+          ? `👋 به <b>SentraVPN</b> خوش آمدید <b>${escapeHtml(user.first_name)}</b>!\n\n` +
             `✅ حساب شما به‌صورت خودکار ایجاد و فعال شد:\n` +
-            `🆔 <b>کد شناسایی یکتا:</b> <code>${escapeHtml(user.user_uuid)}</code>\n` +
-            `💎 <b>پلن اولیه:</b> ${escapeHtml(sub.tier)} (۱۰ گیگابایت)\n\n` +
-            `از دکمه‌های منوی پایین برای دریافت لینک اشتراک، وضعیت حساب یا پشتیبانی استفاده کنید.`
+            `🔑 <b>کد اتصال ۸ رقمی شما:</b> <code>${escapeHtml(connectCode)}</code>\n` +
+            `💎 <b>پلن اولیه:</b> رایگان (Free)\n\n` +
+            `از دکمه «👤 حساب کاربری» کد اتصال و وضعیت حجم خود را ببینید و اپلیکیشن رسمی SentraVPN را از «📥 دانلود اپلیکیشن» دریافت کنید.`
           : `👋 خوش آمدید <b>${escapeHtml(user.first_name)}</b>!\n\n` +
             `حساب شما متصل و آماده استفاده است.\n` +
-            `💎 <b>پلن فعال:</b> ${escapeHtml(sub.tier)}`;
+            `🔑 <b>کد اتصال ۸ رقمی:</b> <code>${escapeHtml(connectCode)}</code>`;
         await tgSendMessage(env, chatId, welcome, buildMainKeyboard(true, isAdmin));
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -3089,11 +3279,12 @@ async function handleTextMessage(
           await env.DB.prepare(
             `INSERT INTO donated_outbounds (
                donor_user_id, tag, protocol, server_address, server_port, config_json,
+               compiled_outbound_json, validation_error,
                latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
                raw_link, fingerprint_sha256, is_official, label, country_code, country_name,
                allow_web, allow_download, allow_gaming, allow_static_ip, allocation_mode,
                last_online_at, last_checked_at
-             ) VALUES (?, ?, ?, ?, ?, ?, 90, 12.0, 'web_browsing', 100, 'pending', 0, ?, ?, 0, ?, ?, ?, 1, 1, 0, 0, 'free_only', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 90, 12.0, 'web_browsing', 100, 'pending', 0, ?, ?, 0, ?, ?, ?, 1, 1, 0, 0, 'free_only', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
           )
             .bind(
               existing?.user.id ?? null,
@@ -3101,7 +3292,8 @@ async function handleTextMessage(
               parsed.protocol,
               parsed.server_address,
               parsed.server_port,
-              JSON.stringify(parsed.config_json),
+              parsed.compiled_outbound_json,
+              parsed.compiled_outbound_json,
               parsed.raw_link,
               parsed.fingerprint_sha256,
               parsed.tag,
@@ -3113,14 +3305,134 @@ async function handleTextMessage(
           await tgSendMessage(
             env,
             chatId,
-            `🤝 <b>سپاس از حمایت شما!</b>\nنود <b>${escapeHtml(parsed.tag)}</b> ثبت شد و در صف بررسی مدیریت قرار گرفت. پس از تأیید، به شما اطلاع داده خواهد شد.`,
+            `🤝 <b>سپاس از حمایت شما!</b>\nنود <b>${escapeHtml(parsed.tag)}</b> بررسی و با استاندارد <code>sing-box 1.14+</code> کامپایل شد و در صف تأیید مدیریت قرار گرفت.`,
             buildMainKeyboard(true, isAdmin)
           );
         } catch (err) {
           await tgSendMessage(
             env,
             chatId,
-            `❌ ${escapeHtml(err instanceof Error ? err.message : 'خطا در ثبت اوتباند.')}`
+            `❌ <b>کانفیگ رد شد:</b>\n${escapeHtml(err instanceof Error ? err.message : 'خطا در ثبت اوتباند.')}`,
+            buildMainKeyboard(true, isAdmin)
+          );
+        }
+        return;
+      }
+
+      if (state.state_type === 'awaiting_donate_sublink') {
+        await clearBotState(env.DB, telegramId);
+        try {
+          if (!text) {
+            await tgSendMessage(
+              env,
+              chatId,
+              '❌ لطفاً آدرس سابلینک را به‌صورت متن ارسال کنید.',
+              buildMainKeyboard(true, isAdmin)
+            );
+            return;
+          }
+
+          // Strict security validation: HTTPS only, max 512 chars, no credentials, anti-SSRF & internal host block.
+          // Worker NEVER performs fetch() on user-submitted sublinks.
+          const validUrl = validateUserSubmittedSublink(text);
+          const normalizedUrl = validUrl.toString();
+
+          const ensured = existing?.user
+            ? existing
+            : await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
+
+          // Rate limit: max 3 sublink submissions per user per 24 hours
+          const rateRow = await env.DB.prepare(
+            `SELECT COUNT(*) AS cnt
+             FROM subscription_sources
+             WHERE submitted_by_user_id = ?
+               AND created_at >= datetime('now', '-24 hours')`
+          )
+            .bind(ensured.user.id)
+            .first<{ cnt: number }>();
+
+          if (Number(rateRow?.cnt || 0) >= 3) {
+            await tgSendMessage(
+              env,
+              chatId,
+              '⏳ شما در ۲۴ ساعت گذشته حداکثر تعداد مجاز (۳ سابلینک) را ارسال کرده‌اید. لطفاً فردا مجدداً تلاش کنید.',
+              buildMainKeyboard(true, isAdmin)
+            );
+            return;
+          }
+
+          // Deduplication check
+          const dup = await env.DB.prepare(
+            'SELECT id FROM subscription_sources WHERE sub_url = ? LIMIT 1'
+          )
+            .bind(normalizedUrl)
+            .first<{ id: number }>();
+
+          if (dup) {
+            await tgSendMessage(
+              env,
+              chatId,
+              '⚠️ این سابلینک قبلاً در سیستم ثبت شده است.',
+              buildMainKeyboard(true, isAdmin)
+            );
+            return;
+          }
+
+          const insertRes = await env.DB.prepare(
+            `INSERT INTO subscription_sources (
+               category, sub_url, tag, submitted_by_user_id, status,
+               total_nodes, healthy_nodes, last_sync_at
+             ) VALUES ('web_browsing', ?, ?, ?, 'pending', 0, 0, CURRENT_TIMESTAMP)`
+          )
+            .bind(normalizedUrl, `user:${ensured.user.id}`, ensured.user.id)
+            .run();
+
+          const newSourceId = Number(insertRes.meta.last_row_id || 0);
+
+          await tgSendMessage(
+            env,
+            chatId,
+            `🤝 <b>سپاس از حمایت شما!</b>\n\n` +
+              `سابلینک اهدایی شما (#${newSourceId}) با موفقیت ثبت شد و در صف بررسی امنیتی مدیریت قرار گرفت.\n` +
+              `پس از تأیید ادمین، نتیجه به شما اطلاع داده خواهد شد.`,
+            buildMainKeyboard(true, isAdmin)
+          );
+
+          // Notify admins with approve/reject inline buttons
+          const adminIds = getAdminTelegramIds(env);
+          const submitterName = escapeHtml(
+            [from.first_name, from.last_name].filter(Boolean).join(' ') || ensured.user.first_name
+          );
+          const submitterUser = from.username ? `@${escapeHtml(from.username)}` : `ID:${telegramId}`;
+          for (const adminId of adminIds) {
+            await tgSendMessage(
+              env,
+              adminId,
+              `🔗 <b>سابلینک اهدایی جدید در انتظار تأیید (#${newSourceId})</b>\n\n` +
+                `👤 ارسال‌کننده: <b>${submitterName}</b> (${submitterUser})\n` +
+                `🌐 آدرس:\n<code>${escapeHtml(normalizedUrl)}</code>`,
+              {
+                inline_keyboard: [
+                  [
+                    {
+                      text: `✅ تأیید سابلینک #${newSourceId}`,
+                      callback_data: `adm_subsrc_approve_${newSourceId}`,
+                    },
+                    {
+                      text: `❌ رد سابلینک #${newSourceId}`,
+                      callback_data: `adm_subsrc_reject_${newSourceId}`,
+                    },
+                  ],
+                ],
+              }
+            );
+          }
+        } catch (err) {
+          await tgSendMessage(
+            env,
+            chatId,
+            `🚫 ${escapeHtml(err instanceof Error ? err.message : 'سابلینک ارسال‌شده نامعتبر است.')}`,
+            buildMainKeyboard(true, isAdmin)
           );
         }
         return;
@@ -3172,7 +3484,7 @@ async function handleTextMessage(
           return;
         }
 
-        const amount = Math.max(0, Math.round(Number(payload.amount) || 150000));
+        const amount = Math.max(0, Math.round(Number(payload.amount) || PRO_PLAN_PRICE_TOMAN));
         const insertRes = await env.DB.prepare(
           `INSERT INTO donations (user_id, amount, receipt_file_id, file_unique_id, image_sha256, status, subscription_granted)
            VALUES (?, ?, ?, ?, ?, 'pending', 0)`
@@ -3347,6 +3659,62 @@ async function handleTextMessage(
           }
           return;
         }
+
+        if (state.state_type === 'admin_awaiting_release_file') {
+          const payload = JSON.parse(state.payload_json || '{}') as { platform?: string };
+          const platform: 'android' | 'windows' =
+            payload.platform === 'windows' ? 'windows' : 'android';
+          const doc = msg.document;
+          if (!doc?.file_id) {
+            await tgSendMessage(
+              env,
+              chatId,
+              '❌ لطفاً فایل نصبی (به‌صورت Document مثل APK، EXE یا ZIP) را ارسال یا فوروارد کنید:',
+              buildCancelStateInlineMarkup()
+            );
+            return;
+          }
+          await clearBotState(env.DB, telegramId);
+
+          const existingRel = await env.DB.prepare(
+            'SELECT version, github_url FROM app_release_files WHERE platform = ? LIMIT 1'
+          )
+            .bind(platform)
+            .first<{ version: string; github_url: string }>();
+
+          const versionMatch = /v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.]+)?/.exec(
+            `${text} ${doc.file_name || ''}`
+          );
+          const version = versionMatch ? versionMatch[0] : existingRel?.version || 'latest';
+          const defaultGithubUrl =
+            platform === 'android'
+              ? `${GITHUB_RELEASES_BASE_URL}/SentraVPN-Android-Universal.apk`
+              : `${GITHUB_RELEASES_BASE_URL}/SentraVPN-Windows-Setup-x64.exe`;
+          const githubUrl = existingRel?.github_url || defaultGithubUrl;
+
+          await env.DB.prepare(
+            `INSERT INTO app_release_files (platform, version, github_url, telegram_file_id, updated_at)
+             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(platform) DO UPDATE SET
+               version = excluded.version,
+               github_url = excluded.github_url,
+               telegram_file_id = excluded.telegram_file_id,
+               updated_at = CURRENT_TIMESTAMP`
+          )
+            .bind(platform, version, githubUrl, doc.file_id)
+            .run();
+
+          await tgSendMessage(
+            env,
+            chatId,
+            `✅ <b>فایل نصبی ${platform === 'android' ? 'اندروید' : 'ویندوز'} با موفقیت در ربات ذخیره شد!</b>\n\n` +
+              `🔹 نسخه: <code>${escapeHtml(version)}</code>\n` +
+              `📄 فایل: <code>${escapeHtml(doc.file_name || platform)}</code>\n` +
+              `🆔 Telegram file_id: <code>${escapeHtml(doc.file_id.slice(0, 32))}...</code>`,
+            buildAdminPanelHomeView().replyMarkup
+          );
+          return;
+        }
       }
     }
 
@@ -3380,44 +3748,26 @@ async function handleTextMessage(
         return;
       }
 
-      case 'account': {
-        const { user, sub } = await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
-        const view = buildUserAccountView(user, sub);
-        await tgSendMessage(env, chatId, view.text, view.replyMarkup);
-        return;
-      }
-
-      case 'get_sub': {
-        const { user, sub } = await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
-        const view = await buildUserSubscriptionView(env, user, sub);
-        await tgSendMessage(env, chatId, view.text, view.replyMarkup);
-        return;
-      }
-
+      case 'account':
+      case 'get_sub':
       case 'ios_menu': {
-        const { sub } = await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
-        const view = await buildUserIosMenuView(env, sub);
+        const { user, sub } = await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
+        const view = await buildUserAccountView(env, user, sub);
         await tgSendMessage(env, chatId, view.text, view.replyMarkup);
         return;
       }
 
       case 'upgrade': {
         const { sub } = await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
-        const view = buildUserUpgradeView(env, sub);
+        const view = buildUserUpgradeView(sub);
         await tgSendMessage(env, chatId, view.text, view.replyMarkup);
         return;
       }
 
       case 'donate_outbound': {
         await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
-        await setBotState(env.DB, telegramId, 'awaiting_donate_outbound');
-        await tgSendMessage(
-          env,
-          chatId,
-          '🤝 <b>اهدای اوتباند (حمایت از Sentra)</b>\n\n' +
-            'لینک پروکسی خود (vless/vmess/trojan/hy2/ss/wg) یا JSON سینگ‌باکس را ارسال کنید تا پس از بررسی امنیتی و اثرانگشت در کل اکوسیستم فعال شود:',
-          buildCancelStateInlineMarkup()
-        );
+        const view = buildUserDonateMenuView();
+        await tgSendMessage(env, chatId, view.text, view.replyMarkup);
         return;
       }
 
