@@ -18,7 +18,7 @@ migrations_dir = "migrations"
 # Cloudflare KV Namespace Binding (L2 Global Cache for shared nodes & topic settings)
 [[kv_namespaces]]
 binding = "SENTRA_KV"
-id = "PASTE_YOUR_KV_ID_HERE"
+id = "6d0cba5038bb4057915891b2112ba196"
 
 [vars]
 BOT_USERNAME = "sentraconnect_bot"
