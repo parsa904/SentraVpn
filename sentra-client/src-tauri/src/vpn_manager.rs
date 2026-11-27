@@ -293,21 +293,70 @@ impl VpnManager {
             }
         }
 
-        let mut config_resp = None;
+        let cache_key = format!(
+            "{}:{}",
+            selected_mode,
+            selected_location.unwrap_or("auto")
+        );
+        let cache_path =
+            crate::auth::AuthManager::app_data_dir().join("last_healthy_singbox_cache.json");
+        let cached_entry: Option<(Option<String>, Value)> = std::fs::read_to_string(&cache_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|json_val| {
+                let stored_key = json_val.get("cache_key").and_then(|k| k.as_str())?;
+                if stored_key != cache_key {
+                    return None;
+                }
+                let etag = json_val
+                    .get("etag")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.to_string());
+                let payload = json_val.get("config")?.clone();
+                Some((etag, payload))
+            });
+        let cached_etag = cached_entry.as_ref().and_then(|(e, _)| e.clone());
+
+        let mut config_val_opt: Option<Value> = None;
         let mut last_status = None;
         let mut last_err_body = None;
 
         for base_url in crate::auth::get_backend_urls() {
             let url = format!("{}/api/v1/client/config", base_url);
-            match client
+            let mut req_builder = client
                 .post(&url)
                 .header("X-Subscription-Token", token)
-                .json(&request_body)
-                .send()
-                .await
-            {
+                .json(&request_body);
+            if let Some(ref etag) = cached_etag {
+                req_builder = req_builder.header("If-None-Match", etag);
+            }
+
+            match req_builder.send().await {
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
+                    if let Some((_, ref cached_cfg)) = cached_entry {
+                        config_val_opt = Some(cached_cfg.clone());
+                        break;
+                    }
+                }
                 Ok(resp) if resp.status().is_success() => {
-                    config_resp = Some(resp);
+                    let resp_etag = resp
+                        .headers()
+                        .get(reqwest::header::ETAG)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    let parsed = resp
+                        .json::<Value>()
+                        .await
+                        .map_err(|e| format!("پاسخ پیکربندی سرور نامعتبر بود: {}", e))?;
+                    let cache_doc = json!({
+                        "cache_key": cache_key,
+                        "etag": resp_etag,
+                        "config": parsed,
+                    });
+                    if let Ok(serialized) = serde_json::to_string(&cache_doc) {
+                        let _ = std::fs::write(&cache_path, serialized);
+                    }
+                    config_val_opt = Some(parsed);
                     break;
                 }
                 Ok(resp) if resp.status().is_server_error() || resp.status().as_u16() == 404 => {
@@ -315,10 +364,34 @@ impl VpnManager {
                     last_err_body = resp.text().await.ok();
                     // Fallback to direct sing-box 1.14+ subscription endpoint GET /sub/{token}?format=singbox
                     let sub_url = format!("{}/sub/{}?format=singbox&mode={}", base_url, token, selected_mode);
-                    if let Ok(sub_resp) = client.get(&sub_url).send().await {
-                        if sub_resp.status().is_success() {
-                            config_resp = Some(sub_resp);
-                            break;
+                    let mut sub_req = client.get(&sub_url);
+                    if let Some(ref etag) = cached_etag {
+                        sub_req = sub_req.header("If-None-Match", etag);
+                    }
+                    if let Ok(sub_resp) = sub_req.send().await {
+                        if sub_resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+                            if let Some((_, ref cached_cfg)) = cached_entry {
+                                config_val_opt = Some(cached_cfg.clone());
+                                break;
+                            }
+                        } else if sub_resp.status().is_success() {
+                            let resp_etag = sub_resp
+                                .headers()
+                                .get(reqwest::header::ETAG)
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.to_string());
+                            if let Ok(parsed) = sub_resp.json::<Value>().await {
+                                let cache_doc = json!({
+                                    "cache_key": cache_key,
+                                    "etag": resp_etag,
+                                    "config": parsed,
+                                });
+                                if let Ok(serialized) = serde_json::to_string(&cache_doc) {
+                                    let _ = std::fs::write(&cache_path, serialized);
+                                }
+                                config_val_opt = Some(parsed);
+                                break;
+                            }
                         }
                     }
                     warn!("Config endpoint {} returned {}; trying next fallback...", base_url, last_status.map(|s| s.as_u16()).unwrap_or(0));
@@ -334,11 +407,8 @@ impl VpnManager {
             }
         }
 
-        let mut config_val = match config_resp {
-            Some(resp) => resp
-                .json::<Value>()
-                .await
-                .map_err(|e| format!("پاسخ پیکربندی سرور نامعتبر بود: {}", e))?,
+        let mut config_val = match config_val_opt {
+            Some(val) => val,
             None => {
                 if let Some(status) = last_status {
                     let err_text = last_err_body.unwrap_or_default();
@@ -360,9 +430,23 @@ impl VpnManager {
                         }
                     }
 
-                    return Err(format!("خطا در دریافت تنظیمات اتصال از سرور (HTTP {}).", status));
+                    // Fall back to last healthy cached config on transient 5xx server outage
+                    if status.is_server_error() {
+                        if let Some((_, cached_cfg)) = cached_entry {
+                            warn!("Using locally cached healthy sing-box config during server outage ({}).", status);
+                            cached_cfg
+                        } else {
+                            return Err(format!("خطا در دریافت تنظیمات اتصال از سرور (HTTP {}).", status));
+                        }
+                    } else {
+                        return Err(format!("خطا در دریافت تنظیمات اتصال از سرور (HTTP {}).", status));
+                    }
+                } else if let Some((_, cached_cfg)) = cached_entry {
+                    warn!("Backend unreachable; falling back to locally cached healthy sing-box config.");
+                    cached_cfg
+                } else {
+                    return Err("امکان برقراری ارتباط با سرور مرکزی سنترا جهت دریافت پیکربندی اتصال وجود ندارد. اینترنت خود را بررسی کنید.".to_string());
                 }
-                return Err("امکان برقراری ارتباط با سرور مرکزی سنترا جهت دریافت پیکربندی اتصال وجود ندارد. اینترنت خود را بررسی کنید.".to_string());
             }
         };
 

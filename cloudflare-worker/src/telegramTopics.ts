@@ -2,6 +2,13 @@ import {
   formatAiReadyErrorMessage,
   normalizeUnknownError,
 } from './errorReporter.ts';
+import {
+  executeD1Batch,
+  getCachedTopicRoutingFromRam,
+  invalidateNodesCache,
+  invalidateSystemSettingsCache,
+  setCachedTopicRoutingInRam,
+} from './workerCache.ts';
 import type { Env } from './types.ts';
 
 export type TopicType = 'logs' | 'backups' | 'support';
@@ -37,7 +44,26 @@ interface TelegramApiResponse {
   description?: string;
 }
 
-const VALID_SQLITE_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * Core persistent tables included in automated 12-hour D1 backups.
+ * High-churn temporary tables (`telegram_states`, `traffic_logs`,
+ * `ip_registrations`, `device_sessions`) are intentionally excluded to stay
+ * well within Cloudflare Workers 10ms CPU and D1 free-tier read budgets.
+ */
+export const CORE_BACKUP_TABLES = [
+  'users',
+  'subscriptions',
+  'donated_outbounds',
+  'subscription_sources',
+  'donations',
+  'system_settings',
+] as const;
+
+export interface StalePruneResult {
+  deletedStates: number;
+  deletedOutbounds: number;
+  deletedIpRegistrations: number;
+}
 
 export function escapeTelegramHtml(input: string): string {
   return input
@@ -76,26 +102,15 @@ export function extractSupportUid(text?: string | null): number | null {
   return parsed;
 }
 
-/**
- * Ensures the `system_settings` table exists in Cloudflare D1 without requiring manual migrations.
- */
-export async function ensureSystemSettingsTable(db: D1Database): Promise<void> {
-  await db
-    .prepare(
-      `CREATE TABLE IF NOT EXISTS system_settings (
-         key TEXT PRIMARY KEY,
-         value TEXT NOT NULL,
-         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-       )`
-    )
-    .run();
-}
-
 export async function getSystemSetting(
   db: D1Database,
   key: SystemSettingKey
 ): Promise<string | null> {
-  await ensureSystemSettingsTable(db);
+  const cached = await getTopicRoutingConfig(db);
+  if (key === SYSTEM_SETTING_KEYS.LOG_GROUP_ID) return cached.logGroupId;
+  if (key === SYSTEM_SETTING_KEYS.TOPIC_LOGS_ID) return cached.topicLogsId;
+  if (key === SYSTEM_SETTING_KEYS.TOPIC_BACKUPS_ID) return cached.topicBackupsId;
+  if (key === SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID) return cached.topicSupportId;
   const row = await db
     .prepare('SELECT value FROM system_settings WHERE key = ? LIMIT 1')
     .bind(key)
@@ -108,7 +123,6 @@ export async function setSystemSetting(
   key: SystemSettingKey,
   value: string
 ): Promise<void> {
-  await ensureSystemSettingsTable(db);
   await db
     .prepare(
       `INSERT INTO system_settings (key, value, updated_at)
@@ -119,6 +133,7 @@ export async function setSystemSetting(
     )
     .bind(key, value)
     .run();
+  invalidateSystemSettingsCache(db);
 }
 
 export async function saveTopicRoute(
@@ -134,14 +149,27 @@ export async function saveTopicRoute(
       ? SYSTEM_SETTING_KEYS.TOPIC_BACKUPS_ID
       : SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID;
 
-  await setSystemSetting(db, SYSTEM_SETTING_KEYS.LOG_GROUP_ID, String(groupId));
-  await setSystemSetting(db, topicKey, String(threadId ?? 0));
+  const upsertSql = `INSERT INTO system_settings (key, value, updated_at)
+     VALUES (?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = CURRENT_TIMESTAMP`;
+
+  await executeD1Batch(db, [
+    db.prepare(upsertSql).bind(SYSTEM_SETTING_KEYS.LOG_GROUP_ID, String(groupId)),
+    db.prepare(upsertSql).bind(topicKey, String(threadId ?? 0)),
+  ]);
+  invalidateSystemSettingsCache(db);
 }
 
 export async function getTopicRoutingConfig(
   db: D1Database
 ): Promise<TopicRoutingConfig> {
-  await ensureSystemSettingsTable(db);
+  const fromRam = getCachedTopicRoutingFromRam(db);
+  if (fromRam) {
+    return fromRam;
+  }
+
   const rows = await db
     .prepare(
       `SELECT key, value FROM system_settings
@@ -160,12 +188,14 @@ export async function getTopicRoutingConfig(
     map.set(row.key, String(row.value));
   }
 
-  return {
+  const config: TopicRoutingConfig = {
     logGroupId: map.get(SYSTEM_SETTING_KEYS.LOG_GROUP_ID) ?? null,
     topicLogsId: map.get(SYSTEM_SETTING_KEYS.TOPIC_LOGS_ID) ?? null,
     topicBackupsId: map.get(SYSTEM_SETTING_KEYS.TOPIC_BACKUPS_ID) ?? null,
     topicSupportId: map.get(SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID) ?? null,
   };
+  setCachedTopicRoutingInRam(db, config);
+  return config;
 }
 
 function resolveTopicThreadId(
@@ -429,44 +459,39 @@ export async function sendDatabaseBackup(
       return { ok: false, error };
     }
 
-    const tablesRes = await env.DB.prepare(
-      `SELECT name FROM sqlite_master
-       WHERE type = 'table'
-         AND name NOT LIKE 'sqlite_%'
-         AND name NOT LIKE '_cf_%'
-       ORDER BY name ASC`
-    ).all<{ name: string }>();
-
-    const tableNames = (tablesRes.results || [])
-      .map((r) => String(r.name || ''))
-      .filter((name) => VALID_SQLITE_IDENTIFIER.test(name));
+    // Single batched read across the 6 core persistent tables (excludes high-churn temp tables)
+    const batchStatements = CORE_BACKUP_TABLES.map((tableName) =>
+      env.DB.prepare(`SELECT * FROM "${tableName}"`)
+    );
+    const batchResults = await executeD1Batch<Record<string, unknown>>(
+      env.DB,
+      batchStatements
+    );
 
     const tablesData: Record<string, unknown[]> = {};
     let totalRows = 0;
 
-    for (const tableName of tableNames) {
-      const rowsRes = await env.DB.prepare(`SELECT * FROM "${tableName}"`).all<
-        Record<string, unknown>
-      >();
-      const rows = rowsRes.results || [];
+    CORE_BACKUP_TABLES.forEach((tableName, idx) => {
+      const rows = batchResults[idx]?.results || [];
       tablesData[tableName] = rows;
       totalRows += rows.length;
-    }
+    });
 
     const filename = buildBackupFilename(now);
     const backupPayload = {
       project: 'SentraVPN',
       exported_at: now.toISOString(),
-      tables_count: tableNames.length,
+      tables_count: CORE_BACKUP_TABLES.length,
       total_rows: totalRows,
       tables: tablesData,
     };
 
-    const jsonString = JSON.stringify(backupPayload, null, 2);
+    // Compact JSON serialization reduces Worker CPU time and Telegram upload size
+    const jsonString = JSON.stringify(backupPayload);
     const caption =
       `💾 <b>بکاپ کامل دیتابیس D1 (SentraVPN)</b>\n\n` +
       `🕒 زمان بکاپ: <code>${escapeTelegramHtml(formatLogTimestamp(now))}</code>\n` +
-      `🗂 تعداد جداول: <b>${tableNames.length}</b>\n` +
+      `🗂 تعداد جداول حیاتی: <b>${CORE_BACKUP_TABLES.length}</b>\n` +
       `📊 مجموع ردیف‌ها: <b>${totalRows}</b>\n` +
       `📄 فایل: <code>${escapeTelegramHtml(filename)}</code>`;
 
@@ -514,7 +539,7 @@ export async function sendDatabaseBackup(
     return {
       ok: true,
       filename,
-      tablesCount: tableNames.length,
+      tablesCount: CORE_BACKUP_TABLES.length,
       totalRows,
     };
   } catch (err) {
@@ -526,4 +551,44 @@ export async function sendDatabaseBackup(
       error: `خطا در تهیه یا ارسال بکاپ: ${errMsg}`,
     };
   }
+}
+
+/**
+ * Automated 12-hour D1 storage protection: prunes expired temporary rows so the
+ * database stays comfortably within Cloudflare D1's 500MB free-tier storage cap.
+ * - `telegram_states` older than 24 hours
+ * - `donated_outbounds` in `rejected` / `inactive` status older than 14 days
+ * - `ip_registrations` older than 7 days
+ */
+export async function pruneStaleRecords(db: D1Database): Promise<StalePruneResult> {
+  const statements = [
+    db.prepare(
+      `DELETE FROM telegram_states
+       WHERE updated_at < datetime('now', '-24 hours')`
+    ),
+    db.prepare(
+      `DELETE FROM donated_outbounds
+       WHERE status IN ('rejected', 'inactive')
+         AND updated_at < datetime('now', '-14 days')`
+    ),
+    db.prepare(
+      `DELETE FROM ip_registrations
+       WHERE created_at < datetime('now', '-7 days')`
+    ),
+  ];
+
+  const [statesRes, outboundsRes, ipRes] = await executeD1Batch(db, statements);
+  const deletedStates = Number(statesRes?.meta?.changes ?? 0);
+  const deletedOutbounds = Number(outboundsRes?.meta?.changes ?? 0);
+  const deletedIpRegistrations = Number(ipRes?.meta?.changes ?? 0);
+
+  if (deletedOutbounds > 0) {
+    invalidateNodesCache(db);
+  }
+
+  return {
+    deletedStates,
+    deletedOutbounds,
+    deletedIpRegistrations,
+  };
 }

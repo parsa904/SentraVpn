@@ -7,7 +7,9 @@ import type {
   ThemeMode,
 } from '../types/sentra';
 
-export const BOOTSTRAP_POLL_INTERVAL_MS = 30_000;
+// 8-hour automatic background refresh (max 3 automatic sync requests/day per user)
+export const SUBSCRIPTION_REFRESH_INTERVAL_MS = 8 * 60 * 60 * 1000;
+export const BOOTSTRAP_POLL_INTERVAL_MS = SUBSCRIPTION_REFRESH_INTERVAL_MS;
 export const STATE_PUSH_DEBOUNCE_MS = 1_200;
 export const MAX_SYNCED_PERSONAL_CONFIGS = 100;
 

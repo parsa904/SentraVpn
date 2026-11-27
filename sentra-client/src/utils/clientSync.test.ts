@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { PersonalConfigItem } from '../types/sentra';
 import {
+  BOOTSTRAP_POLL_INTERVAL_MS,
   MAX_SYNCED_PERSONAL_CONFIGS,
+  SUBSCRIPTION_REFRESH_INTERVAL_MS,
   buildSyncStatePayload,
   mergePersonalConfigs,
   normalizeRemoteClientState,
@@ -125,4 +127,9 @@ test('buildSyncStatePayload and normalizeRemoteClientState round-trip safely', (
   assert.equal(normalized.personal_configs[0].id, 'x');
   assert.equal(normalized.preferences.selected_mode, 'download');
   assert.equal(normalized.updated_at, '2026-05-01T12:00:00.000Z');
+});
+
+test('background subscription refresh interval is set to 8 hours (max 3 auto requests/day)', () => {
+  assert.equal(SUBSCRIPTION_REFRESH_INTERVAL_MS, 8 * 60 * 60 * 1000);
+  assert.equal(BOOTSTRAP_POLL_INTERVAL_MS, 8 * 60 * 60 * 1000);
 });

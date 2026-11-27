@@ -10,8 +10,6 @@ import {
 import { auditOutboundSecurity, parseOutboundInput } from './outboundAnalyzer.ts';
 import {
   buildSubscriptionUserInfoHeader,
-  compileClientSingboxConfig,
-  compileV2RaySubscriptionBase64,
   tierHasGaming,
   tierHasStaticIp,
 } from './singboxCompiler.ts';
@@ -22,12 +20,24 @@ import {
   dispatchUnifiedError,
   parseExternalErrorPayload,
 } from './errorReporter.ts';
+import {
+  checkPublicIpRateLimit,
+  computeWeakEtag,
+  executeD1Batch,
+  extractClientIp,
+  getCachedActiveNodesPool,
+  getCachedCompiledSingbox,
+  getCachedHasActiveGaming,
+  getCachedLocations,
+  getCachedV2RayBase64,
+  invalidateNodesCache,
+  matchesIfNoneMatch,
+} from './workerCache.ts';
 import type {
   ConnectionMode,
   DonatedOutboundRow,
   Env,
   HealthReportPayload,
-  OutboundRow,
   SubscriptionRow,
   SubscriptionSourceRow,
   UserRow,
@@ -64,104 +74,26 @@ function errorResponse(status: number, message: string, code?: string): Response
   );
 }
 
+const SUB_SELECT_COLS =
+  'id, user_id, tier, token, status, upload_bytes, download_bytes, traffic_limit_bytes, speed_limit_bps, max_concurrent_devices, web_browsing_used_mb, download_used_mb, static_ip_used_mb, expires_at';
+const USER_SELECT_COLS =
+  'id, user_uuid, telegram_id, username, email, password_hash, first_name, last_name, role, status, outbound_reward_banned';
+
 async function getSubscriptionWithUser(
   db: D1Database,
   token: string
 ): Promise<{ user: UserRow; sub: SubscriptionRow } | null> {
   const sub = await db
-    .prepare('SELECT * FROM subscriptions WHERE token = ? LIMIT 1')
+    .prepare(`SELECT ${SUB_SELECT_COLS} FROM subscriptions WHERE token = ? LIMIT 1`)
     .bind(token)
     .first<SubscriptionRow>();
   if (!sub) return null;
   const user = await db
-    .prepare('SELECT * FROM users WHERE id = ? LIMIT 1')
+    .prepare(`SELECT ${USER_SELECT_COLS} FROM users WHERE id = ? LIMIT 1`)
     .bind(sub.user_id)
     .first<UserRow>();
   if (!user) return null;
   return { user, sub };
-}
-
-async function hasActiveGamingOutbounds(db: D1Database): Promise<boolean> {
-  const donated = await db
-    .prepare(
-      `SELECT COUNT(*) AS cnt FROM donated_outbounds
-       WHERE status = 'active' AND (allow_gaming = 1 OR assigned_tier = 'gaming')`
-    )
-    .first<{ cnt: number }>();
-  if ((donated?.cnt || 0) > 0) return true;
-
-  const core = await db
-    .prepare(
-      `SELECT COUNT(*) AS cnt FROM outbounds
-       WHERE is_active = 1 AND server_address != '127.0.0.1' AND mode_category = 'gaming'`
-    )
-    .first<{ cnt: number }>();
-  return (core?.cnt || 0) > 0;
-}
-
-async function queryOutboundsForMode(
-  db: D1Database,
-  mode: ConnectionMode,
-  locationCode?: string
-): Promise<{ donated: DonatedOutboundRow[]; core: OutboundRow[] }> {
-  const modeClause =
-    mode === 'static_ip'
-      ? `(allow_static_ip = 1 OR assigned_tier = 'static_ip')`
-      : mode === 'gaming'
-      ? `(allow_gaming = 1 OR assigned_tier = 'gaming')`
-      : mode === 'download'
-      ? `(allow_download = 1 OR assigned_tier = 'download')`
-      : `(allow_web = 1 OR assigned_tier = 'web_browsing')`;
-
-  const loc = (locationCode || '').trim().toUpperCase();
-  let donatedRows: DonatedOutboundRow[];
-
-  if (loc && loc !== 'AUTO') {
-    const res = await db
-      .prepare(
-        `SELECT * FROM donated_outbounds
-         WHERE status = 'active' AND ${modeClause} AND upper(country_code) = ?
-         ORDER BY is_official DESC, speed_score DESC, latency_ms ASC`
-      )
-      .bind(loc)
-      .all<DonatedOutboundRow>();
-    donatedRows = res.results || [];
-  } else {
-    const res = await db
-      .prepare(
-        `SELECT * FROM donated_outbounds
-         WHERE status = 'active' AND ${modeClause}
-         ORDER BY is_official DESC, speed_score DESC, latency_ms ASC`
-      )
-      .all<DonatedOutboundRow>();
-    donatedRows = res.results || [];
-  }
-
-  // Fallback to all active ecosystem outbounds for web/download if mode-specific pool is empty
-  if (donatedRows.length === 0 && (mode === 'web_browsing' || mode === 'download')) {
-    const fallback = await db
-      .prepare(
-        `SELECT * FROM donated_outbounds
-         WHERE status = 'active'
-         ORDER BY is_official DESC, speed_score DESC, latency_ms ASC`
-      )
-      .all<DonatedOutboundRow>();
-    donatedRows = fallback.results || [];
-  }
-
-  const coreRes = await db
-    .prepare(
-      `SELECT * FROM outbounds
-       WHERE is_active = 1 AND (mode_category = ? OR mode_category = 'all')
-       ORDER BY weight DESC, id ASC`
-    )
-    .bind(mode)
-    .all<OutboundRow>();
-
-  return {
-    donated: donatedRows,
-    core: coreRes.results || [],
-  };
 }
 
 function normalizeMode(raw: string | null | undefined): ConnectionMode {
@@ -205,8 +137,24 @@ export async function routeRequest(
   // 2b. Unified AI-Ready Error Telemetry Ingestion (GitHub Actions, Android, Windows)
   if (
     method === 'POST' &&
-    (path === '/api/v1/telemetry/error' || path === '/api/v1/errors/report')
+    (path === '/api/v1/telemetry/error' ||
+      path === '/api/v1/errors/report' ||
+      path === '/api/v1/logs/report')
   ) {
+    const ipLimit = checkPublicIpRateLimit('logs', extractClientIp(request));
+    if (!ipLimit.allowed) {
+      return jsonResponse(
+        {
+          success: false,
+          error: 'تعداد درخواست‌های ارسال خطا از این آی‌پی بیش از حد مجاز است.',
+          message: 'Rate limit exceeded',
+          code: 'RATE_LIMITED',
+        },
+        429,
+        { 'Retry-After': String(ipLimit.retryAfterSec) }
+      );
+    }
+
     let rawBody = '';
     try {
       rawBody = await request.text();
@@ -311,26 +259,30 @@ export async function routeRequest(
       return errorResponse(401, 'دسترسی QualityEngine مجاز نیست.', 'UNAUTHORIZED_QUALITY_ENGINE');
     }
 
-    const rows = await env.DB.prepare(
-      `SELECT id, tag, protocol, server_address, server_port, config_json,
-              country_code, status, fail_count, is_official, allocation_mode, fingerprint_sha256
-       FROM donated_outbounds
-       WHERE status IN ('active', 'inactive')
-       ORDER BY is_official DESC, id ASC
-       LIMIT 200`
-    ).all<DonatedOutboundRow>();
+    const [rowsRes, subSourcesRes] = await executeD1Batch<Record<string, unknown>>(env.DB, [
+      env.DB.prepare(
+        `SELECT id, tag, protocol, server_address, server_port, config_json,
+                country_code, status, fail_count, is_official, allocation_mode, fingerprint_sha256
+         FROM donated_outbounds
+         WHERE status IN ('active', 'inactive')
+         ORDER BY is_official DESC, id ASC
+         LIMIT 200`
+      ),
+      env.DB.prepare(
+        `SELECT id, category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at
+         FROM subscription_sources
+         ORDER BY id ASC
+         LIMIT 50`
+      ),
+    ]);
 
-    const subSources = await env.DB.prepare(
-      `SELECT id, category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at
-       FROM subscription_sources
-       ORDER BY id ASC
-       LIMIT 50`
-    ).all<SubscriptionSourceRow>();
+    const nodeRows = ((rowsRes?.results || []) as unknown) as DonatedOutboundRow[];
+    const subSourceRows = ((subSourcesRes?.results || []) as unknown) as SubscriptionSourceRow[];
 
     return jsonResponse({
       success: true,
-      count: (rows.results || []).length,
-      nodes: (rows.results || []).map((row) => ({
+      count: nodeRows.length,
+      nodes: nodeRows.map((row) => ({
         id: row.id,
         tag: row.tag,
         protocol: row.protocol,
@@ -344,7 +296,7 @@ export async function routeRequest(
         allocation_mode: row.allocation_mode,
         fingerprint_sha256: row.fingerprint_sha256,
       })),
-      subscription_sources: (subSources.results || []).map((src) => ({
+      subscription_sources: subSourceRows.map((src) => ({
         id: src.id,
         category: src.category,
         sub_url: src.sub_url,
@@ -357,6 +309,7 @@ export async function routeRequest(
   }
 
   // 5. QualityEngine — Receive Health Report (POST /api/v1/nodes/health-report)
+  // Uses a single batched read + Diff-Only Writes + db.batch() to stay well below D1 write limits.
   if (method === 'POST' && path === '/api/v1/nodes/health-report') {
     if (!env.QUALITY_ENGINE_SECRET) {
       return errorResponse(503, 'کلید امنیتی QualityEngine پیکربندی نشده است.');
@@ -373,16 +326,138 @@ export async function routeRequest(
       return errorResponse(400, 'بدنه JSON گزارش سلامت معتبر نیست.');
     }
 
-    const nodeResults = Array.isArray(payload.results) ? payload.results : [];
+    const nodeResults = Array.isArray(payload.results) ? payload.results.slice(0, 250) : [];
     const subReports = Array.isArray(payload.subscription_reports)
-      ? payload.subscription_reports
+      ? payload.subscription_reports.slice(0, 50)
       : [];
 
     if (nodeResults.length === 0 && subReports.length === 0) {
       return errorResponse(400, 'آرایه results و subscription_reports خالی است.');
     }
 
+    const nodeIds = Array.from(
+      new Set(
+        nodeResults
+          .map((item) => Number(item.outbound_id))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      )
+    );
+    const sourceIds = Array.from(
+      new Set(
+        subReports
+          .map((src) => Number(src.source_id))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      )
+    );
+    const discoveredFps = Array.from(
+      new Set(
+        subReports.flatMap((src) =>
+          (Array.isArray(src.discovered_nodes) ? src.discovered_nodes.slice(0, 50) : [])
+            .map((n) => String(n.fingerprint_sha256 || '').trim())
+            .filter(Boolean)
+        )
+      )
+    );
+
+    // 1. Single initial batched read using PRIMARY KEY / UNIQUE INDEX lookups
+    const readStmts: D1PreparedStatement[] = [];
+    let nodeReadIdx = -1;
+    let sourceReadIdx = -1;
+    let fpReadIdx = -1;
+
+    if (nodeIds.length > 0) {
+      nodeReadIdx = readStmts.length;
+      const placeholders = nodeIds.map(() => '?').join(', ');
+      readStmts.push(
+        env.DB.prepare(
+          `SELECT id, tag, protocol, status, health_score, fail_count,
+                  gemini_ok, trading_safe, allow_static_ip, offline_since, allocation_mode
+           FROM donated_outbounds
+           WHERE id IN (${placeholders})`
+        ).bind(...nodeIds)
+      );
+    }
+
+    if (sourceIds.length > 0) {
+      sourceReadIdx = readStmts.length;
+      const placeholders = sourceIds.map(() => '?').join(', ');
+      readStmts.push(
+        env.DB.prepare(
+          `SELECT id, total_nodes, healthy_nodes
+           FROM subscription_sources
+           WHERE id IN (${placeholders})`
+        ).bind(...sourceIds)
+      );
+    }
+
+    if (discoveredFps.length > 0) {
+      fpReadIdx = readStmts.length;
+      const placeholders = discoveredFps.map(() => '?').join(', ');
+      readStmts.push(
+        env.DB.prepare(
+          `SELECT id, status, health_score, fail_count, gemini_ok, trading_safe, fingerprint_sha256
+           FROM donated_outbounds
+           WHERE fingerprint_sha256 IN (${placeholders})`
+        ).bind(...discoveredFps)
+      );
+    }
+
+    const readResults = await executeD1Batch<Record<string, unknown>>(env.DB, readStmts);
+
+    interface ExistingHealthNode {
+      id: number;
+      tag: string;
+      protocol: string;
+      status: string;
+      health_score: number;
+      fail_count: number;
+      gemini_ok: number;
+      trading_safe: number;
+      allow_static_ip: number;
+      offline_since: string | null;
+      allocation_mode: string;
+    }
+    interface ExistingSubSource {
+      id: number;
+      total_nodes: number;
+      healthy_nodes: number;
+    }
+    interface ExistingFpNode {
+      id: number;
+      status: string;
+      health_score: number;
+      fail_count: number;
+      gemini_ok: number;
+      trading_safe: number;
+      fingerprint_sha256: string;
+    }
+
+    const existingNodesById = new Map<number, ExistingHealthNode>();
+    if (nodeReadIdx >= 0) {
+      for (const row of (readResults[nodeReadIdx]?.results || []) as unknown as ExistingHealthNode[]) {
+        existingNodesById.set(Number(row.id), row);
+      }
+    }
+
+    const existingSourcesById = new Map<number, ExistingSubSource>();
+    if (sourceReadIdx >= 0) {
+      for (const row of (readResults[sourceReadIdx]?.results || []) as unknown as ExistingSubSource[]) {
+        existingSourcesById.set(Number(row.id), row);
+      }
+    }
+
+    const existingNodesByFp = new Map<string, ExistingFpNode>();
+    if (fpReadIdx >= 0) {
+      for (const row of (readResults[fpReadIdx]?.results || []) as unknown as ExistingFpNode[]) {
+        if (row.fingerprint_sha256) {
+          existingNodesByFp.set(String(row.fingerprint_sha256), row);
+        }
+      }
+    }
+
+    const writeStatements: D1PreparedStatement[] = [];
     let updated = 0;
+    let writesSkipped = 0;
     let deactivated = 0;
     let geminiReady = 0;
     let subscriptionSourcesUpdated = 0;
@@ -396,22 +471,12 @@ export async function routeRequest(
       reason?: string;
     }> = [];
 
-    for (const item of nodeResults.slice(0, 250)) {
+    // 2. Diff-Only Writes for evaluated DB nodes
+    for (const item of nodeResults) {
       const nodeId = Number(item.outbound_id);
       if (!Number.isInteger(nodeId) || nodeId <= 0) continue;
 
-      const existing = await env.DB.prepare(
-        'SELECT id, tag, protocol, fail_count, offline_since, allocation_mode FROM donated_outbounds WHERE id = ? LIMIT 1'
-      )
-        .bind(nodeId)
-        .first<{
-          id: number;
-          tag: string;
-          protocol: string;
-          fail_count: number;
-          offline_since: string | null;
-          allocation_mode: string;
-        }>();
+      const existing = existingNodesById.get(nodeId);
       if (!existing) continue;
 
       const latencyMs = Math.max(0, Math.min(9999, Math.round(Number(item.latency_ms) || 9999)));
@@ -424,15 +489,19 @@ export async function routeRequest(
 
       if (!item.security_passed) {
         const rejectReason = String(item.error_msg || 'Failed security audit');
-        await env.DB.prepare(
-          `UPDATE donated_outbounds
-           SET status = 'rejected', rejection_reason = ?, health_score = 0,
-               last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-           WHERE id = ?`
-        )
-          .bind(rejectReason, nodeId)
-          .run();
-        deactivated += 1;
+        if (existing.status !== 'rejected' || Number(existing.health_score) !== 0) {
+          writeStatements.push(
+            env.DB.prepare(
+              `UPDATE donated_outbounds
+               SET status = 'rejected', rejection_reason = ?, health_score = 0,
+                   last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?`
+            ).bind(rejectReason, nodeId)
+          );
+          deactivated += 1;
+        } else {
+          writesSkipped += 1;
+        }
         updated += 1;
         offlineAlerts.push({
           id: nodeId,
@@ -447,55 +516,81 @@ export async function routeRequest(
 
       if (item.is_healthy) {
         if (geminiOk === 1) geminiReady += 1;
-        // Auto-promote to static_ip only when allocation_mode === 'auto' and both Gemini & Trading pass
         const autoStatic =
           existing.allocation_mode === 'auto' && geminiOk === 1 && tradingSafe === 1 ? 1 : null;
+        const nextAllowStatic = autoStatic ?? Number(existing.allow_static_ip || 0);
 
-        await env.DB.prepare(
-          `UPDATE donated_outbounds
-           SET latency_ms = ?, jitter_ms = ?, speed_mbps = ?, speed_score = ?,
-               health_score = ?, gemini_ok = ?, trading_safe = ?,
-               status = 'active', fail_count = 0, offline_since = NULL,
-               allow_static_ip = COALESCE(?, allow_static_ip),
-               last_online_at = CURRENT_TIMESTAMP, last_checked_at = CURRENT_TIMESTAMP,
-               updated_at = CURRENT_TIMESTAMP
-           WHERE id = ?`
-        )
-          .bind(
-            latencyMs,
-            jitterMs,
-            speedMbps,
-            speedScore,
-            healthScore,
-            geminiOk,
-            tradingSafe,
-            autoStatic,
-            nodeId
-          )
-          .run();
+        const changed =
+          existing.status !== 'active' ||
+          Number(existing.health_score) !== healthScore ||
+          Number(existing.fail_count || 0) !== 0 ||
+          Number(existing.gemini_ok || 0) !== geminiOk ||
+          Number(existing.trading_safe || 0) !== tradingSafe ||
+          Number(existing.allow_static_ip || 0) !== nextAllowStatic;
+
+        if (changed) {
+          writeStatements.push(
+            env.DB.prepare(
+              `UPDATE donated_outbounds
+               SET latency_ms = ?, jitter_ms = ?, speed_mbps = ?, speed_score = ?,
+                   health_score = ?, gemini_ok = ?, trading_safe = ?,
+                   status = 'active', fail_count = 0, offline_since = NULL,
+                   allow_static_ip = COALESCE(?, allow_static_ip),
+                   last_online_at = CURRENT_TIMESTAMP, last_checked_at = CURRENT_TIMESTAMP,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?`
+            ).bind(
+              latencyMs,
+              jitterMs,
+              speedMbps,
+              speedScore,
+              healthScore,
+              geminiOk,
+              tradingSafe,
+              autoStatic,
+              nodeId
+            )
+          );
+        } else {
+          writesSkipped += 1;
+        }
       } else {
-        const nextFailCount = (existing.fail_count || 0) + 1;
+        const nextFailCount = Math.min(3, (Number(existing.fail_count) || 0) + 1);
         const nextStatus = nextFailCount >= 3 ? 'inactive' : 'active';
-        if (nextStatus === 'inactive') deactivated += 1;
+        const nextHealthScore = Math.max(0, 100 - nextFailCount * 35);
+        if (nextStatus === 'inactive' && existing.status !== 'inactive') {
+          deactivated += 1;
+        }
 
-        await env.DB.prepare(
-          `UPDATE donated_outbounds
-           SET latency_ms = ?, jitter_ms = ?, speed_mbps = 0, speed_score = 0,
-               health_score = ?, gemini_ok = 0, trading_safe = 0,
-               status = ?, fail_count = ?,
-               offline_since = COALESCE(offline_since, CURRENT_TIMESTAMP),
-               last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-           WHERE id = ?`
-        )
-          .bind(
-            latencyMs,
-            jitterMs,
-            Math.max(0, 100 - nextFailCount * 35),
-            nextStatus,
-            nextFailCount,
-            nodeId
-          )
-          .run();
+        const changed =
+          existing.status !== nextStatus ||
+          Number(existing.fail_count || 0) !== nextFailCount ||
+          Number(existing.health_score) !== nextHealthScore ||
+          Number(existing.gemini_ok || 0) !== 0 ||
+          Number(existing.trading_safe || 0) !== 0;
+
+        if (changed) {
+          writeStatements.push(
+            env.DB.prepare(
+              `UPDATE donated_outbounds
+               SET latency_ms = ?, jitter_ms = ?, speed_mbps = 0, speed_score = 0,
+                   health_score = ?, gemini_ok = 0, trading_safe = 0,
+                   status = ?, fail_count = ?,
+                   offline_since = COALESCE(offline_since, CURRENT_TIMESTAMP),
+                   last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?`
+            ).bind(
+              latencyMs,
+              jitterMs,
+              nextHealthScore,
+              nextStatus,
+              nextFailCount,
+              nodeId
+            )
+          );
+        } else {
+          writesSkipped += 1;
+        }
 
         offlineAlerts.push({
           id: nodeId,
@@ -510,20 +605,31 @@ export async function routeRequest(
       updated += 1;
     }
 
-    for (const srcReport of subReports.slice(0, 50)) {
+    // 3. Diff-Only Writes for subscription_sources & discovered nodes
+    const seenNewFps = new Set<string>();
+    for (const srcReport of subReports) {
       const sourceId = Number(srcReport.source_id);
       if (!Number.isInteger(sourceId) || sourceId <= 0) continue;
 
       const totalNodes = Math.max(0, Math.round(Number(srcReport.total_nodes) || 0));
       const healthyNodes = Math.max(0, Math.round(Number(srcReport.healthy_nodes) || 0));
 
-      await env.DB.prepare(
-        `UPDATE subscription_sources
-         SET total_nodes = ?, healthy_nodes = ?, last_sync_at = CURRENT_TIMESTAMP
-         WHERE id = ?`
-      )
-        .bind(totalNodes, healthyNodes, sourceId)
-        .run();
+      const existingSrc = existingSourcesById.get(sourceId);
+      if (
+        !existingSrc ||
+        Number(existingSrc.total_nodes) !== totalNodes ||
+        Number(existingSrc.healthy_nodes) !== healthyNodes
+      ) {
+        writeStatements.push(
+          env.DB.prepare(
+            `UPDATE subscription_sources
+             SET total_nodes = ?, healthy_nodes = ?, last_sync_at = CURRENT_TIMESTAMP
+             WHERE id = ?`
+          ).bind(totalNodes, healthyNodes, sourceId)
+        );
+      } else {
+        writesSkipped += 1;
+      }
       subscriptionSourcesUpdated += 1;
 
       const category = String(srcReport.category || 'web_browsing').trim().toLowerCase();
@@ -547,12 +653,7 @@ export async function routeRequest(
         const fp = String(node.fingerprint_sha256 || '').trim();
         if (!fp || !node.server_address || !node.protocol) continue;
 
-        const existingNode = await env.DB.prepare(
-          'SELECT id FROM donated_outbounds WHERE fingerprint_sha256 = ? LIMIT 1'
-        )
-          .bind(fp)
-          .first<{ id: number }>();
-
+        const existingNode = existingNodesByFp.get(fp);
         const lat = Math.max(0, Math.min(9999, Math.round(Number(node.latency_ms) || 120)));
         const jit = Math.max(0, Math.min(9999, Math.round(Number(node.jitter_ms) || 0)));
         const spd = Math.max(0, Number(node.speed_mbps) || 0);
@@ -563,28 +664,39 @@ export async function routeRequest(
         if (gOk === 1) geminiReady += 1;
 
         if (existingNode) {
-          await env.DB.prepare(
-            `UPDATE donated_outbounds
-             SET latency_ms = ?, jitter_ms = ?, speed_mbps = ?, speed_score = ?,
-                 health_score = ?, gemini_ok = ?, trading_safe = ?, status = 'active',
-                 fail_count = 0, offline_since = NULL,
-                 last_online_at = CURRENT_TIMESTAMP, last_checked_at = CURRENT_TIMESTAMP,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?`
-          )
-            .bind(lat, jit, spd, spdScore, hScore, gOk, tSafe, existingNode.id)
-            .run();
-        } else {
-          await env.DB.prepare(
-            `INSERT INTO donated_outbounds (
-               donor_user_id, tag, protocol, server_address, server_port, config_json,
-               latency_ms, jitter_ms, speed_mbps, speed_score, assigned_tier, health_score,
-               status, fail_count, raw_link, fingerprint_sha256, is_official, label,
-               country_code, country_name, allow_web, allow_download, allow_gaming, allow_static_ip,
-               gemini_ok, trading_safe, allocation_mode, last_online_at, last_checked_at
-             ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-          )
-            .bind(
+          const changed =
+            existingNode.status !== 'active' ||
+            Number(existingNode.health_score) !== hScore ||
+            Number(existingNode.fail_count || 0) !== 0 ||
+            Number(existingNode.gemini_ok || 0) !== gOk ||
+            Number(existingNode.trading_safe || 0) !== tSafe;
+          if (changed) {
+            writeStatements.push(
+              env.DB.prepare(
+                `UPDATE donated_outbounds
+                 SET latency_ms = ?, jitter_ms = ?, speed_mbps = ?, speed_score = ?,
+                     health_score = ?, gemini_ok = ?, trading_safe = ?, status = 'active',
+                     fail_count = 0, offline_since = NULL,
+                     last_online_at = CURRENT_TIMESTAMP, last_checked_at = CURRENT_TIMESTAMP,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?`
+              ).bind(lat, jit, spd, spdScore, hScore, gOk, tSafe, existingNode.id)
+            );
+          } else {
+            writesSkipped += 1;
+          }
+        } else if (!seenNewFps.has(fp)) {
+          seenNewFps.add(fp);
+          writeStatements.push(
+            env.DB.prepare(
+              `INSERT INTO donated_outbounds (
+                 donor_user_id, tag, protocol, server_address, server_port, config_json,
+                 latency_ms, jitter_ms, speed_mbps, speed_score, assigned_tier, health_score,
+                 status, fail_count, raw_link, fingerprint_sha256, is_official, label,
+                 country_code, country_name, allow_web, allow_download, allow_gaming, allow_static_ip,
+                 gemini_ok, trading_safe, allocation_mode, last_online_at, last_checked_at
+               ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+            ).bind(
               String(node.tag || 'SubNode').slice(0, 64),
               String(node.protocol),
               String(node.server_address),
@@ -609,14 +721,20 @@ export async function routeRequest(
               tSafe,
               category
             )
-            .run();
+          );
           discoveredNodesAdded += 1;
         }
       }
     }
 
+    // 4. Execute all changed writes in chunked db.batch() and invalidate isolate cache
+    if (writeStatements.length > 0) {
+      await executeD1Batch(env.DB, writeStatements);
+      invalidateNodesCache(env.DB);
+    }
+
     const subSourceAlerts: string[] = [];
-    for (const srcReport of subReports.slice(0, 50)) {
+    for (const srcReport of subReports) {
       const sourceId = Number(srcReport.source_id);
       if (!Number.isInteger(sourceId) || sourceId <= 0) continue;
       const totalNodes = Math.max(0, Math.round(Number(srcReport.total_nodes) || 0));
@@ -633,20 +751,22 @@ export async function routeRequest(
     }
 
     let activePoolCount = 1;
-    try {
-      const poolRow = await env.DB.prepare(
-        `SELECT COUNT(*) AS cnt FROM donated_outbounds WHERE status = 'active'`
-      ).first<{ cnt: number }>();
-      activePoolCount = Number(poolRow?.cnt ?? 0);
-    } catch {
-      activePoolCount = 1;
+    if (writeStatements.length > 0 || offlineAlerts.length > 0 || subSourceAlerts.length > 0) {
+      try {
+        const poolRow = await env.DB.prepare(
+          `SELECT COUNT(*) AS cnt FROM donated_outbounds WHERE status = 'active'`
+        ).first<{ cnt: number }>();
+        activePoolCount = Number(poolRow?.cnt ?? 0);
+      } catch {
+        activePoolCount = 1;
+      }
     }
 
     const criticalPoolDepleted = activePoolCount === 0 && (updated > 0 || subscriptionSourcesUpdated > 0);
 
     if (offlineAlerts.length > 0 || subSourceAlerts.length > 0 || criticalPoolDepleted) {
       const summaryLines: string[] = [
-        `Checked: ${updated} | Deactivated/Rejected: ${deactivated} | Failed: ${offlineAlerts.length} | Active Pool: ${activePoolCount}`,
+        `Checked: ${updated} | Writes: ${writeStatements.length} | Skipped: ${writesSkipped} | Deactivated/Rejected: ${deactivated} | Failed: ${offlineAlerts.length} | Active Pool: ${activePoolCount}`,
       ];
       if (criticalPoolDepleted) {
         summaryLines.push('CRITICAL: Active healthy node pool reached 0!');
@@ -670,6 +790,8 @@ export async function routeRequest(
     return jsonResponse({
       success: true,
       updated,
+      db_writes: writeStatements.length,
+      writes_skipped: writesSkipped,
       deactivated,
       gemini_ready: geminiReady,
       subscription_sources_updated: subscriptionSourcesUpdated,
@@ -678,9 +800,23 @@ export async function routeRequest(
     });
   }
 
-  // 6. Subscription Endpoint: GET /sub/:token & GET /api/v1/sub/:token
+  // 6. Subscription Endpoint: GET /sub/:token & GET /api/v1/sub/:token (Zero-Write + Isolate Cache + ETag/304)
   const subMatch = /^\/(?:api\/v1\/)?sub\/([^/]+)$/.exec(path);
   if (method === 'GET' && subMatch) {
+    const ipLimit = checkPublicIpRateLimit('sub', extractClientIp(request));
+    if (!ipLimit.allowed) {
+      return jsonResponse(
+        {
+          success: false,
+          error: 'تعداد درخواست‌های دریافت اشتراک بیش از حد مجاز است. لطفاً دقایقی دیگر تلاش کنید.',
+          message: 'Rate limit exceeded',
+          code: 'RATE_LIMITED',
+        },
+        429,
+        { 'Retry-After': String(ipLimit.retryAfterSec) }
+      );
+    }
+
     const token = decodeURIComponent(subMatch[1]).trim();
     const found = await getSubscriptionWithUser(env.DB, token);
     if (!found) {
@@ -691,9 +827,10 @@ export async function routeRequest(
     }
 
     const mode = normalizeMode(url.searchParams.get('mode'));
+    const pool = await getCachedActiveNodesPool(env.DB);
+
     if (mode === 'gaming') {
-      const gamingLive = await hasActiveGamingOutbounds(env.DB);
-      if (!gamingLive) {
+      if (!pool.hasActiveGaming) {
         return errorResponse(400, 'بخش گیمینگ به‌زودی راه‌اندازی می‌شود.', 'GAMING_COMING_SOON');
       }
       if (!tierHasGaming(found.sub.tier)) {
@@ -704,12 +841,7 @@ export async function routeRequest(
       return errorResponse(403, 'حالت آی‌پی ثابت نیازمند پلن ویژه است.', 'TIER_REQUIRED');
     }
 
-    const { donated, core } = await queryOutboundsForMode(
-      env.DB,
-      mode,
-      url.searchParams.get('location') || undefined
-    );
-
+    const locationParam = url.searchParams.get('location') || undefined;
     const userAgent = (request.headers.get('User-Agent') || '').toLowerCase();
     const formatParam = (url.searchParams.get('format') || '').toLowerCase();
     const wantsSingbox =
@@ -723,36 +855,65 @@ export async function routeRequest(
       userAgent.includes('hiddify');
 
     const subUserInfo = buildSubscriptionUserInfoHeader(found.sub);
+    const etag = computeWeakEtag([
+      'sub',
+      pool.version,
+      mode,
+      (locationParam || 'auto').toUpperCase(),
+      wantsSingbox ? 'singbox' : 'v2ray',
+      found.sub.tier,
+      found.sub.status,
+      found.sub.expires_at,
+      found.sub.traffic_limit_bytes,
+      found.sub.upload_bytes + found.sub.download_bytes,
+    ]);
+
+    if (matchesIfNoneMatch(request.headers.get('If-None-Match'), etag)) {
+      return new Response(null, {
+        status: 304,
+        headers: {
+          ETag: etag,
+          'Cache-Control': 'private, max-age=1800',
+          'Subscription-Userinfo': subUserInfo,
+          'Profile-Title': 'Sentra Connect',
+          'Profile-Update-Interval': '8',
+        },
+      });
+    }
 
     if (wantsSingbox) {
-      let config: Record<string, unknown>;
+      let compiledJson: string;
       try {
-        config = compileClientSingboxConfig(core, donated, {
+        const compiled = await getCachedCompiledSingbox(env.DB, {
           mode,
+          locationCode: locationParam,
           includeClashApi: false,
           onError: (source, details) => {
             void dispatchErrorAlert(env, ctx, source, details);
           },
         });
+        compiledJson = compiled.json;
       } catch (err) {
         await dispatchErrorAlert(env, ctx, 'singboxCompiler.ts (/sub)', err);
         throw err;
       }
-      return new Response(JSON.stringify(config, null, 2), {
+      return new Response(compiledJson, {
         status: 200,
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
           'Subscription-Userinfo': subUserInfo,
           'Profile-Title': 'Sentra Connect',
-          'Profile-Update-Interval': '6',
-          'Cache-Control': 'no-store',
+          'Profile-Update-Interval': '8',
+          ETag: etag,
+          'Cache-Control': 'private, max-age=1800',
         },
       });
     }
 
     let base64Body: string;
     try {
-      base64Body = compileV2RaySubscriptionBase64(donated, core);
+      const compiled = await getCachedV2RayBase64(env.DB, mode, locationParam);
+      base64Body = compiled.base64;
     } catch (err) {
       await dispatchErrorAlert(env, ctx, 'singboxCompiler.ts (/sub base64)', err);
       throw err;
@@ -762,13 +923,15 @@ export async function routeRequest(
       headers: {
         'Content-Type': 'text/plain; charset=utf-8',
         'Subscription-Userinfo': subUserInfo,
+        'Profile-Update-Interval': '8',
         'Content-Disposition': 'attachment; filename="sentra-sub.txt"',
-        'Cache-Control': 'no-store',
+        ETag: etag,
+        'Cache-Control': 'private, max-age=1800',
       },
     });
   }
 
-  // 7. Client Sing-box 1.14+ Config Endpoint: POST /api/v1/client/config & /connect
+  // 7. Client Sing-box 1.14+ Config Endpoint: POST /api/v1/client/config & /connect (Zero-Write + ETag/304)
   if (method === 'POST' && (path === '/api/v1/client/config' || path === '/api/v1/client/connect')) {
     let body: Record<string, unknown> = {};
     try {
@@ -792,10 +955,10 @@ export async function routeRequest(
 
     const mode = normalizeMode(typeof body.mode === 'string' ? body.mode : 'web_browsing');
     const locationCode = typeof body.location_code === 'string' ? body.location_code : undefined;
+    const pool = await getCachedActiveNodesPool(env.DB);
 
     if (mode === 'gaming') {
-      const gamingLive = await hasActiveGamingOutbounds(env.DB);
-      if (!gamingLive) {
+      if (!pool.hasActiveGaming) {
         return errorResponse(
           400,
           'بخش گیمینگ به‌زودی راه‌اندازی می‌شود و پس از افزودن سرور گیمینگ فعال خواهد شد.',
@@ -824,38 +987,68 @@ export async function routeRequest(
       return errorResponse(429, 'سهمیه روزانه ۳ گیگابایت دانلود پلن رایگان به پایان رسیده است.', 'QUOTA_EXCEEDED');
     }
 
-    const { donated, core } = await queryOutboundsForMode(env.DB, mode, locationCode);
+    const preferFirst = Boolean(body.selected_outbound_id);
+    const etag = computeWeakEtag([
+      'cfg',
+      pool.version,
+      mode,
+      (locationCode || 'auto').toUpperCase(),
+      preferFirst ? 1 : 0,
+      found.sub.tier,
+      found.sub.status,
+      found.sub.expires_at,
+    ]);
+
+    if (matchesIfNoneMatch(request.headers.get('If-None-Match'), etag)) {
+      return new Response(null, {
+        status: 304,
+        headers: {
+          ETag: etag,
+          'Cache-Control': 'private, max-age=1800',
+        },
+      });
+    }
+
     let singboxConfig: Record<string, unknown>;
     try {
-      singboxConfig = compileClientSingboxConfig(core, donated, {
+      const compiled = await getCachedCompiledSingbox(env.DB, {
         mode,
-        preferFirstAsDefault: Boolean(body.selected_outbound_id),
+        locationCode,
+        preferFirstAsDefault: preferFirst,
         includeClashApi: true,
         onError: (source, details) => {
           void dispatchErrorAlert(env, ctx, source, details);
         },
       });
+      singboxConfig = compiled.config;
     } catch (err) {
       await dispatchErrorAlert(env, ctx, 'singboxCompiler.ts (/api/v1/client/config)', err);
       throw err;
     }
 
-    return jsonResponse({
-      success: true,
-      mode,
-      location_code: locationCode || 'auto',
-      singbox_schema: '1.14+',
-      config: singboxConfig,
-      singbox_config: singboxConfig,
-    });
+    return jsonResponse(
+      {
+        success: true,
+        mode,
+        location_code: locationCode || 'auto',
+        singbox_schema: '1.14+',
+        config: singboxConfig,
+        singbox_config: singboxConfig,
+      },
+      200,
+      {
+        ETag: etag,
+        'Cache-Control': 'private, max-age=1800',
+      }
+    );
   }
 
-  // 8. Client Modes Catalog: GET /api/v1/client/modes
+  // 8. Client Modes Catalog: GET /api/v1/client/modes (Served from Isolate Cache)
   if (method === 'GET' && path === '/api/v1/client/modes') {
     const token = extractAuthToken(request);
     const found = token ? await getSubscriptionWithUser(env.DB, token) : null;
     const tier = found?.sub.tier || 'Sentra Lite';
-    const gamingLive = await hasActiveGamingOutbounds(env.DB);
+    const gamingLive = await getCachedHasActiveGaming(env.DB);
     const isLite = tier.toLowerCase() === 'sentra lite';
 
     return jsonResponse({
@@ -902,38 +1095,34 @@ export async function routeRequest(
     });
   }
 
-  // 9. Client Locations: GET /api/v1/client/locations
+  // 9. Client Locations: GET /api/v1/client/locations (Served from Isolate Cache)
   if (method === 'GET' && path === '/api/v1/client/locations') {
-    const rows = await env.DB.prepare(
-      `SELECT country_code, country_name, COUNT(*) AS active_nodes, MIN(latency_ms) AS best_ping
-       FROM donated_outbounds
-       WHERE status = 'active'
-       GROUP BY country_code, country_name
-       ORDER BY best_ping ASC`
-    ).all<{ country_code: string; country_name: string; active_nodes: number; best_ping: number }>();
-
-    const items = rows.results || [];
+    const items = await getCachedLocations(env.DB);
     const totalNodes = items.reduce((sum, r) => sum + r.active_nodes, 0);
     const minPing = items.length > 0 ? items[0].best_ping : 0;
 
-    return jsonResponse([
-      {
-        code: 'auto',
-        name: '⚡️ انتخاب خودکار (سریع‌ترین لوکیشن)',
-        flag: '⚡️',
-        ping_ms: minPing,
-        active_nodes: totalNodes,
-        is_auto: true,
-      },
-      ...items.map((r) => ({
-        code: r.country_code,
-        name: r.country_name,
-        flag: r.country_name.split(' ').pop() || '🌍',
-        ping_ms: r.best_ping,
-        active_nodes: r.active_nodes,
-        is_auto: false,
-      })),
-    ]);
+    return jsonResponse(
+      [
+        {
+          code: 'auto',
+          name: '⚡️ انتخاب خودکار (سریع‌ترین لوکیشن)',
+          flag: '⚡️',
+          ping_ms: minPing,
+          active_nodes: totalNodes,
+          is_auto: true,
+        },
+        ...items.map((r) => ({
+          code: r.country_code,
+          name: r.country_name,
+          flag: r.country_name.split(' ').pop() || '🌍',
+          ping_ms: r.best_ping,
+          active_nodes: r.active_nodes,
+          is_auto: false,
+        })),
+      ],
+      200,
+      { 'Cache-Control': 'public, max-age=300' }
+    );
   }
 
   // 10. Auth: Register (POST /api/v1/auth/register)
@@ -1019,7 +1208,7 @@ export async function routeRequest(
     const username = String(body.username || '').trim();
     const password = String(body.password || '');
     const user = await env.DB.prepare(
-      'SELECT * FROM users WHERE lower(username) = lower(?) OR lower(email) = lower(?) LIMIT 1'
+      `SELECT ${USER_SELECT_COLS} FROM users WHERE lower(username) = lower(?) OR lower(email) = lower(?) LIMIT 1`
     )
       .bind(username, username)
       .first<UserRow>();
@@ -1032,7 +1221,7 @@ export async function routeRequest(
     }
 
     const sub = await env.DB.prepare(
-      'SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1'
+      `SELECT ${SUB_SELECT_COLS} FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1`
     )
       .bind(user.id)
       .first<SubscriptionRow>();
@@ -1081,7 +1270,7 @@ export async function routeRequest(
     }
 
     const user = await env.DB.prepare(
-      `SELECT * FROM users
+      `SELECT ${USER_SELECT_COLS} FROM users
        WHERE auth_code = ? AND auth_code_expires_at > datetime('now')
        LIMIT 1`
     )
@@ -1092,17 +1281,16 @@ export async function routeRequest(
       return errorResponse(401, 'کد ورود نامعتبر یا منقضی شده است.');
     }
 
-    await env.DB.prepare(
-      'UPDATE users SET auth_code = NULL, auth_code_expires_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
-    )
-      .bind(user.id)
-      .run();
+    const [, subBatchRes] = await executeD1Batch<Record<string, unknown>>(env.DB, [
+      env.DB.prepare(
+        'UPDATE users SET auth_code = NULL, auth_code_expires_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+      ).bind(user.id),
+      env.DB.prepare(
+        `SELECT ${SUB_SELECT_COLS} FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1`
+      ).bind(user.id),
+    ]);
 
-    const sub = await env.DB.prepare(
-      'SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1'
-    )
-      .bind(user.id)
-      .first<SubscriptionRow>();
+    const sub = ((subBatchRes?.results || [])[0] as unknown as SubscriptionRow | undefined) ?? null;
     if (!sub) {
       return errorResponse(404, 'اشتراک فعالی یافت نشد.');
     }
@@ -1230,24 +1418,7 @@ export async function routeRequest(
       return errorResponse(403, 'حساب کاربری یا اشتراک شما غیرفعال شده است.', 'ACCOUNT_SUSPENDED');
     }
 
-    const deviceId = (request.headers.get('X-Device-Id') || '').trim();
-    if (deviceId.length >= 4) {
-      const ua = (request.headers.get('User-Agent') || '').toLowerCase();
-      const osName = ua.includes('android') ? 'android' : ua.includes('windows') ? 'windows' : 'client';
-      const deviceName = osName === 'android' ? 'Android Device' : osName === 'windows' ? 'Windows PC' : 'Sentra Client';
-      try {
-        await env.DB.prepare(
-          `INSERT INTO device_sessions (subscription_id, device_identifier, device_name, os, is_active, last_seen_at)
-           VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
-           ON CONFLICT(subscription_id, device_identifier)
-           DO UPDATE SET is_active = 1, last_seen_at = CURRENT_TIMESTAMP`
-        )
-          .bind(found.sub.id, deviceId.slice(0, 128), deviceName, osName)
-          .run();
-      } catch {
-        // Non-fatal if concurrent upsert occurs
-      }
-    }
+    const deviceId = (request.headers.get('X-Device-Id') || '').trim().slice(0, 128);
 
     const devicesRes = await env.DB.prepare(
       `SELECT id, device_identifier, device_name, os, last_seen_at, created_at
@@ -1266,7 +1437,54 @@ export async function routeRequest(
         created_at: string;
       }>();
 
-    const activeDevices = (devicesRes.results || []).map((d) => ({
+    let rawDevices = [...(devicesRes.results || [])];
+
+    // Avoid unnecessary D1 writes: only upsert device_sessions if device is new or unseen for > 6 hours
+    if (deviceId.length >= 4) {
+      const existingDevice = rawDevices.find((d) => d.device_identifier === deviceId);
+      const lastSeenMs = existingDevice ? Date.parse(existingDevice.last_seen_at) : 0;
+      const needsDeviceWrite =
+        !existingDevice ||
+        !Number.isFinite(lastSeenMs) ||
+        Date.now() - lastSeenMs > 6 * 60 * 60 * 1000;
+
+      if (needsDeviceWrite) {
+        const ua = (request.headers.get('User-Agent') || '').toLowerCase();
+        const osName = ua.includes('android') ? 'android' : ua.includes('windows') ? 'windows' : 'client';
+        const deviceName = osName === 'android' ? 'Android Device' : osName === 'windows' ? 'Windows PC' : 'Sentra Client';
+        const nowIso = new Date().toISOString();
+        try {
+          await env.DB.prepare(
+            `INSERT INTO device_sessions (subscription_id, device_identifier, device_name, os, is_active, last_seen_at)
+             VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+             ON CONFLICT(subscription_id, device_identifier)
+             DO UPDATE SET is_active = 1, last_seen_at = CURRENT_TIMESTAMP`
+          )
+            .bind(found.sub.id, deviceId, deviceName, osName)
+            .run();
+
+          if (!existingDevice) {
+            rawDevices = [
+              {
+                id: rawDevices.length + 1,
+                device_identifier: deviceId,
+                device_name: deviceName,
+                os: osName,
+                last_seen_at: nowIso,
+                created_at: nowIso,
+              },
+              ...rawDevices.filter((d) => d.device_identifier !== deviceId),
+            ];
+          } else {
+            existingDevice.last_seen_at = nowIso;
+          }
+        } catch {
+          // Non-fatal if concurrent upsert occurs
+        }
+      }
+    }
+
+    const activeDevices = rawDevices.map((d) => ({
       id: d.id,
       device_id: d.device_identifier,
       device_name: d.device_name,
@@ -1275,16 +1493,9 @@ export async function routeRequest(
       created_at: d.created_at,
     }));
 
-    const outboundsRes = await env.DB.prepare(
-      `SELECT id, tag, label, protocol, server_address, server_port, assigned_tier,
-              country_code, country_name, latency_ms, health_score, is_official, status, raw_link
-       FROM donated_outbounds
-       WHERE status = 'active'
-       ORDER BY is_official DESC, health_score DESC, latency_ms ASC
-       LIMIT 100`
-    ).all<DonatedOutboundRow>();
-
-    const outbounds = (outboundsRes.results || []).map((row) => ({
+    // Serve active outbounds + gaming status from 5-minute isolate RAM cache (zero extra D1 reads)
+    const pool = await getCachedActiveNodesPool(env.DB);
+    const outbounds = pool.donated.slice(0, 100).map((row) => ({
       id: `donated_${row.id}`,
       db_id: row.id,
       name: row.label || row.tag,
@@ -1333,7 +1544,7 @@ export async function routeRequest(
       ? Math.max(0, Math.ceil((expiresMs - Date.now()) / (24 * 60 * 60 * 1000)))
       : 30;
     const isLite = found.sub.tier.toLowerCase() === 'sentra lite';
-    const gamingLive = await hasActiveGamingOutbounds(env.DB);
+    const gamingLive = pool.hasActiveGaming;
 
     return jsonResponse({
       success: true,
@@ -1615,6 +1826,10 @@ export async function routeRequest(
         parsed.country_name
       )
       .run();
+
+    if (status === 'active') {
+      invalidateNodesCache(env.DB);
+    }
 
     return jsonResponse(
       {

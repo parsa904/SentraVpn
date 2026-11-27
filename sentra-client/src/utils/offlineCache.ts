@@ -7,6 +7,7 @@ import type {
 const BOOTSTRAP_CACHE_PREFIX = 'sentra_offline_bootstrap_v1_';
 const DONATIONS_CACHE_PREFIX = 'sentra_offline_donations_v1_';
 const ACTIVE_SERVER_CACHE_PREFIX = 'sentra_offline_active_server_v1_';
+const SINGBOX_CONFIG_CACHE_PREFIX = 'sentra_offline_singbox_cfg_v1_';
 export const OFFLINE_CONFIG_CACHE_NAME = 'sentra-last-config-v1';
 export const SW_RUNTIME_CONFIG_CACHE_NAME = 'sentra-config-cache';
 
@@ -26,6 +27,15 @@ interface CachedActiveServerEnvelope {
   version: 1;
   cachedAt: string;
   selection: ActiveServerSelection;
+}
+
+export interface CachedSingboxConfigEnvelope {
+  version: 1;
+  cachedAt: string;
+  etag: string | null;
+  mode: string;
+  locationCode: string;
+  config: Record<string, unknown>;
 }
 
 /**
@@ -252,6 +262,82 @@ export function loadCachedActiveServer(
   }
 }
 
+function buildSingboxCacheKey(
+  token: string,
+  mode: string,
+  locationCode?: string
+): string {
+  const scope = hashCacheScope(token);
+  const safeMode = (mode || 'web_browsing').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+  const safeLoc = (locationCode || 'auto').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '') || 'AUTO';
+  return `${SINGBOX_CONFIG_CACHE_PREFIX}${scope}_${safeMode}_${safeLoc}`;
+}
+
+export function saveCachedSingboxConfig(
+  token: string,
+  mode: string,
+  locationCode: string | undefined,
+  config: Record<string, unknown>,
+  etag: string | null,
+  storage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem' | 'length' | 'key'>
+): CachedSingboxConfigEnvelope | null {
+  if (!token.trim() || !config || typeof config !== 'object') return null;
+  const key = buildSingboxCacheKey(token, mode, locationCode);
+  const envelope: CachedSingboxConfigEnvelope = {
+    version: 1,
+    cachedAt: new Date().toISOString(),
+    etag: etag && etag.trim() ? etag.trim() : null,
+    mode: (mode || 'web_browsing').trim().toLowerCase(),
+    locationCode: (locationCode || 'auto').trim().toLowerCase() || 'auto',
+    config,
+  };
+  const store = getStorage(storage);
+  if (store) {
+    try {
+      store.setItem(key, JSON.stringify(envelope));
+    } catch {
+      // ignore storage quota errors
+    }
+  }
+  void mirrorToCacheStorage(`/_sentra_offline_cache/singbox/${key}.json`, envelope);
+  return envelope;
+}
+
+export function loadCachedSingboxConfig(
+  token: string,
+  mode: string,
+  locationCode: string | undefined,
+  storage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem' | 'length' | 'key'>
+): CachedSingboxConfigEnvelope | null {
+  if (!token.trim()) return null;
+  const key = buildSingboxCacheKey(token, mode, locationCode);
+  const store = getStorage(storage);
+  if (!store) return null;
+  try {
+    const raw = store.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<CachedSingboxConfigEnvelope>;
+    if (
+      parsed.version !== 1 ||
+      !parsed.config ||
+      typeof parsed.config !== 'object' ||
+      Array.isArray(parsed.config)
+    ) {
+      return null;
+    }
+    return {
+      version: 1,
+      cachedAt: typeof parsed.cachedAt === 'string' ? parsed.cachedAt : new Date().toISOString(),
+      etag: typeof parsed.etag === 'string' && parsed.etag.trim() ? parsed.etag.trim() : null,
+      mode: typeof parsed.mode === 'string' ? parsed.mode : mode,
+      locationCode: typeof parsed.locationCode === 'string' ? parsed.locationCode : locationCode || 'auto',
+      config: parsed.config,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function clearOfflineConfigCache(
   token?: string | null,
   storage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem' | 'length' | 'key'>
@@ -264,6 +350,17 @@ export async function clearOfflineConfigCache(
         store.removeItem(`${BOOTSTRAP_CACHE_PREFIX}${scope}`);
         store.removeItem(`${DONATIONS_CACHE_PREFIX}${scope}`);
         store.removeItem(`${ACTIVE_SERVER_CACHE_PREFIX}${scope}`);
+        const singboxPrefix = `${SINGBOX_CONFIG_CACHE_PREFIX}${scope}_`;
+        const singboxKeys: string[] = [];
+        for (let i = 0; i < store.length; i += 1) {
+          const k = store.key(i);
+          if (k && k.startsWith(singboxPrefix)) {
+            singboxKeys.push(k);
+          }
+        }
+        for (const k of singboxKeys) {
+          store.removeItem(k);
+        }
       } else {
         const keysToRemove: string[] = [];
         for (let i = 0; i < store.length; i += 1) {
@@ -272,7 +369,8 @@ export async function clearOfflineConfigCache(
             k &&
             (k.startsWith(BOOTSTRAP_CACHE_PREFIX) ||
               k.startsWith(DONATIONS_CACHE_PREFIX) ||
-              k.startsWith(ACTIVE_SERVER_CACHE_PREFIX))
+              k.startsWith(ACTIVE_SERVER_CACHE_PREFIX) ||
+              k.startsWith(SINGBOX_CONFIG_CACHE_PREFIX))
           ) {
             keysToRemove.push(k);
           }

@@ -783,7 +783,8 @@ export const App: React.FC = () => {
     };
   }, [syncWithServer, loadDonations, pushLog]);
 
-  // Continuous background database sync (30s interval + focus / visibility / online events)
+  // Optimized background database sync (8-hour automatic interval, max 3 auto requests/day/user;
+  // manual refresh button & network-recovery reconnect remain immediate)
   const sessionToken = session?.subscription_token ?? null;
   useEffect(() => {
     if (!sessionToken) return;
@@ -791,7 +792,9 @@ export const App: React.FC = () => {
     const triggerSilentSync = (force = false) => {
       const current = sessionRef.current;
       if (!current || !navigator.onLine) return;
-      if (!force && Date.now() - lastSyncCompletedAtRef.current < 5_000) return;
+      if (!force && Date.now() - lastSyncCompletedAtRef.current < BOOTSTRAP_POLL_INTERVAL_MS) {
+        return;
+      }
       void syncWithServer(current, { silent: true });
       if (activeTabRef.current === 'donate') {
         void loadDonations(current);
@@ -800,7 +803,7 @@ export const App: React.FC = () => {
 
     const pollTimer = window.setInterval(() => {
       if (document.visibilityState === 'visible') {
-        triggerSilentSync(true);
+        triggerSilentSync(false);
       }
     }, BOOTSTRAP_POLL_INTERVAL_MS);
 

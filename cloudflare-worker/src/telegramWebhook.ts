@@ -28,6 +28,11 @@ import {
   sendToTopic,
   type TopicType,
 } from './telegramTopics.ts';
+import {
+  executeD1Batch,
+  getCachedHasActiveGaming,
+  invalidateNodesCache,
+} from './workerCache.ts';
 import type { Env, SubscriptionRow, UserRow } from './types.ts';
 
 interface TelegramUser {
@@ -472,21 +477,7 @@ function buildMainKeyboard(isRegistered: boolean, isAdmin: boolean): Record<stri
 }
 
 async function hasActiveGamingOutbounds(db: D1Database): Promise<boolean> {
-  const donated = await db
-    .prepare(
-      `SELECT COUNT(*) AS cnt FROM donated_outbounds
-       WHERE status = 'active' AND (allow_gaming = 1 OR assigned_tier = 'gaming')`
-    )
-    .first<{ cnt: number }>();
-  if ((donated?.cnt || 0) > 0) return true;
-
-  const core = await db
-    .prepare(
-      `SELECT COUNT(*) AS cnt FROM outbounds
-       WHERE is_active = 1 AND server_address != '127.0.0.1' AND mode_category = 'gaming'`
-    )
-    .first<{ cnt: number }>();
-  return (core?.cnt || 0) > 0;
+  return await getCachedHasActiveGaming(db);
 }
 
 async function getUserAndSubByTelegramId(
@@ -688,7 +679,106 @@ async function insertOfficialOutboundD1(
     )
     .run();
 
+  invalidateNodesCache(db);
   return { inserted: true, duplicate: false };
+}
+
+async function batchInsertOfficialOutboundsD1(
+  db: D1Database,
+  nodes: Array<Awaited<ReturnType<typeof parseOutboundInput>>>,
+  allocationMode: string
+): Promise<{ added: number; duplicates: number }> {
+  const limited = nodes.slice(0, 100);
+  if (limited.length === 0) return { added: 0, duplicates: 0 };
+
+  const allFps = Array.from(new Set(limited.map((n) => n.fingerprint_sha256).filter(Boolean)));
+  const existingFps = new Set<string>();
+  if (allFps.length > 0) {
+    // Check existing SHA-256 fingerprints in chunks of 50 using unique index
+    const lookupStmts: D1PreparedStatement[] = [];
+    for (let i = 0; i < allFps.length; i += 50) {
+      const chunk = allFps.slice(i, i + 50);
+      const placeholders = chunk.map(() => '?').join(', ');
+      lookupStmts.push(
+        db
+          .prepare(
+            `SELECT fingerprint_sha256 FROM donated_outbounds WHERE fingerprint_sha256 IN (${placeholders})`
+          )
+          .bind(...chunk)
+      );
+    }
+    const lookupRes = await executeD1Batch<{ fingerprint_sha256: string }>(db, lookupStmts);
+    for (const res of lookupRes) {
+      for (const row of res.results || []) {
+        if (row.fingerprint_sha256) existingFps.add(String(row.fingerprint_sha256));
+      }
+    }
+  }
+
+  const allowWeb = ['free_only', 'both', 'all', 'auto', 'web_browsing'].includes(allocationMode) ? 1 : 0;
+  const allowDownload = ['free_only', 'both', 'all', 'auto', 'download'].includes(allocationMode) ? 1 : 0;
+  const allowGaming = ['gaming_only', 'all', 'gaming'].includes(allocationMode) ? 1 : 0;
+  const allowStatic = ['static_only', 'both', 'all', 'static_ip'].includes(allocationMode) ? 1 : 0;
+  const assignedTier =
+    allocationMode === 'gaming_only' || allocationMode === 'gaming'
+      ? 'gaming'
+      : allocationMode === 'static_only' || allocationMode === 'static_ip'
+      ? 'static_ip'
+      : allocationMode === 'download'
+      ? 'download'
+      : 'web_browsing';
+
+  const insertSql = `INSERT INTO donated_outbounds (
+       donor_user_id, tag, protocol, server_address, server_port, config_json,
+       latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
+       raw_link, fingerprint_sha256, is_official, label, country_code, country_name,
+       allow_web, allow_download, allow_gaming, allow_static_ip, allocation_mode,
+       last_online_at, last_checked_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
+
+  const insertStmts: D1PreparedStatement[] = [];
+  let duplicates = 0;
+
+  for (const parsed of limited) {
+    if (existingFps.has(parsed.fingerprint_sha256)) {
+      duplicates += 1;
+      continue;
+    }
+    existingFps.add(parsed.fingerprint_sha256);
+    insertStmts.push(
+      db
+        .prepare(insertSql)
+        .bind(
+          null,
+          parsed.tag,
+          parsed.protocol,
+          parsed.server_address,
+          parsed.server_port,
+          JSON.stringify(parsed.config_json),
+          80,
+          15.0,
+          assignedTier,
+          100,
+          parsed.raw_link,
+          parsed.fingerprint_sha256,
+          parsed.tag,
+          parsed.country_code,
+          parsed.country_name,
+          allowWeb,
+          allowDownload,
+          allowGaming,
+          allowStatic,
+          allocationMode
+        )
+    );
+  }
+
+  if (insertStmts.length > 0) {
+    await executeD1Batch(db, insertStmts);
+    invalidateNodesCache(db);
+  }
+
+  return { added: insertStmts.length, duplicates };
 }
 
 async function handleAdminOutboundSubmission(
@@ -741,13 +831,11 @@ async function handleAdminOutboundSubmission(
       return;
     }
 
-    let added = 0;
-    let duplicates = 0;
-    for (const node of nodes.slice(0, 100)) {
-      const res = await insertOfficialOutboundD1(env.DB, node, allocationMode);
-      if (res.inserted) added += 1;
-      else if (res.duplicate) duplicates += 1;
-    }
+    const { added, duplicates } = await batchInsertOfficialOutboundsD1(
+      env.DB,
+      nodes,
+      allocationMode
+    );
 
     const category =
       allocationMode === 'gaming_only' || allocationMode === 'gaming'
@@ -991,11 +1079,9 @@ async function handleAdminSubSourceSubmission(
       const parsedSub = await parseSubscriptionPayload(body);
       totalNodes = parsedSub.nodes.length;
       skipped = parsedSub.skipped;
-      for (const node of parsedSub.nodes.slice(0, 100)) {
-        const res = await insertOfficialOutboundD1(env.DB, node, category);
-        if (res.inserted) addedNodes += 1;
-        else if (res.duplicate) duplicates += 1;
-      }
+      const batchRes = await batchInsertOfficialOutboundsD1(env.DB, parsedSub.nodes, category);
+      addedNodes = batchRes.added;
+      duplicates = batchRes.duplicates;
     } else {
       fetchWarning = `\n⚠️ دریافت اولیه نودها با کد HTTP ${resp.status} مواجه شد، اما منبع در دیتابیس ذخیره گردید.`;
     }
@@ -1179,21 +1265,28 @@ function buildAdminAddNodeView(): { text: string; replyMarkup: Record<string, un
 async function buildAdminNodesView(
   env: Env
 ): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
-  const counts = await env.DB.prepare(
-    `SELECT
-       COUNT(*) AS total,
-       SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_cnt,
-       SUM(CASE WHEN status = 'active' AND allow_gaming = 1 THEN 1 ELSE 0 END) AS gaming_cnt,
-       SUM(CASE WHEN status = 'active' AND allow_static_ip = 1 THEN 1 ELSE 0 END) AS static_cnt
-     FROM donated_outbounds`
-  ).first<{ total: number; active_cnt: number | null; gaming_cnt: number | null; static_cnt: number | null }>();
+  const [countsRes, recentRes] = await executeD1Batch<Record<string, unknown>>(env.DB, [
+    env.DB.prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_cnt,
+         SUM(CASE WHEN status = 'active' AND allow_gaming = 1 THEN 1 ELSE 0 END) AS gaming_cnt,
+         SUM(CASE WHEN status = 'active' AND allow_static_ip = 1 THEN 1 ELSE 0 END) AS static_cnt
+       FROM donated_outbounds`
+    ),
+    env.DB.prepare(
+      `SELECT id, tag, protocol, country_code, status, latency_ms, allocation_mode
+       FROM donated_outbounds
+       ORDER BY id DESC
+       LIMIT 10`
+    ),
+  ]);
 
-  const recent = await env.DB.prepare(
-    `SELECT id, tag, protocol, country_code, status, latency_ms, allocation_mode
-     FROM donated_outbounds
-     ORDER BY id DESC
-     LIMIT 10`
-  ).all<{
+  const counts = (countsRes?.results?.[0] as unknown as
+    | { total: number; active_cnt: number | null; gaming_cnt: number | null; static_cnt: number | null }
+    | undefined) ?? null;
+
+  const recentRows = ((recentRes?.results || []) as unknown) as Array<{
     id: number;
     tag: string;
     protocol: string;
@@ -1201,9 +1294,9 @@ async function buildAdminNodesView(
     status: string;
     latency_ms: number;
     allocation_mode: string;
-  }>();
+  }>;
 
-  const lines = (recent.results || []).map((n) => {
+  const lines = recentRows.map((n) => {
     const icon = n.status === 'active' ? '🟢' : '🔴';
     return `${icon} <b>#${n.id}</b> <code>${escapeHtml(n.protocol)}</code> | ${escapeHtml(n.tag.slice(0, 28))} (${escapeHtml(n.country_code)}) — <code>${escapeHtml(n.allocation_mode)}</code>`;
   });
@@ -1408,54 +1501,75 @@ async function findSubscriptionForAdmin(db: D1Database, rawQuery: string): Promi
 async function buildAdminStatsView(
   env: Env
 ): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
-  const userStats = await env.DB.prepare(
-    `SELECT
-       COUNT(*) AS total_users,
-       SUM(CASE WHEN role = 'admin' THEN 1 ELSE 0 END) AS admin_users,
-       SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_users
-     FROM users`
-  ).first<{ total_users: number; admin_users: number | null; active_users: number | null }>();
+  const [
+    userStatsRes,
+    subStatsRes,
+    tierBreakdownRes,
+    nodeStatsRes,
+    sourceStatsRes,
+    pendingStatsRes,
+  ] = await executeD1Batch<Record<string, unknown>>(env.DB, [
+    env.DB.prepare(
+      `SELECT
+         COUNT(*) AS total_users,
+         SUM(CASE WHEN role = 'admin' THEN 1 ELSE 0 END) AS admin_users,
+         SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_users
+       FROM users`
+    ),
+    env.DB.prepare(
+      `SELECT
+         COUNT(*) AS total_subs,
+         SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_subs,
+         SUM(upload_bytes + download_bytes) AS total_bytes
+       FROM subscriptions`
+    ),
+    env.DB.prepare(
+      `SELECT tier, COUNT(*) AS cnt FROM subscriptions WHERE status = 'active' GROUP BY tier`
+    ),
+    env.DB.prepare(
+      `SELECT
+         COUNT(*) AS total_nodes,
+         SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_nodes,
+         SUM(CASE WHEN is_official = 1 THEN 1 ELSE 0 END) AS official_nodes,
+         SUM(CASE WHEN status = 'active' AND allow_gaming = 1 THEN 1 ELSE 0 END) AS gaming_nodes,
+         SUM(CASE WHEN status = 'active' AND allow_static_ip = 1 THEN 1 ELSE 0 END) AS static_nodes
+       FROM donated_outbounds`
+    ),
+    env.DB.prepare('SELECT COUNT(*) AS total_sources FROM subscription_sources'),
+    env.DB.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM donated_outbounds WHERE status = 'pending') AS pending_nodes,
+         (SELECT COUNT(*) FROM donations WHERE status = 'pending') AS pending_donations,
+         (SELECT COUNT(*) FROM support_tickets WHERE status = 'open') AS open_tickets`
+    ),
+  ]);
 
-  const subStats = await env.DB.prepare(
-    `SELECT
-       COUNT(*) AS total_subs,
-       SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_subs,
-       SUM(upload_bytes + download_bytes) AS total_bytes
-     FROM subscriptions`
-  ).first<{ total_subs: number; active_subs: number | null; total_bytes: number | null }>();
+  const userStats = (userStatsRes?.results?.[0] as unknown as
+    | { total_users: number; admin_users: number | null; active_users: number | null }
+    | undefined) ?? null;
+  const subStats = (subStatsRes?.results?.[0] as unknown as
+    | { total_subs: number; active_subs: number | null; total_bytes: number | null }
+    | undefined) ?? null;
+  const tierBreakdown = {
+    results: ((tierBreakdownRes?.results || []) as unknown) as Array<{ tier: string; cnt: number }>,
+  };
+  const nodeStats = (nodeStatsRes?.results?.[0] as unknown as
+    | {
+        total_nodes: number;
+        active_nodes: number | null;
+        official_nodes: number | null;
+        gaming_nodes: number | null;
+        static_nodes: number | null;
+      }
+    | undefined) ?? null;
+  const sourceStats = (sourceStatsRes?.results?.[0] as unknown as
+    | { total_sources: number }
+    | undefined) ?? null;
+  const pendingStats = (pendingStatsRes?.results?.[0] as unknown as
+    | { pending_nodes: number; pending_donations: number; open_tickets: number }
+    | undefined) ?? null;
 
-  const tierBreakdown = await env.DB.prepare(
-    `SELECT tier, COUNT(*) AS cnt FROM subscriptions WHERE status = 'active' GROUP BY tier`
-  ).all<{ tier: string; cnt: number }>();
-
-  const nodeStats = await env.DB.prepare(
-    `SELECT
-       COUNT(*) AS total_nodes,
-       SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active_nodes,
-       SUM(CASE WHEN is_official = 1 THEN 1 ELSE 0 END) AS official_nodes,
-       SUM(CASE WHEN status = 'active' AND allow_gaming = 1 THEN 1 ELSE 0 END) AS gaming_nodes,
-       SUM(CASE WHEN status = 'active' AND allow_static_ip = 1 THEN 1 ELSE 0 END) AS static_nodes
-     FROM donated_outbounds`
-  ).first<{
-    total_nodes: number;
-    active_nodes: number | null;
-    official_nodes: number | null;
-    gaming_nodes: number | null;
-    static_nodes: number | null;
-  }>();
-
-  const sourceStats = await env.DB.prepare(
-    'SELECT COUNT(*) AS total_sources FROM subscription_sources'
-  ).first<{ total_sources: number }>();
-
-  const pendingStats = await env.DB.prepare(
-    `SELECT
-       (SELECT COUNT(*) FROM donated_outbounds WHERE status = 'pending') AS pending_nodes,
-       (SELECT COUNT(*) FROM donations WHERE status = 'pending') AS pending_donations,
-       (SELECT COUNT(*) FROM support_tickets WHERE status = 'open') AS open_tickets`
-  ).first<{ pending_nodes: number; pending_donations: number; open_tickets: number }>();
-
-  const gamingLive = await hasActiveGamingOutbounds(env.DB);
+  const gamingLive = (nodeStats?.gaming_nodes || 0) > 0 || (await hasActiveGamingOutbounds(env.DB));
   const tierLines = (tierBreakdown.results || [])
     .map((t) => `   • ${escapeHtml(t.tier)}: <b>${t.cnt}</b>`)
     .join('\n');
@@ -2323,6 +2437,7 @@ async function handleCallbackQuery(
           )
             .bind(nodeId)
             .run();
+          invalidateNodesCache(env.DB);
 
           if (nodeRow.donor_telegram_id) {
             await tgSendMessage(
@@ -2341,6 +2456,7 @@ async function handleCallbackQuery(
           )
             .bind('رد شده توسط مدیریت', nodeId)
             .run();
+          invalidateNodesCache(env.DB);
 
           if (nodeRow.donor_telegram_id) {
             await tgSendMessage(
@@ -2402,30 +2518,31 @@ async function handleCallbackQuery(
             ? 500 * 1024 * 1024 * 1024
             : 200 * 1024 * 1024 * 1024;
 
-          await env.DB.prepare(
-            `UPDATE donations SET status = 'approved', subscription_granted = 1 WHERE id = ?`
-          )
-            .bind(donId)
-            .run();
-
           const userSub = await env.DB.prepare(
             'SELECT id, expires_at FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1'
           )
             .bind(donRow.user_id)
             .first<{ id: number; expires_at: string }>();
 
+          const approveBatch: D1PreparedStatement[] = [
+            env.DB.prepare(
+              `UPDATE donations SET status = 'approved', subscription_granted = 1 WHERE id = ?`
+            ).bind(donId),
+          ];
+
           if (userSub) {
             const baseMs = Math.max(Date.now(), Date.parse(userSub.expires_at) || Date.now());
             const nextExpires = new Date(baseMs + 30 * 24 * 60 * 60 * 1000).toISOString();
-            await env.DB.prepare(
-              `UPDATE subscriptions
-               SET tier = ?, traffic_limit_bytes = ?, status = 'active',
-                   expires_at = ?, updated_at = CURRENT_TIMESTAMP
-               WHERE id = ?`
-            )
-              .bind(targetTier, targetLimit, nextExpires, userSub.id)
-              .run();
+            approveBatch.push(
+              env.DB.prepare(
+                `UPDATE subscriptions
+                 SET tier = ?, traffic_limit_bytes = ?, status = 'active',
+                     expires_at = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?`
+              ).bind(targetTier, targetLimit, nextExpires, userSub.id)
+            );
           }
+          await executeD1Batch(env.DB, approveBatch);
 
           if (donRow.telegram_id) {
             await tgSendMessage(

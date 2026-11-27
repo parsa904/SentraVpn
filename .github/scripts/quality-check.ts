@@ -661,9 +661,10 @@ async function evaluateSubscriptionSource(
     const res = await evaluateNode(pseudoRemote, singboxAvailable);
     if (res.is_healthy && res.security_passed) {
       healthyCount += 1;
-      if (!existingFingerprints.has(parsedNode.fingerprint_sha256)) {
-        existingFingerprints.add(parsedNode.fingerprint_sha256);
+      if (existingFingerprints.has(parsedNode.fingerprint_sha256)) {
+        return;
       }
+      existingFingerprints.add(parsedNode.fingerprint_sha256);
       discoveredHealthy.push({
         tag: parsedNode.tag,
         protocol: parsedNode.protocol,

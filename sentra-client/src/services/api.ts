@@ -17,7 +17,11 @@ import {
   type RawAuthApiResponse,
 } from '../utils/proxyParser';
 import type { BatteryOptimizationStatus } from '../utils/reconnectPolicy';
-import { clearOfflineConfigCache } from '../utils/offlineCache';
+import {
+  clearOfflineConfigCache,
+  loadCachedSingboxConfig,
+  saveCachedSingboxConfig,
+} from '../utils/offlineCache';
 import {
   extractSingboxConfig,
   translateNetworkErrorToPersian,
@@ -280,8 +284,109 @@ async function fetchBackendJson<T>(
   throw new Error(lastError);
 }
 
+async function fetchBackendConfigWithEtag(
+  path: string,
+  options: RequestInit & { timeoutMs?: number },
+  cachedEtag: string | null
+): Promise<{ notModified: true; etag: string | null } | { notModified: false; data: Record<string, unknown>; etag: string | null }> {
+  let lastError = 'امکان برقراری ارتباط با سرور مرکزی سنترا وجود ندارد.';
+  const timeoutMs = options.timeoutMs ?? 12000;
+
+  for (const baseUrl of getActiveBackendUrls()) {
+    const url = baseUrl ? `${baseUrl.replace(/\/$/, '')}${path}` : path;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        ...((options.headers as Record<string, string>) || {}),
+      };
+      if (cachedEtag) {
+        headers['If-None-Match'] = cachedEtag;
+      }
+
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+        headers,
+      });
+      clearTimeout(timer);
+
+      if (response.status === 304) {
+        return {
+          notModified: true,
+          etag: response.headers.get('ETag') || cachedEtag,
+        };
+      }
+
+      if (response.status === 401 || response.status === 403) {
+        let detail = 'نشست کاربری منقضی یا لغو شده است. لطفاً دوباره وارد شوید.';
+        try {
+          const errJson = (await response.json()) as { error?: string; message?: string };
+          if (errJson.error || errJson.message) {
+            detail = errJson.error || errJson.message || detail;
+          }
+        } catch {
+          // keep default message
+        }
+        throw new Error(`AUTH_EXPIRED:${detail}`);
+      }
+
+      const text = await response.text();
+      let parsed: Record<string, unknown> = {};
+      try {
+        parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      } catch {
+        parsed = {};
+      }
+
+      if (!response.ok) {
+        const msg =
+          (typeof parsed.error === 'string' && parsed.error) ||
+          (typeof parsed.message === 'string' && parsed.message) ||
+          translateNetworkErrorToPersian(null, response.status);
+        if (response.status >= 500) {
+          void reportClientError({
+            moduleOrFile: 'sentra-client/src/services/api.ts',
+            actionOrRoute: `${options.method || 'GET'} ${path}`,
+            error: new Error(msg),
+            context: { http_status: response.status },
+          });
+        }
+        throw new Error(msg);
+      }
+
+      return {
+        notModified: false,
+        data: parsed,
+        etag: response.headers.get('ETag'),
+      };
+    } catch (err) {
+      clearTimeout(timer);
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.startsWith('AUTH_EXPIRED:')) {
+        throw err;
+      }
+      if (
+        !message.includes('Failed to fetch') &&
+        !message.includes('AbortError') &&
+        !message.includes('aborted') &&
+        !message.includes('Timeout') &&
+        !message.includes('NetworkError') &&
+        !message.includes('Load failed')
+      ) {
+        throw new Error(translateNetworkErrorToPersian(err));
+      }
+      lastError = translateNetworkErrorToPersian(err);
+    }
+  }
+
+  throw new Error(lastError);
+}
+
 /**
  * Fetches and validates a sing-box 1.14+ configuration from POST /api/v1/client/config,
+ * using ETag / 304 Not Modified + local device cache for offline resilience and
  * automatically falling back to GET /sub/{token}?format=singbox if needed.
  */
 export async function fetchSingboxClientConfig(
@@ -289,56 +394,88 @@ export async function fetchSingboxClientConfig(
   mode: ConnectionModeId = 'web_browsing',
   locationCode?: string
 ): Promise<Record<string, unknown>> {
+  const cached = loadCachedSingboxConfig(token, mode, locationCode);
   try {
-    const raw = await fetchBackendJson<Record<string, unknown>>('/api/v1/client/config', {
-      method: 'POST',
-      headers: {
-        'X-Subscription-Token': token,
-        'X-Device-Id': getOrCreateWebDeviceId(),
+    const res = await fetchBackendConfigWithEtag(
+      '/api/v1/client/config',
+      {
+        method: 'POST',
+        headers: {
+          'X-Subscription-Token': token,
+          'X-Device-Id': getOrCreateWebDeviceId(),
+        },
+        body: JSON.stringify({
+          token,
+          mode,
+          ...(locationCode && locationCode !== 'auto' ? { location_code: locationCode } : {}),
+        }),
+        timeoutMs: 12000,
       },
-      body: JSON.stringify({
-        token,
-        mode,
-        ...(locationCode && locationCode !== 'auto' ? { location_code: locationCode } : {}),
-      }),
-      timeoutMs: 12000,
-    });
-    const extracted = extractSingboxConfig(raw);
+      cached?.etag ?? null
+    );
+    if (res.notModified && cached?.config) {
+      return cached.config;
+    }
+    if (res.notModified) {
+      throw new Error('پیکربندی کش‌شده روی دستگاه یافت نشد.');
+    }
+    const extracted = extractSingboxConfig(res.data);
     const validated = validateSingbox114Config(extracted);
     if (!validated.valid) {
       throw new Error(validated.errors[0] || 'پیکربندی دریافتی با sing-box 1.14+ سازگار نیست.');
     }
+    saveCachedSingboxConfig(token, mode, locationCode, validated.config, res.etag);
     return validated.config;
   } catch (primaryErr) {
     const msg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
     if (msg.startsWith('AUTH_EXPIRED:')) {
       throw primaryErr;
     }
-    return fetchSingboxSubscriptionConfig(token, mode, locationCode);
+    try {
+      return await fetchSingboxSubscriptionConfig(token, mode, locationCode);
+    } catch (fallbackErr) {
+      const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      if (!fbMsg.startsWith('AUTH_EXPIRED:') && cached?.config) {
+        return cached.config;
+      }
+      throw fallbackErr;
+    }
   }
 }
 
 /**
- * Fetches a sing-box 1.14+ configuration directly from GET /sub/{token}?format=singbox.
+ * Fetches a sing-box 1.14+ configuration directly from GET /sub/{token}?format=singbox
+ * with ETag / 304 Not Modified and local cache persistence.
  */
 export async function fetchSingboxSubscriptionConfig(
   token: string,
   mode: ConnectionModeId = 'web_browsing',
   locationCode?: string
 ): Promise<Record<string, unknown>> {
+  const cached = loadCachedSingboxConfig(token, mode, locationCode);
   const params = new URLSearchParams({ format: 'singbox', mode });
   if (locationCode && locationCode !== 'auto') {
     params.set('location', locationCode);
   }
   const path = `/sub/${encodeURIComponent(token.trim())}?${params.toString()}`;
-  const raw = await fetchBackendJson<Record<string, unknown>>(path, {
-    method: 'GET',
-    headers: {
-      Accept: 'application/json',
+  const res = await fetchBackendConfigWithEtag(
+    path,
+    {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+      timeoutMs: 12000,
     },
-    timeoutMs: 12000,
-  });
-  const extracted = extractSingboxConfig(raw);
+    cached?.etag ?? null
+  );
+  if (res.notModified && cached?.config) {
+    return cached.config;
+  }
+  if (res.notModified) {
+    throw new Error('پیکربندی کش‌شده روی دستگاه یافت نشد.');
+  }
+  const extracted = extractSingboxConfig(res.data);
   const validated = validateSingbox114Config(extracted);
   if (!validated.valid) {
     const err = new Error(validated.errors[0] || 'پیکربندی لینک اشتراک با sing-box 1.14+ سازگار نیست.');
@@ -351,6 +488,7 @@ export async function fetchSingboxSubscriptionConfig(
     });
     throw err;
   }
+  saveCachedSingboxConfig(token, mode, locationCode, validated.config, res.etag);
   return validated.config;
 }
 

@@ -1,6 +1,7 @@
 import { routeRequest } from './routes.ts';
 import {
   dispatchErrorAlert,
+  pruneStaleRecords,
   sendDatabaseBackup,
   sendErrorAlert,
 } from './telegramTopics.ts';
@@ -40,7 +41,11 @@ function applySecurityAndCorsHeaders(
     headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     headers.set(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-Subscription-Token, X-Device-Id, X-Quality-Secret, X-App-Version'
+      'Content-Type, Authorization, X-Subscription-Token, X-Device-Id, X-Quality-Secret, X-App-Version, If-None-Match'
+    );
+    headers.set(
+      'Access-Control-Expose-Headers',
+      'ETag, Subscription-Userinfo, Profile-Update-Interval'
     );
   }
 
@@ -92,8 +97,15 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<void> {
-    const runBackup = async (): Promise<void> => {
+    const runScheduledMaintenance = async (): Promise<void> => {
       try {
+        try {
+          await pruneStaleRecords(env.DB);
+        } catch (pruneErr) {
+          console.error('[Sentra Scheduled Prune Error]', pruneErr);
+          await sendErrorAlert(env, 'index.ts (scheduled prune)', pruneErr);
+        }
+
         const res = await sendDatabaseBackup(env);
         if (!res.ok) {
           console.error('[Sentra Scheduled Backup Failed]', res.error);
@@ -105,9 +117,9 @@ export default {
     };
 
     if (ctx && typeof ctx.waitUntil === 'function') {
-      ctx.waitUntil(runBackup());
+      ctx.waitUntil(runScheduledMaintenance());
     } else {
-      await runBackup();
+      await runScheduledMaintenance();
     }
   },
 } satisfies ExportedHandler<Env>;

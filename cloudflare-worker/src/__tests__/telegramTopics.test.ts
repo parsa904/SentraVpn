@@ -32,33 +32,57 @@ function createSqliteD1Adapter(options?: { skipSystemSettings?: boolean }): {
     sqlite.exec(stmt);
   }
 
+  const executedSqls: string[] = [];
+
   const db = {
     prepare(query: string) {
       let params: unknown[] = [];
       const stmtObj = {
+        __query: query,
+        __getParams: () => params,
         bind(...args: unknown[]) {
           params = args;
           return stmtObj;
         },
         async first<T = Record<string, unknown>>() {
+          executedSqls.push(query);
           const row = sqlite.prepare(query).get(...(params as never[])) as T | undefined;
           return row ?? null;
         },
         async all<T = Record<string, unknown>>() {
-          const rows = sqlite.prepare(query).all(...(params as never[])) as T[];
-          return { results: rows };
-        },
-        async run() {
+          executedSqls.push(query);
+          const isSelect = /^\s*SELECT/i.test(query);
+          if (isSelect) {
+            const rows = sqlite.prepare(query).all(...(params as never[])) as T[];
+            return { success: true, results: rows, meta: { changes: 0 } };
+          }
           const info = sqlite.prepare(query).run(...(params as never[]));
           return {
             success: true,
-            meta: { last_row_id: Number(info.lastInsertRowid) },
+            results: [] as T[],
+            meta: { last_row_id: Number(info.lastInsertRowid), changes: Number(info.changes) },
+          };
+        },
+        async run() {
+          executedSqls.push(query);
+          const info = sqlite.prepare(query).run(...(params as never[]));
+          return {
+            success: true,
+            meta: { last_row_id: Number(info.lastInsertRowid), changes: Number(info.changes) },
           };
         },
       };
       return stmtObj;
     },
-  } as unknown as D1Database;
+    async batch<T = Record<string, unknown>>(stmts: Array<{ all: () => Promise<unknown> }>) {
+      const out = [];
+      for (const s of stmts) {
+        out.push(await s.all());
+      }
+      return out as Array<D1Result<T>>;
+    },
+  } as unknown as D1Database & { __executedSqls?: string[] };
+  (db as unknown as { __executedSqls: string[] }).__executedSqls = executedSqls;
 
   return { db, sqlite };
 }
@@ -72,13 +96,28 @@ test('pure helpers: extractSupportUid and buildBackupFilename work deterministic
   assert.equal(buildBackupFilename(fixed), 'sentra-backup-2026-11-27-09-05.json');
 });
 
-test('auto-creates system_settings table on demand without manual migration', async () => {
-  const { db, sqlite } = createSqliteD1Adapter({ skipSystemSettings: true });
+test('system_settings uses zero runtime DDL and serves repeat reads from isolate RAM cache', async () => {
+  const { db, sqlite } = createSqliteD1Adapter();
+  const executedSqls = (db as unknown as { __executedSqls: string[] }).__executedSqls;
   try {
     await saveTopicRoute(db, 'logs', -1001234567890, 101);
-    const cfg = await getTopicRoutingConfig(db);
-    assert.equal(cfg.logGroupId, '-1001234567890');
-    assert.equal(cfg.topicLogsId, '101');
+    const cfg1 = await getTopicRoutingConfig(db);
+    assert.equal(cfg1.logGroupId, '-1001234567890');
+    assert.equal(cfg1.topicLogsId, '101');
+
+    const countAfterFirstRead = executedSqls.length;
+    const cfg2 = await getTopicRoutingConfig(db);
+    assert.equal(cfg2.topicLogsId, '101');
+    assert.equal(
+      executedSqls.length,
+      countAfterFirstRead,
+      'Expected second getTopicRoutingConfig call to be served from isolate RAM cache'
+    );
+    assert.equal(
+      executedSqls.some((q) => /CREATE\s+TABLE/i.test(q)),
+      false,
+      'Runtime CREATE TABLE DDL must never execute'
+    );
   } finally {
     sqlite.close();
   }
@@ -406,12 +445,12 @@ test('sendDatabaseBackup exports all D1 tables as JSON FormData document to back
       )
       .run();
 
-    // 1. Direct sendDatabaseBackup check
+    // 1. Direct sendDatabaseBackup check (6 core tables only, excludes temp tables)
     const fixedDate = new Date('2026-11-27T14:30:00.000Z');
     const result = await sendDatabaseBackup(env, fixedDate);
     assert.equal(result.ok, true);
     assert.equal(result.filename, 'sentra-backup-2026-11-27-14-30.json');
-    assert.ok((result.tablesCount || 0) >= 10);
+    assert.equal(result.tablesCount, 6);
     assert.ok(capturedUrl.includes('/sendDocument'));
     assert.ok(capturedForm);
     assert.equal(capturedForm.get('chat_id'), '-100333444');
@@ -425,7 +464,13 @@ test('sendDatabaseBackup exports all D1 tables as JSON FormData document to back
     };
     assert.equal(parsedBackup.project, 'SentraVPN');
     assert.equal(parsedBackup.tables.users.length, 1);
+    assert.ok(Array.isArray(parsedBackup.tables.subscriptions));
+    assert.ok(Array.isArray(parsedBackup.tables.donated_outbounds));
+    assert.ok(Array.isArray(parsedBackup.tables.subscription_sources));
+    assert.ok(Array.isArray(parsedBackup.tables.donations));
     assert.ok(Array.isArray(parsedBackup.tables.system_settings));
+    assert.equal('telegram_states' in parsedBackup.tables, false);
+    assert.equal('traffic_logs' in parsedBackup.tables, false);
 
     // 2. Manual backup via /admin button (adm_backup_now)
     capturedForm = null;

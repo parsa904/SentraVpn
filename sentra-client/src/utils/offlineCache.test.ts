@@ -6,9 +6,11 @@ import {
   loadCachedActiveServer,
   loadCachedBootstrapSnapshot,
   loadCachedDonationsSnapshot,
+  loadCachedSingboxConfig,
   saveCachedActiveServer,
   saveCachedBootstrapSnapshot,
   saveCachedDonationsSnapshot,
+  saveCachedSingboxConfig,
 } from './offlineCache.ts';
 import type { ActiveServerSelection, BootstrapResponse, DonatedOutboundRecord } from '../types/sentra.ts';
 
@@ -168,9 +170,25 @@ test('caches and restores last known configuration synchronously with token scop
   saveCachedActiveServer(tokenA, activeSel, storage);
   assert.equal(loadCachedActiveServer(tokenA, storage)?.id, 'node-1');
 
+  // Sing-box compiled config + ETag caching for 304 Not Modified & offline fallback
+  saveCachedSingboxConfig(
+    tokenA,
+    'web_browsing',
+    'DE',
+    { outbounds: [{ type: 'vless', tag: 'DE-1' }] },
+    'W/"abc1234567890def"',
+    storage
+  );
+  const restoredSingbox = loadCachedSingboxConfig(tokenA, 'web_browsing', 'DE', storage);
+  assert.ok(restoredSingbox);
+  assert.equal(restoredSingbox.etag, 'W/"abc1234567890def"');
+  assert.equal(loadCachedSingboxConfig(tokenB, 'web_browsing', 'DE', storage), null);
+  assert.equal(loadCachedSingboxConfig(tokenA, 'gaming', 'DE', storage), null);
+
   // Logout clears cached config cleanly
   await clearOfflineConfigCache(tokenA, storage);
   assert.equal(loadCachedBootstrapSnapshot(tokenA, storage), null);
   assert.equal(loadCachedDonationsSnapshot(tokenA, storage), null);
   assert.equal(loadCachedActiveServer(tokenA, storage), null);
+  assert.equal(loadCachedSingboxConfig(tokenA, 'web_browsing', 'DE', storage), null);
 });

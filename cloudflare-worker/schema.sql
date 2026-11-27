@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX IF NOT EXISTS idx_users_uuid ON users(user_uuid);
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 CREATE INDEX IF NOT EXISTS idx_users_auth_code ON users(auth_code);
 CREATE INDEX IF NOT EXISTS idx_users_link_code ON users(link_code);
 
@@ -58,6 +59,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 
 CREATE INDEX IF NOT EXISTS idx_subscriptions_token ON subscriptions(token);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_user_status ON subscriptions(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_tier ON subscriptions(tier);
 
 -- 3. DEVICE_SESSIONS
@@ -78,6 +80,7 @@ CREATE TABLE IF NOT EXISTS device_sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_device_sessions_sub_id ON device_sessions(subscription_id);
+CREATE INDEX IF NOT EXISTS idx_device_sessions_sub_active ON device_sessions(subscription_id, is_active);
 CREATE INDEX IF NOT EXISTS idx_device_sessions_last_seen ON device_sessions(last_seen_at);
 
 -- 4. OUTBOUNDS (Core Static Outbounds)
@@ -108,6 +111,7 @@ CREATE TABLE IF NOT EXISTS outbounds (
 );
 
 CREATE INDEX IF NOT EXISTS idx_outbounds_mode ON outbounds(mode_category);
+CREATE INDEX IF NOT EXISTS idx_outbounds_active_mode ON outbounds(is_active, mode_category);
 CREATE INDEX IF NOT EXISTS idx_outbounds_min_tier ON outbounds(min_tier);
 
 -- 4.1. DONATED_OUTBOUNDS (Official Admin + Community Ecosystem Outbounds)
@@ -167,6 +171,8 @@ CREATE INDEX IF NOT EXISTS idx_donated_allow_static ON donated_outbounds(allow_s
 CREATE INDEX IF NOT EXISTS idx_donated_allow_gaming ON donated_outbounds(allow_gaming);
 CREATE INDEX IF NOT EXISTS idx_donated_allow_web ON donated_outbounds(allow_web);
 CREATE INDEX IF NOT EXISTS idx_donated_allow_dl ON donated_outbounds(allow_download);
+CREATE INDEX IF NOT EXISTS idx_donated_status_official_health ON donated_outbounds(status, is_official, health_score);
+CREATE INDEX IF NOT EXISTS idx_donated_status_updated_at ON donated_outbounds(status, updated_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_donated_fingerprint ON donated_outbounds(fingerprint_sha256);
 
 -- 4.2. SUBSCRIPTION_SOURCES (Admin Subscription URLs)
@@ -199,6 +205,7 @@ CREATE TABLE IF NOT EXISTS donations (
 
 CREATE INDEX IF NOT EXISTS idx_donations_user_id ON donations(user_id);
 CREATE INDEX IF NOT EXISTS idx_donations_status ON donations(status);
+CREATE INDEX IF NOT EXISTS idx_donations_status_user ON donations(status, user_id);
 CREATE INDEX IF NOT EXISTS idx_donations_file_unique_id ON donations(file_unique_id);
 CREATE INDEX IF NOT EXISTS idx_donations_image_sha256 ON donations(image_sha256);
 
@@ -265,6 +272,7 @@ CREATE TABLE IF NOT EXISTS support_tickets (
 
 CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON support_tickets(user_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON support_tickets(status);
+CREATE INDEX IF NOT EXISTS idx_tickets_user_status ON support_tickets(user_id, status);
 
 -- 7. APP_RELEASES
 CREATE TABLE IF NOT EXISTS app_releases (
@@ -293,6 +301,9 @@ CREATE TABLE IF NOT EXISTS telegram_states (
     payload_json            TEXT NOT NULL DEFAULT '{}',
     updated_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_telegram_states_telegram_id ON telegram_states(telegram_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_states_updated_at ON telegram_states(updated_at);
 
 -- 10. SYSTEM_SETTINGS (Telegram Forum Group & Topic IDs + Runtime Config)
 CREATE TABLE IF NOT EXISTS system_settings (

@@ -33,11 +33,13 @@ export interface UnifiedErrorReport {
 
 const REDACTED = '[REDACTED]';
 const TELEGRAM_MAX_MESSAGE_LEN = 3950;
-const DEDUP_WINDOW_MS = 60_000;
+export const ERROR_DEDUP_WINDOW_MS = 5 * 60_000; // 5-minute RAM deduplication window
+export const MAX_ERROR_DEDUP_KEYS = 100; // Strict FIFO cap in Worker isolate RAM
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const MAX_REPORTS_PER_CLIENT_PER_MIN = 10;
+const MAX_CLIENT_RATE_KEYS = 200;
 
-// In-memory sliding windows (per Worker isolate) to prevent crash-loop floods
+// In-memory sliding windows (per Worker isolate — zero D1 reads/writes)
 const recentFingerprints = new Map<string, number>();
 const clientHitTimestamps = new Map<string, number[]>();
 
@@ -312,26 +314,31 @@ export function resetErrorReporterThrottleForTests(): void {
   clientHitTimestamps.clear();
 }
 
+export function getDedupCacheSizeForTests(): number {
+  return recentFingerprints.size;
+}
+
 /**
  * Prevents crash-loop flooding on client ingestion endpoints via per-client rate
- * limiting and identical-error deduplication.
+ * limiting and identical-error deduplication completely inside Worker isolate RAM
+ * (5-minute window, max 100 keys with FIFO eviction, zero D1 writes).
  */
 export function checkIngestionRateAndDedup(
   report: Pick<UnifiedErrorReport, 'platform' | 'moduleOrFile' | 'errorName' | 'errorMessage'>,
   clientKey: string,
   nowMs: number = Date.now()
 ): { allowed: boolean; reason?: 'rate_limited' | 'deduplicated' } {
-  // Prune stale entries periodically to bound memory
-  if (recentFingerprints.size > 500) {
-    for (const [k, ts] of recentFingerprints.entries()) {
-      if (nowMs - ts > DEDUP_WINDOW_MS) recentFingerprints.delete(k);
-    }
-  }
-  if (clientHitTimestamps.size > 500) {
+  // Prune expired client windows if map exceeds bound
+  if (clientHitTimestamps.size >= MAX_CLIENT_RATE_KEYS) {
     for (const [k, list] of clientHitTimestamps.entries()) {
       const fresh = list.filter((ts) => nowMs - ts <= RATE_LIMIT_WINDOW_MS);
       if (fresh.length === 0) clientHitTimestamps.delete(k);
       else clientHitTimestamps.set(k, fresh);
+    }
+    while (clientHitTimestamps.size >= MAX_CLIENT_RATE_KEYS) {
+      const oldestClient = clientHitTimestamps.keys().next().value;
+      if (oldestClient === undefined) break;
+      clientHitTimestamps.delete(oldestClient);
     }
   }
 
@@ -344,7 +351,7 @@ export function checkIngestionRateAndDedup(
     return { allowed: false, reason: 'rate_limited' };
   }
 
-  // 2. Deduplicate identical error signature within DEDUP_WINDOW_MS
+  // 2. Deduplicate identical error signature within ERROR_DEDUP_WINDOW_MS (5 minutes)
   const fingerprint = [
     report.platform,
     report.moduleOrFile.slice(0, 80),
@@ -353,12 +360,29 @@ export function checkIngestionRateAndDedup(
   ].join('|');
 
   const lastSeen = recentFingerprints.get(fingerprint);
-  if (lastSeen !== undefined && nowMs - lastSeen < DEDUP_WINDOW_MS) {
+  if (lastSeen !== undefined && nowMs - lastSeen < ERROR_DEDUP_WINDOW_MS) {
     return { allowed: false, reason: 'deduplicated' };
+  }
+
+  // Prune expired entries first, then evict oldest FIFO key to enforce 100-key cap
+  if (recentFingerprints.size >= MAX_ERROR_DEDUP_KEYS && !recentFingerprints.has(fingerprint)) {
+    for (const [k, ts] of recentFingerprints.entries()) {
+      if (nowMs - ts >= ERROR_DEDUP_WINDOW_MS) {
+        recentFingerprints.delete(k);
+      }
+    }
+    while (recentFingerprints.size >= MAX_ERROR_DEDUP_KEYS) {
+      const oldestKey = recentFingerprints.keys().next().value;
+      if (oldestKey === undefined) break;
+      recentFingerprints.delete(oldestKey);
+    }
   }
 
   hits.push(nowMs);
   clientHitTimestamps.set(clientKey, hits);
+  if (recentFingerprints.has(fingerprint)) {
+    recentFingerprints.delete(fingerprint);
+  }
   recentFingerprints.set(fingerprint, nowMs);
   return { allowed: true };
 }
