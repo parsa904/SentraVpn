@@ -2304,7 +2304,7 @@ async function handleCallbackQuery(
             n.assigned_tier === 'gaming'
         ) ||
         activePool.core.some(
-          (c) => c.category === 'static_ip' || c.category === 'gaming'
+          (c) => c.mode_category === 'static_ip' || c.mode_category === 'gaming'
         );
 
       sub.has_used_special_trial = 1;

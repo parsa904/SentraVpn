@@ -1091,7 +1091,7 @@ export async function routeRequest(
           status: 429,
           headers: {
             'Content-Type': 'application/json; charset=utf-8',
-            'Retry-After': String(rate.retryAfterSeconds),
+            'Retry-After': String(rate.retryAfterSec),
           },
         }
       );

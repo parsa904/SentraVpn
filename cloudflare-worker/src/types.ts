@@ -125,6 +125,9 @@ export interface DonatedOutboundRow {
   last_online_at: string | null;
   allocation_mode: string;
   last_checked_at: string;
+  reward_granted?: number;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface HealthReportNodeResult {

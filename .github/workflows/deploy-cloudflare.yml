@@ -37,7 +37,7 @@ jobs:
           cache-dependency-path: cloudflare-worker/package.json
 
       - name: Install Cloudflare Worker dependencies
-        run: npm install --no-audit --no-fund
+        run: npm install --no-audit --no-fund --legacy-peer-deps
 
       - name: Run TypeScript type check
         run: npm run typecheck

@@ -13,7 +13,7 @@
     "db:migrate:remote": "wrangler d1 migrations apply sentra-db --remote"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250501.0",
+    "@cloudflare/workers-types": "^5.20261127.1",
     "typescript": "^5.7.3",
     "wrangler": "^4.14.0"
   }
