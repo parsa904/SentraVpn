@@ -5,7 +5,9 @@ import './index.css';
 import App from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { installGlobalErrorHandlers } from './utils/errorReporter';
+import { initClientSentry } from './utils/sentry';
 
+initClientSentry();
 installGlobalErrorHandlers();
 
 const isNativeTauri =

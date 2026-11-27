@@ -2,6 +2,7 @@ import {
   escapeTelegramHtml,
   sendToTopic,
 } from './telegramTopics.ts';
+import { logTelemetryToTurso } from './tursoClient.ts';
 import type { Env } from './types.ts';
 
 export type ErrorPlatform = 'worker' | 'github-actions' | 'android' | 'windows';
@@ -121,10 +122,16 @@ export function sanitizeSecrets(
     `$1${REDACTED}$3`
   );
 
-  // 9. Named env assignments like TELEGRAM_BOT_TOKEN=... or QUALITY_ENGINE_SECRET=...
+  // 9. Named env assignments like TELEGRAM_BOT_TOKEN=..., TURSO_AUTH_TOKEN=..., SENTRY_DSN_WORKER=...
   out = out.replace(
-    /(\b(?:TELEGRAM_BOT_TOKEN|QUALITY_ENGINE_SECRET|TELEGRAM_WEBHOOK_SECRET|WIREGUARD_KEY_SALT)\s*=\s*)([^\s"',;\r\n]+)/gi,
+    /(\b(?:TELEGRAM_BOT_TOKEN|QUALITY_ENGINE_SECRET|TELEGRAM_WEBHOOK_SECRET|WIREGUARD_KEY_SALT|TURSO_AUTH_TOKEN|SENTRY_DSN_WORKER|SENTRY_DSN_CLIENT)\s*=\s*)([^\s"',;\r\n]+)/gi,
     `$1${REDACTED}`
+  );
+
+  // 10. Sentry DSN credentials (`https://<public_key>@o123.ingest.sentry.io/456`)
+  out = out.replace(
+    /(https?:\/\/)([A-Za-z0-9]{16,64})(@[^\s"'<>]*sentry\.io)/gi,
+    `$1${REDACTED}$3`
   );
 
   return out;
@@ -137,6 +144,8 @@ function collectEnvSecrets(env?: Env): string[] {
     env.QUALITY_ENGINE_SECRET,
     env.TELEGRAM_WEBHOOK_SECRET,
     env.WIREGUARD_KEY_SALT,
+    env.SENTRY_DSN_WORKER,
+    env.TURSO_AUTH_TOKEN,
   ].filter((v): v is string => typeof v === 'string' && v.trim().length >= 6);
 }
 
@@ -456,9 +465,188 @@ export function parseExternalErrorPayload(raw: unknown):
   };
 }
 
+export interface ParsedSentryDsn {
+  publicKey: string;
+  host: string;
+  projectId: string;
+  envelopeUrl: string;
+}
+
 /**
- * Central sender: formats and sends any UnifiedErrorReport to `topic_logs_id`.
- * Never throws and never recurses.
+ * Parses a standard Sentry DSN (`https://<public_key>@<host>/<project_id>`)
+ * into the direct Sentry Envelope API URL (`https://<host>/api/<project_id>/envelope/`).
+ */
+export function parseSentryDsn(dsn?: string): ParsedSentryDsn | null {
+  const trimmed = (dsn || '').trim();
+  if (!trimmed) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+
+  if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || !parsed.username || !parsed.host) {
+    return null;
+  }
+
+  const segments = parsed.pathname.split('/').filter(Boolean);
+  const projectId = segments[segments.length - 1] || '';
+  if (!projectId || !/^\d+$/.test(projectId)) {
+    return null;
+  }
+
+  const prefixPath = segments.length > 1 ? `/${segments.slice(0, -1).join('/')}` : '';
+  return {
+    publicKey: parsed.username,
+    host: parsed.host,
+    projectId,
+    envelopeUrl: `${parsed.protocol}//${parsed.host}${prefixPath}/api/${projectId}/envelope/`,
+  };
+}
+
+function sanitizeContextObject(
+  context: Record<string, unknown> | undefined,
+  extraSecrets: string[]
+): Record<string, string> {
+  if (!context || typeof context !== 'object') return {};
+  const sensitiveKeyPattern =
+    /(token|secret|password|authorization|cookie|private_key|api_key|salt|dsn)/i;
+  const out: Record<string, string> = {};
+  for (const [rawKey, rawVal] of Object.entries(context).slice(0, 16)) {
+    const key = String(rawKey).replace(/[\r\n]/g, '').slice(0, 64);
+    out[key] = sensitiveKeyPattern.test(key)
+      ? REDACTED
+      : sanitizeContextValue(rawVal, extraSecrets);
+  }
+  return out;
+}
+
+/**
+ * Builds a lightweight Sentry Envelope payload (newline-delimited JSON) with all
+ * secrets redacted — zero Sentry SDK bundle overhead.
+ */
+export function buildSentryEnvelope(
+  dsn: ParsedSentryDsn,
+  report: UnifiedErrorReport,
+  extraSecrets: string[] = []
+): string {
+  const eventId = crypto.randomUUID().replace(/-/g, '');
+  const nowIso = new Date().toISOString();
+  const parsedTs = report.timestamp ? Date.parse(report.timestamp) : NaN;
+  const timestampSec = Number.isFinite(parsedTs) ? parsedTs / 1000 : Date.now() / 1000;
+
+  const errorName = sanitizeSecrets((report.errorName || 'Error').trim().slice(0, 120), extraSecrets);
+  const errorMessage = sanitizeSecrets(
+    (report.errorMessage || 'Unknown error').trim().slice(0, 1000),
+    extraSecrets
+  );
+  const moduleOrFile = sanitizeSecrets(
+    (report.moduleOrFile || 'unknown').trim().slice(0, 180),
+    extraSecrets
+  );
+  const actionOrRoute = sanitizeSecrets(
+    (report.actionOrRoute || 'unknown').trim().slice(0, 180),
+    extraSecrets
+  );
+  const appVersion = sanitizeSecrets(
+    (report.appVersion || 'worker-v1').trim().slice(0, 48),
+    extraSecrets
+  );
+  const sanitizedStack = report.stackTrace
+    ? sanitizeSecrets(report.stackTrace.trim(), extraSecrets).slice(0, 3000)
+    : undefined;
+
+  const sanitizedExtra = sanitizeContextObject(report.context, extraSecrets);
+  if (sanitizedStack) {
+    sanitizedExtra.stackTrace = sanitizedStack;
+  }
+
+  const envelopeHeader = {
+    event_id: eventId,
+    sent_at: nowIso,
+    dsn: `https://${dsn.publicKey}@${dsn.host}/${dsn.projectId}`,
+  };
+  const itemHeader = { type: 'event' };
+  const eventPayload = {
+    event_id: eventId,
+    timestamp: timestampSec,
+    level: 'error',
+    platform: 'javascript',
+    release: `sentra-${report.platform}@${appVersion}`,
+    logger: moduleOrFile,
+    tags: {
+      sentra_platform: report.platform,
+      appVersion,
+      moduleOrFile,
+      actionOrRoute,
+    },
+    exception: {
+      values: [
+        {
+          type: errorName,
+          value: errorMessage,
+        },
+      ],
+    },
+    extra: sanitizedExtra,
+  };
+
+  return `${JSON.stringify(envelopeHeader)}\n${JSON.stringify(itemHeader)}\n${JSON.stringify(eventPayload)}`;
+}
+
+/**
+ * Lightweight zero-dependency Sentry Envelope sender for Cloudflare Workers.
+ * Parses `env.SENTRY_DSN_WORKER` and posts directly to Sentry's Envelope API.
+ * Strictly wrapped in `try/catch` and silently no-ops when DSN is not configured.
+ */
+export async function sendToSentry(
+  env: Env,
+  payload: UnifiedErrorReport
+): Promise<boolean> {
+  try {
+    const parsedDsn = parseSentryDsn(env.SENTRY_DSN_WORKER);
+    if (!parsedDsn) return false;
+
+    const secrets = collectEnvSecrets(env);
+    const envelopeBody = buildSentryEnvelope(parsedDsn, payload, secrets);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    let resp: Response;
+    try {
+      resp = await fetch(parsedDsn.envelopeUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-sentry-envelope',
+          'X-Sentry-Auth': `Sentry sentry_version=7, sentry_key=${parsedDsn.publicKey}, sentry_client=sentra-worker/1.0`,
+        },
+        body: envelopeBody,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!resp.ok) {
+      console.warn('[Sentra Sentry Envelope HTTP Error]', resp.status);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn(
+      '[Sentra Sentry Fallback]',
+      err instanceof Error ? err.message : String(err)
+    );
+    return false;
+  }
+}
+
+/**
+ * Central sender: dispatches any UnifiedErrorReport in parallel (`Promise.allSettled`)
+ * to Telegram `topic_logs_id`, Sentry Envelope API, and Turso `telemetry_logs`.
+ * Sanitizes all secrets before dispatch, never throws, and never recurses.
  */
 export async function reportUnifiedError(
   env: Env,
@@ -467,12 +655,35 @@ export async function reportUnifiedError(
   try {
     const secrets = collectEnvSecrets(env);
     const htmlMessage = formatAiReadyErrorMessage(report, secrets);
-    return await sendToTopic(env, 'logs', htmlMessage);
+
+    const sanitizedDetails = {
+      appVersion: sanitizeSecrets((report.appVersion || 'unknown').slice(0, 48), secrets),
+      moduleOrFile: sanitizeSecrets((report.moduleOrFile || 'unknown').slice(0, 180), secrets),
+      actionOrRoute: sanitizeSecrets((report.actionOrRoute || 'unknown').slice(0, 180), secrets),
+      errorName: sanitizeSecrets((report.errorName || 'Error').slice(0, 120), secrets),
+      errorMessage: sanitizeSecrets((report.errorMessage || 'Unknown error').slice(0, 800), secrets),
+      context: sanitizeContextObject(report.context, secrets),
+      timestamp: report.timestamp || new Date().toISOString(),
+    };
+
+    const [tgOutcome] = await Promise.allSettled([
+      sendToTopic(env, 'logs', htmlMessage),
+      sendToSentry(env, report),
+      logTelemetryToTurso(env, {
+        platform: report.platform,
+        eventType: 'error_report',
+        details: sanitizedDetails,
+      }),
+    ]);
+
+    return tgOutcome.status === 'fulfilled' ? tgOutcome.value : false;
   } catch (err) {
     console.error('[Sentra reportUnifiedError Fatal]', report.platform, report.moduleOrFile, err);
     return false;
   }
 }
+
+export const reportErrorToTelegram = reportUnifiedError;
 
 /**
  * Dispatches a UnifiedErrorReport using `ctx.waitUntil` when available so user

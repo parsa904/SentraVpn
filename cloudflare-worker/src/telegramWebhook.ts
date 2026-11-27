@@ -476,8 +476,11 @@ function buildMainKeyboard(isRegistered: boolean, isAdmin: boolean): Record<stri
   };
 }
 
-async function hasActiveGamingOutbounds(db: D1Database): Promise<boolean> {
-  return await getCachedHasActiveGaming(db);
+async function hasActiveGamingOutbounds(
+  db: D1Database,
+  kv?: KVNamespace
+): Promise<boolean> {
+  return await getCachedHasActiveGaming(db, kv);
 }
 
 async function getUserAndSubByTelegramId(
@@ -622,7 +625,8 @@ async function clearBotState(db: D1Database, telegramId: number): Promise<void> 
 async function insertOfficialOutboundD1(
   db: D1Database,
   parsed: Awaited<ReturnType<typeof parseOutboundInput>>,
-  allocationMode: string
+  allocationMode: string,
+  kv?: KVNamespace
 ): Promise<{ inserted: boolean; duplicate: boolean }> {
   const existing = await db
     .prepare('SELECT id FROM donated_outbounds WHERE fingerprint_sha256 = ? LIMIT 1')
@@ -679,14 +683,15 @@ async function insertOfficialOutboundD1(
     )
     .run();
 
-  invalidateNodesCache(db);
+  await invalidateNodesCache(db, kv);
   return { inserted: true, duplicate: false };
 }
 
 async function batchInsertOfficialOutboundsD1(
   db: D1Database,
   nodes: Array<Awaited<ReturnType<typeof parseOutboundInput>>>,
-  allocationMode: string
+  allocationMode: string,
+  kv?: KVNamespace
 ): Promise<{ added: number; duplicates: number }> {
   const limited = nodes.slice(0, 100);
   if (limited.length === 0) return { added: 0, duplicates: 0 };
@@ -775,7 +780,7 @@ async function batchInsertOfficialOutboundsD1(
 
   if (insertStmts.length > 0) {
     await executeD1Batch(db, insertStmts);
-    invalidateNodesCache(db);
+    await invalidateNodesCache(db, kv);
   }
 
   return { added: insertStmts.length, duplicates };
@@ -834,7 +839,8 @@ async function handleAdminOutboundSubmission(
     const { added, duplicates } = await batchInsertOfficialOutboundsD1(
       env.DB,
       nodes,
-      allocationMode
+      allocationMode,
+      env.SENTRA_KV
     );
 
     const category =
@@ -893,7 +899,7 @@ async function handleAdminOutboundSubmission(
     return;
   }
 
-  const res = await insertOfficialOutboundD1(env.DB, parsed, allocationMode);
+  const res = await insertOfficialOutboundD1(env.DB, parsed, allocationMode, env.SENTRA_KV);
   if (res.duplicate) {
     await tgSendMessage(
       env,
@@ -1079,7 +1085,12 @@ async function handleAdminSubSourceSubmission(
       const parsedSub = await parseSubscriptionPayload(body);
       totalNodes = parsedSub.nodes.length;
       skipped = parsedSub.skipped;
-      const batchRes = await batchInsertOfficialOutboundsD1(env.DB, parsedSub.nodes, category);
+      const batchRes = await batchInsertOfficialOutboundsD1(
+        env.DB,
+        parsedSub.nodes,
+        category,
+        env.SENTRA_KV
+      );
       addedNodes = batchRes.added;
       duplicates = batchRes.duplicates;
     } else {
@@ -1569,7 +1580,8 @@ async function buildAdminStatsView(
     | { pending_nodes: number; pending_donations: number; open_tickets: number }
     | undefined) ?? null;
 
-  const gamingLive = (nodeStats?.gaming_nodes || 0) > 0 || (await hasActiveGamingOutbounds(env.DB));
+  const gamingLive =
+    (nodeStats?.gaming_nodes || 0) > 0 || (await hasActiveGamingOutbounds(env.DB, env.SENTRA_KV));
   const tierLines = (tierBreakdown.results || [])
     .map((t) => `   • ${escapeHtml(t.tier)}: <b>${t.cnt}</b>`)
     .join('\n');
@@ -1757,7 +1769,7 @@ async function buildUserIosMenuView(
   env: Env,
   sub: SubscriptionRow
 ): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
-  const gamingLive = await hasActiveGamingOutbounds(env.DB);
+  const gamingLive = await hasActiveGamingOutbounds(env.DB, env.SENTRA_KV);
   const canStatic = tierHasStaticIp(sub.tier);
   const canGaming = tierHasGaming(sub.tier);
 
@@ -2109,7 +2121,7 @@ async function handleCallbackQuery(
       );
 
       if (mode === 'gaming') {
-        const gamingLive = await hasActiveGamingOutbounds(env.DB);
+        const gamingLive = await hasActiveGamingOutbounds(env.DB, env.SENTRA_KV);
         if (!gamingLive) {
           await tgSendMessage(
             env,
@@ -2393,6 +2405,7 @@ async function handleCallbackQuery(
         const srcId = Number(data.slice('adm_subsrc_del_'.length));
         if (!Number.isInteger(srcId) || srcId <= 0) return;
         await env.DB.prepare('DELETE FROM subscription_sources WHERE id = ?').bind(srcId).run();
+        await invalidateNodesCache(env.DB, env.SENTRA_KV);
         const view = await buildAdminSubSourcesView(env);
         await sendOrEditView(env, chatId, messageId, view);
         return;
@@ -2437,7 +2450,7 @@ async function handleCallbackQuery(
           )
             .bind(nodeId)
             .run();
-          invalidateNodesCache(env.DB);
+          await invalidateNodesCache(env.DB, env.SENTRA_KV);
 
           if (nodeRow.donor_telegram_id) {
             await tgSendMessage(
@@ -2456,7 +2469,7 @@ async function handleCallbackQuery(
           )
             .bind('رد شده توسط مدیریت', nodeId)
             .run();
-          invalidateNodesCache(env.DB);
+          await invalidateNodesCache(env.DB, env.SENTRA_KV);
 
           if (nodeRow.donor_telegram_id) {
             await tgSendMessage(
@@ -2809,7 +2822,7 @@ async function handleGroupMessage(env: Env, msg: TelegramMessage): Promise<void>
       set_support: { type: 'support', label: 'پشتیبانی کاربران' },
     };
     const target = mapping[cmd];
-    await saveTopicRoute(env.DB, target.type, chatId, threadId);
+    await saveTopicRoute(env.DB, target.type, chatId, threadId, env.SENTRA_KV);
 
     const threadLabel = threadId ? String(threadId) : 'عمومی (General / 0)';
     await tgSendMessage(
@@ -2826,7 +2839,7 @@ async function handleGroupMessage(env: Env, msg: TelegramMessage): Promise<void>
 
   // 2. Admin Reply inside configured Support Topic -> forward directly to user's private chat
   if (msg.reply_to_message && (text || largestPhoto || attachedDoc)) {
-    const topicConfig = await getTopicRoutingConfig(env.DB);
+    const topicConfig = await getTopicRoutingConfig(env.DB, env.SENTRA_KV);
     const currentThreadKey = String(threadId ?? 0);
     if (
       topicConfig.logGroupId === String(chatId) &&

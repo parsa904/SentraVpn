@@ -20,6 +20,7 @@ import {
   dispatchUnifiedError,
   parseExternalErrorPayload,
 } from './errorReporter.ts';
+import { logTelemetryToTurso } from './tursoClient.ts';
 import {
   checkPublicIpRateLimit,
   computeWeakEtag,
@@ -471,6 +472,8 @@ export async function routeRequest(
       reason?: string;
     }> = [];
 
+    let nodesChanged = false;
+
     // 2. Diff-Only Writes for evaluated DB nodes
     for (const item of nodeResults) {
       const nodeId = Number(item.outbound_id);
@@ -498,6 +501,7 @@ export async function routeRequest(
                WHERE id = ?`
             ).bind(rejectReason, nodeId)
           );
+          nodesChanged = true;
           deactivated += 1;
         } else {
           writesSkipped += 1;
@@ -551,6 +555,7 @@ export async function routeRequest(
               nodeId
             )
           );
+          nodesChanged = true;
         } else {
           writesSkipped += 1;
         }
@@ -588,6 +593,7 @@ export async function routeRequest(
               nodeId
             )
           );
+          nodesChanged = true;
         } else {
           writesSkipped += 1;
         }
@@ -682,6 +688,7 @@ export async function routeRequest(
                  WHERE id = ?`
               ).bind(lat, jit, spd, spdScore, hScore, gOk, tSafe, existingNode.id)
             );
+            nodesChanged = true;
           } else {
             writesSkipped += 1;
           }
@@ -722,15 +729,18 @@ export async function routeRequest(
               category
             )
           );
+          nodesChanged = true;
           discoveredNodesAdded += 1;
         }
       }
     }
 
-    // 4. Execute all changed writes in chunked db.batch() and invalidate isolate cache
+    // 4. Execute all changed writes in chunked db.batch() and invalidate L1+L2 KV cache ONLY if nodes actually changed
     if (writeStatements.length > 0) {
       await executeD1Batch(env.DB, writeStatements);
-      invalidateNodesCache(env.DB);
+      if (nodesChanged) {
+        await invalidateNodesCache(env.DB, env.SENTRA_KV);
+      }
     }
 
     const subSourceAlerts: string[] = [];
@@ -787,6 +797,38 @@ export async function routeRequest(
       await dispatchErrorAlert(env, ctx, 'QualityEngine (health-report)', summaryLines.join('\n'));
     }
 
+    // Offload QualityEngine health history to Turso telemetry_logs (zero D1 Row Writes)
+    const tursoHealthWrite = logTelemetryToTurso(env, {
+      platform: 'github-actions',
+      eventType: 'node_health_report',
+      details: {
+        runner: payload.runner || 'quality-engine',
+        checked_at: payload.checked_at || new Date().toISOString(),
+        checked_nodes: updated,
+        d1_writes: writeStatements.length,
+        d1_writes_skipped: writesSkipped,
+        deactivated,
+        gemini_ready: geminiReady,
+        active_pool: activePoolCount,
+        subscription_sources_updated: subscriptionSourcesUpdated,
+        discovered_nodes_added: discoveredNodesAdded,
+        offline_count: offlineAlerts.length,
+        nodes_sample: nodeResults.slice(0, 30).map((n) => ({
+          id: Number(n.outbound_id),
+          healthy: Boolean(n.is_healthy),
+          latency_ms: Math.round(Number(n.latency_ms) || 0),
+          health_score: Math.round(Number(n.health_score) || 0),
+          gemini_ok: Boolean(n.gemini_ok),
+        })),
+      },
+    }).then(() => undefined);
+
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(tursoHealthWrite);
+    } else {
+      await tursoHealthWrite;
+    }
+
     return jsonResponse({
       success: true,
       updated,
@@ -827,7 +869,7 @@ export async function routeRequest(
     }
 
     const mode = normalizeMode(url.searchParams.get('mode'));
-    const pool = await getCachedActiveNodesPool(env.DB);
+    const pool = await getCachedActiveNodesPool(env.DB, env.SENTRA_KV);
 
     if (mode === 'gaming') {
       if (!pool.hasActiveGaming) {
@@ -888,6 +930,7 @@ export async function routeRequest(
           mode,
           locationCode: locationParam,
           includeClashApi: false,
+          kv: env.SENTRA_KV,
           onError: (source, details) => {
             void dispatchErrorAlert(env, ctx, source, details);
           },
@@ -912,7 +955,7 @@ export async function routeRequest(
 
     let base64Body: string;
     try {
-      const compiled = await getCachedV2RayBase64(env.DB, mode, locationParam);
+      const compiled = await getCachedV2RayBase64(env.DB, mode, locationParam, env.SENTRA_KV);
       base64Body = compiled.base64;
     } catch (err) {
       await dispatchErrorAlert(env, ctx, 'singboxCompiler.ts (/sub base64)', err);
@@ -955,7 +998,7 @@ export async function routeRequest(
 
     const mode = normalizeMode(typeof body.mode === 'string' ? body.mode : 'web_browsing');
     const locationCode = typeof body.location_code === 'string' ? body.location_code : undefined;
-    const pool = await getCachedActiveNodesPool(env.DB);
+    const pool = await getCachedActiveNodesPool(env.DB, env.SENTRA_KV);
 
     if (mode === 'gaming') {
       if (!pool.hasActiveGaming) {
@@ -1016,6 +1059,7 @@ export async function routeRequest(
         locationCode,
         preferFirstAsDefault: preferFirst,
         includeClashApi: true,
+        kv: env.SENTRA_KV,
         onError: (source, details) => {
           void dispatchErrorAlert(env, ctx, source, details);
         },
@@ -1043,12 +1087,12 @@ export async function routeRequest(
     );
   }
 
-  // 8. Client Modes Catalog: GET /api/v1/client/modes (Served from Isolate Cache)
+  // 8. Client Modes Catalog: GET /api/v1/client/modes (Served from L1 RAM / L2 KV Cache)
   if (method === 'GET' && path === '/api/v1/client/modes') {
     const token = extractAuthToken(request);
     const found = token ? await getSubscriptionWithUser(env.DB, token) : null;
     const tier = found?.sub.tier || 'Sentra Lite';
-    const gamingLive = await getCachedHasActiveGaming(env.DB);
+    const gamingLive = await getCachedHasActiveGaming(env.DB, env.SENTRA_KV);
     const isLite = tier.toLowerCase() === 'sentra lite';
 
     return jsonResponse({
@@ -1095,9 +1139,9 @@ export async function routeRequest(
     });
   }
 
-  // 9. Client Locations: GET /api/v1/client/locations (Served from Isolate Cache)
+  // 9. Client Locations: GET /api/v1/client/locations (Served from L1 RAM / L2 KV Cache)
   if (method === 'GET' && path === '/api/v1/client/locations') {
-    const items = await getCachedLocations(env.DB);
+    const items = await getCachedLocations(env.DB, env.SENTRA_KV);
     const totalNodes = items.reduce((sum, r) => sum + r.active_nodes, 0);
     const minPing = items.length > 0 ? items[0].best_ping : 0;
 
@@ -1493,8 +1537,8 @@ export async function routeRequest(
       created_at: d.created_at,
     }));
 
-    // Serve active outbounds + gaming status from 5-minute isolate RAM cache (zero extra D1 reads)
-    const pool = await getCachedActiveNodesPool(env.DB);
+    // Serve active outbounds + gaming status from L1 RAM / L2 KV cache (zero extra D1 reads)
+    const pool = await getCachedActiveNodesPool(env.DB, env.SENTRA_KV);
     const outbounds = pool.donated.slice(0, 100).map((row) => ({
       id: `donated_${row.id}`,
       db_id: row.id,
@@ -1828,7 +1872,7 @@ export async function routeRequest(
       .run();
 
     if (status === 'active') {
-      invalidateNodesCache(env.DB);
+      await invalidateNodesCache(env.DB, env.SENTRA_KV);
     }
 
     return jsonResponse(

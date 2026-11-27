@@ -1,5 +1,6 @@
 import { API_BASE_URL, SESSION_STORAGE_KEY } from '../constants';
 import { APP_VERSION } from './proxyParser';
+import { captureClientSentryException } from './sentry';
 
 export type ClientErrorPlatform = 'android' | 'windows';
 
@@ -189,6 +190,18 @@ export async function reportClientError(
     }
     sentFingerprints.set(fingerprint, now);
     recentReportTimestamps.push(now);
+
+    // Report sanitized exception to Sentry in parallel (no subscription token included)
+    captureClientSentryException({
+      platform: payload.platform,
+      appVersion: payload.appVersion,
+      moduleOrFile: payload.moduleOrFile,
+      actionOrRoute: payload.actionOrRoute,
+      errorName: payload.errorName,
+      errorMessage: payload.errorMessage,
+      stackTrace: payload.stackTrace,
+      context: payload.context,
+    });
 
     const endpoint = `${API_BASE_URL.replace(/\/+$/, '')}/api/v1/telemetry/error`;
     const subToken = input.subscriptionToken ?? readStoredSubscriptionToken();

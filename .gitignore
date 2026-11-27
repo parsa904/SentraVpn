@@ -39,6 +39,7 @@ keystore.properties
 .env
 .env.*
 !.env.example
+!.github/docs/.env.example
 .dev.vars
 
 # Local runtime databases & data

@@ -85,6 +85,8 @@ jobs:
     needs: health-checks
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      SENTRY_DSN_CLIENT: ${{ secrets.SENTRY_DSN_CLIENT }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -295,6 +297,8 @@ jobs:
     needs: health-checks
     runs-on: windows-latest
     timeout-minutes: 35
+    env:
+      SENTRY_DSN_CLIENT: ${{ secrets.SENTRY_DSN_CLIENT }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

@@ -2,39 +2,33 @@ import {
   compileClientSingboxConfig,
   compileV2RaySubscriptionBase64,
 } from './singboxCompiler.ts';
+import {
+  computeActiveNodesVersionHash,
+  getOrLoadActiveNodesCache,
+  invalidateActiveNodesKvCache,
+  invalidateSystemSettingsKvCache,
+  L1_ACTIVE_NODES_TTL_MS,
+  resetKvL1CachesForTests,
+  type ActiveNodesPoolSnapshot,
+  type CachedLocationSummary,
+  type CachedTopicRoutingConfig,
+} from './kvCache.ts';
 import type {
   ConnectionMode,
   DonatedOutboundRow,
   OutboundRow,
 } from './types.ts';
 
-export const ISOLATE_CACHE_TTL_MS = 5 * 60_000; // 5 minutes per Worker isolate
+export type {
+  ActiveNodesPoolSnapshot,
+  CachedLocationSummary,
+  CachedTopicRoutingConfig,
+};
+
+export const ISOLATE_CACHE_TTL_MS = L1_ACTIVE_NODES_TTL_MS; // 5 minutes per Worker isolate
 const MAX_COMPILED_VARIANTS = 64;
 const MAX_RATE_LIMIT_IPS = 1000;
 const D1_BATCH_CHUNK_SIZE = 50;
-
-export interface CachedLocationSummary {
-  country_code: string;
-  country_name: string;
-  active_nodes: number;
-  best_ping: number;
-}
-
-export interface ActiveNodesPoolSnapshot {
-  version: number;
-  fetchedAtMs: number;
-  donated: DonatedOutboundRow[];
-  core: OutboundRow[];
-  hasActiveGaming: boolean;
-  locations: CachedLocationSummary[];
-}
-
-export interface CachedTopicRoutingConfig {
-  logGroupId: string | null;
-  topicLogsId: string | null;
-  topicBackupsId: string | null;
-  topicSupportId: string | null;
-}
 
 interface CompiledSingboxEntry {
   config: Record<string, unknown>;
@@ -42,20 +36,16 @@ interface CompiledSingboxEntry {
 }
 
 interface IsolateCacheStore {
-  poolVersion: number;
-  nodesPool: ActiveNodesPoolSnapshot | null;
+  lastPoolVersion: string;
   compiledSingbox: Map<string, CompiledSingboxEntry>;
   compiledV2Ray: Map<string, string>;
-  topicRouting: { fetchedAtMs: number; config: CachedTopicRoutingConfig } | null;
 }
 
 function createEmptyStore(): IsolateCacheStore {
   return {
-    poolVersion: 1,
-    nodesPool: null,
+    lastPoolVersion: '',
     compiledSingbox: new Map(),
     compiledV2Ray: new Map(),
-    topicRouting: null,
   };
 }
 
@@ -81,6 +71,7 @@ function getStore(db: D1Database): IsolateCacheStore {
 export function resetAllWorkerCachesForTests(): void {
   globalIsolateStore = createEmptyStore();
   ipRateLimitStore.clear();
+  resetKvL1CachesForTests();
 }
 
 /**
@@ -155,91 +146,104 @@ function deriveLocations(donated: DonatedOutboundRow[]): CachedLocationSummary[]
 }
 
 /**
- * Loads the active nodes pool (`donated_outbounds` + `outbounds`) once per
- * 5 minutes per Worker isolate using a single batched D1 read with narrow columns.
+ * Loads the active nodes pool (`donated_outbounds` + `outbounds`) via 3-tier cache:
+ *   L1: Isolate RAM (5 minutes, 0 KV reads, 0 D1 reads)
+ *   L2: Cloudflare KV `cache:active_nodes_v1` (1 hour, 0 D1 reads, 0 KV writes)
+ *   L3: Single batched D1 read with narrow columns -> populates L1 & L2
  */
 export async function getCachedActiveNodesPool(
   db: D1Database,
+  kv?: KVNamespace,
   nowMs: number = Date.now()
 ): Promise<ActiveNodesPoolSnapshot> {
   const store = getStore(db);
-  if (store.nodesPool && nowMs - store.nodesPool.fetchedAtMs < ISOLATE_CACHE_TTL_MS) {
-    return store.nodesPool;
-  }
 
-  const donatedStmt = db.prepare(
-    `SELECT id, tag, protocol, server_address, server_port, config_json,
-            latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
-            raw_link, fingerprint_sha256, is_official, label, country_code, country_name,
-            allow_web, allow_download, allow_gaming, allow_static_ip,
-            gemini_ok, trading_safe, speed_score, jitter_ms, allocation_mode
-     FROM donated_outbounds
-     WHERE status = 'active'
-     ORDER BY is_official DESC, health_score DESC, speed_score DESC, latency_ms ASC
-     LIMIT 200`
+  const { snapshot } = await getOrLoadActiveNodesCache(
+    db,
+    kv,
+    async () => {
+      const donatedStmt = db.prepare(
+        `SELECT id, tag, protocol, server_address, server_port, config_json,
+                latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
+                raw_link, fingerprint_sha256, is_official, label, country_code, country_name,
+                allow_web, allow_download, allow_gaming, allow_static_ip,
+                gemini_ok, trading_safe, speed_score, jitter_ms, allocation_mode
+         FROM donated_outbounds
+         WHERE status = 'active'
+         ORDER BY is_official DESC, health_score DESC, speed_score DESC, latency_ms ASC
+         LIMIT 200`
+      );
+
+      const coreStmt = db.prepare(
+        `SELECT id, tag, protocol, mode_category, server_address, server_port,
+                uuid, password, network_transport, tls_enabled, tls_sni,
+                reality_public_key, reality_short_id, min_tier, country_code, is_active, weight
+         FROM outbounds
+         WHERE is_active = 1
+         ORDER BY weight DESC, id ASC
+         LIMIT 100`
+      );
+
+      const [donatedRes, coreRes] = await executeD1Batch<Record<string, unknown>>(db, [
+        donatedStmt,
+        coreStmt,
+      ]);
+
+      const donated = ((donatedRes?.results || []) as unknown) as DonatedOutboundRow[];
+      const core = ((coreRes?.results || []) as unknown) as OutboundRow[];
+
+      return {
+        version: computeActiveNodesVersionHash(donated, core),
+        donated,
+        core,
+        hasActiveGaming: deriveHasActiveGaming(donated, core),
+        locations: deriveLocations(donated),
+      };
+    },
+    nowMs
   );
 
-  const coreStmt = db.prepare(
-    `SELECT id, tag, protocol, mode_category, server_address, server_port,
-            uuid, password, network_transport, tls_enabled, tls_sni,
-            reality_public_key, reality_short_id, min_tier, country_code, is_active, weight
-     FROM outbounds
-     WHERE is_active = 1
-     ORDER BY weight DESC, id ASC
-     LIMIT 100`
-  );
-
-  const [donatedRes, coreRes] = await executeD1Batch<Record<string, unknown>>(db, [
-    donatedStmt,
-    coreStmt,
-  ]);
-
-  const donated = ((donatedRes?.results || []) as unknown) as DonatedOutboundRow[];
-  const core = ((coreRes?.results || []) as unknown) as OutboundRow[];
-
-  store.poolVersion += 1;
-  store.compiledSingbox.clear();
-  store.compiledV2Ray.clear();
-
-  const snapshot: ActiveNodesPoolSnapshot = {
-    version: store.poolVersion,
-    fetchedAtMs: nowMs,
-    donated,
-    core,
-    hasActiveGaming: deriveHasActiveGaming(donated, core),
-    locations: deriveLocations(donated),
-  };
-  store.nodesPool = snapshot;
-  return snapshot;
-}
-
-export function invalidateNodesCache(db?: D1Database): void {
-  if (db) {
-    const store = getStore(db);
-    store.nodesPool = null;
-    store.poolVersion += 1;
+  if (store.lastPoolVersion !== snapshot.version) {
+    store.lastPoolVersion = snapshot.version;
     store.compiledSingbox.clear();
     store.compiledV2Ray.clear();
   }
-  globalIsolateStore.nodesPool = null;
-  globalIsolateStore.poolVersion += 1;
+
+  return snapshot;
+}
+
+export async function invalidateNodesCache(
+  db?: D1Database,
+  kv?: KVNamespace
+): Promise<void> {
+  if (db) {
+    const store = getStore(db);
+    store.lastPoolVersion = '';
+    store.compiledSingbox.clear();
+    store.compiledV2Ray.clear();
+  }
+  globalIsolateStore.lastPoolVersion = '';
   globalIsolateStore.compiledSingbox.clear();
   globalIsolateStore.compiledV2Ray.clear();
+
+  await invalidateActiveNodesKvCache(db, kv);
 }
 
 export async function getCachedHasActiveGaming(
   db: D1Database,
+  kv?: KVNamespace,
   nowMs?: number
 ): Promise<boolean> {
-  const pool = await getCachedActiveNodesPool(db, nowMs);
+  const pool = await getCachedActiveNodesPool(db, kv, nowMs);
   return pool.hasActiveGaming;
 }
 
 export async function getCachedLocations(
   db: D1Database,
+  kv?: KVNamespace,
   nowMs?: number
 ): Promise<CachedLocationSummary[]> {
-  const pool = await getCachedActiveNodesPool(db, nowMs);
+  const pool = await getCachedActiveNodesPool(db, kv, nowMs);
   return pool.locations;
 }
 
@@ -323,10 +327,11 @@ export async function getCachedCompiledSingbox(
     preferFirstAsDefault?: boolean;
     includeClashApi: boolean;
     onError?: (source: string, errorDetails: unknown) => void;
+    kv?: KVNamespace;
     nowMs?: number;
   }
-): Promise<{ config: Record<string, unknown>; json: string; poolVersion: number }> {
-  const pool = await getCachedActiveNodesPool(db, options.nowMs);
+): Promise<{ config: Record<string, unknown>; json: string; poolVersion: string }> {
+  const pool = await getCachedActiveNodesPool(db, options.kv, options.nowMs);
   const store = getStore(db);
   const locKey = (options.locationCode || 'AUTO').trim().toUpperCase() || 'AUTO';
   const cacheKey = `${pool.version}:${options.mode}:${locKey}:${
@@ -362,9 +367,10 @@ export async function getCachedV2RayBase64(
   db: D1Database,
   mode: ConnectionMode,
   locationCode?: string,
+  kv?: KVNamespace,
   nowMs?: number
-): Promise<{ base64: string; poolVersion: number }> {
-  const pool = await getCachedActiveNodesPool(db, nowMs);
+): Promise<{ base64: string; poolVersion: string }> {
+  const pool = await getCachedActiveNodesPool(db, kv, nowMs);
   const store = getStore(db);
   const locKey = (locationCode || 'AUTO').trim().toUpperCase() || 'AUTO';
   const cacheKey = `${pool.version}:${mode}:${locKey}`;
@@ -380,34 +386,11 @@ export async function getCachedV2RayBase64(
   return { base64, poolVersion: pool.version };
 }
 
-/**
- * 5-minute isolate RAM cache for `system_settings` topic routing IDs.
- */
-export function getCachedTopicRoutingFromRam(
-  db: D1Database,
-  nowMs: number = Date.now()
-): CachedTopicRoutingConfig | null {
-  const store = getStore(db);
-  if (store.topicRouting && nowMs - store.topicRouting.fetchedAtMs < ISOLATE_CACHE_TTL_MS) {
-    return store.topicRouting.config;
-  }
-  return null;
-}
-
-export function setCachedTopicRoutingInRam(
-  db: D1Database,
-  config: CachedTopicRoutingConfig,
-  nowMs: number = Date.now()
-): void {
-  const store = getStore(db);
-  store.topicRouting = { fetchedAtMs: nowMs, config };
-}
-
-export function invalidateSystemSettingsCache(db?: D1Database): void {
-  if (db) {
-    getStore(db).topicRouting = null;
-  }
-  globalIsolateStore.topicRouting = null;
+export async function invalidateSystemSettingsCache(
+  db?: D1Database,
+  kv?: KVNamespace
+): Promise<void> {
+  await invalidateSystemSettingsKvCache(db, kv);
 }
 
 /**

@@ -1,5 +1,6 @@
 export interface Env {
   DB: D1Database;
+  SENTRA_KV?: KVNamespace;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   ADMIN_TELEGRAM_ID?: string;
@@ -13,6 +14,9 @@ export interface Env {
   WIREGUARD_SERVER_PUBLIC_KEY?: string;
   WIREGUARD_PORT?: string;
   WIREGUARD_KEY_SALT?: string;
+  SENTRY_DSN_WORKER?: string;
+  TURSO_DATABASE_URL?: string;
+  TURSO_AUTH_TOKEN?: string;
 }
 
 export type ConnectionMode = 'web_browsing' | 'download' | 'gaming' | 'static_ip';

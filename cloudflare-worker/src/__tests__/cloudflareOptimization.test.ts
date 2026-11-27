@@ -148,11 +148,16 @@ test('002_add_indexes.sql creates all required D1 indexes and worker src has zer
     sqlite.close();
   }
 
-  // Ensure zero runtime CREATE TABLE IF NOT EXISTS in cloudflare-worker/src/*.ts
+  // Ensure zero runtime D1 CREATE TABLE IF NOT EXISTS in cloudflare-worker/src/*.ts
+  // (tursoClient.ts only sends remote Turso HTTP pipeline statements and never touches env.DB)
   const srcDir = path.resolve(import.meta.dirname, '..');
   for (const entry of fs.readdirSync(srcDir)) {
     if (!entry.endsWith('.ts')) continue;
     const content = fs.readFileSync(path.join(srcDir, entry), 'utf8');
+    if (entry === 'tursoClient.ts') {
+      assert.equal(/\benv\.DB\b/.test(content), false, 'tursoClient.ts must never touch Cloudflare D1 (env.DB)');
+      continue;
+    }
     assert.equal(
       /CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS/i.test(content),
       false,

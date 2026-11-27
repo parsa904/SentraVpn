@@ -111,5 +111,5 @@ export default defineConfig({
     strictPort: true,
     allowedHosts: true,
   },
-  envPrefix: ['VITE_', 'TAURI_'],
+  envPrefix: ['VITE_', 'TAURI_', 'SENTRY_DSN_CLIENT'],
 });

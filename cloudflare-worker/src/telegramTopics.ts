@@ -1,13 +1,15 @@
 import {
-  formatAiReadyErrorMessage,
   normalizeUnknownError,
+  reportUnifiedError,
 } from './errorReporter.ts';
 import {
+  getOrLoadSystemSettingsCache,
+  updateSystemSettingsKvCache,
+} from './kvCache.ts';
+import { saveD1BackupMirrorToTurso } from './tursoClient.ts';
+import {
   executeD1Batch,
-  getCachedTopicRoutingFromRam,
   invalidateNodesCache,
-  invalidateSystemSettingsCache,
-  setCachedTopicRoutingInRam,
 } from './workerCache.ts';
 import type { Env } from './types.ts';
 
@@ -35,6 +37,7 @@ export interface DatabaseBackupResult {
   filename?: string;
   tablesCount?: number;
   totalRows?: number;
+  tursoMirrored?: boolean;
   error?: string;
 }
 
@@ -102,74 +105,7 @@ export function extractSupportUid(text?: string | null): number | null {
   return parsed;
 }
 
-export async function getSystemSetting(
-  db: D1Database,
-  key: SystemSettingKey
-): Promise<string | null> {
-  const cached = await getTopicRoutingConfig(db);
-  if (key === SYSTEM_SETTING_KEYS.LOG_GROUP_ID) return cached.logGroupId;
-  if (key === SYSTEM_SETTING_KEYS.TOPIC_LOGS_ID) return cached.topicLogsId;
-  if (key === SYSTEM_SETTING_KEYS.TOPIC_BACKUPS_ID) return cached.topicBackupsId;
-  if (key === SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID) return cached.topicSupportId;
-  const row = await db
-    .prepare('SELECT value FROM system_settings WHERE key = ? LIMIT 1')
-    .bind(key)
-    .first<{ value: string }>();
-  return row ? String(row.value) : null;
-}
-
-export async function setSystemSetting(
-  db: D1Database,
-  key: SystemSettingKey,
-  value: string
-): Promise<void> {
-  await db
-    .prepare(
-      `INSERT INTO system_settings (key, value, updated_at)
-       VALUES (?, ?, CURRENT_TIMESTAMP)
-       ON CONFLICT(key) DO UPDATE SET
-         value = excluded.value,
-         updated_at = CURRENT_TIMESTAMP`
-    )
-    .bind(key, value)
-    .run();
-  invalidateSystemSettingsCache(db);
-}
-
-export async function saveTopicRoute(
-  db: D1Database,
-  topicType: TopicType,
-  groupId: number,
-  threadId?: number
-): Promise<void> {
-  const topicKey =
-    topicType === 'logs'
-      ? SYSTEM_SETTING_KEYS.TOPIC_LOGS_ID
-      : topicType === 'backups'
-      ? SYSTEM_SETTING_KEYS.TOPIC_BACKUPS_ID
-      : SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID;
-
-  const upsertSql = `INSERT INTO system_settings (key, value, updated_at)
-     VALUES (?, ?, CURRENT_TIMESTAMP)
-     ON CONFLICT(key) DO UPDATE SET
-       value = excluded.value,
-       updated_at = CURRENT_TIMESTAMP`;
-
-  await executeD1Batch(db, [
-    db.prepare(upsertSql).bind(SYSTEM_SETTING_KEYS.LOG_GROUP_ID, String(groupId)),
-    db.prepare(upsertSql).bind(topicKey, String(threadId ?? 0)),
-  ]);
-  invalidateSystemSettingsCache(db);
-}
-
-export async function getTopicRoutingConfig(
-  db: D1Database
-): Promise<TopicRoutingConfig> {
-  const fromRam = getCachedTopicRoutingFromRam(db);
-  if (fromRam) {
-    return fromRam;
-  }
-
+async function fetchTopicRoutingFromD1(db: D1Database): Promise<TopicRoutingConfig> {
   const rows = await db
     .prepare(
       `SELECT key, value FROM system_settings
@@ -188,13 +124,89 @@ export async function getTopicRoutingConfig(
     map.set(row.key, String(row.value));
   }
 
-  const config: TopicRoutingConfig = {
+  return {
     logGroupId: map.get(SYSTEM_SETTING_KEYS.LOG_GROUP_ID) ?? null,
     topicLogsId: map.get(SYSTEM_SETTING_KEYS.TOPIC_LOGS_ID) ?? null,
     topicBackupsId: map.get(SYSTEM_SETTING_KEYS.TOPIC_BACKUPS_ID) ?? null,
     topicSupportId: map.get(SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID) ?? null,
   };
-  setCachedTopicRoutingInRam(db, config);
+}
+
+export async function getSystemSetting(
+  db: D1Database,
+  key: SystemSettingKey,
+  kv?: KVNamespace
+): Promise<string | null> {
+  const cached = await getTopicRoutingConfig(db, kv);
+  if (key === SYSTEM_SETTING_KEYS.LOG_GROUP_ID) return cached.logGroupId;
+  if (key === SYSTEM_SETTING_KEYS.TOPIC_LOGS_ID) return cached.topicLogsId;
+  if (key === SYSTEM_SETTING_KEYS.TOPIC_BACKUPS_ID) return cached.topicBackupsId;
+  if (key === SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID) return cached.topicSupportId;
+  const row = await db
+    .prepare('SELECT value FROM system_settings WHERE key = ? LIMIT 1')
+    .bind(key)
+    .first<{ value: string }>();
+  return row ? String(row.value) : null;
+}
+
+export async function setSystemSetting(
+  db: D1Database,
+  key: SystemSettingKey,
+  value: string,
+  kv?: KVNamespace
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO system_settings (key, value, updated_at)
+       VALUES (?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = CURRENT_TIMESTAMP`
+    )
+    .bind(key, value)
+    .run();
+
+  const freshConfig = await fetchTopicRoutingFromD1(db);
+  await updateSystemSettingsKvCache(db, kv, freshConfig);
+}
+
+export async function saveTopicRoute(
+  db: D1Database,
+  topicType: TopicType,
+  groupId: number,
+  threadId?: number,
+  kv?: KVNamespace
+): Promise<void> {
+  const topicKey =
+    topicType === 'logs'
+      ? SYSTEM_SETTING_KEYS.TOPIC_LOGS_ID
+      : topicType === 'backups'
+      ? SYSTEM_SETTING_KEYS.TOPIC_BACKUPS_ID
+      : SYSTEM_SETTING_KEYS.TOPIC_SUPPORT_ID;
+
+  const upsertSql = `INSERT INTO system_settings (key, value, updated_at)
+     VALUES (?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = CURRENT_TIMESTAMP`;
+
+  await executeD1Batch(db, [
+    db.prepare(upsertSql).bind(SYSTEM_SETTING_KEYS.LOG_GROUP_ID, String(groupId)),
+    db.prepare(upsertSql).bind(topicKey, String(threadId ?? 0)),
+  ]);
+
+  // Write-through to L1 RAM + L2 KV (`cache:system_settings_v1`, 1 single KV write)
+  const freshConfig = await fetchTopicRoutingFromD1(db);
+  await updateSystemSettingsKvCache(db, kv, freshConfig);
+}
+
+export async function getTopicRoutingConfig(
+  db: D1Database,
+  kv?: KVNamespace
+): Promise<TopicRoutingConfig> {
+  const { config } = await getOrLoadSystemSettingsCache(db, kv, () =>
+    fetchTopicRoutingFromD1(db)
+  );
   return config;
 }
 
@@ -233,7 +245,7 @@ export async function sendToTopic(
     const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
     if (!botToken || !env.DB) return false;
 
-    const config = await getTopicRoutingConfig(env.DB);
+    const config = await getTopicRoutingConfig(env.DB, env.SENTRA_KV);
     if (!config.logGroupId) return false;
 
     const groupId = Number(config.logGroupId);
@@ -299,7 +311,7 @@ export async function sendMediaToTopic(
     const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
     if (!botToken || !env.DB) return false;
 
-    const config = await getTopicRoutingConfig(env.DB);
+    const config = await getTopicRoutingConfig(env.DB, env.SENTRA_KV);
     if (!config.logGroupId) return false;
 
     const groupId = Number(config.logGroupId);
@@ -373,29 +385,17 @@ export async function sendErrorAlert(
     const moduleOrFile = parsedSource ? parsedSource[1].trim() : source.trim();
     const actionOrRoute = parsedSource ? parsedSource[2].trim() : source.trim();
 
-    const extraSecrets = [
-      env.TELEGRAM_BOT_TOKEN,
-      env.QUALITY_ENGINE_SECRET,
-      env.TELEGRAM_WEBHOOK_SECRET,
-      env.WIREGUARD_KEY_SALT,
-    ];
-
-    const alertText = formatAiReadyErrorMessage(
-      {
-        platform: 'worker',
-        appVersion: 'worker-v1',
-        moduleOrFile,
-        actionOrRoute,
-        errorName: normalized.errorName,
-        errorMessage: normalized.errorMessage,
-        stackTrace: normalized.stackTrace,
-        context,
-        timestamp: new Date().toISOString(),
-      },
-      extraSecrets
-    );
-
-    return await sendToTopic(env, 'logs', alertText);
+    return await reportUnifiedError(env, {
+      platform: 'worker',
+      appVersion: 'worker-v1',
+      moduleOrFile,
+      actionOrRoute,
+      errorName: normalized.errorName,
+      errorMessage: normalized.errorMessage,
+      stackTrace: normalized.stackTrace,
+      context,
+      timestamp: new Date().toISOString(),
+    });
   } catch (err) {
     console.error('[Sentra sendErrorAlert Fatal]', source, err);
     return false;
@@ -420,85 +420,124 @@ export async function dispatchErrorAlert(
   await promise;
 }
 
+export async function exportCoreD1BackupSnapshot(
+  db: D1Database,
+  now: Date = new Date()
+): Promise<{
+  filename: string;
+  tablesCount: number;
+  totalRows: number;
+  jsonString: string;
+}> {
+  const batchStatements = CORE_BACKUP_TABLES.map((tableName) =>
+    db.prepare(`SELECT * FROM "${tableName}"`)
+  );
+  const batchResults = await executeD1Batch<Record<string, unknown>>(
+    db,
+    batchStatements
+  );
+
+  const tablesData: Record<string, unknown[]> = {};
+  let totalRows = 0;
+
+  CORE_BACKUP_TABLES.forEach((tableName, idx) => {
+    const rows = batchResults[idx]?.results || [];
+    tablesData[tableName] = rows;
+    totalRows += rows.length;
+  });
+
+  const filename = buildBackupFilename(now);
+  const backupPayload = {
+    project: 'SentraVPN',
+    exported_at: now.toISOString(),
+    tables_count: CORE_BACKUP_TABLES.length,
+    total_rows: totalRows,
+    tables: tablesData,
+  };
+
+  return {
+    filename,
+    tablesCount: CORE_BACKUP_TABLES.length,
+    totalRows,
+    jsonString: JSON.stringify(backupPayload),
+  };
+}
+
 /**
- * Exports all real tables from Cloudflare D1 into a JSON file and sends it
- * via Telegram `sendDocument` to the configured Backup Forum Topic (`topic_backups_id`).
- * Automatically reports any backup error to `sendErrorAlert`.
+ * Exports critical tables from Cloudflare D1 into a compact JSON snapshot, sends it
+ * via Telegram `sendDocument` to `topic_backups_id`, and mirrors the snapshot into
+ * Turso `d1_backups` (retaining only the latest 14 backups) when Turso is configured.
+ * Turso failures never break the primary Telegram backup and vice versa.
  */
 export async function sendDatabaseBackup(
   env: Env,
   now: Date = new Date()
 ): Promise<DatabaseBackupResult> {
   try {
-    const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
-    if (!botToken) {
-      const error = 'توکن ربات تلگرام (TELEGRAM_BOT_TOKEN) تنظیم نشده است.';
-      console.error('[Sentra Database Backup Error]', error);
-      return { ok: false, error };
-    }
     if (!env.DB) {
       const error = 'اتصال دیتابیس D1 در دسترس نیست.';
       await sendErrorAlert(env, 'Database Backup (D1)', error);
       return { ok: false, error };
     }
 
-    const config = await getTopicRoutingConfig(env.DB);
-    if (!config.logGroupId) {
-      return {
-        ok: false,
-        error: 'گروه لاگ/بکاپ هنوز متصل نشده است. ابتدا در تاپیک بکاپ دستور /set_backups را ارسال کنید.',
-      };
-    }
+    const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
+    const hasTurso = Boolean(
+      (env.TURSO_DATABASE_URL || '').trim() && (env.TURSO_AUTH_TOKEN || '').trim()
+    );
 
-    const groupId = Number(config.logGroupId);
-    const { configured, threadId } = resolveTopicThreadId(config, 'backups');
-    if (!Number.isFinite(groupId) || groupId === 0 || !configured) {
+    const config = botToken ? await getTopicRoutingConfig(env.DB, env.SENTRA_KV) : null;
+    const groupId = config?.logGroupId ? Number(config.logGroupId) : 0;
+    const topicTarget = config
+      ? resolveTopicThreadId(config, 'backups')
+      : { configured: false, threadId: null };
+    const canSendTelegram =
+      Boolean(botToken) &&
+      Boolean(config?.logGroupId) &&
+      Number.isFinite(groupId) &&
+      groupId !== 0 &&
+      topicTarget.configured;
+
+    // If Telegram cannot run, still attempt Turso Cloud Mirror if configured
+    if (!canSendTelegram) {
+      let tursoMirrored = false;
+      if (hasTurso) {
+        const snapshot = await exportCoreD1BackupSnapshot(env.DB, now);
+        tursoMirrored = await saveD1BackupMirrorToTurso(env, snapshot.jsonString);
+      }
+
+      if (!botToken) {
+        const error = 'توکن ربات تلگرام (TELEGRAM_BOT_TOKEN) تنظیم نشده است.';
+        console.error('[Sentra Database Backup Error]', error);
+        return { ok: false, tursoMirrored, error };
+      }
+      if (!config?.logGroupId) {
+        return {
+          ok: false,
+          tursoMirrored,
+          error: 'گروه لاگ/بکاپ هنوز متصل نشده است. ابتدا در تاپیک بکاپ دستور /set_backups را ارسال کنید.',
+        };
+      }
       const error =
         'تاپیک بکاپ هنوز تنظیم نشده است. در گروه تلگرام داخل تاپیک بکاپ دستور /set_backups را بزنید.';
       await sendErrorAlert(env, 'Database Backup (D1)', error);
-      return { ok: false, error };
+      return { ok: false, tursoMirrored, error };
     }
 
-    // Single batched read across the 6 core persistent tables (excludes high-churn temp tables)
-    const batchStatements = CORE_BACKUP_TABLES.map((tableName) =>
-      env.DB.prepare(`SELECT * FROM "${tableName}"`)
-    );
-    const batchResults = await executeD1Batch<Record<string, unknown>>(
-      env.DB,
-      batchStatements
-    );
+    // Single batched D1 export shared between Telegram document upload & Turso Cloud Mirror
+    const snapshot = await exportCoreD1BackupSnapshot(env.DB, now);
+    const { filename, tablesCount, totalRows, jsonString } = snapshot;
 
-    const tablesData: Record<string, unknown[]> = {};
-    let totalRows = 0;
-
-    CORE_BACKUP_TABLES.forEach((tableName, idx) => {
-      const rows = batchResults[idx]?.results || [];
-      tablesData[tableName] = rows;
-      totalRows += rows.length;
-    });
-
-    const filename = buildBackupFilename(now);
-    const backupPayload = {
-      project: 'SentraVPN',
-      exported_at: now.toISOString(),
-      tables_count: CORE_BACKUP_TABLES.length,
-      total_rows: totalRows,
-      tables: tablesData,
-    };
-
-    // Compact JSON serialization reduces Worker CPU time and Telegram upload size
-    const jsonString = JSON.stringify(backupPayload);
     const caption =
       `💾 <b>بکاپ کامل دیتابیس D1 (SentraVPN)</b>\n\n` +
       `🕒 زمان بکاپ: <code>${escapeTelegramHtml(formatLogTimestamp(now))}</code>\n` +
-      `🗂 تعداد جداول حیاتی: <b>${CORE_BACKUP_TABLES.length}</b>\n` +
+      `🗂 تعداد جداول حیاتی: <b>${tablesCount}</b>\n` +
       `📊 مجموع ردیف‌ها: <b>${totalRows}</b>\n` +
       `📄 فایل: <code>${escapeTelegramHtml(filename)}</code>`;
 
     const form = new FormData();
     form.append('chat_id', String(groupId));
-    if (threadId !== null) {
-      form.append('message_thread_id', String(threadId));
+    if (topicTarget.threadId !== null) {
+      form.append('message_thread_id', String(topicTarget.threadId));
     }
     form.append('caption', caption);
     form.append('parse_mode', 'HTML');
@@ -508,14 +547,22 @@ export async function sendDatabaseBackup(
       filename
     );
 
-    const resp = await fetch(
-      `https://api.telegram.org/bot${botToken}/sendDocument`,
-      {
+    const [tgOutcome, tursoOutcome] = await Promise.allSettled([
+      fetch(`https://api.telegram.org/bot${botToken}/sendDocument`, {
         method: 'POST',
         body: form,
-      }
-    );
+      }),
+      hasTurso ? saveD1BackupMirrorToTurso(env, jsonString) : Promise.resolve(false),
+    ]);
 
+    const tursoMirrored =
+      tursoOutcome.status === 'fulfilled' ? tursoOutcome.value : false;
+
+    if (tgOutcome.status === 'rejected') {
+      throw tgOutcome.reason;
+    }
+
+    const resp = tgOutcome.value;
     const rawText = await resp.text();
     let parsed: TelegramApiResponse | null = null;
     try {
@@ -533,14 +580,15 @@ export async function sendDatabaseBackup(
         description: desc,
       });
       await sendErrorAlert(env, 'Database Backup (sendDocument)', error);
-      return { ok: false, error };
+      return { ok: false, tursoMirrored, error };
     }
 
     return {
       ok: true,
       filename,
-      tablesCount: CORE_BACKUP_TABLES.length,
+      tablesCount,
       totalRows,
+      tursoMirrored,
     };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -583,7 +631,8 @@ export async function pruneStaleRecords(db: D1Database): Promise<StalePruneResul
   const deletedIpRegistrations = Number(ipRes?.meta?.changes ?? 0);
 
   if (deletedOutbounds > 0) {
-    invalidateNodesCache(db);
+    // Only inactive/rejected outbounds are pruned; clear local L1 RAM without consuming a KV write
+    await invalidateNodesCache(db);
   }
 
   return {

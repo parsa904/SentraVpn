@@ -15,6 +15,11 @@ database_name = "sentra-db"
 database_id = "f1f48cc6-f965-4bf0-8670-8cb0248f8e99"
 migrations_dir = "migrations"
 
+# Cloudflare KV Namespace Binding (L2 Global Cache for shared nodes & topic settings)
+[[kv_namespaces]]
+binding = "SENTRA_KV"
+id = "PASTE_YOUR_KV_ID_HERE"
+
 [vars]
 BOT_USERNAME = "sentraconnect_bot"
 PRO_SUBSCRIPTION_PRICE = "150000"
@@ -30,6 +35,9 @@ WIREGUARD_PORT = "51820"
 # - ADMIN_CHAT_ID             (Optional: Legacy Telegram numeric admin chat ID; or comma-separated ADMIN_TELEGRAM_IDS)
 # - WIREGUARD_SERVER_PUBLIC_KEY
 # - WIREGUARD_KEY_SALT
+# - SENTRY_DSN_WORKER         (Optional: Sentry DSN for lightweight Worker Envelope error reporting)
+# - TURSO_DATABASE_URL        (Optional: libsql:// or https:// Turso database URL for telemetry & D1 cloud mirror)
+# - TURSO_AUTH_TOKEN          (Optional: Turso auth token for HTTP Pipeline API)
 
 [triggers]
 crons = ["0 */12 * * *"]
