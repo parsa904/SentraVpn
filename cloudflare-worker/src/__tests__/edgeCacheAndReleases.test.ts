@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import path from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 
 import { routeRequest } from '../routes.ts';
@@ -185,7 +184,7 @@ function createInMemoryEdgeCache(): {
 
 function setupTestDb(): DatabaseSync {
   const sqlite = new DatabaseSync(':memory:');
-  const schemaPath = path.resolve(process.cwd(), 'cloudflare-worker/schema.sql');
+  const schemaPath = new URL('../../schema.sql', import.meta.url);
   const schemaSql = fs.readFileSync(schemaPath, 'utf-8');
   sqlite.exec(schemaSql);
   return sqlite;

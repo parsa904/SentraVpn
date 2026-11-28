@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import path from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 
 import workerDefault, { resolveAllowedOrigin } from '../index.ts';
@@ -123,7 +122,7 @@ function createSqliteD1(sqlite: DatabaseSync): D1Database {
 
 function setupDb(): DatabaseSync {
   const sqlite = new DatabaseSync(':memory:');
-  const schemaPath = path.resolve(process.cwd(), 'cloudflare-worker/schema.sql');
+  const schemaPath = new URL('../../schema.sql', import.meta.url);
   sqlite.exec(fs.readFileSync(schemaPath, 'utf-8'));
   return sqlite;
 }
@@ -405,7 +404,7 @@ test('Telegram Bot renders web_app Mini App button with configured MINIAPP_URL o
 
     // 3. Static miniapp/index.html exists and contains Telegram WebApp SDK + Tailwind CDN + Vazirmatn + RTL
     const miniappHtml = fs.readFileSync(
-      path.resolve(process.cwd(), 'miniapp/index.html'),
+      new URL('../../../miniapp/index.html', import.meta.url),
       'utf-8'
     );
     assert.ok(miniappHtml.includes('dir="rtl"'));
