@@ -149,13 +149,28 @@ function reconcileIdempotently() {
     execD1Sql(`CREATE INDEX IF NOT EXISTS idx_users_email ON users(LOWER(email));`);
   }
 
-  // Mark migrations 0001..005 as applied in d1_migrations so future wrangler runs stay clean
+  // Reconcile Migration 006 `support_sessions` table & indexes
+  const supportSessionCols = getTableColumns('support_sessions');
+  if (supportSessionCols.size > 0) {
+    ensureColumn('support_sessions', supportSessionCols, 'topic_thread_id', 'INTEGER');
+    ensureColumn('support_sessions', supportSessionCols, 'message_count', 'INTEGER NOT NULL DEFAULT 0');
+    ensureColumn('support_sessions', supportSessionCols, 'last_user_message_id', 'INTEGER');
+    ensureColumn('support_sessions', supportSessionCols, 'status', "TEXT NOT NULL DEFAULT 'open'");
+    execD1Sql(
+      `CREATE INDEX IF NOT EXISTS idx_support_sessions_user_status ON support_sessions(user_id, status);`
+    );
+    execD1Sql(
+      `CREATE INDEX IF NOT EXISTS idx_support_sessions_topic_status ON support_sessions(topic_thread_id, status);`
+    );
+  }
+
+  // Mark migrations 0001..006 as applied in d1_migrations so future wrangler runs stay clean
   const migrationFiles = fs
     .readdirSync(MIGRATIONS_DIR)
     .filter((f) => f.endsWith('.sql'))
     .sort();
   for (const file of migrationFiles) {
-    if (/^(0001|002|003|004|005)_/.test(file)) {
+    if (/^(0001|002|003|004|005|006)_/.test(file)) {
       recordMigrationApplied(file);
     }
   }

@@ -7,14 +7,33 @@ import {
 } from './telegramTopics.ts';
 import type { Env } from './types.ts';
 
-function resolveAllowedOrigin(request: Request, env: Env): string | null {
+const PAGES_DEV_ORIGIN_RE =
+  /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.pages\.dev$/i;
+
+export function resolveAllowedOrigin(request: Request, env: Env): string | null {
   const origin = request.headers.get('Origin');
   if (!origin) return null;
+
+  // Allow any HTTPS Cloudflare Pages deployment (*.pages.dev) for the Telegram Mini App
+  if (PAGES_DEV_ORIGIN_RE.test(origin)) {
+    return origin;
+  }
 
   const configured = (env.ALLOWED_ORIGINS || '')
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean);
+
+  if (env.MINIAPP_URL) {
+    try {
+      const parsedMiniApp = new URL(env.MINIAPP_URL.trim());
+      if (parsedMiniApp.protocol === 'https:') {
+        configured.push(parsedMiniApp.origin);
+      }
+    } catch {
+      // Ignore malformed MINIAPP_URL
+    }
+  }
 
   // Allow Tauri native desktop/Android WebView origins + explicitly configured web origins
   const defaultOrigins = new Set([
@@ -41,12 +60,13 @@ function applySecurityAndCorsHeaders(
     headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     headers.set(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, X-Subscription-Token, X-Sentra-Client, X-Connect-Code, X-Device-Id, X-Quality-Secret, X-App-Version, If-None-Match'
+      'Content-Type, Authorization, X-Telegram-Init-Data, X-Subscription-Token, X-Sentra-Client, X-Connect-Code, X-Device-Id, X-Quality-Secret, X-App-Version, If-None-Match'
     );
     headers.set(
       'Access-Control-Expose-Headers',
-      'ETag, Subscription-Userinfo, Profile-Update-Interval'
+      'ETag, Subscription-Userinfo, Profile-Update-Interval, X-Sentra-Cache'
     );
+    headers.set('Access-Control-Max-Age', '86400');
   }
 
   return new Response(response.body, {

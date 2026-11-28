@@ -1,6 +1,6 @@
 import { API_BASE_URL, SESSION_STORAGE_KEY } from '../constants';
 import { APP_VERSION } from './proxyParser';
-import { captureClientSentryException } from './sentry';
+import { captureClientSentryException, isClientSentryEnabled } from './sentry';
 
 export type ClientErrorPlatform = 'android' | 'windows';
 
@@ -192,6 +192,7 @@ export async function reportClientError(
     recentReportTimestamps.push(now);
 
     // Report sanitized exception to Sentry in parallel (no subscription token included)
+    const sentryTracked = isClientSentryEnabled();
     captureClientSentryException({
       platform: payload.platform,
       appVersion: payload.appVersion,
@@ -202,6 +203,15 @@ export async function reportClientError(
       stackTrace: payload.stackTrace,
       context: payload.context,
     });
+
+    const wirePayload = sentryTracked
+      ? {
+          ...payload,
+          source: 'sentry',
+          sentryProject: 'sentra-client',
+          sentryLevel: 'error',
+        }
+      : payload;
 
     const endpoint = `${API_BASE_URL.replace(/\/+$/, '')}/api/v1/telemetry/error`;
     const subToken = input.subscriptionToken ?? readStoredSubscriptionToken();
@@ -219,7 +229,7 @@ export async function reportClientError(
       const resp = await fetch(endpoint, {
         method: 'POST',
         headers,
-        body: JSON.stringify(payload),
+        body: JSON.stringify(wirePayload),
         signal: controller.signal,
         keepalive: true,
       });

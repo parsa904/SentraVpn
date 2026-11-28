@@ -35,9 +35,25 @@ import {
   checkIngestionRateAndDedup,
   dispatchUnifiedError,
   parseExternalErrorPayload,
+  parseSentryWebhookPayload,
   reportWorkerError,
+  verifySentryWebhookSignature,
 } from './errorReporter.ts';
 import { logTelemetryToTurso } from './tursoClient.ts';
+import {
+  EDGE_CACHE_PATHS,
+  EDGE_TTL_METADATA_SECONDS,
+  EDGE_TTL_NODES_SECONDS,
+  SINGBOX_RULE_SETS,
+  invalidateEdgeNodesCache,
+  invalidateEdgeVersionCache,
+  withEdgeCache,
+} from './edgeCache.ts';
+import {
+  ensureMiniAppUserAndSubscription,
+  verifyTelegramInitData,
+} from './miniAppAuth.ts';
+import { ensureSchemaColumns } from './supportSessions.ts';
 import {
   checkPublicIpRateLimit,
   computeWeakEtag,
@@ -234,8 +250,12 @@ export async function routeRequest(
 
     const report = parsed.report;
 
-    // GitHub Actions / QualityEngine reports require QUALITY_ENGINE_SECRET
-    if (report.platform === 'github-actions') {
+    // GitHub Actions / QualityEngine / Client CI build reports require QUALITY_ENGINE_SECRET
+    const isCiReportPlatform =
+      report.platform === 'github-actions' ||
+      report.platform === 'android-build' ||
+      report.platform === 'windows-build';
+    if (isCiReportPlatform) {
       if (!env.QUALITY_ENGINE_SECRET) {
         return errorResponse(503, 'کلید امنیتی QualityEngine پیکربندی نشده است.');
       }
@@ -245,8 +265,22 @@ export async function routeRequest(
       }
     }
 
+    if (report.platform === 'sentry' && (env.SENTRY_WEBHOOK_SECRET || env.QUALITY_ENGINE_SECRET)) {
+      const expected = env.SENTRY_WEBHOOK_SECRET || env.QUALITY_ENGINE_SECRET || '';
+      const providedHeader =
+        extractBearerOrHeaderSecret(request, 'X-Sentry-Webhook-Secret') ||
+        extractBearerOrHeaderSecret(request, 'X-Quality-Secret');
+      if (!providedHeader || !(await constantTimeEquals(providedHeader, expected))) {
+        return errorResponse(401, 'احراز هویت ارسال خطای Sentry نامعتبر است.', 'UNAUTHORIZED_SENTRY');
+      }
+    }
+
     // Optional subscription tier enrichment for Android/Windows (without ever logging the token)
-    let authStatus = report.platform === 'github-actions' ? 'quality_secret_verified' : 'anonymous';
+    let authStatus = isCiReportPlatform
+      ? 'quality_secret_verified'
+      : report.platform === 'sentry'
+      ? 'sentry_verified'
+      : 'anonymous';
     if (report.platform === 'android' || report.platform === 'windows') {
       const subToken = extractAuthToken(request);
       if (subToken) {
@@ -303,6 +337,93 @@ export async function routeRequest(
     );
   }
 
+  // 2c. Dedicated Sentry Webhook Endpoint (Routes to Telegram Logs Topic with #Sentry_Error | 🚨 [SENTRY])
+  if (
+    method === 'POST' &&
+    (path === '/api/v1/webhooks/sentry' || path === '/api/v1/sentry/webhook')
+  ) {
+    const ipLimit = checkPublicIpRateLimit('logs', extractClientIp(request));
+    if (!ipLimit.allowed) {
+      return jsonResponse(
+        {
+          success: false,
+          error: 'تعداد درخواست‌های وب‌هوک Sentry بیش از حد مجاز است.',
+          code: 'RATE_LIMITED',
+        },
+        429,
+        { 'Retry-After': String(ipLimit.retryAfterSec) }
+      );
+    }
+
+    let rawBody = '';
+    try {
+      rawBody = await request.text();
+    } catch {
+      return errorResponse(400, 'خواندن بدنه وب‌هوک Sentry ناموفق بود.');
+    }
+
+    if (rawBody.length > 65_536) {
+      return errorResponse(413, 'حجم بدنه وب‌هوک Sentry بیش از حد مجاز (۶۴ کیلوبایت) است.');
+    }
+
+    // Verify Sentry HMAC-SHA256 signature (`Sentry-Hook-Signature`) or shared secret when configured
+    const configuredSecret = (env.SENTRY_WEBHOOK_SECRET || '').trim();
+    if (configuredSecret) {
+      const hmacSig = request.headers.get('Sentry-Hook-Signature') || '';
+      const sharedHeader = extractBearerOrHeaderSecret(request, 'X-Sentry-Webhook-Secret');
+      const hmacValid = hmacSig
+        ? await verifySentryWebhookSignature(rawBody, hmacSig, configuredSecret)
+        : false;
+      const sharedValid = sharedHeader
+        ? await constantTimeEquals(sharedHeader, configuredSecret)
+        : false;
+      if (!hmacValid && !sharedValid) {
+        return errorResponse(401, 'امضای وب‌هوک Sentry نامعتبر است.', 'INVALID_SENTRY_SIGNATURE');
+      }
+    }
+
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(rawBody);
+    } catch {
+      return errorResponse(400, 'فرمت JSON وب‌هوک Sentry نامعتبر است.');
+    }
+
+    const parsed = parseSentryWebhookPayload(parsedJson);
+    if (!parsed.ok) {
+      return errorResponse(400, parsed.error);
+    }
+
+    const report = parsed.report;
+    const throttleKey = `sentry:${report.sentryProject || 'default'}`;
+    const verdict = checkIngestionRateAndDedup(report, throttleKey);
+    if (!verdict.allowed) {
+      if (verdict.reason === 'rate_limited') {
+        return errorResponse(429, 'تعداد گزارش‌های Sentry در دقیقه بیش از حد مجاز است.', 'RATE_LIMITED');
+      }
+      return jsonResponse(
+        {
+          success: true,
+          accepted: true,
+          source: 'sentry',
+          deduplicated: true,
+        },
+        200
+      );
+    }
+
+    await dispatchUnifiedError(env, ctx, report);
+    return jsonResponse(
+      {
+        success: true,
+        accepted: true,
+        source: 'sentry',
+        deduplicated: false,
+      },
+      200
+    );
+  }
+
   // 3. QualityEngine — Fetch Active/Candidate Nodes (Protected by QUALITY_ENGINE_SECRET)
   if (method === 'GET' && path === '/api/v1/nodes/active') {
     if (!env.QUALITY_ENGINE_SECRET) {
@@ -313,10 +434,16 @@ export async function routeRequest(
       return errorResponse(401, 'دسترسی QualityEngine مجاز نیست.', 'UNAUTHORIZED_QUALITY_ENGINE');
     }
 
-    try {
-      let nodeRows: DonatedOutboundRow[] = [];
-      let subSourceRows: SubscriptionSourceRow[] = [];
-      let schemaFallbackUsed = false;
+    return await withEdgeCache({
+      cachePath: EDGE_CACHE_PATHS.NODES_ACTIVE,
+      ttlSeconds: EDGE_TTL_NODES_SECONDS,
+      origin: request,
+      ctx,
+      producer: async () => {
+        try {
+          let nodeRows: DonatedOutboundRow[] = [];
+          let subSourceRows: SubscriptionSourceRow[] = [];
+          let schemaFallbackUsed = false;
 
       try {
         const [rowsRes, subSourcesRes] = await executeD1Batch<Record<string, unknown>>(env.DB, [
@@ -446,15 +573,17 @@ export async function routeRequest(
         error: err,
         context: { endpoint: '/api/v1/nodes/active' },
       });
-      return jsonResponse(
-        {
-          ok: false,
-          success: false,
-          error: errMessage,
-        },
-        500
-      );
-    }
+          return jsonResponse(
+            {
+              ok: false,
+              success: false,
+              error: errMessage,
+            },
+            500
+          );
+        }
+      },
+    });
   }
 
   // 5. QualityEngine — Receive Health Report (POST /api/v1/nodes/health-report)
@@ -958,12 +1087,16 @@ export async function routeRequest(
       }
     }
 
-    // 4. Execute all changed writes in chunked db.batch() and invalidate L1+L2 KV cache ONLY if nodes actually changed
+    // 4. Execute all changed writes in chunked db.batch() and invalidate L1+L2 KV + Edge Cache
     if (writeStatements.length > 0) {
       await executeD1Batch(env.DB, writeStatements);
       if (nodesChanged) {
-        await invalidateNodesCache(env.DB, env.SENTRA_KV);
+        await invalidateNodesCache(env.DB, env.SENTRA_KV, request);
+      } else {
+        await invalidateEdgeNodesCache(request);
       }
+    } else if (subscriptionSourcesUpdated > 0) {
+      await invalidateEdgeNodesCache(request);
     }
 
     // 5. Inspect remaining healthy capacity per plan tier (single lightweight aggregate query)
@@ -1163,6 +1296,7 @@ export async function routeRequest(
         ? body.telegram_file_id.trim().slice(0, 256)
         : null;
 
+    await ensureSchemaColumns(env.DB);
     await env.DB.prepare(
       `INSERT INTO app_release_files (platform, version, github_url, telegram_file_id, updated_at)
        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -1174,6 +1308,8 @@ export async function routeRequest(
     )
       .bind(platformRaw, version, parsedUrl.toString(), telegramFileId)
       .run();
+
+    await invalidateEdgeVersionCache(request);
 
     return jsonResponse({
       success: true,
@@ -1494,34 +1630,38 @@ export async function routeRequest(
     });
   }
 
-  // 9. Client Locations: GET /api/v1/client/locations (Served from L1 RAM / L2 KV Cache)
+  // 9. Client Locations: GET /api/v1/client/locations (Cloudflare Edge Cache 180s -> L1 RAM / L2 KV)
   if (method === 'GET' && path === '/api/v1/client/locations') {
-    const items = await getCachedLocations(env.DB, env.SENTRA_KV);
-    const totalNodes = items.reduce((sum, r) => sum + r.active_nodes, 0);
-    const minPing = items.length > 0 ? items[0].best_ping : 0;
+    return await withEdgeCache({
+      cachePath: EDGE_CACHE_PATHS.CLIENT_LOCATIONS,
+      ttlSeconds: EDGE_TTL_NODES_SECONDS,
+      origin: request,
+      ctx,
+      producer: async () => {
+        const items = await getCachedLocations(env.DB, env.SENTRA_KV);
+        const totalNodes = items.reduce((sum, r) => sum + r.active_nodes, 0);
+        const minPing = items.length > 0 ? items[0].best_ping : 0;
 
-    return jsonResponse(
-      [
-        {
-          code: 'auto',
-          name: '⚡️ انتخاب خودکار (سریع‌ترین لوکیشن)',
-          flag: '⚡️',
-          ping_ms: minPing,
-          active_nodes: totalNodes,
-          is_auto: true,
-        },
-        ...items.map((r) => ({
-          code: r.country_code,
-          name: r.country_name,
-          flag: r.country_name.split(' ').pop() || '🌍',
-          ping_ms: r.best_ping,
-          active_nodes: r.active_nodes,
-          is_auto: false,
-        })),
-      ],
-      200,
-      { 'Cache-Control': 'public, max-age=300' }
-    );
+        return jsonResponse([
+          {
+            code: 'auto',
+            name: '⚡️ انتخاب خودکار (سریع‌ترین لوکیشن)',
+            flag: '⚡️',
+            ping_ms: minPing,
+            active_nodes: totalNodes,
+            is_auto: true,
+          },
+          ...items.map((r) => ({
+            code: r.country_code,
+            name: r.country_name,
+            flag: r.country_name.split(' ').pop() || '🌍',
+            ping_ms: r.best_ping,
+            active_nodes: r.active_nodes,
+            is_auto: false,
+          })),
+        ]);
+      },
+    });
   }
 
   // 10. Auth: Register (POST /api/v1/auth/register)
@@ -2544,21 +2684,353 @@ export async function routeRequest(
     });
   }
 
-  // 19. Client Version Metadata (GET /api/v1/client/version)
+  // 19. Client Version Metadata (GET /api/v1/client/version — Edge Cached 600s)
   if (method === 'GET' && path === '/api/v1/client/version') {
+    return await withEdgeCache({
+      cachePath: EDGE_CACHE_PATHS.CLIENT_VERSION,
+      ttlSeconds: EDGE_TTL_METADATA_SECONDS,
+      origin: request,
+      ctx,
+      producer: async () => {
+        const baseReleaseUrl = 'https://github.com/parsa904/SentraVpn/releases/latest';
+        const baseDownloadUrl = `${baseReleaseUrl}/download`;
+
+        let releaseRows: Array<{
+          platform: string;
+          version: string;
+          github_url: string;
+          telegram_file_id: string | null;
+          updated_at: string;
+        }> = [];
+        try {
+          await ensureSchemaColumns(env.DB);
+          const res = await env.DB.prepare(
+            'SELECT platform, version, github_url, telegram_file_id, updated_at FROM app_release_files ORDER BY platform ASC'
+          ).all<{
+            platform: string;
+            version: string;
+            github_url: string;
+            telegram_file_id: string | null;
+            updated_at: string;
+          }>();
+          releaseRows = res.results || [];
+        } catch {
+          releaseRows = [];
+        }
+
+        const androidRel = releaseRows.find((r) => r.platform === 'android');
+        const windowsRel = releaseRows.find((r) => r.platform === 'windows');
+        const latestVersion =
+          androidRel?.version || windowsRel?.version || '1.0.0';
+
+        return jsonResponse({
+          success: true,
+          latest_version: latestVersion,
+          min_supported_version: '1.0.0',
+          release_url: baseReleaseUrl,
+          downloads: {
+            android_universal:
+              androidRel?.github_url || `${baseDownloadUrl}/SentraVPN-Android-Universal.apk`,
+            android_armv8: `${baseDownloadUrl}/SentraVPN-Android-ARMv8.apk`,
+            android_armv7: `${baseDownloadUrl}/SentraVPN-Android-ARMv7.apk`,
+            android_x64: `${baseDownloadUrl}/SentraVPN-Android-x64.apk`,
+            windows_setup_x64:
+              windowsRel?.github_url || `${baseDownloadUrl}/SentraVPN-Windows-Setup-x64.exe`,
+            windows_portable_x64: `${baseDownloadUrl}/SentraVPN-Windows-Portable-x64.zip`,
+          },
+          releases: {
+            android: androidRel
+              ? {
+                  version: androidRel.version,
+                  github_url: androidRel.github_url,
+                  telegram_cached: Boolean(androidRel.telegram_file_id),
+                  updated_at: androidRel.updated_at,
+                }
+              : null,
+            windows: windowsRel
+              ? {
+                  version: windowsRel.version,
+                  github_url: windowsRel.github_url,
+                  telegram_cached: Boolean(windowsRel.telegram_file_id),
+                  updated_at: windowsRel.updated_at,
+                }
+              : null,
+          },
+        });
+      },
+    });
+  }
+
+  // 20. sing-box Rule-Sets (GET /api/v1/client/rule-sets & /api/v1/client/rule-sets/:name — Edge Cached 600s)
+  if (method === 'GET' && path === '/api/v1/client/rule-sets') {
+    return await withEdgeCache({
+      cachePath: EDGE_CACHE_PATHS.RULE_SETS_INDEX,
+      ttlSeconds: EDGE_TTL_METADATA_SECONDS,
+      origin: request,
+      ctx,
+      producer: async () =>
+        jsonResponse({
+          success: true,
+          rule_sets: Object.keys(SINGBOX_RULE_SETS).map((name) => ({
+            name,
+            format: 'source',
+            version: 3,
+            url: `/api/v1/client/rule-sets/${name}`,
+          })),
+        }),
+    });
+  }
+
+  const ruleSetMatch = /^\/api\/v1\/client\/rule-sets\/([a-z0-9-]+)(?:\.json)?$/.exec(path);
+  if (method === 'GET' && ruleSetMatch) {
+    const setName = ruleSetMatch[1];
+    const ruleSetPayload = SINGBOX_RULE_SETS[setName];
+    if (!ruleSetPayload) {
+      return errorResponse(404, 'مجموعه قوانین (rule-set) مورد نظر یافت نشد.', 'RULE_SET_NOT_FOUND');
+    }
+    return await withEdgeCache({
+      cachePath: `${EDGE_CACHE_PATHS.RULE_SETS_INDEX}/${setName}`,
+      ttlSeconds: EDGE_TTL_METADATA_SECONDS,
+      origin: request,
+      ctx,
+      producer: async () => jsonResponse(ruleSetPayload),
+    });
+  }
+
+  // 21. Telegram Mini App Authenticated Profile & Live Status (POST /api/v1/miniapp/me)
+  if (method === 'POST' && path === '/api/v1/miniapp/me') {
+    let body: Record<string, unknown> = {};
+    try {
+      const rawText = await request.text();
+      if (rawText.trim()) {
+        body = JSON.parse(rawText) as Record<string, unknown>;
+      }
+    } catch {
+      return errorResponse(400, 'بدنه JSON درخواست مینی‌اپ معتبر نیست.', 'INVALID_JSON');
+    }
+
+    const authHeader = (request.headers.get('Authorization') || '').trim();
+    const tmaToken = authHeader.toLowerCase().startsWith('tma ')
+      ? authHeader.slice(4).trim()
+      : '';
+    const initData =
+      (request.headers.get('X-Telegram-Init-Data') || '').trim() ||
+      tmaToken ||
+      String(body.initData || body.init_data || '').trim();
+
+    const verified = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN || '');
+    if (!verified.ok) {
+      return errorResponse(
+        verified.code === 'BOT_TOKEN_NOT_CONFIGURED' ? 503 : 401,
+        verified.error,
+        verified.code
+      );
+    }
+
+    const tgUser = verified.data.user;
+    const { user, sub, isNewUser } = await ensureMiniAppUserAndSubscription(env.DB, tgUser, env);
+    const planTier = resolvePlanTier(sub);
+    const freeQuotas = await getFreeQuotaSettings(env.DB, env.SENTRA_KV);
+    const activePool = await getCachedActiveNodesPool(env.DB, env.SENTRA_KV);
+
+    const webUsedBytes = Math.max(
+      Number(sub.web_used_bytes || 0),
+      Math.round(Number(sub.web_browsing_used_mb || 0) * MIB_BYTES)
+    );
+    const downloadUsedBytes = Math.max(
+      Number(sub.download_used_bytes || 0),
+      Math.round(Number(sub.download_used_mb || 0) * MIB_BYTES)
+    );
+    const specialUsedBytes = Math.max(
+      Number(sub.special_used_bytes || 0),
+      Math.round(Number(sub.static_ip_used_mb || 0) * MIB_BYTES)
+    );
+    const specialQuotaBytes =
+      planTier === 'flow_plus'
+        ? Math.max(Number(sub.special_quota_bytes || 0), 50 * GIB_BYTES)
+        : planTier === 'pro'
+        ? Math.max(Number(sub.special_quota_bytes || 0), 30 * GIB_BYTES)
+        : Math.max(0, Number(sub.special_quota_bytes || 0));
+
+    const isUnlimitedGeneral = planTier === 'pro' || planTier === 'flow_plus';
+    const webLimitBytes = isUnlimitedGeneral ? 0 : freeQuotas.webQuotaBytes;
+    const downloadLimitBytes = isUnlimitedGeneral ? 0 : freeQuotas.downloadQuotaBytes;
+
+    // Fetch latest release download URLs (with parsa904/SentraVpn fallback)
+    const baseReleaseUrl = 'https://github.com/parsa904/SentraVpn/releases/latest';
+    const baseDownloadUrl = `${baseReleaseUrl}/download`;
+    let androidUrl = `${baseDownloadUrl}/SentraVPN-Android-Universal.apk`;
+    let windowsUrl = `${baseDownloadUrl}/SentraVPN-Windows-Setup-x64.exe`;
+    let androidVersion = 'latest';
+    let windowsVersion = 'latest';
+    try {
+      const relRows = await env.DB.prepare(
+        'SELECT platform, version, github_url FROM app_release_files'
+      ).all<{ platform: string; version: string; github_url: string }>();
+      for (const r of relRows.results || []) {
+        if (r.platform === 'android') {
+          if (r.github_url) androidUrl = r.github_url;
+          if (r.version) androidVersion = r.version;
+        } else if (r.platform === 'windows') {
+          if (r.github_url) windowsUrl = r.github_url;
+          if (r.version) windowsVersion = r.version;
+        }
+      }
+    } catch {
+      // Fallback defaults already set
+    }
+
+    const botUsername = (env.BOT_USERNAME || 'SentraVPNBot').replace(/^@/, '').trim();
+    const referralLink = `https://t.me/${botUsername}?start=ref_${tgUser.id}`;
+
     return jsonResponse({
       success: true,
-      latest_version: '1.0.0',
-      min_supported_version: '1.0.0',
-      release_url: 'https://github.com/parsa904/sentravpn/releases/latest',
-      downloads: {
-        android_universal: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-Universal.apk',
-        android_armv8: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-ARMv8.apk',
-        android_armv7: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-ARMv7.apk',
-        android_x64: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Android-x64.apk',
-        windows_setup_x64: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Windows-Setup-x64.exe',
-        windows_portable_x64: 'https://github.com/parsa904/sentravpn/releases/latest/download/SentraVPN-Windows-Portable-x64.zip',
+      is_new_user: isNewUser,
+      user: {
+        telegram_id: tgUser.id,
+        first_name: tgUser.first_name || user.first_name,
+        last_name: tgUser.last_name || user.last_name || '',
+        telegram_username: tgUser.username || null,
+        username: user.username || null,
+        email: user.email || null,
+        has_password: Boolean(user.password_hash),
+        role: user.role,
       },
+      subscription: {
+        plan_tier: planTier,
+        plan_label:
+          planTier === 'flow_plus'
+            ? 'Flow+'
+            : planTier === 'pro'
+            ? 'Pro'
+            : 'Free',
+        status: sub.status,
+        connect_code: sub.connect_code,
+        expires_at: sub.expires_at,
+        max_concurrent_devices: Number(sub.max_concurrent_devices || 2),
+        has_used_special_trial: Number(sub.has_used_special_trial || 0) === 1,
+      },
+      traffic: {
+        web: {
+          used_bytes: webUsedBytes,
+          limit_bytes: webLimitBytes,
+          unlimited: isUnlimitedGeneral,
+        },
+        download: {
+          used_bytes: downloadUsedBytes,
+          limit_bytes: downloadLimitBytes,
+          unlimited: isUnlimitedGeneral,
+        },
+        special: {
+          used_bytes: specialUsedBytes,
+          limit_bytes: specialQuotaBytes,
+          unlimited: false,
+        },
+      },
+      servers: {
+        online_nodes: activePool.donated.length + activePool.core.length,
+        countries_count: activePool.locations.length,
+        checked_at: new Date().toISOString(),
+      },
+      downloads: {
+        release_url: baseReleaseUrl,
+        android_apk: androidUrl,
+        android_version: androidVersion,
+        windows_exe: windowsUrl,
+        windows_version: windowsVersion,
+        windows_portable_zip: `${baseDownloadUrl}/SentraVPN-Windows-Portable-x64.zip`,
+      },
+      referral: {
+        bot_username: botUsername,
+        invite_link: referralLink,
+      },
+    });
+  }
+
+  // 22. Telegram Mini App Unified Web/App Credentials Update (POST /api/v1/miniapp/credentials)
+  if (method === 'POST' && path === '/api/v1/miniapp/credentials') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await request.json()) as Record<string, unknown>;
+    } catch {
+      return errorResponse(400, 'بدنه JSON معتبر نیست.', 'INVALID_JSON');
+    }
+
+    const authHeader = (request.headers.get('Authorization') || '').trim();
+    const tmaToken = authHeader.toLowerCase().startsWith('tma ')
+      ? authHeader.slice(4).trim()
+      : '';
+    const initData =
+      (request.headers.get('X-Telegram-Init-Data') || '').trim() ||
+      tmaToken ||
+      String(body.initData || body.init_data || '').trim();
+
+    const verified = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN || '');
+    if (!verified.ok) {
+      return errorResponse(
+        verified.code === 'BOT_TOKEN_NOT_CONFIGURED' ? 503 : 401,
+        verified.error,
+        verified.code
+      );
+    }
+
+    const usernameCheck = validateUnifiedUsername(String(body.username || ''));
+    if (!usernameCheck.ok) {
+      return errorResponse(400, usernameCheck.error, 'INVALID_USERNAME');
+    }
+
+    const password = String(body.password || '');
+    const passwordCheck = validateUnifiedPassword(password);
+    if (!passwordCheck.ok) {
+      return errorResponse(400, passwordCheck.error, 'INVALID_PASSWORD');
+    }
+
+    const confirmPassword = String(body.confirm_password ?? body.confirmPassword ?? '');
+    if (confirmPassword !== password) {
+      return errorResponse(400, 'رمز عبور و تکرار آن با یکدیگر مطابقت ندارند.', 'PASSWORD_MISMATCH');
+    }
+
+    const emailCheck = validateOptionalEmail(
+      typeof body.email === 'string' ? body.email : undefined
+    );
+    if (!emailCheck.ok) {
+      return errorResponse(400, emailCheck.error, 'INVALID_EMAIL');
+    }
+
+    const { user } = await ensureMiniAppUserAndSubscription(env.DB, verified.data.user, env);
+
+    const conflict = await env.DB.prepare(
+      'SELECT id FROM users WHERE LOWER(username) = LOWER(?) AND id != ? LIMIT 1'
+    )
+      .bind(usernameCheck.username, user.id)
+      .first<{ id: number }>();
+
+    if (conflict) {
+      return errorResponse(
+        409,
+        'این نام کاربری قبلاً توسط کاربر دیگری ثبت شده است.',
+        'USERNAME_TAKEN'
+      );
+    }
+
+    const passwordHash = await hashPassword(password);
+    await env.DB.prepare(
+      `UPDATE users
+       SET username = ?,
+           password_hash = ?,
+           email = COALESCE(?, email),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`
+    )
+      .bind(usernameCheck.username, passwordHash, emailCheck.email, user.id)
+      .run();
+
+    return jsonResponse({
+      success: true,
+      message: 'نام کاربری و رمز عبور شما با موفقیت ذخیره شد. اکنون می‌توانید در اپلیکیشن نیز وارد شوید.',
+      username: usernameCheck.username,
+      email: emailCheck.email ?? user.email ?? null,
+      has_password: true,
     });
   }
 

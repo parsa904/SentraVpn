@@ -15,6 +15,9 @@ export interface Env {
   WIREGUARD_PORT?: string;
   WIREGUARD_KEY_SALT?: string;
   SENTRY_DSN_WORKER?: string;
+  SENTRY_WEBHOOK_SECRET?: string;
+  RELEASES_CHANNEL_ID?: string;
+  MINIAPP_URL?: string;
   TURSO_DATABASE_URL?: string;
   TURSO_AUTH_TOKEN?: string;
 }

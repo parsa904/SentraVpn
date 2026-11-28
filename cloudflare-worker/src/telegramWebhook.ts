@@ -21,16 +21,32 @@ import {
 } from './security.ts';
 import { resolvePlanTier } from './singboxCompiler.ts';
 import {
+  attachTopicToSupportSession,
+  buildSupportTopicTitle,
+  closeSupportSession,
+  ensureSchemaColumns,
+  getOpenSupportSessionByTopic,
+  getOpenSupportSessionByUser,
+  recordSupportSessionActivity,
+  SUPPORT_TOPIC_ESCALATION_THRESHOLD,
+  type SupportSessionRow,
+} from './supportSessions.ts';
+import { invalidateEdgeVersionCache } from './edgeCache.ts';
+import {
+  createSupportForumTopic,
+  deleteSupportForumTopic,
   dispatchErrorAlert,
   extractSupportUid,
   formatLogTimestamp,
   getFreeQuotaSettings,
   getTopicRoutingConfig,
+  pinGroupMessage,
   saveTopicRoute,
   sendDatabaseBackup,
   sendErrorAlert,
   sendMediaToTopic,
   sendToTopic,
+  sendToTopicWithResult,
   type TopicType,
 } from './telegramTopics.ts';
 import {
@@ -60,6 +76,7 @@ interface TelegramDocument {
   file_id: string;
   file_unique_id: string;
   file_name?: string;
+  mime_type?: string;
 }
 
 interface TelegramReplyMessage {
@@ -94,6 +111,8 @@ interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
+  channel_post?: TelegramMessage;
+  edited_channel_post?: TelegramMessage;
 }
 
 interface BotStateRow {
@@ -124,7 +143,24 @@ const PRO_PLAN_PRICE_TOMAN = 120000;
 const FLOW_PLUS_PLAN_PRICE_TOMAN = 180000;
 const PRO_SPECIAL_QUOTA_BYTES = 30 * GIB_BYTES;
 const FLOW_PLUS_SPECIAL_QUOTA_BYTES = 50 * GIB_BYTES;
-const GITHUB_RELEASES_BASE_URL = 'https://github.com/parsa904/sentravpn/releases/latest/download';
+const GITHUB_RELEASES_BASE_URL = 'https://github.com/parsa904/SentraVpn/releases/latest/download';
+const DEFAULT_MINIAPP_URL = 'https://sentravpn.pages.dev';
+const MINIAPP_BUTTON_LABEL = '📱 ورود به پنل گرافیکی (Mini App)';
+
+function resolveMiniAppUrl(env?: Env): string {
+  const raw = (env?.MINIAPP_URL || '').trim();
+  if (raw) {
+    try {
+      const parsed = new URL(raw);
+      if (parsed.protocol === 'https:') {
+        return parsed.toString().replace(/\/$/, '');
+      }
+    } catch {
+      // Fallback to default Cloudflare Pages URL
+    }
+  }
+  return DEFAULT_MINIAPP_URL;
+}
 
 function buildProgressBar(used: number, total: number, length = 10): string {
   const safeTotal = Math.max(1, total);
@@ -454,22 +490,123 @@ async function tgSendDocumentByFileId(
   env: Env,
   chatId: number,
   fileId: string,
-  caption: string
+  caption: string,
+  replyMarkup?: Record<string, unknown>
 ): Promise<boolean> {
   return await tgApi(env, 'sendDocument', {
     chat_id: chatId,
     document: fileId,
     caption,
     parse_mode: 'HTML',
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
   });
 }
 
-function buildMainKeyboard(isRegistered: boolean, isAdmin: boolean): Record<string, unknown> {
+function detectReleaseBinary(
+  doc: TelegramDocument | null | undefined,
+  captionOrText = ''
+): { platform: 'android' | 'windows'; fileName: string; version: string | null } | null {
+  if (!doc?.file_id) return null;
+  const fileName = (doc.file_name || '').trim();
+  const lowerName = fileName.toLowerCase();
+  const lowerMime = (doc.mime_type || '').toLowerCase();
+  const combinedText = `${captionOrText} ${fileName}`;
+
+  let platform: 'android' | 'windows' | null = null;
+  if (lowerName.endsWith('.apk') || lowerMime === 'application/vnd.android.package-archive') {
+    platform = 'android';
+  } else if (
+    lowerName.endsWith('.exe') ||
+    lowerName.endsWith('.msi') ||
+    lowerMime === 'application/x-msdownload' ||
+    lowerMime === 'application/x-msdos-program'
+  ) {
+    platform = 'windows';
+  } else if (
+    lowerName.endsWith('.zip') &&
+    /(windows|win64|win32|portable|sentra.*x64)/i.test(combinedText)
+  ) {
+    platform = 'windows';
+  }
+
+  if (!platform) return null;
+  const versionMatch = /v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.]+)?/.exec(combinedText);
+  return {
+    platform,
+    fileName: fileName || (platform === 'android' ? 'SentraVPN-Android-Universal.apk' : 'SentraVPN-Windows-Setup-x64.exe'),
+    version: versionMatch ? versionMatch[0] : null,
+  };
+}
+
+async function saveTelegramReleaseFile(
+  env: Env,
+  params: {
+    platform: 'android' | 'windows';
+    fileId: string;
+    fileName?: string;
+    captionOrText?: string;
+    versionHint?: string | null;
+  }
+): Promise<{ platform: 'android' | 'windows'; version: string; githubUrl: string; fileName: string }> {
+  await ensureSchemaColumns(env.DB);
+  const existingRel = await env.DB.prepare(
+    'SELECT version, github_url FROM app_release_files WHERE platform = ? LIMIT 1'
+  )
+    .bind(params.platform)
+    .first<{ version: string; github_url: string }>();
+
+  const versionMatch = /v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.]+)?/.exec(
+    `${params.captionOrText || ''} ${params.fileName || ''}`
+  );
+  const version =
+    params.versionHint ||
+    (versionMatch ? versionMatch[0] : null) ||
+    existingRel?.version ||
+    'latest';
+
+  const defaultGithubUrl =
+    params.platform === 'android'
+      ? `${GITHUB_RELEASES_BASE_URL}/SentraVPN-Android-Universal.apk`
+      : `${GITHUB_RELEASES_BASE_URL}/SentraVPN-Windows-Setup-x64.exe`;
+  const githubUrl = existingRel?.github_url || defaultGithubUrl;
+
+  await env.DB.prepare(
+    `INSERT INTO app_release_files (platform, version, github_url, telegram_file_id, updated_at)
+     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+     ON CONFLICT(platform) DO UPDATE SET
+       version = excluded.version,
+       github_url = excluded.github_url,
+       telegram_file_id = excluded.telegram_file_id,
+       updated_at = CURRENT_TIMESTAMP`
+  )
+    .bind(params.platform, version, githubUrl, params.fileId)
+    .run();
+
+  await invalidateEdgeVersionCache();
+
+  return {
+    platform: params.platform,
+    version,
+    githubUrl,
+    fileName:
+      params.fileName ||
+      (params.platform === 'android'
+        ? 'SentraVPN-Android-Universal.apk'
+        : 'SentraVPN-Windows-Setup-x64.exe'),
+  };
+}
+
+function buildMainKeyboard(
+  isRegistered: boolean,
+  isAdmin: boolean,
+  env?: Env
+): Record<string, unknown> {
   const accountOrAuthBtn = isRegistered
     ? { text: USER_BTN.ACCOUNT }
     : { text: USER_BTN.AUTH };
 
-  const rows: Array<Array<{ text: string }>> = [
+  const rows: Array<Array<{ text: string; web_app?: { url: string } }>> = [
+    [{ text: MINIAPP_BUTTON_LABEL, web_app: { url: resolveMiniAppUrl(env) } }],
     [accountOrAuthBtn, { text: USER_BTN.UPGRADE }],
     [{ text: USER_BTN.DONATE_OUTBOUND }, { text: USER_BTN.DOWNLOAD_APP }],
     [{ text: USER_BTN.GUIDE }, { text: USER_BTN.SUPPORT }],
@@ -1180,6 +1317,8 @@ async function handleAdminSubSourceSubmission(
     .bind(category, validUrl.toString(), `Source (${category})`, totalNodes, addedNodes)
     .run();
 
+  await invalidateNodesCache(env.DB, env.SENTRA_KV);
+
   const gamingNote =
     category === 'gaming' && addedNodes > 0
       ? '\n\n🎮 <b>بخش گیمینگ به صورت خودکار در کل اکوسیستم فعال شد!</b>'
@@ -1709,7 +1848,8 @@ function buildCancelStateInlineMarkup(): Record<string, unknown> {
 function buildUserMenuHomeView(
   user: UserRow | null,
   sub: SubscriptionRow | null,
-  isAdmin: boolean
+  isAdmin: boolean,
+  env?: Env
 ): { text: string; replyMarkup: Record<string, unknown> } {
   const planTier = sub ? resolvePlanTier(sub) : 'free';
   const planLabel =
@@ -1726,8 +1866,9 @@ function buildUserMenuHomeView(
       `بخش مورد نظر خود را انتخاب کنید:`
     : `👋 <b>به SentraVPN خوش آمدید!</b>\n\nبرای دریافت کد اتصال ۸ رقمی اختصاصی و استفاده از اپلیکیشن رسمی SentraVPN، ابتدا ثبت‌نام یا ورود انجام دهید:`;
 
-  const inlineRows: Array<Array<{ text: string; callback_data: string }>> = user
+  const inlineRows: Array<Array<{ text: string; callback_data?: string; web_app?: { url: string } }>> = user
     ? [
+        [{ text: MINIAPP_BUTTON_LABEL, web_app: { url: resolveMiniAppUrl(env) } }],
         [
           { text: '👤 حساب کاربری', callback_data: 'user_account' },
           { text: '💎 ارتقای اشتراک', callback_data: 'user_upgrade' },
@@ -1742,6 +1883,7 @@ function buildUserMenuHomeView(
         ],
       ]
     : [
+        [{ text: MINIAPP_BUTTON_LABEL, web_app: { url: resolveMiniAppUrl(env) } }],
         [{ text: '📝 ثبت‌نام جدید', callback_data: 'auth_register_new' }],
         [{ text: '🔑 ورود به حساب موجود (اتصال به اپلیکیشن)', callback_data: 'auth_login_app' }],
       ];
@@ -1862,7 +2004,9 @@ async function buildUserAccountView(
       `   • <code>${buildProgressBar(specialUsedBytes, totalSpecial)}</code>`;
   }
 
-  const inlineRows: Array<Array<{ text: string; callback_data: string }>> = [];
+  const inlineRows: Array<Array<{ text: string; callback_data?: string; web_app?: { url: string } }>> = [
+    [{ text: MINIAPP_BUTTON_LABEL, web_app: { url: resolveMiniAppUrl(env) } }],
+  ];
   if (planTier === 'free' && !hasUsedTrial) {
     inlineRows.push([
       {
@@ -2003,6 +2147,7 @@ async function buildUserDownloadAppView(
 ): Promise<{ text: string; replyMarkup: Record<string, unknown> }> {
   let rows: AppReleaseFileRow[] = [];
   try {
+    await ensureSchemaColumns(env.DB);
     const res = await env.DB.prepare(
       'SELECT platform, version, github_url, telegram_file_id, updated_at FROM app_release_files ORDER BY platform ASC'
     ).all<AppReleaseFileRow>();
@@ -2017,11 +2162,11 @@ async function buildUserDownloadAppView(
   const lines: string[] = [
     `🤖 <b>اندروید (Android):</b> ` +
       (andr
-        ? `نسخه <code>${escapeHtml(andr.version)}</code>${andr.telegram_file_id ? ' — فایل مستقیم تلگرام آماده ✅' : ' — دانلود مستقیم از گیتهاب'}`
+        ? `نسخه <code>${escapeHtml(andr.version)}</code>${andr.telegram_file_id ? ' — ارسال فوری از سرور تلگرام ⚡️' : ' — دانلود مستقیم از گیتهاب'}`
         : 'دانلود مستقیم آخرین نسخه از گیتهاب (Universal / ARMv8 / ARMv7 / x64)'),
     `🪟 <b>ویندوز (Windows):</b> ` +
       (win
-        ? `نسخه <code>${escapeHtml(win.version)}</code>${win.telegram_file_id ? ' — فایل مستقیم تلگرام آماده ✅' : ' — دانلود مستقیم از گیتهاب'}`
+        ? `نسخه <code>${escapeHtml(win.version)}</code>${win.telegram_file_id ? ' — ارسال فوری از سرور تلگرام ⚡️' : ' — دانلود مستقیم از گیتهاب'}`
         : 'دانلود مستقیم آخرین نسخه از گیتهاب (Setup x64 / Portable x64)'),
   ];
 
@@ -2029,7 +2174,7 @@ async function buildUserDownloadAppView(
     text:
       `📥 <b>دانلود اپلیکیشن رسمی SentraVPN</b>\n\n` +
       `${lines.join('\n\n')}\n\n` +
-      `سیستم‌عامل خود را انتخاب کنید تا هم لینک مستقیم گیتهاب و هم فایل نصبی درون تلگرام برای شما ارسال شود:`,
+      `سیستم‌عامل خود را انتخاب کنید تا فایل نصبی (با نهایت سرعت از سرور تلگرام یا لینک مستقیم گیتهاب) برای شما ارسال شود:`,
     replyMarkup: {
       inline_keyboard: [
         [
@@ -2052,6 +2197,7 @@ async function sendPlatformReleaseDownload(
 ): Promise<void> {
   let relFile: AppReleaseFileRow | null = null;
   try {
+    await ensureSchemaColumns(env.DB);
     relFile = await env.DB.prepare(
       'SELECT platform, version, github_url, telegram_file_id, updated_at FROM app_release_files WHERE platform = ? LIMIT 1'
     )
@@ -2100,27 +2246,39 @@ async function sendPlatformReleaseDownload(
         [{ text: '👤 مشاهده کد اتصال ۸ رقمی', callback_data: 'user_account' }],
       ];
 
+  const installGuide = isAndroid
+    ? `📌 <b>راهنمای نصب:</b> فایل را نصب کرده، سپس کد اتصال ۸ رقمی یا نام کاربری خود را در برنامه وارد کنید.`
+    : `📌 <b>راهنمای نصب:</b> فایل نصبی را اجرا کرده (Run as Administrator در صورت نیاز) و با کد اتصال ۸ رقمی یا نام کاربری وارد شوید.`;
+
+  if (fileId) {
+    // Instant CDN delivery straight from Telegram servers using cached telegram_file_id
+    await tgSendDocumentByFileId(
+      env,
+      chatId,
+      fileId,
+      `⚡️ <b>SentraVPN (${isAndroid ? 'Android' : 'Windows'}) — نسخه <code>${escapeHtml(version)}</code></b>\n\n` +
+        `${installGuide}`
+    );
+
+    await tgSendMessage(
+      env,
+      chatId,
+      `🌐 <b>لینک‌های جایگزین (GitHub Releases) — ${isAndroid ? 'اندروید' : 'ویندوز'}</b>\n` +
+        `در صورت نیاز به معماری خاص یا دانلود از خارج تلگرام، از دکمه‌های زیر استفاده کنید:`,
+      { inline_keyboard: urlButtons }
+    );
+    return;
+  }
+
   await tgSendMessage(
     env,
     chatId,
     `📥 <b>دانلود نسخه رسمی ${isAndroid ? 'اندروید (Android)' : 'ویندوز (Windows)'} SentraVPN</b>\n\n` +
       `🔹 نسخه: <code>${escapeHtml(version)}</code>\n` +
-      `🌐 لینک‌های مستقیم آخرین نسخه از GitHub Releases:\n` +
-      (fileId
-        ? `\n📎 فایل نصبی مستقیم نیز هم‌اکنون در پیام بعدی داخل تلگرام برای شما ارسال می‌شود.`
-        : `\nℹ️ برای نصب، روی دکمه معماری مناسب دستگاه خود در زیر بزنید.`),
+      `🌐 لینک‌های مستقیم آخرین نسخه از GitHub Releases (parsa904/SentraVpn):\n\n` +
+      `${installGuide}`,
     { inline_keyboard: urlButtons }
   );
-
-  if (fileId) {
-    await tgSendDocumentByFileId(
-      env,
-      chatId,
-      fileId,
-      `📦 <b>SentraVPN (${isAndroid ? 'Android' : 'Windows'}) — نسخه <code>${escapeHtml(version)}</code></b>\n` +
-        `پس از نصب، کد اتصال ۸ رقمی خود را از بخش «👤 حساب کاربری» در برنامه وارد کنید.`
-    );
-  }
 }
 
 function buildAdminUpdateReleaseFileView(): {
@@ -2212,6 +2370,8 @@ async function handleCallbackQuery(
 ): Promise<void> {
   const chatId = q.message?.chat.id || q.from.id;
   const messageId = q.message?.message_id;
+  const threadId =
+    typeof q.message?.message_thread_id === 'number' ? q.message.message_thread_id : undefined;
   const telegramId = q.from.id;
   const data = (q.data || '').trim();
 
@@ -2220,6 +2380,108 @@ async function handleCallbackQuery(
 
   try {
     const isAdmin = await resolveIsAdmin(env, telegramId);
+
+    // --- Group Support Management Callbacks (Admin Only) ---
+    if (data.startsWith('support_reply:')) {
+      if (!isAdmin) {
+        await tgSendMessage(env, chatId, '⛔ دسترسی غیرمجاز', undefined, {
+          ...(threadId ? { message_thread_id: threadId } : {}),
+          ...(messageId ? { reply_to_message_id: messageId } : {}),
+        });
+        return;
+      }
+
+      const parts = data.split(':');
+      const targetUserId = Number(parts[1]);
+      const userMessageId = Number(parts[2] || 0);
+      if (!Number.isSafeInteger(targetUserId) || targetUserId <= 0) {
+        return;
+      }
+
+      await setBotState(env.DB, telegramId, 'admin_awaiting_support_reply', {
+        targetUserId,
+        userMessageId: Number.isSafeInteger(userMessageId) && userMessageId > 0 ? userMessageId : null,
+        groupChatId: chatId,
+        groupThreadId: threadId ?? null,
+      });
+
+      await tgSendMessage(
+        env,
+        chatId,
+        `💬 <b>حالت پاسخ به کاربر فعال شد</b>\n` +
+          `🆔 شناسه کاربر: <code>${targetUserId}</code>\n\n` +
+          `لطفاً پاسخ خود را (متن، عکس یا فایل) همینجا ارسال یا روی این پیام Reply کنید تا مستقیماً به پیام اصلی کاربر ارسال شود.`,
+        {
+          inline_keyboard: [
+            [{ text: '❌ انصراف از پاسخ', callback_data: 'cancel_support_reply' }],
+          ],
+        },
+        {
+          ...(threadId ? { message_thread_id: threadId } : {}),
+          ...(messageId ? { reply_to_message_id: messageId, allow_sending_without_reply: true } : {}),
+        }
+      );
+      return;
+    }
+
+    if (data === 'cancel_support_reply') {
+      if (!isAdmin) return;
+      await clearBotState(env.DB, telegramId);
+      const cancelMsg = '❌ حالت پاسخ به کاربر لغو شد.';
+      if (messageId) {
+        await tgEditMessageText(env, chatId, messageId, cancelMsg);
+      } else {
+        await tgSendMessage(env, chatId, cancelMsg, undefined, {
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        });
+      }
+      return;
+    }
+
+    if (data.startsWith('close_support_topic:')) {
+      if (!isAdmin) {
+        await tgSendMessage(env, chatId, '⛔ دسترسی غیرمجاز', undefined, {
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        });
+        return;
+      }
+
+      const parts = data.split(':');
+      const targetUserId = Number(parts[1]);
+      const topicThreadId = Number(parts[2] || threadId || 0);
+      if (!Number.isSafeInteger(targetUserId) || targetUserId <= 0) {
+        return;
+      }
+
+      // 1. Mark session closed in D1 so future messages start a fresh cycle
+      await closeSupportSession(env.DB, {
+        userId: targetUserId,
+        topicThreadId: Number.isSafeInteger(topicThreadId) && topicThreadId > 0 ? topicThreadId : null,
+      });
+
+      // 2. Best-effort close any open support_tickets for this user
+      try {
+        await env.DB.prepare(
+          `UPDATE support_tickets
+           SET status = 'closed', updated_at = CURRENT_TIMESTAMP
+           WHERE user_id IN (SELECT id FROM users WHERE telegram_id = ?)
+             AND status IN ('open', 'awaiting_user', 'investigating')`
+        )
+          .bind(targetUserId)
+          .run();
+      } catch {
+        // Non-fatal ticket sync failure
+      }
+
+      // 3. Delete the dedicated Forum Topic via Telegram Bot API
+      if (Number.isSafeInteger(topicThreadId) && topicThreadId > 0) {
+        await deleteSupportForumTopic(env, topicThreadId);
+      }
+
+      // 4. Notify user in private chat that the support session was closed
+      await tgSendMessage(env, targetUserId, '🔒 گفتگوی پشتیبانی توسط پشتیبانی بسته شد.');
+      return;
+    }
 
     // --- Auth Callbacks ---
     if (data === 'auth_register_new') {
@@ -2261,7 +2523,7 @@ async function handleCallbackQuery(
         env,
         chatId,
         messageId,
-        buildUserMenuHomeView(record?.user || null, record?.sub || null, effectiveIsAdmin)
+        buildUserMenuHomeView(record?.user || null, record?.sub || null, effectiveIsAdmin, env)
       );
       return;
     }
@@ -2275,7 +2537,7 @@ async function handleCallbackQuery(
         env,
         chatId,
         messageId,
-        buildUserMenuHomeView(record?.user || null, record?.sub || null, effectiveIsAdmin)
+        buildUserMenuHomeView(record?.user || null, record?.sub || null, effectiveIsAdmin, env)
       );
       return;
     }
@@ -2983,7 +3245,7 @@ async function handleCallbackQuery(
       env,
       chatId,
       'ℹ️ این دکمه منقضی شده است. لطفاً از منوی زیر گزینه مورد نظر را انتخاب کنید:',
-      buildUserMenuHomeView(record?.user || null, record?.sub || null, isAdmin).replyMarkup
+      buildUserMenuHomeView(record?.user || null, record?.sub || null, isAdmin, env).replyMarkup
     );
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -3011,6 +3273,311 @@ async function handleCallbackQuery(
 }
 
 // ==============================================================================
+// Support Reply & Dedicated Forum Topic Helpers
+// ==============================================================================
+
+function buildSupportReplyInlineMarkup(
+  userTelegramId: number,
+  userMessageId: number
+): Record<string, unknown> {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: '💬 پاسخ به کاربر',
+          callback_data: `support_reply:${userTelegramId}:${userMessageId}`,
+        },
+      ],
+    ],
+  };
+}
+
+function buildCloseSupportTopicInlineMarkup(
+  userTelegramId: number,
+  topicThreadId: number
+): Record<string, unknown> {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: '🗑 پایان گفتگو و حذف تاپیک',
+          callback_data: `close_support_topic:${userTelegramId}:${topicThreadId}`,
+        },
+      ],
+    ],
+  };
+}
+
+/**
+ * Escalates an ongoing support conversation (`message_count >= 3`) to a dedicated
+ * Telegram Forum Topic (`🎫 پشتیبانی: <name> (<uid>)`), saves `topic_thread_id`
+ * in D1 `support_sessions`, pins the control panel with the close/delete button,
+ * and returns the dedicated `topic_thread_id` (or `null` on graceful fallback).
+ */
+async function ensureEscalatedSupportTopicIfNeeded(
+  env: Env,
+  session: SupportSessionRow,
+  userMeta: {
+    userId: number;
+    fullName?: string | null;
+    username?: string | null;
+  }
+): Promise<number | null> {
+  if (session.topic_thread_id && session.topic_thread_id > 0) {
+    return session.topic_thread_id;
+  }
+  if (session.message_count < SUPPORT_TOPIC_ESCALATION_THRESHOLD) {
+    return null;
+  }
+
+  let fullName = (userMeta.fullName || '').trim();
+  let username = (userMeta.username || '').trim();
+  if (!fullName && !username) {
+    try {
+      const userRow = await env.DB.prepare(
+        `SELECT first_name, last_name, username FROM users WHERE telegram_id = ? LIMIT 1`
+      )
+        .bind(userMeta.userId)
+        .first<{ first_name?: string | null; last_name?: string | null; username?: string | null }>();
+      if (userRow) {
+        fullName = [userRow.first_name, userRow.last_name].filter(Boolean).join(' ').trim();
+        username = (userRow.username || '').trim();
+      }
+    } catch {
+      // Fallback to numeric ID in title
+    }
+  }
+
+  const topicTitle = buildSupportTopicTitle({
+    fullName,
+    username,
+    userId: userMeta.userId,
+  });
+
+  const created = await createSupportForumTopic(env, topicTitle);
+  if (!created.ok) {
+    return null;
+  }
+
+  await attachTopicToSupportSession(env.DB, session.id, created.threadId);
+
+  const usernameDisplay = username
+    ? `@${escapeHtml(username.replace(/^@+/, ''))}`
+    : 'ندارد';
+  const controlText =
+    `🎫 <b>تاپیک اختصاصی پشتیبانی فعال شد</b>\n\n` +
+    `👤 نام: <b>${escapeHtml(fullName || 'کاربر')}</b>\n` +
+    `🔗 یوزرنیم: ${usernameDisplay}\n` +
+    `🆔 شناسه کاربر: #UID_${userMeta.userId}\n\n` +
+    `💬 <i>هر پیامی (متن، عکس یا فایل) که ادمین در این تاپیک ارسال کند، بدون نیاز به دکمه یا Reply به‌صورت خودکار برای کاربر ارسال می‌شود.</i>`;
+
+  const ctrlRes = await sendToTopicWithResult(env, 'support', controlText, {
+    threadIdOverride: created.threadId,
+    replyMarkup: buildCloseSupportTopicInlineMarkup(userMeta.userId, created.threadId),
+  });
+  if (ctrlRes.ok && ctrlRes.messageId) {
+    await pinGroupMessage(env, ctrlRes.messageId);
+  }
+
+  await sendToTopic(
+    env,
+    'support',
+    `📌 گفتگوی ادامه‌دار با <b>${escapeHtml(fullName || 'کاربر')}</b> (#UID_${userMeta.userId}) به تاپیک اختصاصی <b>${escapeHtml(topicTitle)}</b> منتقل شد.`
+  );
+
+  return created.threadId;
+}
+
+/**
+ * Forwards an incoming user support message (ticket or follow-up) to either the
+ * user's dedicated Forum Topic (auto-created once `message_count >= 3`) or the
+ * general Support Topic with a one-click `💬 پاسخ به کاربر` inline button.
+ */
+async function forwardUserSupportMessageToGroup(
+  env: Env,
+  params: {
+    telegramId: number;
+    userMessageId: number;
+    fullName: string;
+    username?: string | null;
+    ticketNumber?: string | null;
+    category?: string | null;
+    effectiveBody: string;
+    largestPhoto: TelegramPhotoSize | null;
+    attachedDoc: TelegramDocument | null;
+  }
+): Promise<SupportSessionRow> {
+  const session = await recordSupportSessionActivity(env.DB, {
+    userId: params.telegramId,
+    lastUserMessageId: params.userMessageId,
+  });
+
+  const dedicatedThreadId = await ensureEscalatedSupportTopicIfNeeded(env, session, {
+    userId: params.telegramId,
+    fullName: params.fullName,
+    username: params.username,
+  });
+  const effectiveSession: SupportSessionRow = dedicatedThreadId
+    ? { ...session, topic_thread_id: dedicatedThreadId }
+    : session;
+
+  const usernameLine = params.username
+    ? `@${escapeHtml(params.username.replace(/^@+/, ''))}`
+    : 'ندارد';
+  const titleLine = params.ticketNumber
+    ? `🎫 <b>پیام پشتیبانی جدید (${escapeHtml(params.ticketNumber)})</b>\n\n`
+    : `🎫 <b>پیام جدید کاربر در پشتیبانی</b>\n\n`;
+  const categoryLine = params.category
+    ? `📂 دسته‌بندی: <code>${escapeHtml(params.category)}</code>\n`
+    : '';
+  const supportHeader =
+    titleLine +
+    `🕒 زمان: <code>${escapeHtml(formatLogTimestamp())}</code>\n` +
+    `👤 نام: <b>${escapeHtml(params.fullName)}</b>\n` +
+    `🔗 یوزرنیم: ${usernameLine}\n` +
+    `🆔 شناسه کاربر: #UID_${params.telegramId}\n` +
+    categoryLine +
+    `\n`;
+
+  const footerHint = dedicatedThreadId
+    ? `💬 <i>برای پاسخ به کاربر، پیام خود را مستقیماً در همین تاپیک ارسال کنید.</i>`
+    : `↩️ <i>برای پاسخ مستقیم روی دکمه «💬 پاسخ به کاربر» بزنید یا روی همین پیام Reply کنید.</i>`;
+
+  const sendOptions = dedicatedThreadId
+    ? { threadIdOverride: dedicatedThreadId }
+    : { replyMarkup: buildSupportReplyInlineMarkup(params.telegramId, params.userMessageId) };
+
+  if (params.largestPhoto) {
+    const mediaCaption =
+      supportHeader +
+      `📝 <b>توضیحات:</b> ${escapeHtml(params.effectiveBody.slice(0, 500))}\n\n` +
+      footerHint;
+    await sendMediaToTopic(
+      env,
+      'support',
+      {
+        kind: 'photo',
+        fileId: params.largestPhoto.file_id,
+        caption: mediaCaption,
+      },
+      sendOptions
+    );
+  } else if (params.attachedDoc) {
+    const mediaCaption =
+      supportHeader +
+      `📎 <b>فایل:</b> <code>${escapeHtml(params.attachedDoc.file_name || 'document')}</code>\n` +
+      `📝 <b>توضیحات:</b> ${escapeHtml(params.effectiveBody.slice(0, 450))}\n\n` +
+      footerHint;
+    await sendMediaToTopic(
+      env,
+      'support',
+      {
+        kind: 'document',
+        fileId: params.attachedDoc.file_id,
+        caption: mediaCaption,
+      },
+      sendOptions
+    );
+  } else {
+    await sendToTopic(
+      env,
+      'support',
+      supportHeader +
+        `📝 <b>متن پیام:</b>\n${escapeHtml(params.effectiveBody.slice(0, 2000))}\n\n` +
+        footerHint,
+      sendOptions
+    );
+  }
+
+  return effectiveSession;
+}
+
+/**
+ * Delivers an admin's support reply (text, photo, or document) directly to the
+ * target user's private chat (optionally replying to `replyToUserMessageId`),
+ * syncs ticket & session counters, and auto-escalates to a dedicated topic when
+ * the conversation becomes ongoing (`message_count >= 3`).
+ */
+async function deliverAdminSupportReply(
+  env: Env,
+  params: {
+    targetUserId: number;
+    replyToUserMessageId?: number | null;
+    text: string;
+    largestPhoto: TelegramPhotoSize | null;
+    attachedDoc: TelegramDocument | null;
+    skipAutoEscalate?: boolean;
+  }
+): Promise<boolean> {
+  const replyCaption = params.text
+    ? `💬 <b>پاسخ تیم پشتیبانی SentraVPN:</b>\n\n${escapeHtml(params.text)}`
+    : '💬 <b>پاسخ تیم پشتیبانی SentraVPN:</b>';
+
+  const replyExtra: Record<string, unknown> =
+    params.replyToUserMessageId && params.replyToUserMessageId > 0
+      ? {
+          reply_to_message_id: params.replyToUserMessageId,
+          allow_sending_without_reply: true,
+        }
+      : {};
+
+  let delivered = false;
+  if (params.largestPhoto) {
+    delivered = await tgApi(env, 'sendPhoto', {
+      chat_id: params.targetUserId,
+      photo: params.largestPhoto.file_id,
+      caption: replyCaption.slice(0, 1020),
+      parse_mode: 'HTML',
+      ...replyExtra,
+    });
+  } else if (params.attachedDoc) {
+    delivered = await tgApi(env, 'sendDocument', {
+      chat_id: params.targetUserId,
+      document: params.attachedDoc.file_id,
+      caption: replyCaption.slice(0, 1020),
+      parse_mode: 'HTML',
+      ...replyExtra,
+    });
+  } else {
+    delivered = await tgSendMessage(env, params.targetUserId, replyCaption, undefined, replyExtra);
+  }
+
+  if (delivered) {
+    try {
+      await env.DB.prepare(
+        `UPDATE support_tickets
+         SET status = 'awaiting_user', updated_at = CURRENT_TIMESTAMP
+         WHERE id = (
+           SELECT st.id FROM support_tickets st
+           JOIN users u ON u.id = st.user_id
+           WHERE u.telegram_id = ? AND st.status IN ('open', 'investigating')
+           ORDER BY st.id DESC LIMIT 1
+         )`
+      )
+        .bind(params.targetUserId)
+        .run();
+    } catch {
+      // Non-critical status sync failure should never block support reply confirmation
+    }
+
+    try {
+      const updatedSession = await recordSupportSessionActivity(env.DB, {
+        userId: params.targetUserId,
+      });
+      if (!params.skipAutoEscalate) {
+        await ensureEscalatedSupportTopicIfNeeded(env, updatedSession, {
+          userId: params.targetUserId,
+        });
+      }
+    } catch {
+      // Non-critical session tracking error should never block reply confirmation
+    }
+  }
+
+  return delivered;
+}
+
+// ==============================================================================
 // Incoming Message Handler (Commands, Reply Keyboard Buttons & FSM States)
 // ==============================================================================
 
@@ -3032,6 +3599,7 @@ async function handleGroupMessage(env: Env, msg: TelegramMessage): Promise<void>
       ? msg.photo[msg.photo.length - 1]
       : null;
   const attachedDoc = msg.document || null;
+  const hasPayload = Boolean(text || largestPhoto || attachedDoc);
   const threadExtra: Record<string, unknown> = {
     ...(threadId ? { message_thread_id: threadId } : {}),
     reply_to_message_id: msg.message_id,
@@ -3068,79 +3636,142 @@ async function handleGroupMessage(env: Env, msg: TelegramMessage): Promise<void>
     return;
   }
 
-  // 2. Admin Reply inside configured Support Topic -> forward directly to user's private chat
-  if (msg.reply_to_message && (text || largestPhoto || attachedDoc)) {
-    const topicConfig = await getTopicRoutingConfig(env.DB, env.SENTRA_KV);
-    const currentThreadKey = String(threadId ?? 0);
-    if (
-      topicConfig.logGroupId === String(chatId) &&
-      topicConfig.topicSupportId !== null &&
-      String(topicConfig.topicSupportId) === currentThreadKey
-    ) {
-      const isAdmin = await resolveIsAdmin(env, telegramId);
-      if (!isAdmin) return;
+  if (!hasPayload) return;
 
-      const repliedText = msg.reply_to_message.text || msg.reply_to_message.caption || '';
-      const targetUserId = extractSupportUid(repliedText);
-      if (!targetUserId) return;
+  // Only inspect support routing inside the configured management group (RAM/KV cached)
+  const topicConfig = await getTopicRoutingConfig(env.DB, env.SENTRA_KV);
+  if (topicConfig.logGroupId !== String(chatId)) {
+    return;
+  }
 
-      let delivered = false;
-      const replyCaption = text
-        ? `💬 <b>پاسخ تیم پشتیبانی SentraVPN:</b>\n\n${escapeHtml(text)}`
-        : '💬 <b>پاسخ تیم پشتیبانی SentraVPN:</b>';
+  const isAdmin = await resolveIsAdmin(env, telegramId);
+  if (!isAdmin) return;
 
-      if (largestPhoto) {
-        delivered = await tgApi(env, 'sendPhoto', {
-          chat_id: targetUserId,
-          photo: largestPhoto.file_id,
-          caption: replyCaption.slice(0, 1020),
-          parse_mode: 'HTML',
-        });
-      } else if (attachedDoc) {
-        delivered = await tgApi(env, 'sendDocument', {
-          chat_id: targetUserId,
-          document: attachedDoc.file_id,
-          caption: replyCaption.slice(0, 1020),
-          parse_mode: 'HTML',
-        });
-      } else {
-        delivered = await tgSendMessage(env, targetUserId, replyCaption);
-      }
+  const currentThreadKey = String(threadId ?? 0);
 
-      if (delivered) {
-        try {
-          await env.DB.prepare(
-            `UPDATE support_tickets
-             SET status = 'awaiting_user', updated_at = CURRENT_TIMESTAMP
-             WHERE id = (
-               SELECT st.id FROM support_tickets st
-               JOIN users u ON u.id = st.user_id
-               WHERE u.telegram_id = ? AND st.status IN ('open', 'investigating')
-               ORDER BY st.id DESC LIMIT 1
-             )`
-          )
-            .bind(targetUserId)
-            .run();
-        } catch {
-          // Non-critical status sync failure should never block support reply confirmation
-        }
+  // 2A. Admin message inside a Dedicated User Support Topic -> auto-forward directly to user
+  if (
+    threadId &&
+    threadId > 0 &&
+    String(topicConfig.topicSupportId ?? '') !== currentThreadKey &&
+    String(topicConfig.topicLogsId ?? '') !== currentThreadKey &&
+    String(topicConfig.topicBackupsId ?? '') !== currentThreadKey
+  ) {
+    const dedicatedSession = await getOpenSupportSessionByTopic(env.DB, threadId);
+    if (dedicatedSession) {
+      const delivered = await deliverAdminSupportReply(env, {
+        targetUserId: dedicatedSession.user_id,
+        replyToUserMessageId: dedicatedSession.last_user_message_id,
+        text,
+        largestPhoto,
+        attachedDoc,
+        skipAutoEscalate: true,
+      });
+      await tgSendMessage(
+        env,
+        chatId,
+        delivered
+          ? '✅ پاسخ برای کاربر ارسال شد'
+          : '⚠️ ارسال پاسخ به کاربر ناموفق بود (ممکن است کاربر ربات را مسدود کرده باشد).',
+        undefined,
+        threadExtra
+      );
+      return;
+    }
+  }
 
-        await tgSendMessage(
-          env,
-          chatId,
-          '✅ پاسخ به کاربر ارسال شد',
-          undefined,
-          threadExtra
-        );
-      } else {
-        await tgSendMessage(
-          env,
-          chatId,
-          '⚠️ ارسال پاسخ به کاربر ناموفق بود (ممکن است کاربر ربات را مسدود کرده باشد).',
-          undefined,
-          threadExtra
-        );
-      }
+  // 2B. Admin in one-click `admin_awaiting_support_reply` state (clicked `💬 پاسخ به کاربر`)
+  const adminState = await getBotState(env.DB, telegramId);
+  if (adminState?.state_type === 'admin_awaiting_support_reply') {
+    const statePayload = JSON.parse(adminState.payload_json || '{}') as {
+      targetUserId?: number;
+      userMessageId?: number | null;
+      groupChatId?: number;
+      groupThreadId?: number | null;
+    };
+    const matchesGroup =
+      !statePayload.groupChatId || Number(statePayload.groupChatId) === chatId;
+    const matchesThread =
+      statePayload.groupThreadId === undefined ||
+      statePayload.groupThreadId === null ||
+      Number(statePayload.groupThreadId) === Number(threadId ?? 0);
+
+    if (matchesGroup && matchesThread && statePayload.targetUserId) {
+      await clearBotState(env.DB, telegramId);
+      const delivered = await deliverAdminSupportReply(env, {
+        targetUserId: Number(statePayload.targetUserId),
+        replyToUserMessageId: statePayload.userMessageId ?? null,
+        text,
+        largestPhoto,
+        attachedDoc,
+      });
+      await tgSendMessage(
+        env,
+        chatId,
+        delivered
+          ? '✅ پاسخ برای کاربر ارسال شد'
+          : '⚠️ ارسال پاسخ به کاربر ناموفق بود (ممکن است کاربر ربات را مسدود کرده باشد).',
+        undefined,
+        threadExtra
+      );
+      return;
+    }
+  }
+
+  // 2C. Classic Admin Reply to `#UID_<id>` inside configured Support Topic
+  if (
+    msg.reply_to_message &&
+    topicConfig.topicSupportId !== null &&
+    String(topicConfig.topicSupportId) === currentThreadKey
+  ) {
+    const repliedText = msg.reply_to_message.text || msg.reply_to_message.caption || '';
+    const targetUserId = extractSupportUid(repliedText);
+    if (!targetUserId) return;
+
+    const existingSession = await getOpenSupportSessionByUser(env.DB, targetUserId);
+    const delivered = await deliverAdminSupportReply(env, {
+      targetUserId,
+      replyToUserMessageId: existingSession?.last_user_message_id ?? null,
+      text,
+      largestPhoto,
+      attachedDoc,
+    });
+
+    await tgSendMessage(
+      env,
+      chatId,
+      delivered
+        ? '✅ پاسخ به کاربر ارسال شد'
+        : '⚠️ ارسال پاسخ به کاربر ناموفق بود (ممکن است کاربر ربات را مسدود کرده باشد).',
+      undefined,
+      threadExtra
+    );
+    return;
+  }
+
+  // 2D. Auto-capture APK / EXE / Windows ZIP files uploaded or forwarded by Admin in the management group
+  if (attachedDoc) {
+    const detected = detectReleaseBinary(attachedDoc, text);
+    if (detected) {
+      const saved = await saveTelegramReleaseFile(env, {
+        platform: detected.platform,
+        fileId: attachedDoc.file_id,
+        fileName: detected.fileName,
+        versionHint: detected.version,
+        captionOrText: text,
+      });
+      await tgSendMessage(
+        env,
+        chatId,
+        `✅ <b>فایل نسخه جدید در سرور تلگرام کش شد</b>\n\n` +
+          `🖥 پلتفرم: <b>${saved.platform === 'android' ? 'اندروید (Android)' : 'ویندوز (Windows)'}</b>\n` +
+          `🔹 نسخه: <code>${escapeHtml(saved.version)}</code>\n` +
+          `📄 فایل: <code>${escapeHtml(saved.fileName)}</code>\n` +
+          `🆔 Telegram file_id: <code>${escapeHtml(attachedDoc.file_id.slice(0, 32))}...</code>`,
+        undefined,
+        threadExtra
+      );
+      return;
     }
   }
 
@@ -3195,7 +3826,7 @@ async function handleTextMessage(
           : `👋 خوش آمدید <b>${escapeHtml(user.first_name)}</b>!\n\n` +
             `حساب شما متصل و آماده استفاده است.\n` +
             `🔑 <b>کد اتصال ۸ رقمی:</b> <code>${escapeHtml(connectCode)}</code>`;
-        await tgSendMessage(env, chatId, welcome, buildMainKeyboard(true, isAdmin));
+        await tgSendMessage(env, chatId, welcome, buildMainKeyboard(true, isAdmin, env));
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         console.error('[Sentra D1 Error] /start failed:', errMsg, err);
@@ -3367,7 +3998,7 @@ async function handleTextMessage(
             env,
             chatId,
             '❌ این نام کاربری هم‌اکنون توسط کاربر دیگری ثبت شده است. لطفاً از بخش «👤 حساب کاربری» دوباره ثبت‌نام کنید.',
-            buildMainKeyboard(isRegistered, isAdmin)
+            buildMainKeyboard(isRegistered, isAdmin, env)
           );
           return;
         }
@@ -3459,7 +4090,7 @@ async function handleTextMessage(
             `👤 <b>نام کاربری:</b> <code>${escapeHtml(targetUser.username || username)}</code>\n` +
             `🔑 <b>کد اتصال ۸ رقمی:</b> <code>${escapeHtml(connectCode)}</code>\n\n` +
             `از این پس می‌توانید با همین نام کاربری و رمز عبور یا کد اتصال ۸ رقمی در اپلیکیشن SentraVPN وارد شوید.`,
-          buildMainKeyboard(true, effectiveIsAdmin)
+          buildMainKeyboard(true, effectiveIsAdmin, env)
         );
         const accountView = await buildUserAccountView(env, targetUser, targetSub);
         await tgSendMessage(env, chatId, accountView.text, accountView.replyMarkup);
@@ -3505,7 +4136,7 @@ async function handleTextMessage(
             env,
             chatId,
             '❌ نام کاربری یا رمز عبور اشتباه است. لطفاً از بخش «👤 حساب کاربری» دوباره تلاش کنید.',
-            buildMainKeyboard(isRegistered, isAdmin)
+            buildMainKeyboard(isRegistered, isAdmin, env)
           );
           return;
         }
@@ -3515,7 +4146,7 @@ async function handleTextMessage(
             env,
             chatId,
             '⛔ حساب کاربری شما تعلیق شده است.',
-            buildMainKeyboard(isRegistered, isAdmin)
+            buildMainKeyboard(isRegistered, isAdmin, env)
           );
           return;
         }
@@ -3525,7 +4156,7 @@ async function handleTextMessage(
             env,
             chatId,
             '⛔ این حساب کاربری قبلاً به یک حساب تلگرام دیگر متصل شده است. در صورت نیاز با پشتیبانی تماس بگیرید.',
-            buildMainKeyboard(isRegistered, isAdmin)
+            buildMainKeyboard(isRegistered, isAdmin, env)
           );
           return;
         }
@@ -3537,7 +4168,7 @@ async function handleTextMessage(
               env,
               chatId,
               '⚠️ تلگرام شما هم‌اکنون به یک حساب ثبت‌نام‌شده دیگر متصل است.',
-              buildMainKeyboard(true, isAdmin)
+              buildMainKeyboard(true, isAdmin, env)
             );
             return;
           }
@@ -3600,7 +4231,7 @@ async function handleTextMessage(
             `👤 <b>حساب:</b> <code>${escapeHtml(linkedUser.username || linkedUser.first_name)}</code>\n` +
             (connectCode ? `🔑 <b>کد اتصال ۸ رقمی:</b> <code>${escapeHtml(connectCode)}</code>\n` : '') +
             `حساب اپلیکیشن شما با موفقیت به تلگرام متصل شد.`,
-          buildMainKeyboard(true, loggedInIsAdmin)
+          buildMainKeyboard(true, loggedInIsAdmin, env)
         );
         if (linkedSub) {
           const accountView = await buildUserAccountView(env, linkedUser, linkedSub);
@@ -3661,14 +4292,14 @@ async function handleTextMessage(
             env,
             chatId,
             `🤝 <b>سپاس از حمایت شما!</b>\nنود <b>${escapeHtml(parsed.tag)}</b> بررسی و با استاندارد <code>sing-box 1.14+</code> کامپایل شد و در صف تأیید مدیریت قرار گرفت.`,
-            buildMainKeyboard(true, isAdmin)
+            buildMainKeyboard(true, isAdmin, env)
           );
         } catch (err) {
           await tgSendMessage(
             env,
             chatId,
             `❌ <b>کانفیگ رد شد:</b>\n${escapeHtml(err instanceof Error ? err.message : 'خطا در ثبت اوتباند.')}`,
-            buildMainKeyboard(true, isAdmin)
+            buildMainKeyboard(true, isAdmin, env)
           );
         }
         return;
@@ -3682,7 +4313,7 @@ async function handleTextMessage(
               env,
               chatId,
               '❌ لطفاً آدرس سابلینک را به‌صورت متن ارسال کنید.',
-              buildMainKeyboard(true, isAdmin)
+              buildMainKeyboard(true, isAdmin, env)
             );
             return;
           }
@@ -3711,7 +4342,7 @@ async function handleTextMessage(
               env,
               chatId,
               '⏳ شما در ۲۴ ساعت گذشته حداکثر تعداد مجاز (۳ سابلینک) را ارسال کرده‌اید. لطفاً فردا مجدداً تلاش کنید.',
-              buildMainKeyboard(true, isAdmin)
+              buildMainKeyboard(true, isAdmin, env)
             );
             return;
           }
@@ -3728,7 +4359,7 @@ async function handleTextMessage(
               env,
               chatId,
               '⚠️ این سابلینک قبلاً در سیستم ثبت شده است.',
-              buildMainKeyboard(true, isAdmin)
+              buildMainKeyboard(true, isAdmin, env)
             );
             return;
           }
@@ -3750,7 +4381,7 @@ async function handleTextMessage(
             `🤝 <b>سپاس از حمایت شما!</b>\n\n` +
               `سابلینک اهدایی شما (#${newSourceId}) با موفقیت ثبت شد و در صف بررسی امنیتی مدیریت قرار گرفت.\n` +
               `پس از تأیید ادمین، نتیجه به شما اطلاع داده خواهد شد.`,
-            buildMainKeyboard(true, isAdmin)
+            buildMainKeyboard(true, isAdmin, env)
           );
 
           // Notify admins with approve/reject inline buttons
@@ -3787,7 +4418,7 @@ async function handleTextMessage(
             env,
             chatId,
             `🚫 ${escapeHtml(err instanceof Error ? err.message : 'سابلینک ارسال‌شده نامعتبر است.')}`,
-            buildMainKeyboard(true, isAdmin)
+            buildMainKeyboard(true, isAdmin, env)
           );
         }
         return;
@@ -3834,7 +4465,7 @@ async function handleTextMessage(
             env,
             chatId,
             '⚠️ این فیش یا کد پیگیری قبلاً در سیستم ثبت شده است.',
-            buildMainKeyboard(true, isAdmin)
+            buildMainKeyboard(true, isAdmin, env)
           );
           return;
         }
@@ -3855,7 +4486,7 @@ async function handleTextMessage(
             `💎 پلن درخواستی: <b>${escapeHtml(payload.plan || 'Sentra Pro')}</b>\n` +
             `💰 مبلغ: <b>${amount.toLocaleString('en-US')} تومان</b>\n\n` +
             `پس از بررسی توسط مدیریت، اشتراک شما به صورت خودکار ارتقا خواهد یافت.`,
-          buildMainKeyboard(true, isAdmin)
+          buildMainKeyboard(true, isAdmin, env)
         );
         return;
       }
@@ -3918,55 +4549,25 @@ async function handleTextMessage(
             `🎫 شماره تیکت: <code>${escapeHtml(ticketNumber)}</code>\n` +
             `📌 موضوع: <b>${escapeHtml(subject)}</b>\n\n` +
             `تیم پشتیبانی در کوتاه‌ترین زمان درخواست شما را بررسی خواهد کرد.`,
-          buildMainKeyboard(true, isAdmin)
+          buildMainKeyboard(true, isAdmin, env)
         );
 
         const fullName =
           [from.first_name, from.last_name].filter(Boolean).join(' ').trim() ||
           ensured.user.first_name;
-        const usernameLine = from.username
-          ? `@${escapeHtml(from.username)}`
-          : ensured.user.username
-          ? `@${escapeHtml(ensured.user.username)}`
-          : 'ندارد';
-        const supportHeader =
-          `🎫 <b>پیام پشتیبانی جدید (${escapeHtml(ticketNumber)})</b>\n\n` +
-          `🕒 زمان: <code>${escapeHtml(formatLogTimestamp())}</code>\n` +
-          `👤 نام: <b>${escapeHtml(fullName)}</b>\n` +
-          `🔗 یوزرنیم: ${usernameLine}\n` +
-          `🆔 شناسه کاربر: #UID_${telegramId}\n` +
-          `📂 دسته‌بندی: <code>${escapeHtml(category)}</code>\n\n`;
+        const username = from.username || ensured.user.username || null;
 
-        if (largestPhoto) {
-          const mediaCaption =
-            supportHeader +
-            `📝 <b>توضیحات:</b> ${escapeHtml(effectiveBody.slice(0, 500))}\n\n` +
-            `↩️ <i>برای پاسخ مستقیم به کاربر، روی همین پیام Reply کنید.</i>`;
-          await sendMediaToTopic(env, 'support', {
-            kind: 'photo',
-            fileId: largestPhoto.file_id,
-            caption: mediaCaption,
-          });
-        } else if (attachedDoc) {
-          const mediaCaption =
-            supportHeader +
-            `📎 <b>فایل:</b> <code>${escapeHtml(attachedDoc.file_name || 'document')}</code>\n` +
-            `📝 <b>توضیحات:</b> ${escapeHtml(effectiveBody.slice(0, 450))}\n\n` +
-            `↩️ <i>برای پاسخ مستقیم به کاربر، روی همین پیام Reply کنید.</i>`;
-          await sendMediaToTopic(env, 'support', {
-            kind: 'document',
-            fileId: attachedDoc.file_id,
-            caption: mediaCaption,
-          });
-        } else {
-          await sendToTopic(
-            env,
-            'support',
-            supportHeader +
-              `📝 <b>متن پیام:</b>\n${escapeHtml(effectiveBody.slice(0, 2000))}\n\n` +
-              `↩️ <i>برای پاسخ مستقیم به کاربر، روی همین پیام Reply کنید.</i>`
-          );
-        }
+        await forwardUserSupportMessageToGroup(env, {
+          telegramId,
+          userMessageId: msg.message_id,
+          fullName,
+          username,
+          ticketNumber,
+          category,
+          effectiveBody,
+          largestPhoto,
+          attachedDoc,
+        });
         return;
       }
 
@@ -3981,6 +4582,45 @@ async function handleTextMessage(
           const payload = JSON.parse(state.payload_json || '{}') as { allocation?: string };
           await clearBotState(env.DB, telegramId);
           await handleAdminOutboundSubmission(env, chatId, text, payload.allocation || 'auto');
+          return;
+        }
+
+        if (state.state_type === 'admin_awaiting_support_reply') {
+          const payload = JSON.parse(state.payload_json || '{}') as {
+            targetUserId?: number;
+            userMessageId?: number | null;
+          };
+          const largestPhoto =
+            Array.isArray(msg.photo) && msg.photo.length > 0
+              ? msg.photo[msg.photo.length - 1]
+              : null;
+          const attachedDoc = msg.document || null;
+          if (!text && !largestPhoto && !attachedDoc) {
+            await tgSendMessage(
+              env,
+              chatId,
+              '❌ لطفاً متن، تصویر یا فایل پاسخ خود را ارسال کنید:',
+              buildCancelStateInlineMarkup()
+            );
+            return;
+          }
+          await clearBotState(env.DB, telegramId);
+          if (payload.targetUserId) {
+            const delivered = await deliverAdminSupportReply(env, {
+              targetUserId: Number(payload.targetUserId),
+              replyToUserMessageId: payload.userMessageId ?? null,
+              text,
+              largestPhoto,
+              attachedDoc,
+            });
+            await tgSendMessage(
+              env,
+              chatId,
+              delivered
+                ? '✅ پاسخ برای کاربر ارسال شد'
+                : '⚠️ ارسال پاسخ به کاربر ناموفق بود (ممکن است کاربر ربات را مسدود کرده باشد).'
+            );
+          }
           return;
         }
 
@@ -4031,45 +4671,54 @@ async function handleTextMessage(
           }
           await clearBotState(env.DB, telegramId);
 
-          const existingRel = await env.DB.prepare(
-            'SELECT version, github_url FROM app_release_files WHERE platform = ? LIMIT 1'
-          )
-            .bind(platform)
-            .first<{ version: string; github_url: string }>();
-
-          const versionMatch = /v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.]+)?/.exec(
-            `${text} ${doc.file_name || ''}`
-          );
-          const version = versionMatch ? versionMatch[0] : existingRel?.version || 'latest';
-          const defaultGithubUrl =
-            platform === 'android'
-              ? `${GITHUB_RELEASES_BASE_URL}/SentraVPN-Android-Universal.apk`
-              : `${GITHUB_RELEASES_BASE_URL}/SentraVPN-Windows-Setup-x64.exe`;
-          const githubUrl = existingRel?.github_url || defaultGithubUrl;
-
-          await env.DB.prepare(
-            `INSERT INTO app_release_files (platform, version, github_url, telegram_file_id, updated_at)
-             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-             ON CONFLICT(platform) DO UPDATE SET
-               version = excluded.version,
-               github_url = excluded.github_url,
-               telegram_file_id = excluded.telegram_file_id,
-               updated_at = CURRENT_TIMESTAMP`
-          )
-            .bind(platform, version, githubUrl, doc.file_id)
-            .run();
+          const saved = await saveTelegramReleaseFile(env, {
+            platform,
+            fileId: doc.file_id,
+            fileName: doc.file_name,
+            captionOrText: text,
+          });
 
           await tgSendMessage(
             env,
             chatId,
-            `✅ <b>فایل نصبی ${platform === 'android' ? 'اندروید' : 'ویندوز'} با موفقیت در ربات ذخیره شد!</b>\n\n` +
-              `🔹 نسخه: <code>${escapeHtml(version)}</code>\n` +
-              `📄 فایل: <code>${escapeHtml(doc.file_name || platform)}</code>\n` +
+            `✅ <b>فایل نسخه جدید در سرور تلگرام کش شد</b>\n\n` +
+              `🖥 پلتفرم: <b>${saved.platform === 'android' ? 'اندروید (Android)' : 'ویندوز (Windows)'}</b>\n` +
+              `🔹 نسخه: <code>${escapeHtml(saved.version)}</code>\n` +
+              `📄 فایل: <code>${escapeHtml(saved.fileName)}</code>\n` +
               `🆔 Telegram file_id: <code>${escapeHtml(doc.file_id.slice(0, 32))}...</code>`,
             buildAdminPanelHomeView().replyMarkup
           );
           return;
         }
+      }
+    }
+
+    // Auto-capture APK / EXE / Windows ZIP files forwarded or uploaded directly by Admin in private chat
+    if (isAdmin && msg.document && !menuAction && !text.startsWith('/')) {
+      const detected = detectReleaseBinary(msg.document, text);
+      if (detected) {
+        if (state) {
+          await clearBotState(env.DB, telegramId);
+        }
+        const saved = await saveTelegramReleaseFile(env, {
+          platform: detected.platform,
+          fileId: msg.document.file_id,
+          fileName: detected.fileName,
+          versionHint: detected.version,
+          captionOrText: text,
+        });
+        await tgSendMessage(
+          env,
+          chatId,
+          `✅ <b>فایل نسخه جدید در سرور تلگرام کش شد</b>\n\n` +
+            `🖥 پلتفرم: <b>${saved.platform === 'android' ? 'اندروید (Android)' : 'ویندوز (Windows)'}</b>\n` +
+            `🔹 نسخه: <code>${escapeHtml(saved.version)}</code>\n` +
+            `📄 فایل: <code>${escapeHtml(saved.fileName)}</code>\n` +
+            `🆔 Telegram file_id: <code>${escapeHtml(msg.document.file_id.slice(0, 32))}...</code>\n\n` +
+            `⚡️ از این لحظه کاربران در بخش «📥 دانلود اپلیکیشن» این نسخه را مستقیماً از سرور تلگرام دریافت می‌کنند.`,
+          buildAdminPanelHomeView().replyMarkup
+        );
+        return;
       }
     }
 
@@ -4084,7 +4733,7 @@ async function handleTextMessage(
         const welcome = isRegistered
           ? `👋 خوش آمدید <b>${escapeHtml(existing!.user.first_name)}</b>!\nحساب شما متصل و آماده استفاده است.`
           : `👋 به <b>Sentra Platform</b> خوش آمدید!\n\nبرای شروع، روی دکمه <b>📝 ثبت‌نام / ورود</b> کلیک کنید.`;
-        await tgSendMessage(env, chatId, welcome, buildMainKeyboard(isRegistered, isAdmin));
+        await tgSendMessage(env, chatId, welcome, buildMainKeyboard(isRegistered, isAdmin, env));
         return;
       }
 
@@ -4151,10 +4800,58 @@ async function handleTextMessage(
       }
 
       default: {
+        const largestPhoto =
+          Array.isArray(msg.photo) && msg.photo.length > 0
+            ? msg.photo[msg.photo.length - 1]
+            : null;
+        const attachedDoc = msg.document || null;
+        const hasPayload = Boolean(text || largestPhoto || attachedDoc);
+
+        // Route follow-up private messages into an active dedicated support topic
+        // (or when the user directly replies to a support reply in private chat)
+        if (hasPayload && !text.startsWith('/')) {
+          const repliedToSupport = Boolean(
+            msg.reply_to_message &&
+              ((msg.reply_to_message.text || msg.reply_to_message.caption || '').includes(
+                'پاسخ تیم پشتیبانی SentraVPN'
+              ))
+          );
+          const openSession = await getOpenSupportSessionByUser(env.DB, telegramId);
+          if (openSession && (openSession.topic_thread_id || repliedToSupport)) {
+            const fullName =
+              [from.first_name, from.last_name].filter(Boolean).join(' ').trim() ||
+              existing?.user.first_name ||
+              'کاربر';
+            const username = from.username || existing?.user.username || null;
+            const effectiveBody =
+              text ||
+              (largestPhoto
+                ? '[تصویر پیوست‌شده توسط کاربر]'
+                : `[فایل پیوست‌شده: ${attachedDoc?.file_name || 'document'}]`);
+
+            await forwardUserSupportMessageToGroup(env, {
+              telegramId,
+              userMessageId: msg.message_id,
+              fullName,
+              username,
+              effectiveBody,
+              largestPhoto,
+              attachedDoc,
+            });
+            await tgSendMessage(
+              env,
+              chatId,
+              '✅ پیام شما به تیم پشتیبانی ارسال شد. پاسخ به محض بررسی همینجا ارسال می‌شود.'
+            );
+            return;
+          }
+        }
+
         const quickMenu = buildUserMenuHomeView(
           existing?.user || null,
           existing?.sub || null,
-          isAdmin
+          isAdmin,
+          env
         );
         await tgSendMessage(
           env,
@@ -4187,6 +4884,25 @@ async function handleTextMessage(
         : '⚠️ خطایی در پردازش پیام شما رخ داد. لطفاً لحظاتی دیگر دوباره تلاش کنید یا /start را ارسال نمایید.'
     );
   }
+}
+
+async function handleChannelReleasePost(env: Env, post: TelegramMessage): Promise<void> {
+  const configuredChannelId = (env.RELEASES_CHANNEL_ID || '').trim();
+  if (!configuredChannelId) return;
+  if (String(post.chat.id) !== configuredChannelId) return;
+  if (!post.document?.file_id) return;
+
+  const caption = (post.caption || post.text || '').trim();
+  const detected = detectReleaseBinary(post.document, caption);
+  if (!detected) return;
+
+  await saveTelegramReleaseFile(env, {
+    platform: detected.platform,
+    fileId: post.document.file_id,
+    fileName: detected.fileName,
+    versionHint: detected.version,
+    captionOrText: caption,
+  });
 }
 
 /**
@@ -4224,6 +4940,10 @@ export async function handleTelegramWebhook(
       await handleCallbackQuery(env, update.callback_query, ctx);
     } else if (update.message) {
       await handleTextMessage(env, update.message, ctx);
+    } else if (update.channel_post) {
+      await handleChannelReleasePost(env, update.channel_post);
+    } else if (update.edited_channel_post) {
+      await handleChannelReleasePost(env, update.edited_channel_post);
     }
   } catch (err) {
     console.error('[Sentra Webhook Error]', err);

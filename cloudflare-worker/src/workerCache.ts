@@ -16,6 +16,7 @@ import {
   type CachedTopicRoutingConfig,
   type CompiledPlanConfigSnapshot,
 } from './kvCache.ts';
+import { invalidateEdgeNodesCache } from './edgeCache.ts';
 import type {
   ConnectionMode,
   DonatedOutboundRow,
@@ -244,7 +245,8 @@ export async function getCachedActiveNodesPool(
 
 export async function invalidateNodesCache(
   db?: D1Database,
-  kv?: KVNamespace
+  kv?: KVNamespace,
+  edgeOrigin?: string | Request | null
 ): Promise<void> {
   if (db) {
     const store = getStore(db);
@@ -256,7 +258,10 @@ export async function invalidateNodesCache(
   globalIsolateStore.compiledSingbox.clear();
   globalIsolateStore.compiledV2Ray.clear();
 
-  await invalidateActiveNodesKvCache(db, kv);
+  await Promise.allSettled([
+    invalidateActiveNodesKvCache(db, kv),
+    invalidateEdgeNodesCache(edgeOrigin),
+  ]);
 }
 
 export async function getCachedHasActiveGaming(

@@ -58,6 +58,17 @@ interface TelegramApiResponse {
   ok?: boolean;
   error_code?: number;
   description?: string;
+  result?: {
+    message_id?: number;
+    message_thread_id?: number;
+    [key: string]: unknown;
+  };
+}
+
+export interface TopicSendOptions {
+  threadIdOverride?: number | null;
+  replyMarkup?: Record<string, unknown>;
+  replyToMessageId?: number;
 }
 
 /**
@@ -293,26 +304,36 @@ function resolveTopicThreadId(
 
 /**
  * Sends a formatted HTML message to the configured Telegram Forum Topic
- * (`logs`, `backups`, or `support`). Always wrapped in try/catch so logging
- * failures can never crash the worker or trigger recursive error loops.
+ * (`logs`, `backups`, or `support`), returning `{ ok, messageId }` so callers
+ * can optionally pin control messages in newly created topics.
  */
-export async function sendToTopic(
+export async function sendToTopicWithResult(
   env: Env,
   topicType: TopicType,
-  text: string
-): Promise<boolean> {
+  text: string,
+  options?: TopicSendOptions
+): Promise<{ ok: boolean; messageId?: number }> {
   try {
     const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
-    if (!botToken || !env.DB) return false;
+    if (!botToken || !env.DB) return { ok: false };
 
     const config = await getTopicRoutingConfig(env.DB, env.SENTRA_KV);
-    if (!config.logGroupId) return false;
+    if (!config.logGroupId) return { ok: false };
 
     const groupId = Number(config.logGroupId);
-    if (!Number.isFinite(groupId) || groupId === 0) return false;
+    if (!Number.isFinite(groupId) || groupId === 0) return { ok: false };
 
-    const { configured, threadId } = resolveTopicThreadId(config, topicType);
-    if (!configured) return false;
+    let threadId: number | null = null;
+    if (options && options.threadIdOverride !== undefined) {
+      threadId =
+        typeof options.threadIdOverride === 'number' && options.threadIdOverride > 0
+          ? options.threadIdOverride
+          : null;
+    } else {
+      const resolved = resolveTopicThreadId(config, topicType);
+      if (!resolved.configured) return { ok: false };
+      threadId = resolved.threadId;
+    }
 
     const payload: Record<string, unknown> = {
       chat_id: groupId,
@@ -322,6 +343,13 @@ export async function sendToTopic(
     };
     if (threadId !== null) {
       payload.message_thread_id = threadId;
+    }
+    if (options?.replyMarkup) {
+      payload.reply_markup = options.replyMarkup;
+    }
+    if (options?.replyToMessageId && options.replyToMessageId > 0) {
+      payload.reply_to_message_id = options.replyToMessageId;
+      payload.allow_sending_without_reply = true;
     }
 
     const resp = await fetch(
@@ -348,14 +376,33 @@ export async function sendToTopic(
         error_code: parsed?.error_code ?? null,
         description: parsed?.description ?? rawText.slice(0, 300),
       });
-      return false;
+      return { ok: false };
     }
 
-    return true;
+    return {
+      ok: true,
+      messageId:
+        typeof parsed.result?.message_id === 'number' ? parsed.result.message_id : undefined,
+    };
   } catch (err) {
     console.error('[Sentra Topic Send Error]', topicType, err);
-    return false;
+    return { ok: false };
   }
+}
+
+/**
+ * Sends a formatted HTML message to the configured Telegram Forum Topic
+ * (`logs`, `backups`, or `support`). Always wrapped in try/catch so logging
+ * failures can never crash the worker or trigger recursive error loops.
+ */
+export async function sendToTopic(
+  env: Env,
+  topicType: TopicType,
+  text: string,
+  options?: TopicSendOptions
+): Promise<boolean> {
+  const res = await sendToTopicWithResult(env, topicType, text, options);
+  return res.ok;
 }
 
 /**
@@ -365,7 +412,8 @@ export async function sendToTopic(
 export async function sendMediaToTopic(
   env: Env,
   topicType: TopicType,
-  media: { kind: 'photo' | 'document'; fileId: string; caption: string }
+  media: { kind: 'photo' | 'document'; fileId: string; caption: string },
+  options?: TopicSendOptions
 ): Promise<boolean> {
   try {
     const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
@@ -377,8 +425,17 @@ export async function sendMediaToTopic(
     const groupId = Number(config.logGroupId);
     if (!Number.isFinite(groupId) || groupId === 0) return false;
 
-    const { configured, threadId } = resolveTopicThreadId(config, topicType);
-    if (!configured) return false;
+    let threadId: number | null = null;
+    if (options && options.threadIdOverride !== undefined) {
+      threadId =
+        typeof options.threadIdOverride === 'number' && options.threadIdOverride > 0
+          ? options.threadIdOverride
+          : null;
+    } else {
+      const resolved = resolveTopicThreadId(config, topicType);
+      if (!resolved.configured) return false;
+      threadId = resolved.threadId;
+    }
 
     const method = media.kind === 'photo' ? 'sendPhoto' : 'sendDocument';
     const fieldName = media.kind === 'photo' ? 'photo' : 'document';
@@ -390,6 +447,13 @@ export async function sendMediaToTopic(
     };
     if (threadId !== null) {
       payload.message_thread_id = threadId;
+    }
+    if (options?.replyMarkup) {
+      payload.reply_markup = options.replyMarkup;
+    }
+    if (options?.replyToMessageId && options.replyToMessageId > 0) {
+      payload.reply_to_message_id = options.replyToMessageId;
+      payload.allow_sending_without_reply = true;
     }
 
     const resp = await fetch(
@@ -423,6 +487,158 @@ export async function sendMediaToTopic(
     return true;
   } catch (err) {
     console.error('[Sentra Topic Media Send Error]', topicType, err);
+    return false;
+  }
+}
+
+/**
+ * Creates a dedicated Telegram Forum Topic inside the configured management supergroup.
+ * Requires the bot to have `can_manage_topics` permission in the supergroup.
+ */
+export async function createSupportForumTopic(
+  env: Env,
+  name: string
+): Promise<{ ok: true; threadId: number } | { ok: false; error?: string }> {
+  try {
+    const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
+    if (!botToken || !env.DB) return { ok: false, error: 'Missing bot token or DB' };
+
+    const config = await getTopicRoutingConfig(env.DB, env.SENTRA_KV);
+    if (!config.logGroupId) return { ok: false, error: 'Management group not configured' };
+
+    const groupId = Number(config.logGroupId);
+    if (!Number.isFinite(groupId) || groupId === 0) {
+      return { ok: false, error: 'Invalid management group ID' };
+    }
+
+    const cleanName = name.trim().slice(0, 128);
+    if (!cleanName) return { ok: false, error: 'Empty topic name' };
+
+    const resp = await fetch(
+      `https://api.telegram.org/bot${botToken}/createForumTopic`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: groupId,
+          name: cleanName,
+        }),
+      }
+    );
+
+    const rawText = await resp.text();
+    let parsed: TelegramApiResponse | null = null;
+    try {
+      parsed = JSON.parse(rawText) as TelegramApiResponse;
+    } catch {
+      parsed = null;
+    }
+
+    const threadId = parsed?.result?.message_thread_id;
+    if (!resp.ok || !parsed || parsed.ok !== true || typeof threadId !== 'number' || threadId <= 0) {
+      const desc = parsed?.description ?? rawText.slice(0, 250);
+      console.warn('[Sentra createForumTopic Failed]', {
+        http_status: resp.status,
+        error_code: parsed?.error_code ?? null,
+        description: desc,
+      });
+      return { ok: false, error: desc };
+    }
+
+    return { ok: true, threadId };
+  } catch (err) {
+    console.warn('[Sentra createForumTopic Error]', err);
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Permanently deletes a dedicated Telegram Forum Topic via `deleteForumTopic`.
+ */
+export async function deleteSupportForumTopic(
+  env: Env,
+  threadId: number
+): Promise<boolean> {
+  try {
+    const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
+    if (!botToken || !env.DB || !Number.isSafeInteger(threadId) || threadId <= 0) {
+      return false;
+    }
+
+    const config = await getTopicRoutingConfig(env.DB, env.SENTRA_KV);
+    if (!config.logGroupId) return false;
+
+    const groupId = Number(config.logGroupId);
+    if (!Number.isFinite(groupId) || groupId === 0) return false;
+
+    const resp = await fetch(
+      `https://api.telegram.org/bot${botToken}/deleteForumTopic`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: groupId,
+          message_thread_id: threadId,
+        }),
+      }
+    );
+
+    const rawText = await resp.text();
+    let parsed: TelegramApiResponse | null = null;
+    try {
+      parsed = JSON.parse(rawText) as TelegramApiResponse;
+    } catch {
+      parsed = null;
+    }
+
+    if (!resp.ok || !parsed || parsed.ok !== true) {
+      console.warn('[Sentra deleteForumTopic Failed]', {
+        threadId,
+        http_status: resp.status,
+        error_code: parsed?.error_code ?? null,
+        description: parsed?.description ?? rawText.slice(0, 250),
+      });
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.warn('[Sentra deleteForumTopic Error]', threadId, err);
+    return false;
+  }
+}
+
+/**
+ * Best-effort pins a control-panel message inside the configured management group.
+ */
+export async function pinGroupMessage(
+  env: Env,
+  messageId: number
+): Promise<boolean> {
+  try {
+    const botToken = (env.TELEGRAM_BOT_TOKEN || '').trim();
+    if (!botToken || !env.DB || !Number.isSafeInteger(messageId) || messageId <= 0) {
+      return false;
+    }
+    const config = await getTopicRoutingConfig(env.DB, env.SENTRA_KV);
+    if (!config.logGroupId) return false;
+    const groupId = Number(config.logGroupId);
+    if (!Number.isFinite(groupId) || groupId === 0) return false;
+
+    const resp = await fetch(
+      `https://api.telegram.org/bot${botToken}/pinChatMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: groupId,
+          message_id: messageId,
+          disable_notification: true,
+        }),
+      }
+    );
+    return resp.ok;
+  } catch {
     return false;
   }
 }

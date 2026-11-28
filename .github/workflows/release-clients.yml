@@ -2,14 +2,16 @@ name: Release SentraVPN Clients (Android & Windows)
 
 on:
   push:
+    branches:
+      - main
     tags:
-      - 'v*.*.*'
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version tag (e.g. v1.0.0)'
-        required: true
-        default: 'v1.0.0'
+        description: 'Release version override (leave empty to use sentra-client/package.json)'
+        required: false
+        default: ''
         type: string
 
 permissions:
@@ -26,63 +28,196 @@ env:
 
 jobs:
   health-checks:
-    name: Code Health, Typecheck & Unit Tests
+    name: Version Detection, Code Health & Unit Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     outputs:
+      should_release: ${{ steps.resolve-version.outputs.should_release }}
       release_tag: ${{ steps.resolve-version.outputs.release_tag }}
       app_version: ${{ steps.resolve-version.outputs.app_version }}
       version_code: ${{ steps.resolve-version.outputs.version_code }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Resolve release version metadata
+      - name: Resolve release trigger & version metadata
         id: resolve-version
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          FULL_REF: ${{ github.ref }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RAW_TAG="${{ inputs.version }}"
-          else
-            RAW_TAG="${GITHUB_REF_NAME}"
+          set -euo pipefail
+          STEP_FILE="${RUNNER_TEMP}/sentra-last-step.txt"
+          LOG_FILE="${RUNNER_TEMP}/sentra-build.log"
+          echo "STEP_TRACKER_FILE=${STEP_FILE}" >> "$GITHUB_ENV"
+          echo "BUILD_LOG_FILE=${LOG_FILE}" >> "$GITHUB_ENV"
+          echo "Resolve release trigger & version metadata" > "$STEP_FILE"
+
+          SHOULD_RELEASE="false"
+          RAW_VER=""
+
+          read_pkg_version() {
+            node -e '
+              const fs = require("fs");
+              const pkg = JSON.parse(fs.readFileSync("sentra-client/package.json", "utf8"));
+              process.stdout.write(String(pkg.version || "").trim());
+            '
+          }
+
+          read_tauri_version() {
+            node -e '
+              const fs = require("fs");
+              const conf = JSON.parse(fs.readFileSync("sentra-client/src-tauri/tauri.conf.json", "utf8"));
+              process.stdout.write(String(conf.version || "").trim());
+            '
+          }
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            SHOULD_RELEASE="true"
+            if [ -n "${INPUT_VERSION}" ]; then
+              RAW_VER="${INPUT_VERSION}"
+            else
+              RAW_VER="$(read_pkg_version)"
+            fi
+          elif [[ "${FULL_REF}" == refs/tags/v* ]]; then
+            SHOULD_RELEASE="true"
+            RAW_VER="${REF_NAME}"
+          elif [[ "${FULL_REF}" == refs/heads/main ]]; then
+            CHANGED_FILES=""
+            if [ -n "${BEFORE_SHA}" ] && [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+              CHANGED_FILES="$(git diff --name-only "${BEFORE_SHA}" "${CURRENT_SHA}" || true)"
+            else
+              CHANGED_FILES="$(git diff-tree --no-commit-id --name-only -r "${CURRENT_SHA}" || true)"
+            fi
+
+            PKG_CHANGED="false"
+            TAURI_CHANGED="false"
+            if echo "${CHANGED_FILES}" | grep -qx "sentra-client/package.json"; then
+              PKG_CHANGED="true"
+            fi
+            if echo "${CHANGED_FILES}" | grep -qx "sentra-client/src-tauri/tauri.conf.json"; then
+              TAURI_CHANGED="true"
+            fi
+
+            if [ "${PKG_CHANGED}" = "true" ] || [ "${TAURI_CHANGED}" = "true" ]; then
+              PKG_VER="$(read_pkg_version)"
+              TAURI_VER="$(read_tauri_version)"
+              if [ "${PKG_CHANGED}" = "true" ] && [ -n "${PKG_VER}" ]; then
+                RAW_VER="${PKG_VER}"
+                OLD_VER="$(git show "${BEFORE_SHA}:sentra-client/package.json" 2>/dev/null | node -e 'try { const j = JSON.parse(require("fs").readFileSync(0,"utf8")); process.stdout.write(String(j.version || "").trim()); } catch {}' || true)"
+              else
+                RAW_VER="${TAURI_VER}"
+                OLD_VER="$(git show "${BEFORE_SHA}:sentra-client/src-tauri/tauri.conf.json" 2>/dev/null | node -e 'try { const j = JSON.parse(require("fs").readFileSync(0,"utf8")); process.stdout.write(String(j.version || "").trim()); } catch {}' || true)"
+              fi
+
+              CANDIDATE_TAG="v${RAW_VER#v}"
+              if [ -n "${RAW_VER}" ] && [ "${RAW_VER}" != "${OLD_VER}" ]; then
+                SHOULD_RELEASE="true"
+                echo "Version bumped on main (${OLD_VER:-none} -> ${RAW_VER}); triggering automatic release ${CANDIDATE_TAG}."
+              elif [ -n "${RAW_VER}" ] && ! git ls-remote --tags origin "refs/tags/${CANDIDATE_TAG}" | grep -q .; then
+                SHOULD_RELEASE="true"
+                echo "Version file modified on main and tag ${CANDIDATE_TAG} does not exist yet; triggering automatic release."
+              else
+                echo "Version file touched on main but version (${RAW_VER}) already released as ${CANDIDATE_TAG}; skipping release."
+              fi
+            else
+              echo "Push to main did not modify sentra-client/package.json or tauri.conf.json; skipping client release."
+            fi
           fi
-          RAW_TAG="${RAW_TAG#refs/tags/}"
+
+          if [ "${SHOULD_RELEASE}" != "true" ]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "release_tag=" >> "$GITHUB_OUTPUT"
+            echo "app_version=" >> "$GITHUB_OUTPUT"
+            echo "version_code=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RAW_TAG="${RAW_VER#refs/tags/}"
           if [[ "$RAW_TAG" != v* ]]; then
             RAW_TAG="v${RAW_TAG}"
           fi
           APP_VER="${RAW_TAG#v}"
+          if ! [[ "$APP_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid semantic version '${APP_VER}' (expected e.g. 1.0.1)" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+
           IFS='.' read -r MAJOR MINOR PATCH_RAW <<< "$APP_VER"
           PATCH="${PATCH_RAW%%-*}"
           MAJOR="${MAJOR:-1}"
           MINOR="${MINOR:-0}"
           PATCH="${PATCH:-0}"
           VERSION_CODE=$(( MAJOR * 10000 + MINOR * 100 + PATCH ))
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
           echo "release_tag=${RAW_TAG}" >> "$GITHUB_OUTPUT"
           echo "app_version=${APP_VER}" >> "$GITHUB_OUTPUT"
           echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
           echo "Resolved release: tag=${RAW_TAG}, app_version=${APP_VER}, version_code=${VERSION_CODE}"
 
       - name: Setup Node.js 22
+        if: steps.resolve-version.outputs.should_release == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
 
       - name: Install workspace dependencies
-        run: npm ci
+        if: steps.resolve-version.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Install workspace dependencies" > "$STEP_TRACKER_FILE"
+          npm install --no-audit --no-fund --legacy-peer-deps 2>&1 | tee -a "$BUILD_LOG_FILE"
 
       - name: Typecheck & Lint Sentra Client
-        run: npm run typecheck --workspace=sentra-connect
+        if: steps.resolve-version.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Typecheck & Lint Sentra Client" > "$STEP_TRACKER_FILE"
+          npm run typecheck --workspace=sentra-connect 2>&1 | tee -a "$BUILD_LOG_FILE"
 
       - name: Run Client & Cloudflare Worker Unit Tests
-        run: npm run test
+        if: steps.resolve-version.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Run Client & Cloudflare Worker Unit Tests" > "$STEP_TRACKER_FILE"
+          npm run test 2>&1 | tee -a "$BUILD_LOG_FILE"
 
       - name: Verify Production Web Bundle Build
-        run: npm run build --workspace=sentra-connect
+        if: steps.resolve-version.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Verify Production Web Bundle Build" > "$STEP_TRACKER_FILE"
+          npm run build --workspace=sentra-connect 2>&1 | tee -a "$BUILD_LOG_FILE"
+
+      - name: Report health-checks failure to Telegram (AI-Ready)
+        if: failure()
+        shell: bash
+        env:
+          BUILD_PLATFORM: health-checks
+          RELEASE_TAG: ${{ steps.resolve-version.outputs.release_tag }}
+          SENTRA_WORKER_URL: ${{ secrets.SENTRA_WORKER_URL || vars.SENTRA_API_BASE_URL || 'https://sentra-core.kziepr.workers.dev' }}
+          QUALITY_ENGINE_SECRET: ${{ secrets.QUALITY_ENGINE_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID || secrets.ADMIN_TELEGRAM_ID || secrets.TELEGRAM_RELEASE_CHANNEL_ID }}
+          TELEGRAM_LOG_TOPIC_ID: ${{ secrets.TELEGRAM_LOG_TOPIC_ID }}
+        run: node .github/scripts/report-build-failure.mjs
 
   build-android:
     name: Build Android APKs (Universal, ARMv8, ARMv7, x64)
     needs: health-checks
+    if: needs.health-checks.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -91,11 +226,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Initialize Android build log tracker
+        shell: bash
+        run: |
+          echo "STEP_TRACKER_FILE=${RUNNER_TEMP}/sentra-last-step.txt" >> "$GITHUB_ENV"
+          echo "BUILD_LOG_FILE=${RUNNER_TEMP}/sentra-build.log" >> "$GITHUB_ENV"
+          echo "Initialize Android environment" > "${RUNNER_TEMP}/sentra-last-step.txt"
+          : > "${RUNNER_TEMP}/sentra-build.log"
+
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -111,6 +253,7 @@ jobs:
       - name: Configure Android environment variables
         shell: bash
         run: |
+          echo "Configure Android environment variables" > "$STEP_TRACKER_FILE"
           echo "ANDROID_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}" >> "$GITHUB_ENV"
           echo "NDK_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
@@ -125,18 +268,27 @@ jobs:
           workspaces: sentra-client/src-tauri
 
       - name: Install dependencies & Tauri CLI v2
+        shell: bash
         run: |
-          npm ci
-          npm install --no-save @tauri-apps/cli@2
+          set -euo pipefail
+          echo "Install dependencies & Tauri CLI v2" > "$STEP_TRACKER_FILE"
+          npm install --no-audit --no-fund --legacy-peer-deps 2>&1 | tee -a "$BUILD_LOG_FILE"
+          npm install --no-save --no-audit --no-fund --legacy-peer-deps @tauri-apps/cli@2 2>&1 | tee -a "$BUILD_LOG_FILE"
 
       - name: Sync version into client configs
         shell: bash
         env:
           APP_VER: ${{ needs.health-checks.outputs.app_version }}
         run: |
+          set -euo pipefail
+          echo "Sync version into client configs" > "$STEP_TRACKER_FILE"
           node -e '
             const fs = require("fs");
             const ver = process.env.APP_VER;
+            const pkgPath = "sentra-client/package.json";
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+            pkg.version = ver;
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
             const confPath = "sentra-client/src-tauri/tauri.conf.json";
             const conf = JSON.parse(fs.readFileSync(confPath, "utf8"));
             conf.version = ver;
@@ -144,7 +296,7 @@ jobs:
             const cargoPath = "sentra-client/src-tauri/Cargo.toml";
             const cargo = fs.readFileSync(cargoPath, "utf8").replace(/^version = ".*"$/m, `version = "${ver}"`);
             fs.writeFileSync(cargoPath, cargo);
-          '
+          ' 2>&1 | tee -a "$BUILD_LOG_FILE"
 
       - name: Bundle sing-box native Android binaries (arm64-v8a, armeabi-v7a, x86_64)
         shell: bash
@@ -152,6 +304,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          echo "Bundle sing-box native Android binaries" > "$STEP_TRACKER_FILE"
           JNI_BASE="sentra-client/src-tauri/gen/android/app/src/main/jniLibs"
           mkdir -p "$JNI_BASE/arm64-v8a" "$JNI_BASE/armeabi-v7a" "$JNI_BASE/x86_64"
 
@@ -159,7 +312,7 @@ jobs:
             "https://api.github.com/repos/SagerNet/sing-box/releases/latest" \
             | node -e 'const d = JSON.parse(require("fs").readFileSync(0, "utf8")); console.log((d.tag_name || "").replace(/^v/, ""));' || true)
           SB_VER="${LATEST_TAG:-$SINGBOX_FALLBACK_VERSION}"
-          echo "Using sing-box version: ${SB_VER}"
+          echo "Using sing-box version: ${SB_VER}" | tee -a "$BUILD_LOG_FILE"
 
           download_arch() {
             local sb_arch="$1"
@@ -183,9 +336,9 @@ jobs:
             rm -rf "$tmpdir"
           }
 
-          download_arch "arm64" "arm64-v8a"
-          download_arch "armv7" "armeabi-v7a"
-          download_arch "amd64" "x86_64"
+          download_arch "arm64" "arm64-v8a" 2>&1 | tee -a "$BUILD_LOG_FILE"
+          download_arch "armv7" "armeabi-v7a" 2>&1 | tee -a "$BUILD_LOG_FILE"
+          download_arch "amd64" "x86_64" 2>&1 | tee -a "$BUILD_LOG_FILE"
 
       - name: Prepare Android release signing keystore
         shell: bash
@@ -196,6 +349,7 @@ jobs:
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          echo "Prepare Android release signing keystore" > "$STEP_TRACKER_FILE"
           KEYSTORE_FILE="${GITHUB_WORKSPACE}/sentra-client/src-tauri/gen/android/release.keystore"
           if [ -n "${KEYSTORE_B64:-}" ]; then
             echo "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE_FILE"
@@ -225,19 +379,25 @@ jobs:
           EOF
 
       - name: Build production frontend bundle
-        run: npm run build --workspace=sentra-connect
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Build production frontend bundle" > "$STEP_TRACKER_FILE"
+          npm run build --workspace=sentra-connect 2>&1 | tee -a "$BUILD_LOG_FILE"
 
       - name: Compile Rust Android libraries & Gradle APKs (Universal, ARMv8, ARMv7, x64)
         working-directory: sentra-client
+        shell: bash
         env:
           APP_VER: ${{ needs.health-checks.outputs.app_version }}
           VER_CODE: ${{ needs.health-checks.outputs.version_code }}
         run: |
           set -euo pipefail
+          echo "Compile Rust Android libraries & Gradle APKs" > "$STEP_TRACKER_FILE"
           npx tauri android build --apk \
             --target aarch64 \
             --target armv7 \
-            --target x86_64
+            --target x86_64 2>&1 | tee -a "$BUILD_LOG_FILE"
 
           cd src-tauri/gen/android
           chmod +x gradlew
@@ -251,12 +411,13 @@ jobs:
             -PabiList="arm64-v8a,armeabi-v7a,x86_64" \
             -ParchList="arm64,arm,x86_64" \
             -PtargetList="aarch64,armv7,x86_64" \
-            --no-daemon
+            --no-daemon 2>&1 | tee -a "$BUILD_LOG_FILE"
 
       - name: Collect and rename exact Android release APKs
         shell: bash
         run: |
           set -euo pipefail
+          echo "Collect and rename exact Android release APKs" > "$STEP_TRACKER_FILE"
           OUT_DIR="${GITHUB_WORKSPACE}/release-android"
           APK_ROOT="sentra-client/src-tauri/gen/android/app/build/outputs/apk"
           mkdir -p "$OUT_DIR"
@@ -270,8 +431,8 @@ jobs:
               found=$(find "$APK_ROOT/$flavor/release" -type f -name "*.apk" | head -n 1 || true)
             fi
             if [ -z "$found" ]; then
-              echo "::error::Expected APK for flavor '$flavor' was not found under $APK_ROOT/$flavor/release"
-              find "$APK_ROOT" -type f || true
+              echo "::error::Expected APK for flavor '$flavor' was not found under $APK_ROOT/$flavor/release" | tee -a "$BUILD_LOG_FILE"
+              find "$APK_ROOT" -type f | tee -a "$BUILD_LOG_FILE" || true
               exit 1
             fi
             cp "$found" "$OUT_DIR/$target_name"
@@ -292,9 +453,23 @@ jobs:
           path: release-android/*.apk
           if-no-files-found: error
 
+      - name: Report android-build failure to Telegram (AI-Ready)
+        if: failure()
+        shell: bash
+        env:
+          BUILD_PLATFORM: android-build
+          RELEASE_TAG: ${{ needs.health-checks.outputs.release_tag }}
+          SENTRA_WORKER_URL: ${{ secrets.SENTRA_WORKER_URL || vars.SENTRA_API_BASE_URL || 'https://sentra-core.kziepr.workers.dev' }}
+          QUALITY_ENGINE_SECRET: ${{ secrets.QUALITY_ENGINE_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID || secrets.ADMIN_TELEGRAM_ID || secrets.TELEGRAM_RELEASE_CHANNEL_ID }}
+          TELEGRAM_LOG_TOPIC_ID: ${{ secrets.TELEGRAM_LOG_TOPIC_ID }}
+        run: node .github/scripts/report-build-failure.mjs
+
   build-windows:
     name: Build Windows x64 (Setup NSIS & Portable ZIP)
     needs: health-checks
+    if: needs.health-checks.outputs.should_release == 'true'
     runs-on: windows-latest
     timeout-minutes: 35
     env:
@@ -303,11 +478,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Initialize Windows build log tracker
+        shell: pwsh
+        run: |
+          $stepFile = Join-Path $env:RUNNER_TEMP "sentra-last-step.txt"
+          $logFile = Join-Path $env:RUNNER_TEMP "sentra-build.log"
+          "STEP_TRACKER_FILE=$stepFile" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "BUILD_LOG_FILE=$logFile" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Initialize Windows environment" | Set-Content -Path $stepFile -Encoding utf8
+          "" | Set-Content -Path $logFile -Encoding utf8
+
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
 
       - name: Setup Rust (x86_64-pc-windows-msvc)
         uses: dtolnay/rust-toolchain@stable
@@ -322,17 +506,27 @@ jobs:
       - name: Install dependencies & Tauri CLI v2
         shell: pwsh
         run: |
-          npm ci
-          npm install --no-save @tauri-apps/cli@2
+          $ErrorActionPreference = "Stop"
+          "Install dependencies & Tauri CLI v2" | Set-Content -Path $env:STEP_TRACKER_FILE -Encoding utf8
+          npm install --no-audit --no-fund --legacy-peer-deps 2>&1 | Tee-Object -FilePath $env:BUILD_LOG_FILE -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm install --no-save --no-audit --no-fund --legacy-peer-deps @tauri-apps/cli@2 2>&1 | Tee-Object -FilePath $env:BUILD_LOG_FILE -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sync version into client configs
         shell: pwsh
         env:
           APP_VER: ${{ needs.health-checks.outputs.app_version }}
         run: |
+          $ErrorActionPreference = "Stop"
+          "Sync version into client configs" | Set-Content -Path $env:STEP_TRACKER_FILE -Encoding utf8
           node -e '
             const fs = require("fs");
             const ver = process.env.APP_VER;
+            const pkgPath = "sentra-client/package.json";
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+            pkg.version = ver;
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
             const confPath = "sentra-client/src-tauri/tauri.conf.json";
             const conf = JSON.parse(fs.readFileSync(confPath, "utf8"));
             conf.version = ver;
@@ -340,7 +534,8 @@ jobs:
             const cargoPath = "sentra-client/src-tauri/Cargo.toml";
             const cargo = fs.readFileSync(cargoPath, "utf8").replace(/^version = ".*"$/m, `version = "${ver}"`);
             fs.writeFileSync(cargoPath, cargo);
-          '
+          ' 2>&1 | Tee-Object -FilePath $env:BUILD_LOG_FILE -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Download sing-box Windows x64 sidecar binary
         shell: pwsh
@@ -348,6 +543,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
+          "Download sing-box Windows x64 sidecar binary" | Set-Content -Path $env:STEP_TRACKER_FILE -Encoding utf8
           $binDir = "sentra-client/src-tauri/binaries"
           New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 
@@ -371,6 +567,7 @@ jobs:
 
           $sbExe = Get-ChildItem -Path $extractDir -Recurse -Filter "sing-box.exe" | Select-Object -First 1
           if (-not $sbExe) {
+            "sing-box.exe was not found inside downloaded archive" | Out-File -FilePath $env:BUILD_LOG_FILE -Append -Encoding utf8
             throw "sing-box.exe was not found inside downloaded archive"
           }
 
@@ -382,12 +579,16 @@ jobs:
         working-directory: sentra-client
         shell: pwsh
         run: |
-          npx tauri build --bundles nsis --target x86_64-pc-windows-msvc
+          $ErrorActionPreference = "Stop"
+          "Build Windows Setup x64 (NSIS) via Tauri v2" | Set-Content -Path $env:STEP_TRACKER_FILE -Encoding utf8
+          npx tauri build --bundles nsis --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath $env:BUILD_LOG_FILE -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package exact Windows Setup x64 & Portable x64 artifacts
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          "Package Windows Setup x64 & Portable x64 artifacts" | Set-Content -Path $env:STEP_TRACKER_FILE -Encoding utf8
           $outDir = Join-Path $env:GITHUB_WORKSPACE "release-windows"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
@@ -398,6 +599,7 @@ jobs:
             $installer = Get-ChildItem -Path $nsisDir -Filter "*.exe" | Select-Object -First 1
           }
           if (-not $installer) {
+            "NSIS installer executable not found in $nsisDir" | Out-File -FilePath $env:BUILD_LOG_FILE -Append -Encoding utf8
             throw "NSIS installer executable not found in $nsisDir"
           }
           $setupOut = Join-Path $outDir "SentraVPN-Windows-Setup-x64.exe"
@@ -408,6 +610,7 @@ jobs:
           $releaseDir = "sentra-client/src-tauri/target/x86_64-pc-windows-msvc/release"
           $mainExe = Get-ChildItem -Path $releaseDir -Filter "*.exe" | Where-Object { $_.Name -notlike "*uninstall*" } | Select-Object -First 1
           if (-not $mainExe) {
+            "Compiled Windows executable not found in $releaseDir" | Out-File -FilePath $env:BUILD_LOG_FILE -Append -Encoding utf8
             throw "Compiled Windows executable not found in $releaseDir"
           }
           $portableStage = Join-Path $env:RUNNER_TEMP "SentraVPN-Windows-Portable-x64"
@@ -440,12 +643,37 @@ jobs:
             release-windows/SentraVPN-Windows-Portable-x64.zip
           if-no-files-found: error
 
+      - name: Report windows-build failure to Telegram (AI-Ready)
+        if: failure()
+        shell: pwsh
+        env:
+          BUILD_PLATFORM: windows-build
+          RELEASE_TAG: ${{ needs.health-checks.outputs.release_tag }}
+          SENTRA_WORKER_URL: ${{ secrets.SENTRA_WORKER_URL || vars.SENTRA_API_BASE_URL || 'https://sentra-core.kziepr.workers.dev' }}
+          QUALITY_ENGINE_SECRET: ${{ secrets.QUALITY_ENGINE_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID || secrets.ADMIN_TELEGRAM_ID || secrets.TELEGRAM_RELEASE_CHANNEL_ID }}
+          TELEGRAM_LOG_TOPIC_ID: ${{ secrets.TELEGRAM_LOG_TOPIC_ID }}
+        run: node .github/scripts/report-build-failure.mjs
+
   release:
     name: Publish GitHub Release (Android & Windows)
     needs: [health-checks, build-android, build-windows]
+    if: needs.health-checks.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize release log tracker
+        shell: bash
+        run: |
+          echo "STEP_TRACKER_FILE=${RUNNER_TEMP}/sentra-last-step.txt" >> "$GITHUB_ENV"
+          echo "BUILD_LOG_FILE=${RUNNER_TEMP}/sentra-build.log" >> "$GITHUB_ENV"
+          echo "Download release artifacts" > "${RUNNER_TEMP}/sentra-last-step.txt"
+          : > "${RUNNER_TEMP}/sentra-build.log"
+
       - name: Download Android APKs
         uses: actions/download-artifact@v4
         with:
@@ -463,6 +691,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "Verify all 6 release binaries & generate SHA256SUMS.txt" > "$STEP_TRACKER_FILE"
           REQUIRED_FILES=(
             "SentraVPN-Android-Universal.apk"
             "SentraVPN-Android-ARMv8.apk"
@@ -473,7 +702,7 @@ jobs:
           )
           for f in "${REQUIRED_FILES[@]}"; do
             if [ ! -s "$f" ]; then
-              echo "::error::Missing or empty release artifact: $f"
+              echo "::error::Missing or empty release artifact: $f" | tee -a "$BUILD_LOG_FILE"
               exit 1
             fi
           done
@@ -484,6 +713,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.health-checks.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
           name: SentraVPN ${{ needs.health-checks.outputs.release_tag }}
           make_latest: true
           generate_release_notes: true
@@ -526,6 +756,7 @@ jobs:
           GITHUB_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          echo "Sync release binaries & Telegram file_id to Sentra Worker" > "$STEP_TRACKER_FILE"
           MAX_TG_BYTES=50331648 # 48 MB safe cap under Telegram's 50 MB Bot API limit
           WORKER_BASE="${SENTRA_API_BASE_URL%/}"
 
@@ -597,3 +828,16 @@ jobs:
 
           sync_platform "android" "release-dist/SentraVPN-Android-Universal.apk" "SentraVPN-Android-Universal.apk"
           sync_platform "windows" "release-dist/SentraVPN-Windows-Setup-x64.exe" "SentraVPN-Windows-Setup-x64.exe"
+
+      - name: Report release-publish failure to Telegram (AI-Ready)
+        if: failure()
+        shell: bash
+        env:
+          BUILD_PLATFORM: release-publish
+          RELEASE_TAG: ${{ needs.health-checks.outputs.release_tag }}
+          SENTRA_WORKER_URL: ${{ secrets.SENTRA_WORKER_URL || vars.SENTRA_API_BASE_URL || 'https://sentra-core.kziepr.workers.dev' }}
+          QUALITY_ENGINE_SECRET: ${{ secrets.QUALITY_ENGINE_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID || secrets.ADMIN_TELEGRAM_ID || secrets.TELEGRAM_RELEASE_CHANNEL_ID }}
+          TELEGRAM_LOG_TOPIC_ID: ${{ secrets.TELEGRAM_LOG_TOPIC_ID }}
+        run: node .github/scripts/report-build-failure.mjs

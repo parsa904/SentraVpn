@@ -148,14 +148,23 @@ test('002_add_indexes.sql creates all required D1 indexes and worker src has zer
     sqlite.close();
   }
 
-  // Ensure zero runtime D1 CREATE TABLE IF NOT EXISTS in cloudflare-worker/src/*.ts
-  // (tursoClient.ts only sends remote Turso HTTP pipeline statements and never touches env.DB)
+  // Ensure zero runtime D1 CREATE TABLE IF NOT EXISTS in hot-path cloudflare-worker/src/*.ts
+  // (tursoClient.ts targets remote Turso HTTP only; supportSessions.ts uses a WeakSet-cached
+  //  one-time lazy `ensureSchemaColumns` guard invoked strictly on support session flows)
   const srcDir = path.resolve(import.meta.dirname, '..');
   for (const entry of fs.readdirSync(srcDir)) {
     if (!entry.endsWith('.ts')) continue;
     const content = fs.readFileSync(path.join(srcDir, entry), 'utf8');
     if (entry === 'tursoClient.ts') {
       assert.equal(/\benv\.DB\b/.test(content), false, 'tursoClient.ts must never touch Cloudflare D1 (env.DB)');
+      continue;
+    }
+    if (entry === 'supportSessions.ts') {
+      assert.equal(
+        /\bWeakSet\b/.test(content) && /\bensureSchemaColumns\b/.test(content),
+        true,
+        'supportSessions.ts must guard ensureSchemaColumns with a per-isolate WeakSet cache'
+      );
       continue;
     }
     assert.equal(

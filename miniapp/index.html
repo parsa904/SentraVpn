@@ -1,0 +1,1061 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <title>SentraVPN — پنل کاربری مینی‌اپ</title>
+    <meta
+      name="description"
+      content="پنل کاربری سریع و یکپارچه SentraVPN در تلگرام — کد اتصال ۸ رقمی، مصرف ترافیک، وضعیت زنده سرورها و دانلود اپلیکیشن."
+    />
+
+    <!-- Vazirmatn (Persian UI) + JetBrains Mono (8-digit connect code & tabular metrics) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Vazirmatn:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- Official Telegram WebApp SDK -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+    <!-- Tailwind CSS via CDN (Zero-build deployment on Cloudflare Pages) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: ['Vazirmatn', 'system-ui', '-apple-system', 'sans-serif'],
+              mono: ['JetBrains Mono', 'ui-monospace', 'SFMono-Regular', 'monospace'],
+            },
+          },
+        },
+      };
+    </script>
+
+    <style>
+      :root {
+        --bg-canvas: #0b1120;
+        --bg-surface: #111827;
+        --bg-elevated: #172033;
+        --bg-input: #0f172a;
+        --border-hairline: rgba(148, 163, 184, 0.16);
+        --text-primary: #f1f5f9;
+        --text-secondary: #94a3b8;
+        --text-muted: #64748b;
+        --accent: #0ea5e9;
+        --accent-hover: #0284c7;
+        --accent-soft: rgba(14, 165, 233, 0.14);
+        --emerald: #10b981;
+        --amber: #f59e0b;
+        --rose: #f43f5e;
+      }
+
+      html[data-theme='light'] {
+        --bg-canvas: #f8fafc;
+        --bg-surface: #ffffff;
+        --bg-elevated: #f1f5f9;
+        --bg-input: #ffffff;
+        --border-hairline: rgba(15, 23, 42, 0.1);
+        --text-primary: #0f172a;
+        --text-secondary: #475569;
+        --text-muted: #64748b;
+        --accent: #0284c7;
+        --accent-hover: #0369a1;
+        --accent-soft: rgba(2, 132, 199, 0.1);
+        --emerald: #059669;
+        --amber: #d97706;
+        --rose: #e11d48;
+      }
+
+      html,
+      body {
+        background-color: var(--bg-canvas);
+        color: var(--text-primary);
+        font-family: 'Vazirmatn', system-ui, -apple-system, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      .surface {
+        background-color: var(--bg-surface);
+        border: 1px solid var(--border-hairline);
+      }
+
+      .surface-elevated {
+        background-color: var(--bg-elevated);
+        border: 1px solid var(--border-hairline);
+      }
+
+      .field-input {
+        background-color: var(--bg-input);
+        border: 1px solid var(--border-hairline);
+        color: var(--text-primary);
+      }
+
+      .field-input:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+
+      .tabular-nums {
+        font-variant-numeric: tabular-nums;
+      }
+
+      .progress-track {
+        background-color: var(--bg-elevated);
+        overflow: hidden;
+      }
+
+      .progress-fill {
+        transition: transform 420ms cubic-bezier(0.16, 1, 0.3, 1);
+        transform-origin: right center;
+      }
+
+      @keyframes spinSlow {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      .is-spinning {
+        animation: spinSlow 700ms linear infinite;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .progress-fill,
+        .is-spinning {
+          transition: none !important;
+          animation: none !important;
+        }
+      }
+    </style>
+  </head>
+
+  <body class="min-h-screen pb-8 selection:bg-sky-500/30">
+    <!-- Compact Sticky Top Bar (<= 56px, respects 15% mobile sticky cap) -->
+    <header
+      class="sticky top-0 z-30 backdrop-blur-md border-b"
+      style="background-color: color-mix(in srgb, var(--bg-canvas) 88%, transparent); border-color: var(--border-hairline);"
+    >
+      <div class="max-w-4xl mx-auto px-4 h-14 flex items-center justify-between gap-3">
+        <div class="flex items-center gap-3 min-w-0">
+          <div
+            id="user-avatar"
+            class="w-9 h-9 rounded-xl flex items-center justify-center font-bold text-sm shrink-0 select-none"
+            style="background-color: var(--accent-soft); color: var(--accent);"
+            aria-hidden="true"
+          >
+            S
+          </div>
+          <div class="min-w-0">
+            <h1 id="header-name" class="text-sm font-bold truncate leading-tight">
+              SentraVPN
+            </h1>
+            <div
+              id="header-meta"
+              class="flex items-center gap-1.5 text-xs truncate mt-0.5"
+              style="color: var(--text-secondary);"
+            >
+              <span id="header-plan">در حال بررسی اشتراک...</span>
+              <span aria-hidden="true">·</span>
+              <span id="header-status">لطفاً صبر کنید</span>
+            </div>
+          </div>
+        </div>
+
+        <button
+          id="btn-refresh"
+          type="button"
+          class="min-w-[44px] min-h-[44px] rounded-xl flex items-center justify-center transition-transform active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
+          style="background-color: var(--bg-surface); border: 1px solid var(--border-hairline); color: var(--text-primary);"
+          aria-label="بروزرسانی اطلاعات حساب"
+          title="بروزرسانی آنی"
+        >
+          <svg
+            id="refresh-icon"
+            class="w-5 h-5"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
+            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+            <path d="M16 16h5v5" />
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Toast Notification -->
+    <div
+      id="toast"
+      role="status"
+      aria-live="polite"
+      class="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 rounded-xl text-xs font-semibold shadow-lg pointer-events-none opacity-0 transition-opacity duration-200 whitespace-nowrap"
+      style="background-color: #0f172a; color: #f8fafc; border: 1px solid rgba(148,163,184,0.28);"
+    ></div>
+
+    <main class="max-w-4xl mx-auto px-4 pt-5 space-y-5">
+      <!-- State Banner (Loading / Error / Outside Telegram Notice) -->
+      <section
+        id="state-panel"
+        class="surface rounded-2xl p-6 text-center space-y-3"
+        aria-live="polite"
+      >
+        <div
+          id="state-spinner"
+          class="w-9 h-9 mx-auto rounded-full border-2 border-sky-500/25 border-t-sky-500 is-spinning"
+        ></div>
+        <h2 id="state-title" class="text-base font-bold">در حال اتصال امن به سرور SentraVPN...</h2>
+        <p id="state-desc" class="text-xs leading-relaxed" style="color: var(--text-secondary);">
+          اعتبارسنجی نشست تلگرام و بارگذاری اطلاعات حساب شما
+        </p>
+        <div id="state-actions" class="hidden pt-2 flex flex-wrap items-center justify-center gap-2">
+          <button
+            id="btn-retry"
+            type="button"
+            class="min-h-[44px] px-5 py-2 rounded-xl text-xs font-semibold text-white transition-transform active:scale-95"
+            style="background-color: var(--accent);"
+          >
+            تلاش مجدد
+          </button>
+          <a
+            id="link-open-bot"
+            href="https://t.me/SentraVPNBot"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="min-h-[44px] px-5 py-2 rounded-xl text-xs font-semibold inline-flex items-center justify-center surface-elevated"
+          >
+            ورود از طریق ربات تلگرام
+          </a>
+        </div>
+      </section>
+
+      <!-- Main Authenticated Dashboard -->
+      <div id="dashboard" class="hidden space-y-5">
+        <!-- Top Responsive Grid: Connect Code (Focal Anchor) + Live Server Status & Account Summary -->
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-5 items-stretch">
+          <!-- 1. Focal Anchor: 8-Digit Connect Code Card -->
+          <section class="lg:col-span-7 surface rounded-2xl p-5 flex flex-col justify-between gap-5">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <p class="text-xs font-medium" style="color: var(--text-secondary);">
+                  کد اتصال اختصاصی اپلیکیشن
+                </p>
+                <h2 class="text-base font-bold mt-0.5">کد اتصال ۸ رقمی شما</h2>
+              </div>
+              <div class="text-left text-xs tabular-nums" style="color: var(--text-secondary);">
+                <span id="sub-devices">۲ دستگاه</span>
+                <span aria-hidden="true"> · </span>
+                <span id="sub-expires">---</span>
+              </div>
+            </div>
+
+            <div
+              class="rounded-2xl px-4 py-5 text-center select-all"
+              style="background-color: var(--bg-elevated);"
+            >
+              <div
+                id="connect-code-display"
+                dir="ltr"
+                class="font-mono tabular-nums text-3xl sm:text-4xl font-bold tracking-[0.22em]"
+                style="color: var(--text-primary);"
+              >
+                ---- ----
+              </div>
+              <p class="text-xs mt-2" style="color: var(--text-muted);">
+                این کد را در اپلیکیشن رسمی SentraVPN (اندروید یا ویندوز) وارد کنید
+              </p>
+            </div>
+
+            <button
+              id="btn-copy-code"
+              type="button"
+              class="w-full min-h-[48px] px-4 py-3 rounded-xl text-sm font-bold text-white flex items-center justify-center gap-2 transition-transform active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+              style="background-color: var(--accent);"
+            >
+              <span id="btn-copy-code-label">📋 کپی کد اتصال</span>
+            </button>
+          </section>
+
+          <!-- 2. Live Server Status + Plan Details -->
+          <section class="lg:col-span-5 surface rounded-2xl p-5 flex flex-col justify-between gap-5">
+            <div>
+              <div class="flex items-center justify-between gap-2">
+                <h2 class="text-sm font-bold">وضعیت زنده سرورها</h2>
+                <span class="inline-flex items-center gap-1.5 text-xs font-semibold" style="color: var(--emerald);">
+                  <span
+                    class="w-2 h-2 rounded-full"
+                    style="background-color: var(--emerald);"
+                    aria-hidden="true"
+                  ></span>
+                  <span id="server-live-label">آنلاین</span>
+                </span>
+              </div>
+
+              <div class="mt-4 flex items-baseline gap-2 tabular-nums">
+                <span id="online-nodes-count" class="font-mono text-3xl font-bold">0</span>
+                <span class="text-sm" style="color: var(--text-secondary);">سرور فعال و سالم</span>
+              </div>
+              <p id="server-countries-note" class="text-xs mt-1.5" style="color: var(--text-muted);">
+                پایش خودکار کیفیت اتصال در چند موقعیت جغرافیایی
+              </p>
+            </div>
+
+            <div class="pt-4 border-t space-y-2.5 text-xs" style="border-color: var(--border-hairline);">
+              <div class="flex items-center justify-between gap-2">
+                <span style="color: var(--text-secondary);">پلن فعلی حساب</span>
+                <span id="summary-plan-tier" class="font-bold">Free</span>
+              </div>
+              <div class="flex items-center justify-between gap-2">
+                <span style="color: var(--text-secondary);">نام کاربری نرم‌افزار</span>
+                <span id="summary-web-username" dir="ltr" class="font-mono font-medium">تنظیم نشده</span>
+              </div>
+              <div class="flex items-center justify-between gap-2">
+                <span style="color: var(--text-secondary);">شناسه تلگرام</span>
+                <span id="summary-tg-id" dir="ltr" class="font-mono tabular-nums">---</span>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <!-- 3. Graphical Traffic Usage Section -->
+        <section class="surface rounded-2xl p-5 space-y-4">
+          <div class="flex items-center justify-between gap-2">
+            <div>
+              <h2 class="text-sm font-bold">مصرف ترافیک و سهمیه</h2>
+              <p class="text-xs mt-0.5" style="color: var(--text-secondary);">
+                گزارش دقیق حجم مصرف‌شده به تفکیک سرویس
+              </p>
+            </div>
+            <span id="traffic-reset-hint" class="text-xs tabular-nums" style="color: var(--text-muted);">
+              لحظه‌ای
+            </span>
+          </div>
+
+          <div class="space-y-4 pt-1">
+            <!-- Web Browsing -->
+            <div class="space-y-1.5">
+              <div class="flex items-center justify-between gap-2 text-xs">
+                <span class="font-semibold">وبگردی (Web Browsing)</span>
+                <span id="traffic-web-text" class="tabular-nums font-medium" style="color: var(--text-secondary);">
+                  0 MB / 0 GB
+                </span>
+              </div>
+              <div class="progress-track h-2.5 rounded-full w-full">
+                <div
+                  id="traffic-web-bar"
+                  class="progress-fill h-full rounded-full"
+                  style="width: 100%; transform: scaleX(0); background-color: var(--accent);"
+                ></div>
+              </div>
+            </div>
+
+            <!-- Download -->
+            <div class="space-y-1.5">
+              <div class="flex items-center justify-between gap-2 text-xs">
+                <span class="font-semibold">دانلود (Download)</span>
+                <span id="traffic-dl-text" class="tabular-nums font-medium" style="color: var(--text-secondary);">
+                  0 MB / 0 GB
+                </span>
+              </div>
+              <div class="progress-track h-2.5 rounded-full w-full">
+                <div
+                  id="traffic-dl-bar"
+                  class="progress-fill h-full rounded-full"
+                  style="width: 100%; transform: scaleX(0); background-color: var(--emerald);"
+                ></div>
+              </div>
+            </div>
+
+            <!-- Special Quota (Static IP / Gaming) -->
+            <div class="space-y-1.5">
+              <div class="flex items-center justify-between gap-2 text-xs">
+                <span class="font-semibold">سهمیه بخش ویژه (آیپی ثابت و گیمینگ)</span>
+                <span id="traffic-special-text" class="tabular-nums font-medium" style="color: var(--text-secondary);">
+                  0 MB / 0 GB
+                </span>
+              </div>
+              <div class="progress-track h-2.5 rounded-full w-full">
+                <div
+                  id="traffic-special-bar"
+                  class="progress-fill h-full rounded-full"
+                  style="width: 100%; transform: scaleX(0); background-color: var(--amber);"
+                ></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Bottom Responsive Grid: Downloads & Web Credentials + Referral & Support -->
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+          <!-- 4. Direct App Downloads + Optional Web Login Credentials -->
+          <section class="lg:col-span-7 surface rounded-2xl p-5 space-y-5">
+            <div class="space-y-3">
+              <div>
+                <h2 class="text-sm font-bold">دانلود مستقیم اپلیکیشن SentraVPN</h2>
+                <p class="text-xs mt-0.5" style="color: var(--text-secondary);">
+                  آخرین نسخه رسمی آماده نصب برای اندروید و ویندوز
+                </p>
+              </div>
+
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <a
+                  id="btn-dl-android"
+                  href="https://github.com/parsa904/SentraVpn/releases/latest/download/SentraVPN-Android-Universal.apk"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="min-h-[48px] px-4 py-3 rounded-xl surface-elevated flex items-center justify-between gap-2 text-xs font-bold transition-transform active:scale-[0.98]"
+                >
+                  <span>دانلود نسخه اندروید (APK)</span>
+                  <span id="ver-android" dir="ltr" class="font-mono text-[11px]" style="color: var(--text-secondary);">
+                    latest
+                  </span>
+                </a>
+
+                <a
+                  id="btn-dl-windows"
+                  href="https://github.com/parsa904/SentraVpn/releases/latest/download/SentraVPN-Windows-Setup-x64.exe"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="min-h-[48px] px-4 py-3 rounded-xl surface-elevated flex items-center justify-between gap-2 text-xs font-bold transition-transform active:scale-[0.98]"
+                >
+                  <span>دانلود نسخه ویندوز (EXE)</span>
+                  <span id="ver-windows" dir="ltr" class="font-mono text-[11px]" style="color: var(--text-secondary);">
+                    latest
+                  </span>
+                </a>
+              </div>
+            </div>
+
+            <!-- Collapsible / Inline Credentials Form -->
+            <div class="pt-4 border-t space-y-3" style="border-color: var(--border-hairline);">
+              <button
+                id="btn-toggle-creds"
+                type="button"
+                aria-expanded="false"
+                aria-controls="creds-form-wrapper"
+                class="w-full min-h-[44px] flex items-center justify-between gap-2 text-right"
+              >
+                <div>
+                  <span id="creds-heading" class="text-sm font-bold block">
+                    تنظیم نام کاربری و رمز عبور نرم‌افزار
+                  </span>
+                  <span class="text-xs" style="color: var(--text-secondary);">
+                    اختیاری — برای ورود یکپارچه با نام کاربری در اپلیکیشن اندروید و ویندوز
+                  </span>
+                </div>
+                <svg
+                  id="creds-chevron"
+                  class="w-5 h-5 shrink-0 transition-transform duration-200"
+                  style="color: var(--text-secondary);"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </button>
+
+              <div id="creds-form-wrapper" class="hidden pt-2">
+                <form id="creds-form" class="space-y-3" novalidate>
+                  <div>
+                    <label for="input-username" class="block text-xs font-medium mb-1" style="color: var(--text-secondary);">
+                      نام کاربری (انگلیسی، حداقل ۳ کاراکتر)
+                    </label>
+                    <input
+                      id="input-username"
+                      name="username"
+                      type="text"
+                      dir="ltr"
+                      autocomplete="username"
+                      placeholder="ali_sentra"
+                      required
+                      minlength="3"
+                      maxlength="32"
+                      class="field-input w-full min-h-[44px] px-3.5 rounded-xl text-sm font-mono"
+                    />
+                  </div>
+
+                  <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label for="input-password" class="block text-xs font-medium mb-1" style="color: var(--text-secondary);">
+                        رمز عبور (حداقل ۶ کاراکتر)
+                      </label>
+                      <input
+                        id="input-password"
+                        name="password"
+                        type="password"
+                        dir="ltr"
+                        autocomplete="new-password"
+                        placeholder="••••••••"
+                        required
+                        minlength="6"
+                        maxlength="128"
+                        class="field-input w-full min-h-[44px] px-3.5 rounded-xl text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label for="input-confirm" class="block text-xs font-medium mb-1" style="color: var(--text-secondary);">
+                        تکرار رمز عبور
+                      </label>
+                      <input
+                        id="input-confirm"
+                        name="confirm_password"
+                        type="password"
+                        dir="ltr"
+                        autocomplete="new-password"
+                        placeholder="••••••••"
+                        required
+                        minlength="6"
+                        maxlength="128"
+                        class="field-input w-full min-h-[44px] px-3.5 rounded-xl text-sm"
+                      />
+                    </div>
+                  </div>
+
+                  <p id="creds-feedback" class="hidden text-xs font-medium leading-relaxed"></p>
+
+                  <button
+                    id="btn-save-creds"
+                    type="submit"
+                    class="w-full min-h-[46px] px-4 py-2.5 rounded-xl text-xs font-bold text-white transition-transform active:scale-[0.98]"
+                    style="background-color: var(--accent);"
+                  >
+                    ذخیره نام کاربری و رمز عبور
+                  </button>
+                </form>
+              </div>
+            </div>
+          </section>
+
+          <!-- 5. Referral Invite & Support Quick Actions -->
+          <section class="lg:col-span-5 surface rounded-2xl p-5 space-y-4">
+            <div>
+              <h2 class="text-sm font-bold">دعوت دوستان و پشتیبانی</h2>
+              <p class="text-xs mt-0.5 leading-relaxed" style="color: var(--text-secondary);">
+                لینک دعوت اختصاصی خود را برای دوستانتان بفرستید یا برای دریافت راهنمایی مستقیم به چت ربات برگردید.
+              </p>
+            </div>
+
+            <div class="rounded-xl px-3.5 py-2.5" style="background-color: var(--bg-elevated);">
+              <p class="text-[11px] mb-1" style="color: var(--text-muted);">لینک دعوت اختصاصی شما</p>
+              <p
+                id="referral-link-text"
+                dir="ltr"
+                class="font-mono text-xs truncate select-all"
+                style="color: var(--text-primary);"
+              >
+                https://t.me/SentraVPNBot
+              </p>
+            </div>
+
+            <div class="space-y-2.5">
+              <button
+                id="btn-copy-referral"
+                type="button"
+                class="w-full min-h-[46px] px-4 py-2.5 rounded-xl text-xs font-bold surface-elevated transition-transform active:scale-[0.98]"
+              >
+                کپی لینک دعوت اختصاصی
+              </button>
+
+              <button
+                id="btn-support-close"
+                type="button"
+                class="w-full min-h-[46px] px-4 py-2.5 rounded-xl text-xs font-bold transition-transform active:scale-[0.98]"
+                style="background-color: var(--accent-soft); color: var(--accent);"
+              >
+                بازگشت به چت پشتیبانی ربات
+              </button>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <script>
+      (() => {
+        'use strict';
+
+        const DEFAULT_API_BASE = 'https://sentra-core.kziepr.workers.dev';
+        const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+
+        function resolveApiBase() {
+          try {
+            const q = new URLSearchParams(window.location.search).get('api');
+            if (q && /^https:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(q.trim())) {
+              return q.trim().replace(/\/$/, '');
+            }
+          } catch (_) {}
+          return DEFAULT_API_BASE;
+        }
+
+        const API_BASE = resolveApiBase();
+        let currentProfile = null;
+        let toastTimer = null;
+
+        // DOM references
+        const el = {
+          avatar: document.getElementById('user-avatar'),
+          headerName: document.getElementById('header-name'),
+          headerPlan: document.getElementById('header-plan'),
+          headerStatus: document.getElementById('header-status'),
+          btnRefresh: document.getElementById('btn-refresh'),
+          refreshIcon: document.getElementById('refresh-icon'),
+          toast: document.getElementById('toast'),
+          statePanel: document.getElementById('state-panel'),
+          stateSpinner: document.getElementById('state-spinner'),
+          stateTitle: document.getElementById('state-title'),
+          stateDesc: document.getElementById('state-desc'),
+          stateActions: document.getElementById('state-actions'),
+          btnRetry: document.getElementById('btn-retry'),
+          dashboard: document.getElementById('dashboard'),
+          connectCode: document.getElementById('connect-code-display'),
+          subDevices: document.getElementById('sub-devices'),
+          subExpires: document.getElementById('sub-expires'),
+          btnCopyCode: document.getElementById('btn-copy-code'),
+          btnCopyCodeLabel: document.getElementById('btn-copy-code-label'),
+          onlineNodes: document.getElementById('online-nodes-count'),
+          serverLiveLabel: document.getElementById('server-live-label'),
+          serverCountriesNote: document.getElementById('server-countries-note'),
+          summaryPlanTier: document.getElementById('summary-plan-tier'),
+          summaryWebUsername: document.getElementById('summary-web-username'),
+          summaryTgId: document.getElementById('summary-tg-id'),
+          trafficWebText: document.getElementById('traffic-web-text'),
+          trafficWebBar: document.getElementById('traffic-web-bar'),
+          trafficDlText: document.getElementById('traffic-dl-text'),
+          trafficDlBar: document.getElementById('traffic-dl-bar'),
+          trafficSpecialText: document.getElementById('traffic-special-text'),
+          trafficSpecialBar: document.getElementById('traffic-special-bar'),
+          btnDlAndroid: document.getElementById('btn-dl-android'),
+          btnDlWindows: document.getElementById('btn-dl-windows'),
+          verAndroid: document.getElementById('ver-android'),
+          verWindows: document.getElementById('ver-windows'),
+          btnToggleCreds: document.getElementById('btn-toggle-creds'),
+          credsHeading: document.getElementById('creds-heading'),
+          credsChevron: document.getElementById('creds-chevron'),
+          credsWrapper: document.getElementById('creds-form-wrapper'),
+          credsForm: document.getElementById('creds-form'),
+          inputUsername: document.getElementById('input-username'),
+          inputPassword: document.getElementById('input-password'),
+          inputConfirm: document.getElementById('input-confirm'),
+          credsFeedback: document.getElementById('creds-feedback'),
+          btnSaveCreds: document.getElementById('btn-save-creds'),
+          referralText: document.getElementById('referral-link-text'),
+          btnCopyReferral: document.getElementById('btn-copy-referral'),
+          btnSupportClose: document.getElementById('btn-support-close'),
+        };
+
+        function applyTelegramTheme() {
+          const scheme = tg && tg.colorScheme === 'light' ? 'light' : 'dark';
+          document.documentElement.setAttribute('data-theme', scheme);
+          if (tg) {
+            try {
+              const bg = scheme === 'light' ? '#f8fafc' : '#0b1120';
+              if (typeof tg.setHeaderColor === 'function') tg.setHeaderColor(bg);
+              if (typeof tg.setBackgroundColor === 'function') tg.setBackgroundColor(bg);
+            } catch (_) {}
+          }
+        }
+
+        function triggerHaptic(type) {
+          if (!tg || !tg.HapticFeedback) return;
+          try {
+            if (type === 'success' || type === 'error' || type === 'warning') {
+              tg.HapticFeedback.notificationOccurred(type);
+            } else {
+              tg.HapticFeedback.impactOccurred('light');
+            }
+          } catch (_) {}
+        }
+
+        function showToast(message) {
+          el.toast.textContent = message;
+          el.toast.classList.remove('opacity-0');
+          el.toast.classList.add('opacity-100');
+          if (toastTimer) clearTimeout(toastTimer);
+          toastTimer = setTimeout(() => {
+            el.toast.classList.remove('opacity-100');
+            el.toast.classList.add('opacity-0');
+          }, 2400);
+        }
+
+        function isSafeHttpsUrl(url) {
+          return typeof url === 'string' && /^https:\/\/[^\s]+$/i.test(url.trim());
+        }
+
+        function formatBytes(bytes) {
+          const safe = Math.max(0, Number(bytes) || 0);
+          const gb = 1024 * 1024 * 1024;
+          const mb = 1024 * 1024;
+          if (safe >= gb) {
+            return (safe / gb).toFixed(2) + ' GB';
+          }
+          return (safe / mb).toFixed(1) + ' MB';
+        }
+
+        function formatConnectCode(raw) {
+          const clean = String(raw || '').replace(/\D/g, '');
+          if (clean.length === 8) {
+            return clean.slice(0, 4) + ' ' + clean.slice(4);
+          }
+          return clean || '---- ----';
+        }
+
+        async function copyText(text) {
+          if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            try {
+              await navigator.clipboard.writeText(text);
+              return true;
+            } catch (_) {}
+          }
+          try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+            return ok;
+          } catch (_) {
+            return false;
+          }
+        }
+
+        function updateProgressBar(textEl, barEl, metric, isSpecial) {
+          const used = Math.max(0, Number(metric && metric.used_bytes) || 0);
+          const limit = Math.max(0, Number(metric && metric.limit_bytes) || 0);
+          const unlimited = Boolean(metric && metric.unlimited);
+
+          if (unlimited) {
+            textEl.textContent = formatBytes(used) + ' مصرف‌شده · نامحدود';
+            barEl.style.transform = 'scaleX(0.18)';
+            return;
+          }
+
+          if (limit <= 0) {
+            textEl.textContent = isSpecial
+              ? 'غیرفعال در پلن فعلی (قابل ارتقا یا تست ۱ گیگابایتی در ربات)'
+              : formatBytes(used) + ' / 0 GB';
+            barEl.style.transform = 'scaleX(0)';
+            return;
+          }
+
+          const ratio = Math.min(1, used / limit);
+          const pct = Math.round(ratio * 100);
+          textEl.textContent = formatBytes(used) + ' از ' + formatBytes(limit) + ' (' + pct + '٪)';
+          barEl.style.transform = 'scaleX(' + Math.max(ratio > 0 ? 0.03 : 0, ratio) + ')';
+        }
+
+        function showState(mode, title, desc) {
+          el.dashboard.classList.add('hidden');
+          el.statePanel.classList.remove('hidden');
+          el.stateTitle.textContent = title;
+          el.stateDesc.textContent = desc;
+
+          if (mode === 'loading') {
+            el.stateSpinner.classList.remove('hidden');
+            el.stateActions.classList.add('hidden');
+          } else {
+            el.stateSpinner.classList.add('hidden');
+            el.stateActions.classList.remove('hidden');
+          }
+        }
+
+        function renderProfile(data) {
+          currentProfile = data;
+
+          const fullName = [data.user.first_name, data.user.last_name].filter(Boolean).join(' ').trim() || 'کاربر SentraVPN';
+          const initial = fullName.slice(0, 1).toUpperCase();
+          const statusMap = {
+            active: 'فعال',
+            expired: 'منقضی‌شده',
+            depleted: 'اتمام حجم',
+            disabled: 'غیرفعال',
+          };
+          const statusFa = statusMap[data.subscription.status] || data.subscription.status;
+
+          el.avatar.textContent = initial;
+          el.headerName.textContent = fullName;
+          el.headerPlan.textContent = 'پلن ' + data.subscription.plan_label;
+          el.headerStatus.textContent = statusFa;
+
+          el.connectCode.textContent = formatConnectCode(data.subscription.connect_code);
+          el.subDevices.textContent = (data.subscription.max_concurrent_devices || 2) + ' دستگاه هم‌زمان';
+          el.subExpires.textContent = data.subscription.expires_at
+            ? 'انقضا ' + String(data.subscription.expires_at).slice(0, 10)
+            : 'بدون محدودیت';
+
+          const onlineNodes = Number(data.servers && data.servers.online_nodes) || 0;
+          const countriesCount = Number(data.servers && data.servers.countries_count) || 0;
+          el.onlineNodes.textContent = String(onlineNodes);
+          el.serverLiveLabel.textContent = onlineNodes > 0 ? 'آنلاین' : 'در حال بروزرسانی';
+          el.serverCountriesNote.textContent =
+            countriesCount > 0
+              ? 'آماده اتصال در ' + countriesCount + ' موقعیت جغرافیایی فعال'
+              : 'پایش خودکار سلامت سرورها فعال است';
+
+          el.summaryPlanTier.textContent = data.subscription.plan_label + ' (' + statusFa + ')';
+          el.summaryWebUsername.textContent = data.user.username ? data.user.username : 'تنظیم نشده';
+          el.summaryTgId.textContent = String(data.user.telegram_id);
+
+          updateProgressBar(el.trafficWebText, el.trafficWebBar, data.traffic.web, false);
+          updateProgressBar(el.trafficDlText, el.trafficDlBar, data.traffic.download, false);
+          updateProgressBar(el.trafficSpecialText, el.trafficSpecialBar, data.traffic.special, true);
+
+          if (data.downloads) {
+            if (isSafeHttpsUrl(data.downloads.android_apk)) {
+              el.btnDlAndroid.href = data.downloads.android_apk;
+            }
+            if (isSafeHttpsUrl(data.downloads.windows_exe)) {
+              el.btnDlWindows.href = data.downloads.windows_exe;
+            }
+            el.verAndroid.textContent = data.downloads.android_version || 'latest';
+            el.verWindows.textContent = data.downloads.windows_version || 'latest';
+          }
+
+          if (data.user.username) {
+            el.inputUsername.value = data.user.username;
+            el.credsHeading.textContent = 'تغییر نام کاربری و رمز عبور نرم‌افزار';
+          } else {
+            el.credsHeading.textContent = 'تنظیم نام کاربری و رمز عبور نرم‌افزار';
+          }
+
+          if (data.referral && isSafeHttpsUrl(data.referral.invite_link)) {
+            el.referralText.textContent = data.referral.invite_link;
+          }
+
+          el.statePanel.classList.add('hidden');
+          el.dashboard.classList.remove('hidden');
+        }
+
+        async function loadProfile(isManualRefresh) {
+          const initData = tg && typeof tg.initData === 'string' ? tg.initData.trim() : '';
+          if (!initData) {
+            el.headerPlan.textContent = 'نیازمند ورود از تلگرام';
+            el.headerStatus.textContent = 'نشست یافت نشد';
+            showState(
+              'error',
+              'لطفاً این صفحه را از داخل ربات تلگرام باز کنید',
+              'برای حفظ امنیت حساب شما، احراز هویت مینی‌اپ تنها با امضای رسمی تلگرام (initData) انجام می‌شود.'
+            );
+            return;
+          }
+
+          if (isManualRefresh) {
+            el.refreshIcon.classList.add('is-spinning');
+            triggerHaptic('light');
+          } else {
+            showState(
+              'loading',
+              'در حال اتصال امن به سرور SentraVPN...',
+              'اعتبارسنجی نشست تلگرام و بارگذاری اطلاعات حساب شما'
+            );
+          }
+
+          try {
+            const resp = await fetch(API_BASE + '/api/v1/miniapp/me', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Telegram-Init-Data': initData,
+              },
+              body: JSON.stringify({ initData }),
+            });
+
+            const payload = await resp.json().catch(() => ({}));
+            if (!resp.ok || !payload.success) {
+              throw new Error(payload.error || 'خطا در دریافت اطلاعات از سرور (' + resp.status + ')');
+            }
+
+            renderProfile(payload);
+            if (isManualRefresh) {
+              triggerHaptic('success');
+              showToast('اطلاعات حساب بروزرسانی شد');
+            }
+          } catch (err) {
+            triggerHaptic('error');
+            const msg = err instanceof Error ? err.message : 'ارتباط با سرور برقرار نشد.';
+            if (isManualRefresh && currentProfile) {
+              showToast(msg);
+            } else {
+              showState('error', 'خطا در بارگذاری پنل کاربری', msg);
+            }
+          } finally {
+            el.refreshIcon.classList.remove('is-spinning');
+          }
+        }
+
+        // Event handlers
+        el.btnRefresh.addEventListener('click', () => loadProfile(true));
+        el.btnRetry.addEventListener('click', () => loadProfile(false));
+
+        el.btnCopyCode.addEventListener('click', async () => {
+          const code = currentProfile && currentProfile.subscription && currentProfile.subscription.connect_code;
+          if (!code) return;
+          const ok = await copyText(String(code));
+          if (ok) {
+            triggerHaptic('success');
+            el.btnCopyCodeLabel.textContent = '✅ کد اتصال کپی شد!';
+            showToast('کد اتصال ۸ رقمی در کلیپ‌بورد کپی شد');
+            setTimeout(() => {
+              el.btnCopyCodeLabel.textContent = '📋 کپی کد اتصال';
+            }, 1800);
+          } else {
+            triggerHaptic('error');
+            showToast('کپی خودکار انجام نشد؛ کد را دستی انتخاب کنید');
+          }
+        });
+
+        el.btnCopyReferral.addEventListener('click', async () => {
+          const link = el.referralText.textContent.trim();
+          if (!link) return;
+          const ok = await copyText(link);
+          if (ok) {
+            triggerHaptic('success');
+            showToast('لینک دعوت اختصاصی کپی شد');
+          } else {
+            triggerHaptic('error');
+            showToast('کپی لینک با خطا مواجه شد');
+          }
+        });
+
+        el.btnSupportClose.addEventListener('click', () => {
+          triggerHaptic('light');
+          if (tg && typeof tg.close === 'function') {
+            tg.close();
+          } else {
+            const botUser =
+              (currentProfile && currentProfile.referral && currentProfile.referral.bot_username) ||
+              'SentraVPNBot';
+            window.open('https://t.me/' + encodeURIComponent(botUser), '_blank', 'noopener,noreferrer');
+          }
+        });
+
+        function handleDownloadClick(event) {
+          const href = event.currentTarget.getAttribute('href');
+          if (!isSafeHttpsUrl(href)) {
+            event.preventDefault();
+            return;
+          }
+          triggerHaptic('light');
+          if (tg && typeof tg.openLink === 'function') {
+            event.preventDefault();
+            tg.openLink(href);
+          }
+        }
+
+        el.btnDlAndroid.addEventListener('click', handleDownloadClick);
+        el.btnDlWindows.addEventListener('click', handleDownloadClick);
+
+        el.btnToggleCreds.addEventListener('click', () => {
+          const isOpen = !el.credsWrapper.classList.contains('hidden');
+          el.credsWrapper.classList.toggle('hidden', isOpen);
+          el.btnToggleCreds.setAttribute('aria-expanded', String(!isOpen));
+          el.credsChevron.style.transform = isOpen ? 'rotate(0deg)' : 'rotate(180deg)';
+          triggerHaptic('light');
+        });
+
+        el.credsForm.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const initData = tg && typeof tg.initData === 'string' ? tg.initData.trim() : '';
+          if (!initData) {
+            showToast('نشست تلگرام معتبر نیست');
+            return;
+          }
+
+          const username = el.inputUsername.value.trim();
+          const password = el.inputPassword.value;
+          const confirmPassword = el.inputConfirm.value;
+
+          const setFeedback = (msg, isError) => {
+            el.credsFeedback.textContent = msg;
+            el.credsFeedback.style.color = isError ? 'var(--rose)' : 'var(--emerald)';
+            el.credsFeedback.classList.remove('hidden');
+          };
+
+          if (username.length < 3) {
+            triggerHaptic('error');
+            setFeedback('نام کاربری باید حداقل ۳ کاراکتر انگلیسی باشد.', true);
+            return;
+          }
+          if (password.length < 6) {
+            triggerHaptic('error');
+            setFeedback('رمز عبور باید حداقل ۶ کاراکتر باشد.', true);
+            return;
+          }
+          if (password !== confirmPassword) {
+            triggerHaptic('error');
+            setFeedback('رمز عبور و تکرار آن مطابقت ندارند.', true);
+            return;
+          }
+
+          el.btnSaveCreds.disabled = true;
+          el.btnSaveCreds.textContent = 'در حال ذخیره...';
+          el.credsFeedback.classList.add('hidden');
+
+          try {
+            const resp = await fetch(API_BASE + '/api/v1/miniapp/credentials', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Telegram-Init-Data': initData,
+              },
+              body: JSON.stringify({
+                initData,
+                username,
+                password,
+                confirm_password: confirmPassword,
+              }),
+            });
+
+            const payload = await resp.json().catch(() => ({}));
+            if (!resp.ok || !payload.success) {
+              throw new Error(payload.error || 'ذخیره اطلاعات ناموفق بود.');
+            }
+
+            triggerHaptic('success');
+            el.inputPassword.value = '';
+            el.inputConfirm.value = '';
+            el.summaryWebUsername.textContent = payload.username || username;
+            el.credsHeading.textContent = 'تغییر نام کاربری و رمز عبور نرم‌افزار';
+            setFeedback(payload.message || 'نام کاربری و رمز عبور با موفقیت ذخیره شد.', false);
+            showToast('اطلاعات ورود نرم‌افزار ذخیره شد');
+          } catch (err) {
+            triggerHaptic('error');
+            setFeedback(err instanceof Error ? err.message : 'خطای ارتباط با سرور', true);
+          } finally {
+            el.btnSaveCreds.disabled = false;
+            el.btnSaveCreds.textContent = 'ذخیره نام کاربری و رمز عبور';
+          }
+        });
+
+        // Boot Telegram Mini App
+        if (tg) {
+          try {
+            tg.ready();
+            tg.expand();
+            if (typeof tg.onEvent === 'function') {
+              tg.onEvent('themeChanged', applyTelegramTheme);
+            }
+          } catch (_) {}
+        }
+        applyTelegramTheme();
+        loadProfile(false);
+      })();
+    </script>
+  </body>
+</html>
