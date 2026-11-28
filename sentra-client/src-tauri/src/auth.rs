@@ -36,6 +36,10 @@ pub fn get_backend_urls() -> Vec<String> {
 pub struct SessionData {
     pub auth_token: String,
     pub subscription_token: String,
+    #[serde(default)]
+    pub connect_code: Option<String>,
+    #[serde(default)]
+    pub plan_tier: Option<String>,
     pub tier: String,
     pub username: String,
     pub remaining_bytes: i64,
@@ -196,9 +200,29 @@ impl AuthManager {
             .and_then(|e| e.as_str())
             .map(|s| s.to_string());
 
+        let connect_code = data
+            .get("subscription")
+            .and_then(|s| s.get("connect_code"))
+            .and_then(|c| c.as_str())
+            .or_else(|| data.get("connect_code").and_then(|c| c.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let plan_tier = data
+            .get("subscription")
+            .and_then(|s| s.get("plan_tier"))
+            .and_then(|p| p.as_str())
+            .or_else(|| data.get("plan_tier").and_then(|p| p.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
         Ok(SessionData {
             auth_token,
             subscription_token: sub_token,
+            connect_code,
+            plan_tier,
             tier,
             username: uname,
             remaining_bytes,
@@ -206,18 +230,27 @@ impl AuthManager {
         })
     }
 
-    /// Register a new account with username and password directly in the app
-    pub async fn register_with_credentials(username: &str, password: &str) -> Result<SessionData, String> {
+    /// Register a new account with username, password, confirmPassword, and optional email
+    pub async fn register_with_credentials(
+        username: &str,
+        password: &str,
+        confirm_password: Option<&str>,
+        email: Option<&str>,
+    ) -> Result<SessionData, String> {
         let clean_username = username.trim().to_lowercase();
 
-        if clean_username.len() < 3 || clean_username.len() > 32 {
-            return Err("نام کاربری باید بین ۳ تا ۳۲ کاراکتر باشد.".to_string());
+        if clean_username.len() < 3 || clean_username.len() > 24 {
+            return Err("نام کاربری باید بین ۳ تا ۲۴ کاراکتر باشد.".to_string());
         }
         if !clean_username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err("نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و زیرخط (_) باشد.".to_string());
         }
-        if password.len() < 8 {
-            return Err("رمز عبور باید حداقل ۸ کاراکتر باشد.".to_string());
+        if password.len() < 6 {
+            return Err("رمز عبور باید حداقل ۶ کاراکتر باشد.".to_string());
+        }
+        let confirm = confirm_password.unwrap_or(password);
+        if confirm != password {
+            return Err("رمز عبور و تکرار رمز عبور مطابقت ندارند.".to_string());
         }
 
         let client = Self::build_http_client()?;
@@ -229,14 +262,21 @@ impl AuthManager {
             "Windows PC".to_string()
         };
 
-        let request_payload = json!({
+        let mut request_payload = json!({
             "username": clean_username,
             "password": password,
+            "confirmPassword": confirm,
             "device_identifier": dev_id,
             "device_name": dev_name,
             "os": if cfg!(target_os = "android") { "android" } else { "windows" },
             "client_version": "1.0.0"
         });
+        if let Some(raw_email) = email {
+            let clean_email = raw_email.trim().to_lowercase();
+            if !clean_email.is_empty() {
+                request_payload["email"] = json!(clean_email);
+            }
+        }
 
         let mut resp_opt = None;
         let mut last_err = None;

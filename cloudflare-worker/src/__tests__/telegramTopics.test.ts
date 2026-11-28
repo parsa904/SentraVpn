@@ -583,6 +583,7 @@ test('error-only policy: routine /start and /api/v1/auth/register do NOT send me
         body: JSON.stringify({
           username: 'sara_client_01',
           password: 'Password123!',
+          confirmPassword: 'Password123!',
         }),
       }),
       env,

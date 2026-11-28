@@ -190,10 +190,34 @@ export async function getCachedActiveNodesPool(
          LIMIT 100`
       );
 
-      const [donatedRes, coreRes] = await executeD1Batch<Record<string, unknown>>(db, [
-        donatedStmt,
-        coreStmt,
-      ]);
+      let donatedRes: D1Result<Record<string, unknown>> | undefined;
+      let coreRes: D1Result<Record<string, unknown>> | undefined;
+      try {
+        [donatedRes, coreRes] = await executeD1Batch<Record<string, unknown>>(db, [
+          donatedStmt,
+          coreStmt,
+        ]);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err || '');
+        if (!/no such column|has no column named/i.test(msg)) {
+          throw err;
+        }
+        const legacyDonatedStmt = db.prepare(
+          `SELECT id, tag, protocol, server_address, server_port, config_json,
+                  latency_ms, speed_mbps, assigned_tier, health_score, status, fail_count,
+                  raw_link, fingerprint_sha256, is_official, label, country_code, country_name,
+                  allow_web, allow_download, allow_gaming, allow_static_ip,
+                  gemini_ok, trading_safe, speed_score, jitter_ms, allocation_mode
+           FROM donated_outbounds
+           WHERE status = 'active'
+           ORDER BY is_official DESC, health_score DESC, speed_score DESC, latency_ms ASC
+           LIMIT 200`
+        );
+        [donatedRes, coreRes] = await executeD1Batch<Record<string, unknown>>(db, [
+          legacyDonatedStmt,
+          coreStmt,
+        ]);
+      }
 
       const donated = ((donatedRes?.results || []) as unknown) as DonatedOutboundRow[];
       const core = ((coreRes?.results || []) as unknown) as OutboundRow[];

@@ -475,10 +475,27 @@ test('User panel reply buttons, inline callbacks, and multi-step telegram_states
       message: { message_id: 1, chat: { id: 555001, type: 'private' }, from: user, text: '/start' },
     });
 
-    // 2. Reply buttons: Account (shows 8-digit code, zero /sub/ links), Upgrade, Guide, Download App, Support
-    const accountCalls = await sendUpdate({
+    // 2. Unlinked user tapping Account sees ONLY the 2 unified auth inline buttons
+    const unlinkedAccountCalls = await sendUpdate({
       update_id: 402,
       message: { message_id: 2, chat: { id: 555001, type: 'private' }, from: user, text: '👤 حساب کاربری' },
+    });
+    const unlinkedMarkup = unlinkedAccountCalls[0].body.reply_markup as {
+      inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+    };
+    const unlinkedButtons = unlinkedMarkup.inline_keyboard.flat();
+    assert.equal(unlinkedButtons.length, 2);
+    assert.equal(unlinkedButtons[0].callback_data, 'auth_register_new');
+    assert.equal(unlinkedButtons[1].callback_data, 'auth_login_app');
+
+    // Mark user as registered with unified credentials, then Account shows 8-digit code & zero /sub/ links
+    sqlite
+      .prepare('UPDATE users SET password_hash = ? WHERE telegram_id = ?')
+      .run('pbkdf2_sha256$15000$00112233445566778899aabbccddeeff$00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff', 555001);
+
+    const accountCalls = await sendUpdate({
+      update_id: 4021,
+      message: { message_id: 21, chat: { id: 555001, type: 'private' }, from: user, text: '👤 حساب کاربری' },
     });
     assert.ok(String(accountCalls[0].body.text).includes('کد اتصال ۸ رقمی'));
     assert.ok(String(accountCalls[0].body.text).includes('باقیمانده'));

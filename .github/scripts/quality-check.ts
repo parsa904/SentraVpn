@@ -110,6 +110,16 @@ const RUNNER_VERSION =
   (process.env.GITHUB_SHA || '').trim().slice(0, 7) ||
   (process.env.GITHUB_RUN_NUMBER ? `run-${process.env.GITHUB_RUN_NUMBER}` : 'quality-engine-ci');
 
+async function readResponseSnippet(resp: Response, maxChars = 500): Promise<string> {
+  try {
+    const raw = (await resp.text()).trim();
+    if (!raw) return '(empty body)';
+    return raw.length > maxChars ? `${raw.slice(0, maxChars)}…` : raw;
+  } catch {
+    return '(unreadable body)';
+  }
+}
+
 /**
  * Reports QualityEngine runtime/CI errors to the Cloudflare Worker unified
  * AI-ready telemetry endpoint (`POST /api/v1/telemetry/error`). Never throws.
@@ -140,7 +150,8 @@ async function reportQualityEngineError(
       timestamp: new Date().toISOString(),
     };
 
-    await fetch(`${WORKER_URL}/api/v1/telemetry/error`, {
+    const telemetryEndpoint = '/api/v1/telemetry/error';
+    const resp = await fetch(`${WORKER_URL}${telemetryEndpoint}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -149,6 +160,12 @@ async function reportQualityEngineError(
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(5_000),
     });
+    if (!resp.ok) {
+      const responseText = await readResponseSnippet(resp, 500);
+      console.error(
+        `[QualityEngine] Error telemetry rejected (${telemetryEndpoint}): HTTP ${resp.status} - ${responseText}`
+      );
+    }
   } catch (reportErr) {
     console.error('[QualityEngine] Failed to transmit error report:', reportErr);
   }
@@ -1037,7 +1054,8 @@ async function main(): Promise<void> {
     `[QualityEngine] Starting 2-stage validation cycle against ${WORKER_URL} (sing-box available: ${singboxAvailable})`
   );
 
-  const listResp = await fetch(`${WORKER_URL}/api/v1/nodes/active`, {
+  const activeEndpoint = '/api/v1/nodes/active';
+  const listResp = await fetch(`${WORKER_URL}${activeEndpoint}`, {
     headers: {
       'X-Quality-Secret': QUALITY_SECRET,
       Accept: 'application/json',
@@ -1046,7 +1064,10 @@ async function main(): Promise<void> {
   });
 
   if (!listResp.ok) {
-    throw new Error(`Failed to fetch active nodes: HTTP ${listResp.status}`);
+    const responseText = await readResponseSnippet(listResp, 500);
+    throw new Error(
+      `Failed to fetch active nodes (${activeEndpoint}): HTTP ${listResp.status} - ${responseText}`
+    );
   }
 
   const listData = (await listResp.json()) as {
@@ -1197,7 +1218,8 @@ async function main(): Promise<void> {
     `[QualityEngine] Evaluated ${results.length} DB nodes (healthy=${healthyCount}, quarantined=${quarantinedCount}, gemini_ok=${geminiCount}, trading_safe=${tradingCount}) and ${subscriptionReports.length} subscription sources.`
   );
 
-  const reportResp = await fetch(`${WORKER_URL}/api/v1/nodes/health-report`, {
+  const reportEndpoint = '/api/v1/nodes/health-report';
+  const reportResp = await fetch(`${WORKER_URL}${reportEndpoint}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -1214,8 +1236,10 @@ async function main(): Promise<void> {
   });
 
   if (!reportResp.ok) {
-    const errText = await reportResp.text();
-    throw new Error(`Failed to submit health report: HTTP ${reportResp.status} — ${errText}`);
+    const responseText = await readResponseSnippet(reportResp, 500);
+    throw new Error(
+      `Failed to submit health report (${reportEndpoint}): HTTP ${reportResp.status} - ${responseText}`
+    );
   }
 
   const summary = await reportResp.json();

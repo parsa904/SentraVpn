@@ -367,26 +367,38 @@ export function formatRemainingDays(
   return lang === 'fa' ? `${days} روز باقی‌مانده` : `${days}d left`;
 }
 
+export interface CredentialsValidationOptions {
+  confirmPassword?: string;
+  email?: string;
+}
+
 export function validateCredentialsForm(
   username: string,
   password: string,
   isRegister: boolean,
-  lang: 'en' | 'fa' = 'en'
+  lang: 'en' | 'fa' = 'en',
+  options?: CredentialsValidationOptions
 ): string | null {
   const u = username.trim();
   if (!u) {
     return lang === 'fa' ? 'نام کاربری نمی‌تواند خالی باشد.' : 'Username is required.';
   }
   if (isRegister) {
-    if (u.length < 3 || u.length > 32) {
+    if (u.length < 3 || u.length > 24) {
       return lang === 'fa'
-        ? 'نام کاربری باید بین ۳ تا ۳۲ کاراکتر باشد.'
-        : 'Username must be between 3 and 32 characters.';
+        ? 'نام کاربری باید بین ۳ تا ۲۴ کاراکتر باشد.'
+        : 'Username must be between 3 and 24 characters.';
     }
     if (!/^[a-zA-Z0-9_]+$/.test(u)) {
       return lang === 'fa'
         ? 'نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد و زیرخط (_) باشد.'
         : 'Username can only contain letters, numbers, and underscores (_).';
+    }
+    const cleanEmail = (options?.email ?? '').trim();
+    if (cleanEmail && (cleanEmail.length > 120 || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail))) {
+      return lang === 'fa'
+        ? 'فرمت ایمیل واردشده معتبر نیست.'
+        : 'Enter a valid email address or leave it blank.';
     }
   } else {
     const cleanSignIn = u.startsWith('@') && !u.slice(1).includes('@') ? u.slice(1) : u;
@@ -404,10 +416,22 @@ export function validateCredentialsForm(
   if (!password) {
     return lang === 'fa' ? 'رمز عبور را وارد کنید.' : 'Password is required.';
   }
-  if (isRegister && password.length < 8) {
+  if (isRegister && password.length < 6) {
     return lang === 'fa'
-      ? 'رمز عبور برای ثبت‌نام باید حداقل ۸ کاراکتر باشد.'
-      : 'Password must be at least 8 characters.';
+      ? 'رمز عبور برای ثبت‌نام باید حداقل ۶ کاراکتر باشد.'
+      : 'Password must be at least 6 characters.';
+  }
+  if (isRegister && options && options.confirmPassword !== undefined) {
+    if (!options.confirmPassword) {
+      return lang === 'fa'
+        ? 'لطفاً تکرار رمز عبور را وارد کنید.'
+        : 'Please confirm your password.';
+    }
+    if (options.confirmPassword !== password) {
+      return lang === 'fa'
+        ? 'رمز عبور و تکرار رمز عبور مطابقت ندارند.'
+        : 'Passwords do not match.';
+    }
   }
   return null;
 }

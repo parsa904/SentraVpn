@@ -360,6 +360,14 @@ test('Telegram Bot: Free/Pro/Flow+ account views, atomic 1GB trial double-click 
     assert.equal(kbJson.includes('دریافت کانفیگ'), false);
     assert.equal(kbJson.includes('دریافت لینک اشتراک'), false);
 
+    // Link unified credentials for Sara so Account opens the full account panel
+    sqlite
+      .prepare('UPDATE users SET password_hash = ? WHERE telegram_id = ?')
+      .run(
+        'pbkdf2_sha256$15000$00112233445566778899aabbccddeeff$00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',
+        888002
+      );
+
     // 2. Account view (Free) shows dynamic 2GB/3GB quotas + 1GB trial button
     const accFree = await sendUpdate({
       update_id: 2,

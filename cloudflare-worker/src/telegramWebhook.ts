@@ -4,6 +4,13 @@ import {
   parseSubscriptionPayload,
 } from './outboundAnalyzer.ts';
 import {
+  hashPassword,
+  normalizeLoginIdentifier,
+  validateUnifiedPassword,
+  validateUnifiedUsername,
+  verifyPassword,
+} from './auth.ts';
+import {
   constantTimeEquals,
   generateNumericCode,
   generateSubscriptionToken,
@@ -11,7 +18,6 @@ import {
   sha256Hex,
   validateExternalHttpsUrl,
   validateUserSubmittedSublink,
-  verifyPassword,
 } from './security.ts';
 import { resolvePlanTier } from './singboxCompiler.ts';
 import {
@@ -412,6 +418,36 @@ async function tgAnswerCallbackQuery(
     callback_query_id: callbackQueryId,
     ...(text ? { text } : {}),
   });
+}
+
+/**
+ * Quiet best-effort deleteMessage helper used to immediately erase user password
+ * messages from Telegram chat history without spamming admin logs if already removed.
+ */
+async function tgDeleteMessage(
+  env: Env,
+  chatId: number,
+  messageId: number
+): Promise<boolean> {
+  const botToken = resolveBotToken(env);
+  if (!botToken || !messageId) return false;
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${botToken}/deleteMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+      }),
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+
+function isUnifiedRegisteredAccount(user: UserRow | null | undefined): boolean {
+  return Boolean(user && user.username && user.password_hash);
 }
 
 async function tgSendDocumentByFileId(
@@ -1706,9 +1742,8 @@ function buildUserMenuHomeView(
         ],
       ]
     : [
-        [{ text: '✨ ثبت‌نام جدید (فوری)', callback_data: 'auth_register_new' }],
-        [{ text: '🔑 ورود با حساب برنامه', callback_data: 'auth_login_app' }],
-        [{ text: '📥 دانلود اپلیکیشن', callback_data: 'user_download_app' }],
+        [{ text: '📝 ثبت‌نام جدید', callback_data: 'auth_register_new' }],
+        [{ text: '🔑 ورود به حساب موجود (اتصال به اپلیکیشن)', callback_data: 'auth_login_app' }],
       ];
 
   if (isAdmin) {
@@ -1718,6 +1753,20 @@ function buildUserMenuHomeView(
   return {
     text: greeting,
     replyMarkup: { inline_keyboard: inlineRows },
+  };
+}
+
+function buildUnlinkedAccountAuthView(): { text: string; replyMarkup: Record<string, unknown> } {
+  return {
+    text:
+      `👋 <b>به بخش حساب کاربری SentraVPN خوش آمدید!</b>\n\n` +
+      `برای دریافت <b>کد اتصال ۸ رقمی اختصاصی</b>، مشاهده وضعیت مصرف و همگام‌سازی یکپارچه حساب خود بین ربات تلگرام و اپلیکیشن SentraVPN، لطفاً یکی از گزینه‌های زیر را انتخاب کنید:`,
+    replyMarkup: {
+      inline_keyboard: [
+        [{ text: '📝 ثبت‌نام جدید', callback_data: 'auth_register_new' }],
+        [{ text: '🔑 ورود به حساب موجود (اتصال به اپلیکیشن)', callback_data: 'auth_login_app' }],
+      ],
+    },
   };
 }
 
@@ -2174,39 +2223,32 @@ async function handleCallbackQuery(
 
     // --- Auth Callbacks ---
     if (data === 'auth_register_new') {
-      const { user, sub, isNewUser } = await ensureTelegramUserAndSubscription(
-        env.DB,
-        q.from,
-        isEnvAdmin(env, telegramId)
-      );
-      const effectiveIsAdmin = isEnvAdmin(env, telegramId) || user.role === 'admin';
-      if (messageId) {
-        await tgEditMessageText(
-          env,
-          chatId,
-          messageId,
-          isNewUser
-            ? `🎉 <b>ثبت‌نام شما با موفقیت انجام شد!</b>\n\n🆔 <b>کد شناسایی یکتا:</b> <code>${escapeHtml(user.user_uuid)}</code>\n💎 <b>پلن فعال:</b> ${escapeHtml(sub.tier)} (۱۰ گیگابایت)`
-            : `✅ حساب شما از قبل فعال است.\n🆔 شناسه یکتا: <code>${escapeHtml(user.user_uuid)}</code>`
-        );
+      const existingRecord = await getUserAndSubByTelegramId(env.DB, telegramId);
+      if (existingRecord?.sub && isUnifiedRegisteredAccount(existingRecord.user)) {
+        const view = await buildUserAccountView(env, existingRecord.user, existingRecord.sub);
+        await sendOrEditView(env, chatId, messageId, view);
+        return;
       }
-      await tgSendMessage(
-        env,
-        chatId,
-        `از این پس می‌توانید وضعیت اشتراک، لینک اتصال و پشتیبانی را از منوی زیر مدیریت کنید.`,
-        buildMainKeyboard(true, effectiveIsAdmin)
-      );
+
+      await setBotState(env.DB, telegramId, 'awaiting_register_username');
+      await sendOrEditView(env, chatId, messageId, {
+        text:
+          `📝 <b>ثبت‌نام حساب جدید SentraVPN (مرحله ۱ از ۳)</b>\n\n` +
+          `لطفاً <b>نام کاربری (Username)</b> دلخواه خود را وارد کنید:\n` +
+          `<i>• بین ۳ تا ۲۴ کاراکتر\n• فقط حروف انگلیسی، اعداد و زیرخط (_)</i>`,
+        replyMarkup: buildCancelStateInlineMarkup(),
+      });
       return;
     }
 
     if (data === 'auth_login_app') {
       await setBotState(env.DB, telegramId, 'awaiting_login_username');
-      await tgSendMessage(
-        env,
-        chatId,
-        '🔐 <b>ورود با حساب اپلیکیشن Sentra</b>\n\nلطفاً <b>نام کاربری (Username)</b> حساب خود در اپلیکیشن را ارسال کنید:',
-        buildCancelStateInlineMarkup()
-      );
+      await sendOrEditView(env, chatId, messageId, {
+        text:
+          `🔑 <b>ورود به حساب موجود (اتصال به اپلیکیشن)</b>\n\n` +
+          `لطفاً <b>نام کاربری (Username)</b> حساب خود در اپلیکیشن SentraVPN را ارسال کنید:`,
+        replyMarkup: buildCancelStateInlineMarkup(),
+      });
       return;
     }
 
@@ -2238,14 +2280,14 @@ async function handleCallbackQuery(
       return;
     }
 
-    // --- User Account Status ---
+    // --- User Account Status (Unified Auth Gate) ---
     if (data === 'user_account') {
-      const { user, sub } = await ensureTelegramUserAndSubscription(
-        env.DB,
-        q.from,
-        isEnvAdmin(env, telegramId)
-      );
-      const view = await buildUserAccountView(env, user, sub);
+      const record = await getUserAndSubByTelegramId(env.DB, telegramId);
+      if (!record || !record.sub || !isUnifiedRegisteredAccount(record.user)) {
+        await sendOrEditView(env, chatId, messageId, buildUnlinkedAccountAuthView());
+        return;
+      }
+      const view = await buildUserAccountView(env, record.user, record.sub);
       await sendOrEditView(env, chatId, messageId, view);
       return;
     }
@@ -3203,27 +3245,257 @@ async function handleTextMessage(
     // cancel the FSM state first so menu buttons always stay responsive.
     const state = await getBotState(env.DB, telegramId);
     if (state && !text.startsWith('/') && !menuAction) {
-      if (state.state_type === 'awaiting_login_username') {
-        if (!text) {
-          await tgSendMessage(env, chatId, '❌ لطفاً نام کاربری خود را به‌صورت متن ارسال کنید:');
+      if (state.state_type === 'awaiting_register_username') {
+        const usernameCheck = validateUnifiedUsername(text);
+        if (!usernameCheck.ok) {
+          await tgSendMessage(
+            env,
+            chatId,
+            `❌ ${escapeHtml(usernameCheck.error)}\n\nلطفاً نام کاربری معتبر دیگری وارد کنید:`,
+            buildCancelStateInlineMarkup()
+          );
           return;
         }
-        await setBotState(env.DB, telegramId, 'awaiting_login_password', { username: text });
+
+        const candidate = usernameCheck.username;
+        const taken = await env.DB.prepare(
+          'SELECT id, telegram_id, password_hash FROM users WHERE LOWER(username) = LOWER(?) LIMIT 1'
+        )
+          .bind(candidate)
+          .first<{ id: number; telegram_id: number | null; password_hash: string | null }>();
+
+        if (taken && (taken.telegram_id !== telegramId || Boolean(taken.password_hash))) {
+          await tgSendMessage(
+            env,
+            chatId,
+            '❌ این نام کاربری قبلاً ثبت شده است. لطفاً نام کاربری دیگری ارسال کنید:',
+            buildCancelStateInlineMarkup()
+          );
+          return;
+        }
+
+        await setBotState(env.DB, telegramId, 'awaiting_register_password', {
+          username: candidate,
+        });
         await tgSendMessage(
           env,
           chatId,
-          '🔑 اکنون <b>رمز عبور (Password)</b> حساب خود را وارد کنید:',
+          `🔐 <b>ثبت‌نام حساب جدید (مرحله ۲ از ۳ — تعیین رمز عبور)</b>\n\n` +
+            `نام کاربری: <code>${escapeHtml(candidate)}</code>\n` +
+            `لطفاً <b>رمز عبور</b> دلخواه خود را وارد کنید (حداقل ۶ کاراکتر):\n\n` +
+            `<i>🛡 برای حفظ امنیت، پیام رمز عبور شما بلافاصله از چت حذف می‌شود.</i>`,
+          buildCancelStateInlineMarkup()
+        );
+        return;
+      }
+
+      if (state.state_type === 'awaiting_register_password') {
+        await tgDeleteMessage(env, chatId, msg.message_id);
+        const payload = JSON.parse(state.payload_json || '{}') as { username?: string };
+        const username = (payload.username || '').trim().toLowerCase();
+        if (!username) {
+          await clearBotState(env.DB, telegramId);
+          await tgSendMessage(env, chatId, '⚠️ جلسه ثبت‌نام منقضی شد. لطفاً از بخش «👤 حساب کاربری» دوباره تلاش کنید.');
+          return;
+        }
+
+        const passwordCheck = validateUnifiedPassword(text);
+        if (!passwordCheck.ok) {
+          await tgSendMessage(
+            env,
+            chatId,
+            `❌ ${escapeHtml(passwordCheck.error)}\n\nلطفاً رمز عبور معتبر وارد کنید:`,
+            buildCancelStateInlineMarkup()
+          );
+          return;
+        }
+
+        // Hash immediately — plaintext password is NEVER persisted in telegram_states
+        const pendingHash = await hashPassword(passwordCheck.password);
+        await setBotState(env.DB, telegramId, 'awaiting_register_confirm_password', {
+          username,
+          password_hash: pendingHash,
+        });
+        await tgSendMessage(
+          env,
+          chatId,
+          `🔁 <b>ثبت‌نام حساب جدید (مرحله ۳ از ۳ — تکرار رمز عبور)</b>\n\n` +
+            `لطفاً رمز عبور خود را <b>مجدداً وارد کنید</b> تا مطابقت آن تأیید شود:\n\n` +
+            `<i>🛡 پیام شما پس از بررسی فوراً از چت حذف می‌شود.</i>`,
+          buildCancelStateInlineMarkup()
+        );
+        return;
+      }
+
+      if (state.state_type === 'awaiting_register_confirm_password') {
+        await tgDeleteMessage(env, chatId, msg.message_id);
+        const payload = JSON.parse(state.payload_json || '{}') as {
+          username?: string;
+          password_hash?: string;
+        };
+        const username = (payload.username || '').trim().toLowerCase();
+        const pendingHash = payload.password_hash || '';
+
+        if (!username || !pendingHash) {
+          await clearBotState(env.DB, telegramId);
+          await tgSendMessage(env, chatId, '⚠️ جلسه ثبت‌نام منقضی شد. لطفاً از بخش «👤 حساب کاربری» دوباره تلاش کنید.');
+          return;
+        }
+
+        const matches = await verifyPassword(text, pendingHash);
+        if (!matches) {
+          await setBotState(env.DB, telegramId, 'awaiting_register_password', { username });
+          await tgSendMessage(
+            env,
+            chatId,
+            `❌ <b>تکرار رمز عبور مطابقت نداشت.</b>\n\nلطفاً رمز عبور خود را مجدداً وارد کنید (حداقل ۶ کاراکتر):`,
+            buildCancelStateInlineMarkup()
+          );
+          return;
+        }
+
+        await clearBotState(env.DB, telegramId);
+
+        const taken = await env.DB.prepare(
+          'SELECT id, telegram_id, password_hash FROM users WHERE LOWER(username) = LOWER(?) LIMIT 1'
+        )
+          .bind(username)
+          .first<{ id: number; telegram_id: number | null; password_hash: string | null }>();
+
+        if (taken && (taken.telegram_id !== telegramId || Boolean(taken.password_hash))) {
+          await tgSendMessage(
+            env,
+            chatId,
+            '❌ این نام کاربری هم‌اکنون توسط کاربر دیگری ثبت شده است. لطفاً از بخش «👤 حساب کاربری» دوباره ثبت‌نام کنید.',
+            buildMainKeyboard(isRegistered, isAdmin)
+          );
+          return;
+        }
+
+        let targetUser: UserRow | null = null;
+        let targetSub: SubscriptionRow | null = null;
+
+        if (existing?.user && !existing.user.password_hash) {
+          await env.DB.prepare(
+            `UPDATE users
+             SET username = ?, password_hash = ?, role = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?`
+          )
+            .bind(
+              username,
+              pendingHash,
+              envAdmin || existing.user.role === 'admin' ? 'admin' : 'user',
+              existing.user.id
+            )
+            .run();
+          const refreshed = await getUserAndSubByTelegramId(env.DB, telegramId);
+          targetUser = refreshed?.user ?? null;
+          targetSub = refreshed?.sub ?? null;
+        } else {
+          const userUuid = crypto.randomUUID();
+          await env.DB.prepare(
+            `INSERT INTO users (
+               user_uuid, telegram_id, username, email, password_hash,
+               first_name, last_name, role, status, outbound_reward_banned
+             ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'active', 0)`
+          )
+            .bind(
+              userUuid,
+              telegramId,
+              username,
+              pendingHash,
+              (from.first_name || username).trim() || username,
+              from.last_name || null,
+              envAdmin ? 'admin' : 'user'
+            )
+            .run();
+          const created = await getUserAndSubByTelegramId(env.DB, telegramId);
+          targetUser = created?.user ?? null;
+          targetSub = created?.sub ?? null;
+        }
+
+        if (!targetUser) {
+          await tgSendMessage(env, chatId, '⚠️ خطایی در ذخیره حساب کاربری رخ داد. لطفاً دوباره تلاش کنید.');
+          return;
+        }
+
+        if (!targetSub) {
+          const token = generateSubscriptionToken();
+          const connectCode = await generateUniqueConnectCode(env.DB);
+          const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+          const freeQuotas = await getFreeQuotaSettings(env.DB);
+          const initialLimit = freeQuotas.webQuotaBytes + freeQuotas.downloadQuotaBytes;
+          await env.DB.prepare(
+            `INSERT INTO subscriptions (
+               user_id, tier, plan_tier, connect_code, token, status,
+               upload_bytes, download_bytes, traffic_limit_bytes, speed_limit_bps,
+               max_concurrent_devices, web_browsing_used_mb, download_used_mb,
+               static_ip_used_mb, web_used_bytes, download_used_bytes,
+               special_quota_bytes, special_used_bytes, has_used_special_trial, expires_at
+             ) VALUES (?, 'Sentra Lite', 'free', ?, ?, 'active', 0, 0, ?, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, ?)`
+          )
+            .bind(targetUser.id, connectCode, token, initialLimit, expiresAt)
+            .run();
+          targetSub = await env.DB.prepare(
+            'SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1'
+          )
+            .bind(targetUser.id)
+            .first<SubscriptionRow>();
+        }
+
+        if (!targetSub) {
+          await tgSendMessage(env, chatId, '⚠️ خطایی در ایجاد اشتراک رخ داد. لطفاً دوباره تلاش کنید.');
+          return;
+        }
+
+        const connectCode = await ensureSubscriptionConnectCode(env.DB, targetSub);
+        targetSub = { ...targetSub, connect_code: connectCode };
+        const effectiveIsAdmin = envAdmin || targetUser.role === 'admin';
+
+        await tgSendMessage(
+          env,
+          chatId,
+          `🎉 <b>ثبت‌نام یکپارچه با موفقیت انجام شد!</b>\n\n` +
+            `👤 <b>نام کاربری:</b> <code>${escapeHtml(targetUser.username || username)}</code>\n` +
+            `🔑 <b>کد اتصال ۸ رقمی:</b> <code>${escapeHtml(connectCode)}</code>\n\n` +
+            `از این پس می‌توانید با همین نام کاربری و رمز عبور یا کد اتصال ۸ رقمی در اپلیکیشن SentraVPN وارد شوید.`,
+          buildMainKeyboard(true, effectiveIsAdmin)
+        );
+        const accountView = await buildUserAccountView(env, targetUser, targetSub);
+        await tgSendMessage(env, chatId, accountView.text, accountView.replyMarkup);
+        return;
+      }
+
+      if (state.state_type === 'awaiting_login_username') {
+        const cleanIdentifier = normalizeLoginIdentifier(text);
+        if (!cleanIdentifier) {
+          await tgSendMessage(
+            env,
+            chatId,
+            '❌ لطفاً نام کاربری خود را به‌صورت متن ارسال کنید:',
+            buildCancelStateInlineMarkup()
+          );
+          return;
+        }
+        await setBotState(env.DB, telegramId, 'awaiting_login_password', {
+          username: cleanIdentifier,
+        });
+        await tgSendMessage(
+          env,
+          chatId,
+          `🔑 اکنون <b>رمز عبور (Password)</b> حساب خود را وارد کنید:\n\n<i>🛡 برای حفظ امنیت، پیام رمز عبور شما بلافاصله از چت حذف می‌شود.</i>`,
           buildCancelStateInlineMarkup()
         );
         return;
       }
 
       if (state.state_type === 'awaiting_login_password') {
+        await tgDeleteMessage(env, chatId, msg.message_id);
         const payload = JSON.parse(state.payload_json || '{}') as { username?: string };
         await clearBotState(env.DB, telegramId);
-        const username = (payload.username || '').trim();
+        const username = normalizeLoginIdentifier(payload.username);
         const user = await env.DB.prepare(
-          'SELECT * FROM users WHERE lower(username) = lower(?) OR lower(email) = lower(?) LIMIT 1'
+          'SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?) LIMIT 1'
         )
           .bind(username, username)
           .first<UserRow>();
@@ -3232,10 +3504,48 @@ async function handleTextMessage(
           await tgSendMessage(
             env,
             chatId,
-            '❌ نام کاربری یا رمز عبور اشتباه است. لطفاً دوباره تلاش کنید.',
+            '❌ نام کاربری یا رمز عبور اشتباه است. لطفاً از بخش «👤 حساب کاربری» دوباره تلاش کنید.',
             buildMainKeyboard(isRegistered, isAdmin)
           );
           return;
+        }
+
+        if (user.status !== 'active') {
+          await tgSendMessage(
+            env,
+            chatId,
+            '⛔ حساب کاربری شما تعلیق شده است.',
+            buildMainKeyboard(isRegistered, isAdmin)
+          );
+          return;
+        }
+
+        if (user.telegram_id && user.telegram_id !== telegramId) {
+          await tgSendMessage(
+            env,
+            chatId,
+            '⛔ این حساب کاربری قبلاً به یک حساب تلگرام دیگر متصل شده است. در صورت نیاز با پشتیبانی تماس بگیرید.',
+            buildMainKeyboard(isRegistered, isAdmin)
+          );
+          return;
+        }
+
+        // If current Telegram user had an unlinked passwordless shell record, detach its telegram_id first
+        if (existing?.user && existing.user.id !== user.id) {
+          if (existing.user.password_hash) {
+            await tgSendMessage(
+              env,
+              chatId,
+              '⚠️ تلگرام شما هم‌اکنون به یک حساب ثبت‌نام‌شده دیگر متصل است.',
+              buildMainKeyboard(true, isAdmin)
+            );
+            return;
+          }
+          await env.DB.prepare(
+            'UPDATE users SET telegram_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+          )
+            .bind(existing.user.id)
+            .run();
         }
 
         await env.DB.prepare(
@@ -3244,13 +3554,58 @@ async function handleTextMessage(
           .bind(telegramId, user.id)
           .run();
 
-        const loggedInIsAdmin = envAdmin || user.role === 'admin';
+        let linkedSub = await env.DB.prepare(
+          'SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1'
+        )
+          .bind(user.id)
+          .first<SubscriptionRow>();
+
+        if (!linkedSub) {
+          const token = generateSubscriptionToken();
+          const connectCode = await generateUniqueConnectCode(env.DB);
+          const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+          const freeQuotas = await getFreeQuotaSettings(env.DB);
+          const initialLimit = freeQuotas.webQuotaBytes + freeQuotas.downloadQuotaBytes;
+          await env.DB.prepare(
+            `INSERT INTO subscriptions (
+               user_id, tier, plan_tier, connect_code, token, status,
+               upload_bytes, download_bytes, traffic_limit_bytes, speed_limit_bps,
+               max_concurrent_devices, web_browsing_used_mb, download_used_mb,
+               static_ip_used_mb, web_used_bytes, download_used_bytes,
+               special_quota_bytes, special_used_bytes, has_used_special_trial, expires_at
+             ) VALUES (?, 'Sentra Lite', 'free', ?, ?, 'active', 0, 0, ?, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, ?)`
+          )
+            .bind(user.id, connectCode, token, initialLimit, expiresAt)
+            .run();
+          linkedSub = await env.DB.prepare(
+            'SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1'
+          )
+            .bind(user.id)
+            .first<SubscriptionRow>();
+        }
+
+        const linkedUser: UserRow = { ...user, telegram_id: telegramId };
+        const loggedInIsAdmin = envAdmin || linkedUser.role === 'admin';
+        const connectCode = linkedSub
+          ? await ensureSubscriptionConnectCode(env.DB, linkedSub)
+          : '';
+        if (linkedSub) {
+          linkedSub = { ...linkedSub, connect_code: connectCode };
+        }
+
         await tgSendMessage(
           env,
           chatId,
-          `✅ <b>ورود موفق!</b>\nحساب <b>${escapeHtml(user.username || user.first_name)}</b> به تلگرام شما متصل شد.`,
+          `✅ <b>ورود موفق و همگام‌سازی کامل!</b>\n\n` +
+            `👤 <b>حساب:</b> <code>${escapeHtml(linkedUser.username || linkedUser.first_name)}</code>\n` +
+            (connectCode ? `🔑 <b>کد اتصال ۸ رقمی:</b> <code>${escapeHtml(connectCode)}</code>\n` : '') +
+            `حساب اپلیکیشن شما با موفقیت به تلگرام متصل شد.`,
           buildMainKeyboard(true, loggedInIsAdmin)
         );
+        if (linkedSub) {
+          const accountView = await buildUserAccountView(env, linkedUser, linkedSub);
+          await tgSendMessage(env, chatId, accountView.text, accountView.replyMarkup);
+        }
         return;
       }
 
@@ -3734,25 +4089,20 @@ async function handleTextMessage(
       }
 
       case 'auth': {
-        await tgSendMessage(
-          env,
-          chatId,
-          '🔐 <b>احراز هویت Sentra</b>\n\nاگر قبلاً داخل اپلیکیشن حساب ساخته‌اید روی «ورود با حساب برنامه» بزنید، در غیر این صورت ثبت‌نام فوری انجام دهید:',
-          {
-            inline_keyboard: [
-              [{ text: '✨ ثبت‌نام جدید (فوری)', callback_data: 'auth_register_new' }],
-              [{ text: '🔑 ورود با حساب برنامه', callback_data: 'auth_login_app' }],
-            ],
-          }
-        );
+        const authView = buildUnlinkedAccountAuthView();
+        await tgSendMessage(env, chatId, authView.text, authView.replyMarkup);
         return;
       }
 
       case 'account':
       case 'get_sub':
       case 'ios_menu': {
-        const { user, sub } = await ensureTelegramUserAndSubscription(env.DB, from, envAdmin);
-        const view = await buildUserAccountView(env, user, sub);
+        if (!existing || !existing.sub || !isUnifiedRegisteredAccount(existing.user)) {
+          const authView = buildUnlinkedAccountAuthView();
+          await tgSendMessage(env, chatId, authView.text, authView.replyMarkup);
+          return;
+        }
+        const view = await buildUserAccountView(env, existing.user, existing.sub);
         await tgSendMessage(env, chatId, view.text, view.replyMarkup);
         return;
       }
@@ -3818,7 +4168,7 @@ async function handleTextMessage(
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error('[Sentra Message Handler Error]', {
       telegram_id: telegramId,
-      text: text.slice(0, 120),
+      text_length: text.length,
       error: errMsg,
       err,
     });

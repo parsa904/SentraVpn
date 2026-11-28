@@ -170,12 +170,36 @@ test('compares semver versions and validates GitHub Release URLs safely', () => 
   assert.equal(isSafeReleaseUrl('http://github.com/parsa904/SentraVpn/releases'), false);
 });
 
-test('validates credentials (8-char register rule, email & @username sign-in) and 8-digit OTP in both EN and FA', () => {
-  assert.ok(validateCredentialsForm('', '12345678', false, 'en'));
-  assert.ok(validateCredentialsForm('ab', '12345678', true, 'fa'));
-  assert.ok(validateCredentialsForm('valid_user', '1234567', true, 'en'));
+test('validates credentials (6-char register rule, confirmPassword, optional email) and 8-digit OTP in both EN and FA', () => {
+  assert.ok(validateCredentialsForm('', '123456', false, 'en'));
+  assert.ok(validateCredentialsForm('ab', '123456', true, 'fa'));
+  assert.ok(validateCredentialsForm('valid_user', '12345', true, 'en'));
   assert.ok(validateCredentialsForm('bad-user.name', 'secret123', true, 'en'));
-  assert.equal(validateCredentialsForm('valid_user', 'secret123', true, 'en'), null);
+  assert.ok(
+    validateCredentialsForm('valid_user', 'secret123', true, 'fa', {
+      confirmPassword: 'wrong',
+    })
+  );
+  assert.ok(
+    validateCredentialsForm('valid_user', 'secret123', true, 'en', {
+      confirmPassword: 'secret123',
+      email: 'not-an-email',
+    })
+  );
+  assert.equal(
+    validateCredentialsForm('valid_user', 'secret1', true, 'en', {
+      confirmPassword: 'secret1',
+      email: '',
+    }),
+    null
+  );
+  assert.equal(
+    validateCredentialsForm('valid_user', 'secret123', true, 'fa', {
+      confirmPassword: 'secret123',
+      email: 'user@example.com',
+    }),
+    null
+  );
   assert.equal(validateCredentialsForm('legacy.user', '1234', false, 'fa'), null);
   assert.equal(validateCredentialsForm('@existing_user', 'secret123', false, 'fa'), null);
   assert.equal(validateCredentialsForm('user.name+1@example.com', 'secret123', false, 'en'), null);

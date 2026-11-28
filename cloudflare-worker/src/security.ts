@@ -1,6 +1,6 @@
-const PBKDF2_ITERATIONS = 100_000;
-const SALT_BYTES = 16;
-const DERIVED_BITS = 256;
+import { hashPassword, verifyPassword } from './auth.ts';
+
+export { hashPassword, verifyPassword };
 
 const encoder = new TextEncoder();
 
@@ -40,70 +40,6 @@ export async function constantTimeEquals(a: string, b: string): Promise<boolean>
   let diff = 0;
   for (let i = 0; i < ba.length; i += 1) {
     diff |= ba[i] ^ bb[i];
-  }
-  return diff === 0;
-}
-
-export async function hashPassword(password: string): Promise<string> {
-  const salt = new Uint8Array(new ArrayBuffer(SALT_BYTES));
-  crypto.getRandomValues(salt);
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(password),
-    'PBKDF2',
-    false,
-    ['deriveBits']
-  );
-  const derived = await crypto.subtle.deriveBits(
-    {
-      name: 'PBKDF2',
-      salt,
-      iterations: PBKDF2_ITERATIONS,
-      hash: 'SHA-256',
-    },
-    keyMaterial,
-    DERIVED_BITS
-  );
-  return `pbkdf2_sha256$${PBKDF2_ITERATIONS}$${toHex(salt)}$${toHex(new Uint8Array(derived))}`;
-}
-
-export async function verifyPassword(password: string, storedHash: string | null): Promise<boolean> {
-  if (!storedHash || !password) return false;
-  const parts = storedHash.split('$');
-  if (parts.length !== 4 || parts[0] !== 'pbkdf2_sha256') {
-    return false;
-  }
-  const iterations = Number(parts[1]);
-  const salt = fromHex(parts[2]);
-  const expected = fromHex(parts[3]);
-  if (!Number.isFinite(iterations) || iterations < 10_000 || !salt || !expected) {
-    return false;
-  }
-
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(password),
-    'PBKDF2',
-    false,
-    ['deriveBits']
-  );
-  const derived = new Uint8Array(
-    await crypto.subtle.deriveBits(
-      {
-        name: 'PBKDF2',
-        salt,
-        iterations,
-        hash: 'SHA-256',
-      },
-      keyMaterial,
-      expected.length * 8
-    )
-  );
-
-  if (derived.length !== expected.length) return false;
-  let diff = 0;
-  for (let i = 0; i < derived.length; i += 1) {
-    diff |= derived[i] ^ expected[i];
   }
   return diff === 0;
 }

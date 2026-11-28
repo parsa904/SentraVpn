@@ -16,6 +16,8 @@ pub async fn login_with_code(
     app_state.is_authenticated = true;
     app_state.auth_token = Some(session.auth_token);
     app_state.subscription_token = Some(session.subscription_token);
+    app_state.connect_code = session.connect_code.clone();
+    app_state.plan_tier = session.plan_tier.clone();
     app_state.tier = session.tier.clone();
     app_state.username = session.username.clone();
     app_state.remaining_bytes = session.remaining_bytes;
@@ -34,14 +36,24 @@ pub async fn login_with_code(
 pub async fn register_with_credentials(
     username: String,
     password: String,
+    confirm_password: Option<String>,
+    email: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ClientState, String> {
-    let session = AuthManager::register_with_credentials(&username, &password).await?;
+    let session = AuthManager::register_with_credentials(
+        &username,
+        &password,
+        confirm_password.as_deref(),
+        email.as_deref(),
+    )
+    .await?;
 
     let mut app_state = state.lock().await;
     app_state.is_authenticated = true;
     app_state.auth_token = Some(session.auth_token);
     app_state.subscription_token = Some(session.subscription_token);
+    app_state.connect_code = session.connect_code.clone();
+    app_state.plan_tier = session.plan_tier.clone();
     app_state.tier = session.tier.clone();
     app_state.username = session.username.clone();
     app_state.remaining_bytes = session.remaining_bytes;
@@ -68,6 +80,8 @@ pub async fn login_with_credentials(
     app_state.is_authenticated = true;
     app_state.auth_token = Some(session.auth_token);
     app_state.subscription_token = Some(session.subscription_token);
+    app_state.connect_code = session.connect_code.clone();
+    app_state.plan_tier = session.plan_tier.clone();
     app_state.tier = session.tier.clone();
     app_state.username = session.username.clone();
     app_state.remaining_bytes = session.remaining_bytes;
@@ -809,12 +823,22 @@ pub async fn fetch_client_bootstrap(
                     s.username = uname.to_string();
                 }
             }
+            if let Some(sub) = data.get("subscription") {
+                if let Some(code) = sub.get("connect_code").and_then(|v| v.as_str()) {
+                    s.connect_code = Some(code.to_string());
+                }
+                if let Some(pt) = sub.get("plan_tier").and_then(|v| v.as_str()) {
+                    s.plan_tier = Some(pt.to_string());
+                }
+            }
             let refreshed_session = crate::auth::SessionData {
                 auth_token: s
                     .auth_token
                     .clone()
                     .unwrap_or_else(|| format!("jwt_sentra_{}", token)),
                 subscription_token: token.clone(),
+                connect_code: s.connect_code.clone(),
+                plan_tier: s.plan_tier.clone(),
                 tier: s.tier.clone(),
                 username: s.username.clone(),
                 remaining_bytes: s.remaining_bytes,
@@ -925,6 +949,8 @@ pub async fn save_persisted_session(
         s.is_authenticated = true;
         s.auth_token = Some(parsed.auth_token);
         s.subscription_token = Some(parsed.subscription_token);
+        s.connect_code = parsed.connect_code;
+        s.plan_tier = parsed.plan_tier;
         s.tier = parsed.tier;
         s.username = parsed.username;
         s.remaining_bytes = parsed.remaining_bytes;
@@ -959,6 +985,8 @@ pub async fn load_persisted_session(
                     s.is_authenticated = true;
                     s.auth_token = Some(parsed.auth_token);
                     s.subscription_token = Some(parsed.subscription_token);
+                    s.connect_code = parsed.connect_code;
+                    s.plan_tier = parsed.plan_tier;
                     s.tier = parsed.tier;
                     s.username = parsed.username;
                     s.remaining_bytes = parsed.remaining_bytes;

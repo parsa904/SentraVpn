@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
     user_uuid               TEXT NOT NULL UNIQUE,
     telegram_id             INTEGER UNIQUE,
     username                TEXT UNIQUE,
-    email                   TEXT UNIQUE,
+    email                   TEXT,
     password_hash           TEXT,
     first_name              TEXT NOT NULL,
     last_name               TEXT,
@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_uuid ON users(user_uuid);
-CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(LOWER(username));
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(LOWER(email));
 CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 CREATE INDEX IF NOT EXISTS idx_users_auth_code ON users(auth_code);

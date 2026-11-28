@@ -85,6 +85,10 @@ pub struct ClientState {
     pub is_authenticated: bool,
     pub auth_token: Option<String>,
     pub subscription_token: Option<String>,
+    #[serde(default)]
+    pub connect_code: Option<String>,
+    #[serde(default)]
+    pub plan_tier: Option<String>,
     pub tier: String,
     pub username: String,
     pub remaining_bytes: i64,
@@ -118,6 +122,8 @@ impl Default for ClientState {
             is_authenticated: false,
             auth_token: None,
             subscription_token: None,
+            connect_code: None,
+            plan_tier: None,
             tier: String::new(),
             username: String::new(),
             remaining_bytes: 0,

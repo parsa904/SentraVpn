@@ -3,10 +3,13 @@ import {
   AlertCircle,
   ArrowLeft,
   ArrowRight,
+  Eye,
+  EyeOff,
   Globe,
   KeyRound,
   Loader2,
   Lock,
+  Mail,
   Moon,
   Send,
   Sun,
@@ -48,12 +51,23 @@ export const AuthView: React.FC<AuthViewProps> = ({
 }) => {
   const [tab, setTab] = useState<AuthTab>('otp');
   const [username, setUsername] = useState('');
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [otpCode, setOtpCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(initialNotice || null);
 
   const isRtl = lang === 'fa';
+
+  const switchTab = (next: AuthTab) => {
+    setTab(next);
+    setError(null);
+    setShowPassword(false);
+    setShowConfirmPassword(false);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -81,7 +95,8 @@ export const AuthView: React.FC<AuthViewProps> = ({
       username,
       password,
       tab === 'register',
-      lang
+      lang,
+      tab === 'register' ? { confirmPassword, email } : undefined
     );
     if (validationError) {
       setError(validationError);
@@ -92,7 +107,12 @@ export const AuthView: React.FC<AuthViewProps> = ({
     try {
       const session =
         tab === 'register'
-          ? await registerWithCredentials(username.trim(), password)
+          ? await registerWithCredentials(
+              username.trim().toLowerCase(),
+              password,
+              confirmPassword,
+              email.trim() || undefined
+            )
           : await loginWithCredentials(username.trim(), password);
       onAuthenticated(session);
     } catch (err) {
@@ -259,21 +279,18 @@ export const AuthView: React.FC<AuthViewProps> = ({
             <h1 className="sr-only">{t(lang, 'brand')}</h1>
           </div>
 
-          {/* Auth Mode Tabs — 8-Digit Connect Code Primary */}
+          {/* Auth Mode Tabs — 8-Digit Connect Code Primary + Unified Sign In & Sign Up */}
           <div
             role="tablist"
             aria-label={t(lang, 'authMethodAria')}
-            className="mt-5 grid grid-cols-[1.35fr_1fr_1fr] gap-1 rounded-xl bg-slate-100/90 dark:bg-slate-800/80 p-1 animate-sentra-stagger-1"
+            className="mt-5 grid grid-cols-3 gap-1 rounded-xl bg-slate-100/90 dark:bg-slate-800/80 p-1 animate-sentra-stagger-1"
           >
             <button
               type="button"
               role="tab"
               aria-selected={tab === 'otp'}
               data-testid="auth-tab-connect-code"
-              onClick={() => {
-                setTab('otp');
-                setError(null);
-              }}
+              onClick={() => switchTab('otp')}
               className={`inline-flex items-center justify-center gap-1.5 rounded-lg py-2 px-2 text-xs font-semibold whitespace-nowrap transition duration-150 active:scale-[0.98] ${
                 tab === 'otp'
                   ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm'
@@ -288,10 +305,7 @@ export const AuthView: React.FC<AuthViewProps> = ({
               role="tab"
               aria-selected={tab === 'login'}
               data-testid="auth-tab-login"
-              onClick={() => {
-                setTab('login');
-                setError(null);
-              }}
+              onClick={() => switchTab('login')}
               className={`inline-flex items-center justify-center gap-1.5 rounded-lg py-2 px-2 text-xs font-semibold whitespace-nowrap transition duration-150 active:scale-[0.98] ${
                 tab === 'login'
                   ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm'
@@ -306,10 +320,7 @@ export const AuthView: React.FC<AuthViewProps> = ({
               role="tab"
               aria-selected={tab === 'register'}
               data-testid="auth-tab-register"
-              onClick={() => {
-                setTab('register');
-                setError(null);
-              }}
+              onClick={() => switchTab('register')}
               className={`inline-flex items-center justify-center gap-1.5 rounded-lg py-2 px-2 text-xs font-semibold whitespace-nowrap transition duration-150 active:scale-[0.98] ${
                 tab === 'register'
                   ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm'
@@ -398,6 +409,38 @@ export const AuthView: React.FC<AuthViewProps> = ({
                   </div>
                 </div>
 
+                {tab === 'register' && (
+                  <div>
+                    <div className="mb-1.5 flex items-center justify-between">
+                      <label
+                        htmlFor="auth-email"
+                        className="text-xs font-medium text-slate-700 dark:text-slate-300"
+                      >
+                        {t(lang, 'emailOptional')}
+                      </label>
+                      <span className="text-[11px] text-slate-400 dark:text-slate-500">
+                        {t(lang, 'optionalTag')}
+                      </span>
+                    </div>
+                    <div className="relative">
+                      <Mail
+                        size={16}
+                        className="pointer-events-none absolute top-1/2 start-3.5 -translate-y-1/2 text-slate-400"
+                      />
+                      <input
+                        id="auth-email"
+                        type="email"
+                        dir="ltr"
+                        autoComplete="email"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        placeholder={t(lang, 'emailPlaceholder')}
+                        className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-950/60 ps-10 pe-3.5 py-2.5 text-left text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                      />
+                    </div>
+                  </div>
+                )}
+
                 <div>
                   <label
                     htmlFor="auth-password"
@@ -412,16 +455,65 @@ export const AuthView: React.FC<AuthViewProps> = ({
                     />
                     <input
                       id="auth-password"
-                      type="password"
+                      type={showPassword ? 'text' : 'password'}
                       dir="ltr"
                       autoComplete={tab === 'register' ? 'new-password' : 'current-password'}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
                       placeholder="••••••••"
-                      className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-950/60 ps-10 pe-3.5 py-2.5 text-left text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                      className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-950/60 ps-10 pe-10 py-2.5 text-left text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
                     />
+                    <button
+                      type="button"
+                      data-testid="toggle-password-visibility"
+                      aria-label={showPassword ? t(lang, 'hidePassword') : t(lang, 'showPassword')}
+                      aria-pressed={showPassword}
+                      onClick={() => setShowPassword((prev) => !prev)}
+                      className="absolute top-1/2 end-2.5 -translate-y-1/2 rounded-lg p-1.5 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
+                    >
+                      {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </button>
                   </div>
                 </div>
+
+                {tab === 'register' && (
+                  <div>
+                    <label
+                      htmlFor="auth-confirm-password"
+                      className="mb-1.5 block text-xs font-medium text-slate-700 dark:text-slate-300"
+                    >
+                      {t(lang, 'confirmPassword')}
+                    </label>
+                    <div className="relative">
+                      <Lock
+                        size={16}
+                        className="pointer-events-none absolute top-1/2 start-3.5 -translate-y-1/2 text-slate-400"
+                      />
+                      <input
+                        id="auth-confirm-password"
+                        type={showConfirmPassword ? 'text' : 'password'}
+                        dir="ltr"
+                        autoComplete="new-password"
+                        value={confirmPassword}
+                        onChange={(e) => setConfirmPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/70 dark:bg-slate-950/60 ps-10 pe-10 py-2.5 text-left text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                      />
+                      <button
+                        type="button"
+                        data-testid="toggle-confirm-password-visibility"
+                        aria-label={
+                          showConfirmPassword ? t(lang, 'hidePassword') : t(lang, 'showPassword')
+                        }
+                        aria-pressed={showConfirmPassword}
+                        onClick={() => setShowConfirmPassword((prev) => !prev)}
+                        className="absolute top-1/2 end-2.5 -translate-y-1/2 rounded-lg p-1.5 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
+                      >
+                        {showConfirmPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </>
             )}
 

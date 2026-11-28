@@ -6,9 +6,11 @@ import test from 'node:test';
 import { routeRequest } from '../routes.ts';
 import type { Env } from '../types.ts';
 
-function createSqliteD1Adapter(): { db: D1Database; sqlite: DatabaseSync } {
+function createSqliteD1Adapter(
+  schemaRelPath = '../../schema.sql'
+): { db: D1Database; sqlite: DatabaseSync } {
   const sqlite = new DatabaseSync(':memory:');
-  const schemaPath = path.resolve(import.meta.dirname, '../../schema.sql');
+  const schemaPath = path.resolve(import.meta.dirname, schemaRelPath);
   const sql = fs.readFileSync(schemaPath, 'utf8');
   for (const stmt of sql.split(';').map((s) => s.trim()).filter(Boolean)) {
     sqlite.exec(stmt);
@@ -239,3 +241,101 @@ test('POST /api/v1/nodes/health-report updates donated_outbounds, subscription_s
     sqlite.close();
   }
 });
+
+test('GET /api/v1/nodes/active gracefully falls back on pre-003/004 schema (missing compiled_outbound_json and subscription_sources.status)', async () => {
+  const { db, sqlite } = createSqliteD1Adapter('../../migrations/0001_initial_schema.sql');
+
+  try {
+    sqlite
+      .prepare(
+        `INSERT INTO donated_outbounds (
+           tag, protocol, server_address, server_port, config_json,
+           status, fail_count, fingerprint_sha256, is_official, country_code
+         ) VALUES (
+           'Legacy-DE', 'vless', '198.51.100.70', 443,
+           '{"type":"vless","tag":"Legacy-DE","server":"198.51.100.70","server_port":443,"uuid":"11111111-2222-3333-4444-555555555555"}',
+           'active', 0, 'fp_legacy_de', 1, 'DE'
+         )`
+      )
+      .run();
+
+    sqlite
+      .prepare(
+        `INSERT INTO subscription_sources (category, sub_url, tag)
+         VALUES ('web_browsing', 'https://example.com/legacy-sub.txt', 'LegacySub')`
+      )
+      .run();
+
+    const resp = await routeRequest(
+      new Request('https://sentra-core.kziepr.workers.dev/api/v1/nodes/active', {
+        method: 'GET',
+        headers: { 'X-Quality-Secret': 'qe_super_secret_123' },
+      }),
+      {
+        DB: db,
+        QUALITY_ENGINE_SECRET: 'qe_super_secret_123',
+      } as Env
+    );
+
+    assert.equal(resp.status, 200);
+    const body = (await resp.json()) as {
+      ok: boolean;
+      success: boolean;
+      schema_fallback: boolean;
+      nodes: Array<{ tag: string; compiled_outbound_json: string | null }>;
+      subscription_sources: Array<{ tag: string }>;
+    };
+    assert.equal(body.ok, true);
+    assert.equal(body.success, true);
+    assert.equal(body.schema_fallback, true);
+    assert.equal(body.nodes.length, 1);
+    assert.equal(body.nodes[0].tag, 'Legacy-DE');
+    assert.equal(body.nodes[0].compiled_outbound_json, null);
+    assert.equal(body.subscription_sources.length, 1);
+    assert.equal(body.subscription_sources[0].tag, 'LegacySub');
+  } finally {
+    sqlite.close();
+  }
+});
+
+test('GET /api/v1/nodes/active catches unexpected D1 errors and returns structured 500 JSON { ok: false, error }', async () => {
+  const brokenDb = {
+    prepare() {
+      return {
+        bind() {
+          return this;
+        },
+        async all() {
+          throw new Error('D1_ERROR: database is locked');
+        },
+        async first() {
+          throw new Error('D1_ERROR: database is locked');
+        },
+        async run() {
+          throw new Error('D1_ERROR: database is locked');
+        },
+      };
+    },
+    async batch() {
+      throw new Error('D1_ERROR: database is locked');
+    },
+  } as unknown as D1Database;
+
+  const resp = await routeRequest(
+    new Request('https://sentra-core.kziepr.workers.dev/api/v1/nodes/active', {
+      method: 'GET',
+      headers: { 'X-Quality-Secret': 'qe_super_secret_123' },
+    }),
+    {
+      DB: brokenDb,
+      QUALITY_ENGINE_SECRET: 'qe_super_secret_123',
+    } as Env
+  );
+
+  assert.equal(resp.status, 500);
+  const body = (await resp.json()) as { ok: boolean; success: boolean; error: string };
+  assert.equal(body.ok, false);
+  assert.equal(body.success, false);
+  assert.match(body.error, /database is locked/);
+});
+

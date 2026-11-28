@@ -1,15 +1,24 @@
 import {
+  checkAuthFailureRateLimit,
+  clearAuthFailures,
+  hashPassword,
+  normalizeLoginIdentifier,
+  recordAuthFailure,
+  validateOptionalEmail,
+  validateUnifiedPassword,
+  validateUnifiedUsername,
+  verifyPassword,
+} from './auth.ts';
+import {
   constantTimeEquals,
   extractAuthToken,
   extractBearerOrHeaderSecret,
   generateNumericCode,
   generateSubscriptionToken,
   generateUniqueConnectCode,
-  hashPassword,
   isValidEightDigitConnectCode,
   validateExternalHttpsUrl,
   validateSentraClientRequest,
-  verifyPassword,
 } from './security.ts';
 import {
   auditOutboundSecurity,
@@ -26,6 +35,7 @@ import {
   checkIngestionRateAndDedup,
   dispatchUnifiedError,
   parseExternalErrorPayload,
+  reportWorkerError,
 } from './errorReporter.ts';
 import { logTelemetryToTurso } from './tursoClient.ts';
 import {
@@ -54,6 +64,11 @@ import type {
 const STATIC_IP_MONTHLY_QUOTA_MB = 30720;
 const GIB_BYTES = 1024 * 1024 * 1024;
 const MIB_BYTES = 1024 * 1024;
+
+function isMissingSchemaElementError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err || '');
+  return /no such column|has no column named|no such table/i.test(msg);
+}
 
 function jsonResponse(
   data: unknown,
@@ -298,63 +313,148 @@ export async function routeRequest(
       return errorResponse(401, 'دسترسی QualityEngine مجاز نیست.', 'UNAUTHORIZED_QUALITY_ENGINE');
     }
 
-    const [rowsRes, subSourcesRes] = await executeD1Batch<Record<string, unknown>>(env.DB, [
-      env.DB.prepare(
-        `SELECT id, tag, protocol, server_address, server_port, config_json,
-                compiled_outbound_json, validation_error,
-                country_code, status, fail_count, is_official, allocation_mode,
-                assigned_tier, allow_web, allow_download, allow_gaming, allow_static_ip,
-                fingerprint_sha256
-         FROM donated_outbounds
-         WHERE status IN ('active', 'inactive')
-         ORDER BY is_official DESC, id ASC
-         LIMIT 200`
-      ),
-      env.DB.prepare(
-        `SELECT id, category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at
-         FROM subscription_sources
-         WHERE status = 'active'
-         ORDER BY id ASC
-         LIMIT 50`
-      ),
-    ]);
+    try {
+      let nodeRows: DonatedOutboundRow[] = [];
+      let subSourceRows: SubscriptionSourceRow[] = [];
+      let schemaFallbackUsed = false;
 
-    const nodeRows = ((rowsRes?.results || []) as unknown) as DonatedOutboundRow[];
-    const subSourceRows = ((subSourcesRes?.results || []) as unknown) as SubscriptionSourceRow[];
+      try {
+        const [rowsRes, subSourcesRes] = await executeD1Batch<Record<string, unknown>>(env.DB, [
+          env.DB.prepare(
+            `SELECT id, tag, protocol, server_address, server_port, config_json,
+                    compiled_outbound_json, validation_error,
+                    country_code, status, fail_count, is_official, allocation_mode,
+                    assigned_tier, allow_web, allow_download, allow_gaming, allow_static_ip,
+                    fingerprint_sha256
+             FROM donated_outbounds
+             WHERE status IN ('active', 'inactive')
+             ORDER BY is_official DESC, id ASC
+             LIMIT 200`
+          ),
+          env.DB.prepare(
+            `SELECT id, category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at
+             FROM subscription_sources
+             WHERE status = 'active'
+             ORDER BY id ASC
+             LIMIT 50`
+          ),
+        ]);
 
-    return jsonResponse({
-      success: true,
-      count: nodeRows.length,
-      nodes: nodeRows.map((row) => ({
-        id: row.id,
-        tag: row.tag,
-        protocol: row.protocol,
-        server_address: row.server_address,
-        server_port: row.server_port,
-        config_json: row.compiled_outbound_json || row.config_json,
-        compiled_outbound_json: row.compiled_outbound_json || null,
-        country_code: row.country_code,
-        status: row.status,
-        fail_count: row.fail_count,
-        is_official: row.is_official === 1,
-        allocation_mode: row.allocation_mode,
-        assigned_tier: row.assigned_tier,
-        allow_web: row.allow_web,
-        allow_download: row.allow_download,
-        allow_gaming: row.allow_gaming,
-        allow_static_ip: row.allow_static_ip,
-        fingerprint_sha256: row.fingerprint_sha256,
-      })),
-      subscription_sources: subSourceRows.map((src) => ({
-        id: src.id,
-        category: src.category,
-        sub_url: src.sub_url,
-        tag: src.tag,
-        total_nodes: src.total_nodes,
-        healthy_nodes: src.healthy_nodes,
-        last_sync_at: src.last_sync_at,
-      })),
-    });
+        nodeRows = ((rowsRes?.results || []) as unknown) as DonatedOutboundRow[];
+        subSourceRows = ((subSourcesRes?.results || []) as unknown) as SubscriptionSourceRow[];
+      } catch (batchErr) {
+        if (!isMissingSchemaElementError(batchErr)) {
+          throw batchErr;
+        }
+        schemaFallbackUsed = true;
+
+        // Report pending D1 migration warning non-blockingly so admin knows migrations need applying
+        await reportWorkerError(env, ctx, {
+          moduleOrFile: 'cloudflare-worker/src/routes.ts',
+          actionOrRoute: 'GET /api/v1/nodes/active (schema-fallback)',
+          error: batchErr,
+          context: {
+            fallback_activated: true,
+            hint: 'Run wrangler d1 migrations apply sentra-db --remote (migrations 003/004)',
+          },
+        });
+
+        // Fallback 1: Query donated_outbounds using pre-004 base columns (with ultra-safe minimal retry)
+        try {
+          const fallbackNodes = await env.DB.prepare(
+            `SELECT id, tag, protocol, server_address, server_port, config_json,
+                    country_code, status, fail_count, is_official, allocation_mode,
+                    assigned_tier, allow_web, allow_download, allow_gaming, allow_static_ip,
+                    fingerprint_sha256
+             FROM donated_outbounds
+             WHERE status IN ('active', 'inactive')
+             ORDER BY is_official DESC, id ASC
+             LIMIT 200`
+          ).all<Record<string, unknown>>();
+          nodeRows = ((fallbackNodes?.results || []) as unknown) as DonatedOutboundRow[];
+        } catch (nodesErr) {
+          if (!isMissingSchemaElementError(nodesErr)) {
+            throw nodesErr;
+          }
+          const minimalNodes = await env.DB.prepare(
+            `SELECT id, tag, protocol, server_address, server_port, config_json, status, fail_count
+             FROM donated_outbounds
+             WHERE status IN ('active', 'inactive')
+             ORDER BY id ASC
+             LIMIT 200`
+          ).all<Record<string, unknown>>();
+          nodeRows = ((minimalNodes?.results || []) as unknown) as DonatedOutboundRow[];
+        }
+
+        // Fallback 2: Query subscription_sources without requiring migration-003 `status` column
+        try {
+          const fallbackSubs = await env.DB.prepare(
+            `SELECT id, category, sub_url, tag, total_nodes, healthy_nodes, last_sync_at
+             FROM subscription_sources
+             ORDER BY id ASC
+             LIMIT 50`
+          ).all<Record<string, unknown>>();
+          subSourceRows = ((fallbackSubs?.results || []) as unknown) as SubscriptionSourceRow[];
+        } catch (subsErr) {
+          if (!isMissingSchemaElementError(subsErr)) {
+            throw subsErr;
+          }
+          subSourceRows = [];
+        }
+      }
+
+      return jsonResponse({
+        ok: true,
+        success: true,
+        schema_fallback: schemaFallbackUsed,
+        count: nodeRows.length,
+        nodes: nodeRows.map((row) => ({
+          id: row.id,
+          tag: row.tag,
+          protocol: row.protocol,
+          server_address: row.server_address,
+          server_port: row.server_port,
+          config_json: row.compiled_outbound_json || row.config_json,
+          compiled_outbound_json: row.compiled_outbound_json || null,
+          country_code: row.country_code || 'XX',
+          status: row.status,
+          fail_count: Number(row.fail_count || 0),
+          is_official: Number(row.is_official || 0) === 1,
+          allocation_mode: row.allocation_mode || 'auto',
+          assigned_tier: row.assigned_tier || 'web_browsing',
+          allow_web: row.allow_web ?? 1,
+          allow_download: row.allow_download ?? 1,
+          allow_gaming: row.allow_gaming ?? 0,
+          allow_static_ip: row.allow_static_ip ?? 0,
+          fingerprint_sha256: row.fingerprint_sha256 || null,
+        })),
+        subscription_sources: subSourceRows.map((src) => ({
+          id: src.id,
+          category: src.category,
+          sub_url: src.sub_url,
+          tag: src.tag,
+          total_nodes: Number(src.total_nodes || 0),
+          healthy_nodes: Number(src.healthy_nodes || 0),
+          last_sync_at: src.last_sync_at || null,
+        })),
+      });
+    } catch (err) {
+      const errMessage = err instanceof Error ? err.message : String(err || 'Unknown D1/KV error');
+      await reportWorkerError(env, ctx, {
+        moduleOrFile: 'cloudflare-worker/src/routes.ts',
+        actionOrRoute: 'GET /api/v1/nodes/active',
+        error: err,
+        context: { endpoint: '/api/v1/nodes/active' },
+      });
+      return jsonResponse(
+        {
+          ok: false,
+          success: false,
+          error: errMessage,
+        },
+        500
+      );
+    }
   }
 
   // 5. QualityEngine — Receive Health Report (POST /api/v1/nodes/health-report)
@@ -383,6 +483,8 @@ export async function routeRequest(
     if (nodeResults.length === 0 && subReports.length === 0) {
       return errorResponse(400, 'آرایه results و subscription_reports خالی است.');
     }
+
+    try {
 
     const nodeIds = Array.from(
       new Set(
@@ -977,6 +1079,7 @@ export async function routeRequest(
     }
 
     return jsonResponse({
+      ok: true,
       success: true,
       updated,
       db_writes: writeStatements.length,
@@ -994,6 +1097,27 @@ export async function routeRequest(
       },
       recorded_at: new Date().toISOString(),
     });
+    } catch (err) {
+      const errMessage = err instanceof Error ? err.message : String(err || 'Unknown D1/KV error');
+      await reportWorkerError(env, ctx, {
+        moduleOrFile: 'cloudflare-worker/src/routes.ts',
+        actionOrRoute: 'POST /api/v1/nodes/health-report',
+        error: err,
+        context: {
+          endpoint: '/api/v1/nodes/health-report',
+          results_count: nodeResults.length,
+          sub_reports_count: subReports.length,
+        },
+      });
+      return jsonResponse(
+        {
+          ok: false,
+          success: false,
+          error: errMessage,
+        },
+        500
+      );
+    }
   }
 
   // 5b. Automated GitHub Releases Sync Endpoint: POST /api/v1/releases/sync (Protected by QUALITY_ENGINE_SECRET)
@@ -1402,60 +1526,108 @@ export async function routeRequest(
 
   // 10. Auth: Register (POST /api/v1/auth/register)
   if (method === 'POST' && path === '/api/v1/auth/register') {
+    const clientIp = extractClientIp(request);
+    const rate = checkAuthFailureRateLimit(clientIp);
+    if (!rate.allowed) {
+      return jsonResponse(
+        {
+          success: false,
+          error: 'تعداد تلاش‌های ناموفق بیش از حد مجاز است. لطفاً یک دقیقه دیگر دوباره تلاش کنید.',
+          message: 'تعداد تلاش‌های ناموفق بیش از حد مجاز است. لطفاً یک دقیقه دیگر دوباره تلاش کنید.',
+          code: 'RATE_LIMITED',
+          retry_after_seconds: rate.retryAfterSec,
+        },
+        429,
+        { 'Retry-After': String(rate.retryAfterSec) }
+      );
+    }
+
     let body: Record<string, unknown>;
     try {
       body = (await request.json()) as Record<string, unknown>;
     } catch {
+      recordAuthFailure(clientIp);
       return errorResponse(400, 'بدنه درخواست معتبر نیست.');
     }
 
-    const username = String(body.username || '').trim();
-    const password = String(body.password || '');
-    if (username.length < 3 || username.length > 40 || !/^[a-zA-Z0-9._-]+$/.test(username)) {
-      return errorResponse(400, 'نام کاربری باید بین ۳ تا ۴۰ کاراکتر انگلیسی، عدد یا _ باشد.');
-    }
-    if (password.length < 6) {
-      return errorResponse(400, 'رمز عبور باید حداقل ۶ کاراکتر باشد.');
+    const usernameCheck = validateUnifiedUsername(body.username);
+    if (!usernameCheck.ok) {
+      recordAuthFailure(clientIp);
+      return errorResponse(400, usernameCheck.error, 'INVALID_USERNAME');
     }
 
-    const exists = await env.DB.prepare('SELECT id FROM users WHERE lower(username) = lower(?) LIMIT 1')
+    const passwordCheck = validateUnifiedPassword(body.password);
+    if (!passwordCheck.ok) {
+      recordAuthFailure(clientIp);
+      return errorResponse(400, passwordCheck.error, 'INVALID_PASSWORD');
+    }
+
+    const rawConfirm =
+      body.confirmPassword !== undefined ? body.confirmPassword : body.confirm_password;
+    if (typeof rawConfirm !== 'string' || rawConfirm !== passwordCheck.password) {
+      recordAuthFailure(clientIp);
+      return errorResponse(400, 'رمز عبور و تکرار رمز عبور مطابقت ندارند.', 'PASSWORD_MISMATCH');
+    }
+
+    const emailCheck = validateOptionalEmail(body.email);
+    if (!emailCheck.ok) {
+      recordAuthFailure(clientIp);
+      return errorResponse(400, emailCheck.error, 'INVALID_EMAIL');
+    }
+
+    const username = usernameCheck.username;
+    const email = emailCheck.email;
+
+    const exists = await env.DB.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?) LIMIT 1')
       .bind(username)
       .first<{ id: number }>();
     if (exists) {
-      return errorResponse(409, 'این نام کاربری قبلاً ثبت شده است.');
+      recordAuthFailure(clientIp);
+      return errorResponse(409, 'این نام کاربری قبلاً ثبت شده است.', 'USERNAME_TAKEN');
     }
 
     const userUuid = crypto.randomUUID();
-    const passwordHash = await hashPassword(password);
+    const passwordHash = await hashPassword(passwordCheck.password);
     const token = generateSubscriptionToken();
     const connectCode = await generateUniqueConnectCode(env.DB);
     const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const freeQuotas = await getFreeQuotaSettings(env.DB);
+    const initialTrafficLimit = freeQuotas.webQuotaBytes + freeQuotas.downloadQuotaBytes;
 
     const userRes = await env.DB.prepare(
-      `INSERT INTO users (user_uuid, username, password_hash, first_name, role, status)
-       VALUES (?, ?, ?, ?, 'user', 'active')`
+      `INSERT INTO users (user_uuid, telegram_id, username, email, password_hash, first_name, role, status)
+       VALUES (?, NULL, ?, ?, ?, ?, 'user', 'active')`
     )
-      .bind(userUuid, username, passwordHash, username)
+      .bind(userUuid, username, email, passwordHash, username)
       .run();
 
     const userId = userRes.meta.last_row_id;
     await env.DB.prepare(
-      `INSERT INTO subscriptions (user_id, tier, plan_tier, connect_code, token, status, traffic_limit_bytes, max_concurrent_devices, expires_at)
-       VALUES (?, 'Sentra Lite', 'free', ?, ?, 'active', ?, 3, ?)`
+      `INSERT INTO subscriptions (
+         user_id, tier, plan_tier, connect_code, token, status,
+         traffic_limit_bytes, max_concurrent_devices,
+         web_used_bytes, download_used_bytes, special_quota_bytes, special_used_bytes,
+         has_used_special_trial, expires_at
+       ) VALUES (?, 'Sentra Lite', 'free', ?, ?, 'active', ?, 3, 0, 0, 0, 0, 0, ?)`
     )
-      .bind(userId, connectCode, token, 10 * GIB_BYTES, expiresAt)
+      .bind(userId, connectCode, token, initialTrafficLimit, expiresAt)
       .run();
+
+    clearAuthFailures(clientIp);
 
     return jsonResponse(
       {
         success: true,
         access_token: `jwt_sentra_${token}`,
         token_type: 'Bearer',
+        connect_code: connectCode,
+        plan_tier: 'free',
         user: {
           id: userId,
           user_uuid: userUuid,
           telegram_id: null,
           username,
+          email,
           first_name: username,
           role: 'user',
         },
@@ -1465,7 +1637,15 @@ export async function routeRequest(
           connect_code: connectCode,
           token,
           status: 'active',
-          remaining_bytes: 10 * GIB_BYTES,
+          traffic_limit_bytes: initialTrafficLimit,
+          remaining_bytes: initialTrafficLimit,
+          web_used_bytes: 0,
+          download_used_bytes: 0,
+          special_quota_bytes: 0,
+          special_used_bytes: 0,
+          has_used_special_trial: false,
+          free_web_quota_gb: freeQuotas.webQuotaGb,
+          free_download_quota_gb: freeQuotas.downloadQuotaGb,
           max_concurrent_devices: 3,
           expires_at: expiresAt,
         },
@@ -1476,56 +1656,139 @@ export async function routeRequest(
 
   // 11. Auth: Login (POST /api/v1/auth/login)
   if (method === 'POST' && path === '/api/v1/auth/login') {
+    const clientIp = extractClientIp(request);
+    const rate = checkAuthFailureRateLimit(clientIp);
+    if (!rate.allowed) {
+      return jsonResponse(
+        {
+          success: false,
+          error: 'تعداد تلاش‌های ناموفق بیش از حد مجاز است. لطفاً یک دقیقه دیگر دوباره تلاش کنید.',
+          message: 'تعداد تلاش‌های ناموفق بیش از حد مجاز است. لطفاً یک دقیقه دیگر دوباره تلاش کنید.',
+          code: 'RATE_LIMITED',
+          retry_after_seconds: rate.retryAfterSec,
+        },
+        429,
+        { 'Retry-After': String(rate.retryAfterSec) }
+      );
+    }
+
     let body: Record<string, unknown>;
     try {
       body = (await request.json()) as Record<string, unknown>;
     } catch {
+      recordAuthFailure(clientIp);
       return errorResponse(400, 'بدنه درخواست معتبر نیست.');
     }
 
-    const username = String(body.username || '').trim();
-    const password = String(body.password || '');
+    const identifier = normalizeLoginIdentifier(body.username);
+    const password = typeof body.password === 'string' ? body.password : '';
+    if (!identifier || !password) {
+      recordAuthFailure(clientIp);
+      return errorResponse(400, 'نام کاربری و رمز عبور الزامی است.');
+    }
+
     const user = await env.DB.prepare(
-      `SELECT ${USER_SELECT_COLS} FROM users WHERE lower(username) = lower(?) OR lower(email) = lower(?) LIMIT 1`
+      `SELECT ${USER_SELECT_COLS} FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?) LIMIT 1`
     )
-      .bind(username, username)
+      .bind(identifier, identifier)
       .first<UserRow>();
 
     if (!user || !(await verifyPassword(password, user.password_hash))) {
-      return errorResponse(401, 'نام کاربری یا رمز عبور اشتباه است.');
+      recordAuthFailure(clientIp);
+      return errorResponse(401, 'نام کاربری یا رمز عبور اشتباه است.', 'INVALID_CREDENTIALS');
     }
     if (user.status !== 'active') {
-      return errorResponse(403, 'حساب کاربری شما تعلیق شده است.');
+      return errorResponse(403, 'حساب کاربری شما تعلیق شده است.', 'ACCOUNT_SUSPENDED');
     }
 
-    const sub = await env.DB.prepare(
+    clearAuthFailures(clientIp);
+
+    let sub = await env.DB.prepare(
       `SELECT ${SUB_SELECT_COLS} FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1`
     )
       .bind(user.id)
       .first<SubscriptionRow>();
+
+    const freeQuotas = await getFreeQuotaSettings(env.DB);
     if (!sub) {
-      return errorResponse(404, 'اشتراک فعالی برای این کاربر یافت نشد.');
+      const token = generateSubscriptionToken();
+      const connectCode = await generateUniqueConnectCode(env.DB);
+      const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      const initialLimit = freeQuotas.webQuotaBytes + freeQuotas.downloadQuotaBytes;
+      await env.DB.prepare(
+        `INSERT INTO subscriptions (
+           user_id, tier, plan_tier, connect_code, token, status,
+           traffic_limit_bytes, max_concurrent_devices,
+           web_used_bytes, download_used_bytes, special_quota_bytes, special_used_bytes,
+           has_used_special_trial, expires_at
+         ) VALUES (?, 'Sentra Lite', 'free', ?, ?, 'active', ?, 3, 0, 0, 0, 0, 0, ?)`
+      )
+        .bind(user.id, connectCode, token, initialLimit, expiresAt)
+        .run();
+      sub = await env.DB.prepare(
+        `SELECT ${SUB_SELECT_COLS} FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1`
+      )
+        .bind(user.id)
+        .first<SubscriptionRow>();
     }
+
+    if (!sub) {
+      return errorResponse(500, 'خطا در بازیابی اشتراک کاربر.');
+    }
+
+    if (!sub.connect_code) {
+      const generatedCode = await generateUniqueConnectCode(env.DB);
+      await env.DB.prepare(
+        'UPDATE subscriptions SET connect_code = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+      )
+        .bind(generatedCode, sub.id)
+        .run();
+      sub = { ...sub, connect_code: generatedCode };
+    }
+
+    const planTier = resolvePlanTier(sub);
+    const webUsedBytes = Number(sub.web_used_bytes ?? (sub.web_browsing_used_mb || 0) * MIB_BYTES);
+    const downloadUsedBytes = Number(
+      sub.download_used_bytes ?? (sub.download_used_mb || 0) * MIB_BYTES
+    );
+    const specialQuotaBytes = Number(sub.special_quota_bytes ?? 0);
+    const specialUsedBytes = Number(sub.special_used_bytes ?? 0);
+    const remainingBytes = Math.max(
+      0,
+      sub.traffic_limit_bytes - (sub.upload_bytes + sub.download_bytes)
+    );
 
     return jsonResponse({
       success: true,
       access_token: `jwt_sentra_${sub.token}`,
       token_type: 'Bearer',
+      connect_code: sub.connect_code,
+      plan_tier: planTier,
       user: {
         id: user.id,
         user_uuid: user.user_uuid,
         telegram_id: user.telegram_id,
         username: user.username,
+        email: user.email,
         first_name: user.first_name,
         role: user.role,
       },
       subscription: {
         tier: sub.tier,
-        plan_tier: resolvePlanTier(sub),
-        connect_code: sub.connect_code || null,
+        plan_tier: planTier,
+        connect_code: sub.connect_code,
         token: sub.token,
         status: sub.status,
-        remaining_bytes: Math.max(0, sub.traffic_limit_bytes - (sub.upload_bytes + sub.download_bytes)),
+        traffic_limit_bytes: sub.traffic_limit_bytes,
+        used_bytes: sub.upload_bytes + sub.download_bytes,
+        remaining_bytes: remainingBytes,
+        web_used_bytes: webUsedBytes,
+        download_used_bytes: downloadUsedBytes,
+        special_quota_bytes: specialQuotaBytes,
+        special_used_bytes: specialUsedBytes,
+        has_used_special_trial: Boolean(sub.has_used_special_trial),
+        free_web_quota_gb: freeQuotas.webQuotaGb,
+        free_download_quota_gb: freeQuotas.downloadQuotaGb,
         max_concurrent_devices: sub.max_concurrent_devices,
         expires_at: sub.expires_at,
       },

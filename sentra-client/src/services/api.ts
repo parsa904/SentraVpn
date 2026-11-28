@@ -499,6 +499,8 @@ export async function loginWithCredentials(
     const state = await invokeTauri<{
       auth_token?: string | null;
       subscription_token?: string | null;
+      connect_code?: string | null;
+      plan_tier?: string | null;
       username?: string;
       tier?: string;
       expires_at?: string | null;
@@ -510,6 +512,8 @@ export async function loginWithCredentials(
     const session: PersistedSession = {
       auth_token: state.auth_token || state.subscription_token,
       subscription_token: state.subscription_token,
+      connect_code: state.connect_code ?? null,
+      plan_tier: state.plan_tier ?? undefined,
       username: state.username || username,
       tier: state.tier || '',
       expires_at: state.expires_at ?? null,
@@ -540,16 +544,26 @@ export async function loginWithCredentials(
 
 export async function registerWithCredentials(
   username: string,
-  password: string
+  password: string,
+  confirmPassword: string = password,
+  email?: string
 ): Promise<PersistedSession> {
+  const cleanEmail = email?.trim() || undefined;
   if (isTauriRuntime()) {
     const state = await invokeTauri<{
       auth_token?: string | null;
       subscription_token?: string | null;
+      connect_code?: string | null;
+      plan_tier?: string | null;
       username?: string;
       tier?: string;
       expires_at?: string | null;
-    }>('register_with_credentials', { username, password });
+    }>('register_with_credentials', {
+      username,
+      password,
+      confirmPassword,
+      email: cleanEmail ?? null,
+    });
 
     if (!state.subscription_token) {
       throw new Error('ثبت‌نام انجام شد اما توکن نشست دریافت نشد.');
@@ -557,6 +571,8 @@ export async function registerWithCredentials(
     const session: PersistedSession = {
       auth_token: state.auth_token || state.subscription_token,
       subscription_token: state.subscription_token,
+      connect_code: state.connect_code ?? null,
+      plan_tier: state.plan_tier ?? 'free',
       username: state.username || username,
       tier: state.tier || '',
       expires_at: state.expires_at ?? null,
@@ -571,6 +587,8 @@ export async function registerWithCredentials(
     body: JSON.stringify({
       username,
       password,
+      confirmPassword,
+      ...(cleanEmail ? { email: cleanEmail } : {}),
       device_identifier: getOrCreateWebDeviceId(),
       device_name: navigator.userAgent.slice(0, 48),
       os: 'web',
@@ -590,6 +608,8 @@ export async function loginWithOtpCode(code: string): Promise<PersistedSession> 
     const state = await invokeTauri<{
       auth_token?: string | null;
       subscription_token?: string | null;
+      connect_code?: string | null;
+      plan_tier?: string | null;
       username?: string;
       tier?: string;
       expires_at?: string | null;
@@ -601,6 +621,8 @@ export async function loginWithOtpCode(code: string): Promise<PersistedSession> 
     const session: PersistedSession = {
       auth_token: state.auth_token || state.subscription_token,
       subscription_token: state.subscription_token,
+      connect_code: state.connect_code ?? (/^\d{8}$/.test(code.trim()) ? code.trim() : null),
+      plan_tier: state.plan_tier ?? undefined,
       username: state.username || '',
       tier: state.tier || '',
       expires_at: state.expires_at ?? null,
