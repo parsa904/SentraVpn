@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 
 import { routeRequest } from '../routes.ts';
@@ -184,7 +186,7 @@ function createInMemoryEdgeCache(): {
 
 function setupTestDb(): DatabaseSync {
   const sqlite = new DatabaseSync(':memory:');
-  const schemaPath = new URL('../../schema.sql', import.meta.url);
+  const schemaPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../schema.sql');
   const schemaSql = fs.readFileSync(schemaPath, 'utf-8');
   sqlite.exec(schemaSql);
   return sqlite;
