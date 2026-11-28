@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     special_quota_bytes     INTEGER NOT NULL DEFAULT 0,
     special_used_bytes      INTEGER NOT NULL DEFAULT 0,
     has_used_special_trial  INTEGER NOT NULL DEFAULT 0,
+    account_rev             INTEGER NOT NULL DEFAULT 1,
     last_quota_reset        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     starts_at               TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     expires_at              TEXT NOT NULL,

@@ -602,6 +602,7 @@
 
         const API_BASE = resolveApiBase();
         let currentProfile = null;
+        let lastBootstrapEtag = null;
         let toastTimer = null;
 
         // DOM references
@@ -867,20 +868,50 @@
           }
 
           try {
-            const resp = await fetch(API_BASE + '/api/v1/miniapp/me', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Telegram-Init-Data': initData,
-              },
-              body: JSON.stringify({ initData }),
+            const headers = {
+              'X-Telegram-Init-Data': initData,
+            };
+            if (lastBootstrapEtag && currentProfile) {
+              headers['If-None-Match'] = lastBootstrapEtag;
+            }
+
+            let resp = await fetch(API_BASE + '/api/v1/bootstrap', {
+              method: 'GET',
+              headers,
             });
+
+            // 304 Not Modified: keep rendered state intact with zero extra parsing
+            if (resp.status === 304 && currentProfile) {
+              const refreshedEtag = resp.headers.get('ETag');
+              if (refreshedEtag) lastBootstrapEtag = refreshedEtag;
+              if (isManualRefresh) {
+                triggerHaptic('success');
+                showToast('اطلاعات حساب شما کاملاً به‌روز است');
+              }
+              return;
+            }
+
+            // Backward-compatible fallback if an older Worker version does not expose /api/v1/bootstrap
+            if (resp.status === 404) {
+              resp = await fetch(API_BASE + '/api/v1/miniapp/me', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Telegram-Init-Data': initData,
+                },
+                body: JSON.stringify({ initData }),
+              });
+            }
 
             const payload = await resp.json().catch(() => ({}));
             if (!resp.ok || !payload.success) {
               throw new Error(payload.error || 'خطا در دریافت اطلاعات از سرور (' + resp.status + ')');
             }
 
+            const nextEtag = resp.headers.get('ETag');
+            if (nextEtag) {
+              lastBootstrapEtag = nextEtag;
+            }
             renderProfile(payload);
             if (isManualRefresh) {
               triggerHaptic('success');
@@ -1028,9 +1059,14 @@
             }
 
             triggerHaptic('success');
+            lastBootstrapEtag = null;
             el.inputPassword.value = '';
             el.inputConfirm.value = '';
             el.summaryWebUsername.textContent = payload.username || username;
+            if (currentProfile && currentProfile.user) {
+              currentProfile.user.username = payload.username || username;
+              currentProfile.user.has_password = true;
+            }
             el.credsHeading.textContent = 'تغییر نام کاربری و رمز عبور نرم‌افزار';
             setFeedback(payload.message || 'نام کاربری و رمز عبور با موفقیت ذخیره شد.', false);
             showToast('اطلاعات ورود نرم‌افزار ذخیره شد');

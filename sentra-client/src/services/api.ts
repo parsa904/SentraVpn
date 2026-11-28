@@ -656,8 +656,81 @@ export async function loginWithOtpCode(code: string): Promise<PersistedSession> 
   return withCode;
 }
 
+interface CachedEtagEntry<T> {
+  etag: string | null;
+  data: T;
+}
+
+const clientBootstrapEtagCache = new Map<string, CachedEtagEntry<BootstrapResponse>>();
+const unifiedBootstrapEtagCache = new Map<string, CachedEtagEntry<UnifiedBootstrapResponse>>();
+
+export interface UnifiedBootstrapResponse {
+  success: boolean;
+  auth_source?: 'telegram_miniapp' | 'client_token' | 'connect_code';
+  sync: {
+    nodes_rev: string;
+    account_rev: number;
+    app_version: string;
+    etag: string;
+    snapshot_source: string;
+    updated_at: string;
+  };
+  user: {
+    id: number;
+    user_uuid: string;
+    telegram_id: number | null;
+    first_name: string;
+    last_name: string;
+    username: string | null;
+    email: string | null;
+    has_password: boolean;
+    role: string;
+  };
+  subscription: {
+    tier: string;
+    plan_tier: 'free' | 'pro' | 'flow_plus';
+    plan_label: string;
+    status: string;
+    connect_code: string | null;
+    account_rev: number;
+    expires_at: string;
+    max_concurrent_devices: number;
+    has_used_special_trial: boolean;
+  };
+  traffic: {
+    web: { used_bytes: number; limit_bytes: number; unlimited: boolean };
+    download: { used_bytes: number; limit_bytes: number; unlimited: boolean };
+    special: { used_bytes: number; limit_bytes: number; unlimited: boolean };
+  };
+  servers: {
+    online_nodes: number;
+    countries_count: number;
+    has_active_gaming: boolean;
+    checked_at: string;
+  };
+  nodes_snapshot: {
+    nodes_rev: string;
+    updated_at: string;
+    tier: 'free' | 'pro' | 'special';
+    node_count: number;
+    nodes: Array<Record<string, unknown>>;
+    singbox_config: Record<string, unknown>;
+  };
+  downloads: {
+    latest_version: string;
+    release_url: string;
+    android_apk: string;
+    android_version: string;
+    windows_exe: string;
+    windows_version: string;
+    windows_portable_zip: string;
+  };
+}
+
 export async function logoutSession(): Promise<void> {
   const previous = loadLocalSession();
+  clientBootstrapEtagCache.clear();
+  unifiedBootstrapEtagCache.clear();
   saveLocalSession(null);
   await saveAndroidEncryptedSession(null);
   await clearOfflineConfigCache(previous?.subscription_token ?? null);
@@ -670,9 +743,85 @@ export async function logoutSession(): Promise<void> {
   }
 }
 
+export async function fetchUnifiedBootstrap(
+  token: string,
+  connectCode?: string | null
+): Promise<{ data: UnifiedBootstrapResponse; notModified: boolean; etag: string | null }> {
+  const cacheKey = token ? `tok:${token}` : `code:${(connectCode || '').trim()}`;
+  const cached = unifiedBootstrapEtagCache.get(cacheKey) || null;
+  const headers: Record<string, string> = {
+    'X-Device-Id': getOrCreateWebDeviceId(),
+  };
+  if (token) {
+    headers['X-Subscription-Token'] = token;
+  } else if (connectCode) {
+    headers['X-Connect-Code'] = connectCode.trim();
+  }
+
+  const res = await fetchBackendConfigWithEtag(
+    '/api/v1/bootstrap',
+    { method: 'GET', headers },
+    cached?.etag ?? null
+  );
+
+  if (res.notModified && cached) {
+    return { data: cached.data, notModified: true, etag: res.etag ?? cached.etag };
+  }
+
+  if (res.notModified) {
+    // Fallback if server returned 304 without local cache
+    const fresh = await fetchBackendConfigWithEtag(
+      '/api/v1/bootstrap',
+      { method: 'GET', headers },
+      null
+    );
+    if (fresh.notModified) {
+      throw new Error('پاسخ نامعتبر از سرور دریافت شد.');
+    }
+    const parsed = fresh.data as unknown as UnifiedBootstrapResponse;
+    unifiedBootstrapEtagCache.set(cacheKey, { etag: fresh.etag, data: parsed });
+    return { data: parsed, notModified: false, etag: fresh.etag };
+  }
+
+  const parsed = res.data as unknown as UnifiedBootstrapResponse;
+  unifiedBootstrapEtagCache.set(cacheKey, { etag: res.etag, data: parsed });
+  return { data: parsed, notModified: false, etag: res.etag };
+}
+
 export async function fetchBootstrap(token: string): Promise<BootstrapResponse> {
   let raw: BootstrapResponse;
   const webDeviceId = getOrCreateWebDeviceId();
+  const cachedEntry = clientBootstrapEtagCache.get(token) || null;
+
+  const fetchHttpWithEtag = async (): Promise<BootstrapResponse> => {
+    const res = await fetchBackendConfigWithEtag(
+      '/api/v1/client/bootstrap',
+      {
+        method: 'GET',
+        headers: {
+          'X-Subscription-Token': token,
+          'X-Device-Id': webDeviceId,
+        },
+      },
+      cachedEntry?.etag ?? null
+    );
+    if (res.notModified && cachedEntry) {
+      return cachedEntry.data;
+    }
+    if (res.notModified) {
+      const fresh = await fetchBackendJson<BootstrapResponse>('/api/v1/client/bootstrap', {
+        headers: {
+          'X-Subscription-Token': token,
+          'X-Device-Id': webDeviceId,
+        },
+      });
+      clientBootstrapEtagCache.set(token, { etag: null, data: fresh });
+      return fresh;
+    }
+    const parsed = res.data as unknown as BootstrapResponse;
+    clientBootstrapEtagCache.set(token, { etag: res.etag, data: parsed });
+    return parsed;
+  };
 
   if (isTauriRuntime()) {
     try {
@@ -680,25 +829,16 @@ export async function fetchBootstrap(token: string): Promise<BootstrapResponse> 
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.startsWith('AUTH_EXPIRED:')) {
+        clientBootstrapEtagCache.delete(token);
         saveLocalSession(null);
         await saveAndroidEncryptedSession(null);
         throw new Error(msg);
       }
-      // Fallback to direct HTTP if backend state wasn't hydrated yet (e.g., Android EncryptedSharedPreferences restore)
-      raw = await fetchBackendJson<BootstrapResponse>('/api/v1/client/bootstrap', {
-        headers: {
-          'X-Subscription-Token': token,
-          'X-Device-Id': webDeviceId,
-        },
-      });
+      // Fallback to direct HTTP with ETag/304 if backend state wasn't hydrated yet
+      raw = await fetchHttpWithEtag();
     }
   } else {
-    raw = await fetchBackendJson<BootstrapResponse>('/api/v1/client/bootstrap', {
-      headers: {
-        'X-Subscription-Token': token,
-        'X-Device-Id': webDeviceId,
-      },
-    });
+    raw = await fetchHttpWithEtag();
   }
 
   // Keep persisted local/Android session in sync with live subscription tier/expiry/username (e.g. Telegram upgrades)

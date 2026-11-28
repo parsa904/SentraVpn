@@ -23,6 +23,7 @@ import { resolvePlanTier } from './singboxCompiler.ts';
 import {
   attachTopicToSupportSession,
   buildSupportTopicTitle,
+  bumpSubscriptionAccountRev,
   closeSupportSession,
   ensureSchemaColumns,
   getOpenSupportSessionByTopic,
@@ -32,6 +33,7 @@ import {
   type SupportSessionRow,
 } from './supportSessions.ts';
 import { invalidateEdgeVersionCache } from './edgeCache.ts';
+import { rebuildNodesSnapshot } from './snapshot.ts';
 import {
   createSupportForumTopic,
   deleteSupportForumTopic,
@@ -1023,6 +1025,8 @@ async function handleAdminOutboundSubmission(
       .bind(category, validUrl.toString(), `Sub (${category})`, nodes.length, added)
       .run();
 
+    await rebuildNodesSnapshot(env);
+
     const gamingNote =
       allocationMode === 'gaming_only' || allocationMode === 'all'
         ? '\n\n🎮 <b>بخش گیمینگ به صورت خودکار در کل اکوسیستم فعال شد!</b>'
@@ -1072,6 +1076,7 @@ async function handleAdminOutboundSubmission(
     );
     return;
   }
+  await rebuildNodesSnapshot(env);
 
   const gamingNote =
     allocationMode === 'gaming_only' || allocationMode === 'all'
@@ -1318,6 +1323,7 @@ async function handleAdminSubSourceSubmission(
     .run();
 
   await invalidateNodesCache(env.DB, env.SENTRA_KV);
+  await rebuildNodesSnapshot(env);
 
   const gamingNote =
     category === 'gaming' && addedNodes > 0
@@ -2613,6 +2619,7 @@ async function handleCallbackQuery(
 
       sub.has_used_special_trial = 1;
       sub.special_quota_bytes = Math.max(Number(sub.special_quota_bytes || 0), SPECIAL_TRIAL_BYTES);
+      await bumpSubscriptionAccountRev(env.DB, sub.id);
 
       const notice = hasSpecialServers
         ? '🎁 <b>تست رایگان ۱ گیگابایتی بخش ویژه (آیپی ثابت + گیمینگ) با موفقیت برای حساب شما فعال شد!</b>\n\nهم‌اکنون می‌توانید با کد ۸ رقمی خود داخل اپلیکیشن SentraVPN از حالت‌های آیپی ثابت و گیمینگ استفاده کنید.'
@@ -2846,6 +2853,7 @@ async function handleCallbackQuery(
           .bind(nextStatus, srcId)
           .run();
         await invalidateNodesCache(env.DB, env.SENTRA_KV);
+        await rebuildNodesSnapshot(env);
 
         if (srcRow.submitter_telegram_id) {
           await tgSendMessage(
@@ -2867,6 +2875,7 @@ async function handleCallbackQuery(
         if (!Number.isInteger(srcId) || srcId <= 0) return;
         await env.DB.prepare('DELETE FROM subscription_sources WHERE id = ?').bind(srcId).run();
         await invalidateNodesCache(env.DB, env.SENTRA_KV);
+        await rebuildNodesSnapshot(env);
         const view = await buildAdminSubSourcesView(env);
         await sendOrEditView(env, chatId, messageId, view);
         return;
@@ -2912,6 +2921,7 @@ async function handleCallbackQuery(
             .bind(nodeId)
             .run();
           await invalidateNodesCache(env.DB, env.SENTRA_KV);
+          await rebuildNodesSnapshot(env);
 
           if (nodeRow.donor_telegram_id) {
             await tgSendMessage(
@@ -2931,6 +2941,7 @@ async function handleCallbackQuery(
             .bind('رد شده توسط مدیریت', nodeId)
             .run();
           await invalidateNodesCache(env.DB, env.SENTRA_KV);
+          await rebuildNodesSnapshot(env);
 
           if (nodeRow.donor_telegram_id) {
             await tgSendMessage(
@@ -3026,6 +3037,9 @@ async function handleCallbackQuery(
             );
           }
           await executeD1Batch(env.DB, approveBatch);
+          if (userSub) {
+            await bumpSubscriptionAccountRev(env.DB, userSub.id);
+          }
 
           if (donRow.telegram_id) {
             await tgSendMessage(
@@ -3100,6 +3114,7 @@ async function handleCallbackQuery(
         )
           .bind(cfg.tier, cfg.planTier, cfg.limitBytes, cfg.specialQuotaBytes, subId)
           .run();
+        await bumpSubscriptionAccountRev(env.DB, subId);
         const view = await buildAdminSubscriptionDetailView(env, subId);
         if (view) {
           await sendOrEditView(env, chatId, messageId, view);
@@ -3123,6 +3138,7 @@ async function handleCallbackQuery(
           )
             .bind(nextExpires, subId)
             .run();
+          await bumpSubscriptionAccountRev(env.DB, subId);
         }
         const view = await buildAdminSubscriptionDetailView(env, subId);
         if (view) {
@@ -3145,6 +3161,7 @@ async function handleCallbackQuery(
         )
           .bind(subId)
           .run();
+        await bumpSubscriptionAccountRev(env.DB, subId);
         const view = await buildAdminSubscriptionDetailView(env, subId);
         if (view) {
           await sendOrEditView(env, chatId, messageId, view);
@@ -3165,6 +3182,7 @@ async function handleCallbackQuery(
           )
             .bind(nextStatus, subId)
             .run();
+          await bumpSubscriptionAccountRev(env.DB, subId);
         }
         const view = await buildAdminSubscriptionDetailView(env, subId);
         if (view) {

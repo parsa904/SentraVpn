@@ -66,6 +66,7 @@ export interface SubscriptionRow {
   special_quota_bytes?: number;
   special_used_bytes?: number;
   has_used_special_trial?: number;
+  account_rev?: number;
   last_quota_reset: string;
   starts_at: string;
   expires_at: string;

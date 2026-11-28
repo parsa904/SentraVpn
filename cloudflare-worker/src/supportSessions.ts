@@ -128,9 +128,54 @@ export async function ensureSchemaColumns(db: D1Database): Promise<void> {
       // Best-effort column reconciliation
     }
 
+    // Also ensure `subscriptions.account_rev` exists for O(1) ETag / 304 Not Modified sync
+    try {
+      const subInfo = await db
+        .prepare(`SELECT name FROM pragma_table_info('subscriptions')`)
+        .all<{ name: string }>();
+      const subCols = new Set((subInfo.results || []).map((r) => String(r.name)));
+      if (subCols.size > 0 && !subCols.has('account_rev')) {
+        await db
+          .prepare(`ALTER TABLE subscriptions ADD COLUMN account_rev INTEGER NOT NULL DEFAULT 1`)
+          .run();
+      }
+    } catch {
+      // Best-effort column reconciliation
+    }
+
     ensuredDbs.add(db);
   } catch (err) {
     console.warn('[Sentra ensureSchemaColumns warning]', err);
+  }
+}
+
+/**
+ * Increments `subscriptions.account_rev` after any subscription/account change
+ * so clients & Telegram Mini App immediately invalidate their cached ETag.
+ */
+export async function bumpSubscriptionAccountRev(
+  db: D1Database,
+  subscriptionId: number
+): Promise<number> {
+  try {
+    await ensureSchemaColumns(db);
+    await db
+      .prepare(
+        `UPDATE subscriptions
+         SET account_rev = COALESCE(account_rev, 1) + 1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`
+      )
+      .bind(subscriptionId)
+      .run();
+    const row = await db
+      .prepare('SELECT account_rev FROM subscriptions WHERE id = ? LIMIT 1')
+      .bind(subscriptionId)
+      .first<{ account_rev?: number }>();
+    return Number(row?.account_rev ?? 1);
+  } catch {
+    // Non-fatal if running on a minimal mock DB without account_rev
+    return 1;
   }
 }
 

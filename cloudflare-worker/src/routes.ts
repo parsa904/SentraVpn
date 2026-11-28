@@ -45,15 +45,26 @@ import {
   EDGE_TTL_METADATA_SECONDS,
   EDGE_TTL_NODES_SECONDS,
   SINGBOX_RULE_SETS,
+  buildNotModifiedResponse,
+  buildRevisionEtag,
   invalidateEdgeNodesCache,
   invalidateEdgeVersionCache,
+  matchesWeakEtag,
   withEdgeCache,
 } from './edgeCache.ts';
 import {
   ensureMiniAppUserAndSubscription,
   verifyTelegramInitData,
 } from './miniAppAuth.ts';
-import { ensureSchemaColumns } from './supportSessions.ts';
+import {
+  getOrBuildNodesSnapshot,
+  rebuildNodesSnapshot,
+  selectSnapshotTierForPlan,
+} from './snapshot.ts';
+import {
+  bumpSubscriptionAccountRev,
+  ensureSchemaColumns,
+} from './supportSessions.ts';
 import {
   checkPublicIpRateLimit,
   computeWeakEtag,
@@ -114,18 +125,44 @@ function errorResponse(status: number, message: string, code?: string): Response
 }
 
 const SUB_SELECT_COLS =
+  'id, user_id, tier, plan_tier, connect_code, token, status, upload_bytes, download_bytes, traffic_limit_bytes, speed_limit_bps, max_concurrent_devices, web_browsing_used_mb, download_used_mb, static_ip_used_mb, web_used_bytes, download_used_bytes, special_quota_bytes, special_used_bytes, has_used_special_trial, account_rev, expires_at';
+const SUB_SELECT_COLS_LEGACY =
   'id, user_id, tier, plan_tier, connect_code, token, status, upload_bytes, download_bytes, traffic_limit_bytes, speed_limit_bps, max_concurrent_devices, web_browsing_used_mb, download_used_mb, static_ip_used_mb, web_used_bytes, download_used_bytes, special_quota_bytes, special_used_bytes, has_used_special_trial, expires_at';
 const USER_SELECT_COLS =
   'id, user_uuid, telegram_id, username, email, password_hash, first_name, last_name, role, status, outbound_reward_banned';
+
+async function selectSubscriptionSafe(
+  db: D1Database,
+  whereCol: 'token' | 'connect_code',
+  value: string
+): Promise<SubscriptionRow | null> {
+  try {
+    return await db
+      .prepare(`SELECT ${SUB_SELECT_COLS} FROM subscriptions WHERE ${whereCol} = ? LIMIT 1`)
+      .bind(value)
+      .first<SubscriptionRow>();
+  } catch (err) {
+    if (!isMissingSchemaElementError(err)) throw err;
+    try {
+      await ensureSchemaColumns(db);
+      return await db
+        .prepare(`SELECT ${SUB_SELECT_COLS} FROM subscriptions WHERE ${whereCol} = ? LIMIT 1`)
+        .bind(value)
+        .first<SubscriptionRow>();
+    } catch {
+      return await db
+        .prepare(`SELECT ${SUB_SELECT_COLS_LEGACY} FROM subscriptions WHERE ${whereCol} = ? LIMIT 1`)
+        .bind(value)
+        .first<SubscriptionRow>();
+    }
+  }
+}
 
 async function getSubscriptionWithUser(
   db: D1Database,
   token: string
 ): Promise<{ user: UserRow; sub: SubscriptionRow } | null> {
-  const sub = await db
-    .prepare(`SELECT ${SUB_SELECT_COLS} FROM subscriptions WHERE token = ? LIMIT 1`)
-    .bind(token)
-    .first<SubscriptionRow>();
+  const sub = await selectSubscriptionSafe(db, 'token', token);
   if (!sub) return null;
   const user = await db
     .prepare(`SELECT ${USER_SELECT_COLS} FROM users WHERE id = ? LIMIT 1`)
@@ -141,10 +178,7 @@ async function getSubscriptionWithUserByConnectCode(
 ): Promise<{ user: UserRow; sub: SubscriptionRow } | null> {
   const cleanCode = connectCode.trim();
   if (!isValidEightDigitConnectCode(cleanCode)) return null;
-  const sub = await db
-    .prepare(`SELECT ${SUB_SELECT_COLS} FROM subscriptions WHERE connect_code = ? LIMIT 1`)
-    .bind(cleanCode)
-    .first<SubscriptionRow>();
+  const sub = await selectSubscriptionSafe(db, 'connect_code', cleanCode);
   if (!sub) return null;
   const user = await db
     .prepare(`SELECT ${USER_SELECT_COLS} FROM users WHERE id = ? LIMIT 1`)
@@ -438,6 +472,7 @@ export async function routeRequest(
       cachePath: EDGE_CACHE_PATHS.NODES_ACTIVE,
       ttlSeconds: EDGE_TTL_NODES_SECONDS,
       origin: request,
+      request,
       ctx,
       producer: async () => {
         try {
@@ -564,6 +599,13 @@ export async function routeRequest(
           healthy_nodes: Number(src.healthy_nodes || 0),
           last_sync_at: src.last_sync_at || null,
         })),
+      }, 200, {
+        ETag: buildRevisionEtag([
+          'nodes-active',
+          nodeRows.length,
+          subSourceRows.length,
+          nodeRows.map((n) => `${n.id}:${n.status}:${n.fail_count ?? 0}`).join(',').slice(0, 40),
+        ]),
       });
     } catch (err) {
       const errMessage = err instanceof Error ? err.message : String(err || 'Unknown D1/KV error');
@@ -1087,13 +1129,17 @@ export async function routeRequest(
       }
     }
 
-    // 4. Execute all changed writes in chunked db.batch() and invalidate L1+L2 KV + Edge Cache
+    // 4. Execute all changed writes in chunked db.batch() and invalidate L1+L2 KV + Edge Cache + Snapshot
     if (writeStatements.length > 0) {
       await executeD1Batch(env.DB, writeStatements);
       if (nodesChanged) {
         await invalidateNodesCache(env.DB, env.SENTRA_KV, request);
+        await rebuildNodesSnapshot(env, request);
       } else {
         await invalidateEdgeNodesCache(request);
+        if (subscriptionSourcesUpdated > 0) {
+          await rebuildNodesSnapshot(env, request);
+        }
       }
     } else if (subscriptionSourcesUpdated > 0) {
       await invalidateEdgeNodesCache(request);
@@ -1491,6 +1537,7 @@ export async function routeRequest(
     const etag = computeWeakEtag([
       'cfg',
       pool.version,
+      Number(found.sub.account_rev ?? 1),
       mode,
       normalizedLocation.toUpperCase(),
       preferFirst ? 1 : 0,
@@ -1506,6 +1553,7 @@ export async function routeRequest(
         headers: {
           ETag: etag,
           'Cache-Control': 'private, max-age=1800',
+          'X-Sentra-Cache': 'HIT-304',
         },
       });
     }
@@ -1630,36 +1678,44 @@ export async function routeRequest(
     });
   }
 
-  // 9. Client Locations: GET /api/v1/client/locations (Cloudflare Edge Cache 180s -> L1 RAM / L2 KV)
+  // 9. Client Locations: GET /api/v1/client/locations (Cloudflare Edge Cache 180s -> Unified Snapshot)
   if (method === 'GET' && path === '/api/v1/client/locations') {
     return await withEdgeCache({
       cachePath: EDGE_CACHE_PATHS.CLIENT_LOCATIONS,
       ttlSeconds: EDGE_TTL_NODES_SECONDS,
       origin: request,
+      request,
       ctx,
       producer: async () => {
-        const items = await getCachedLocations(env.DB, env.SENTRA_KV);
+        const { snapshot } = await getOrBuildNodesSnapshot(env, request, ctx);
+        const items = snapshot.locations.length > 0
+          ? snapshot.locations
+          : await getCachedLocations(env.DB, env.SENTRA_KV);
         const totalNodes = items.reduce((sum, r) => sum + r.active_nodes, 0);
         const minPing = items.length > 0 ? items[0].best_ping : 0;
 
-        return jsonResponse([
-          {
-            code: 'auto',
-            name: '⚡️ انتخاب خودکار (سریع‌ترین لوکیشن)',
-            flag: '⚡️',
-            ping_ms: minPing,
-            active_nodes: totalNodes,
-            is_auto: true,
-          },
-          ...items.map((r) => ({
-            code: r.country_code,
-            name: r.country_name,
-            flag: r.country_name.split(' ').pop() || '🌍',
-            ping_ms: r.best_ping,
-            active_nodes: r.active_nodes,
-            is_auto: false,
-          })),
-        ]);
+        return jsonResponse(
+          [
+            {
+              code: 'auto',
+              name: '⚡️ انتخاب خودکار (سریع‌ترین لوکیشن)',
+              flag: '⚡️',
+              ping_ms: minPing,
+              active_nodes: totalNodes,
+              is_auto: true,
+            },
+            ...items.map((r) => ({
+              code: r.country_code,
+              name: r.country_name,
+              flag: r.country_name.split(' ').pop() || '🌍',
+              ping_ms: r.best_ping,
+              active_nodes: r.active_nodes,
+              is_auto: false,
+            })),
+          ],
+          200,
+          { ETag: buildRevisionEtag(['locations', snapshot.nodes_rev]) }
+        );
       },
     });
   }
@@ -2194,6 +2250,25 @@ export async function routeRequest(
       return errorResponse(403, 'حساب کاربری یا اشتراک شما غیرفعال شده است.', 'ACCOUNT_SUSPENDED');
     }
 
+    const { snapshot: clientSnap, source: clientSnapSource } = await getOrBuildNodesSnapshot(
+      env,
+      request,
+      ctx
+    );
+    const clientPlanTier = resolvePlanTier(found.sub);
+    const clientAccountRev = Number(found.sub.account_rev ?? 1);
+    const clientBootstrapEtag = buildRevisionEtag([
+      'cboot',
+      clientSnap.nodes_rev,
+      clientAccountRev,
+      clientPlanTier,
+      found.sub.status,
+      found.sub.expires_at,
+    ]);
+    if (matchesWeakEtag(request.headers.get('If-None-Match'), clientBootstrapEtag)) {
+      return buildNotModifiedResponse(clientBootstrapEtag, 'private, max-age=60, must-revalidate');
+    }
+
     const deviceId = (request.headers.get('X-Device-Id') || '').trim().slice(0, 128);
 
     const devicesRes = await env.DB.prepare(
@@ -2415,11 +2490,22 @@ export async function routeRequest(
         },
       ],
       outbounds,
+      sync: {
+        nodes_rev: clientSnap.nodes_rev,
+        account_rev: clientAccountRev,
+        etag: clientBootstrapEtag,
+        snapshot_source: clientSnapSource,
+        updated_at: clientSnap.updated_at,
+      },
       client_state: {
         personal_configs: personalConfigs,
         preferences,
         updated_at: clientStateRow?.updated_at ?? null,
       },
+    }, 200, {
+      ETag: clientBootstrapEtag,
+      'Cache-Control': 'private, max-age=60, must-revalidate',
+      'X-Sentra-Cache': clientSnapSource.toUpperCase(),
     });
   }
 
@@ -2629,7 +2715,8 @@ export async function routeRequest(
       .run();
 
     if (status === 'active') {
-      await invalidateNodesCache(env.DB, env.SENTRA_KV);
+      await invalidateNodesCache(env.DB, env.SENTRA_KV, request);
+      await rebuildNodesSnapshot(env, request);
     }
 
     return jsonResponse(
@@ -2684,12 +2771,13 @@ export async function routeRequest(
     });
   }
 
-  // 19. Client Version Metadata (GET /api/v1/client/version — Edge Cached 600s)
+  // 19. Client Version Metadata (GET /api/v1/client/version — Edge Cached 600s + ETag 304)
   if (method === 'GET' && path === '/api/v1/client/version') {
     return await withEdgeCache({
       cachePath: EDGE_CACHE_PATHS.CLIENT_VERSION,
       ttlSeconds: EDGE_TTL_METADATA_SECONDS,
       origin: request,
+      request,
       ctx,
       producer: async () => {
         const baseReleaseUrl = 'https://github.com/parsa904/SentraVpn/releases/latest';
@@ -2723,50 +2811,56 @@ export async function routeRequest(
         const latestVersion =
           androidRel?.version || windowsRel?.version || '1.0.0';
 
-        return jsonResponse({
-          success: true,
-          latest_version: latestVersion,
-          min_supported_version: '1.0.0',
-          release_url: baseReleaseUrl,
-          downloads: {
-            android_universal:
-              androidRel?.github_url || `${baseDownloadUrl}/SentraVPN-Android-Universal.apk`,
-            android_armv8: `${baseDownloadUrl}/SentraVPN-Android-ARMv8.apk`,
-            android_armv7: `${baseDownloadUrl}/SentraVPN-Android-ARMv7.apk`,
-            android_x64: `${baseDownloadUrl}/SentraVPN-Android-x64.apk`,
-            windows_setup_x64:
-              windowsRel?.github_url || `${baseDownloadUrl}/SentraVPN-Windows-Setup-x64.exe`,
-            windows_portable_x64: `${baseDownloadUrl}/SentraVPN-Windows-Portable-x64.zip`,
+        return jsonResponse(
+          {
+            success: true,
+            latest_version: latestVersion,
+            min_supported_version: '1.0.0',
+            release_url: baseReleaseUrl,
+            downloads: {
+              android_universal:
+                androidRel?.github_url || `${baseDownloadUrl}/SentraVPN-Android-Universal.apk`,
+              android_armv8: `${baseDownloadUrl}/SentraVPN-Android-ARMv8.apk`,
+              android_armv7: `${baseDownloadUrl}/SentraVPN-Android-ARMv7.apk`,
+              android_x64: `${baseDownloadUrl}/SentraVPN-Android-x64.apk`,
+              windows_setup_x64:
+                windowsRel?.github_url || `${baseDownloadUrl}/SentraVPN-Windows-Setup-x64.exe`,
+              windows_portable_x64: `${baseDownloadUrl}/SentraVPN-Windows-Portable-x64.zip`,
+            },
+            releases: {
+              android: androidRel
+                ? {
+                    version: androidRel.version,
+                    github_url: androidRel.github_url,
+                    telegram_cached: Boolean(androidRel.telegram_file_id),
+                    updated_at: androidRel.updated_at,
+                  }
+                : null,
+              windows: windowsRel
+                ? {
+                    version: windowsRel.version,
+                    github_url: windowsRel.github_url,
+                    telegram_cached: Boolean(windowsRel.telegram_file_id),
+                    updated_at: windowsRel.updated_at,
+                  }
+                : null,
+            },
           },
-          releases: {
-            android: androidRel
-              ? {
-                  version: androidRel.version,
-                  github_url: androidRel.github_url,
-                  telegram_cached: Boolean(androidRel.telegram_file_id),
-                  updated_at: androidRel.updated_at,
-                }
-              : null,
-            windows: windowsRel
-              ? {
-                  version: windowsRel.version,
-                  github_url: windowsRel.github_url,
-                  telegram_cached: Boolean(windowsRel.telegram_file_id),
-                  updated_at: windowsRel.updated_at,
-                }
-              : null,
-          },
-        });
+          200,
+          { ETag: buildRevisionEtag(['version', latestVersion, androidRel?.version || '0', windowsRel?.version || '0']) }
+        );
       },
     });
   }
 
-  // 20. sing-box Rule-Sets (GET /api/v1/client/rule-sets & /api/v1/client/rule-sets/:name — Edge Cached 600s)
+  // 20. sing-box Rule-Sets (GET /api/v1/client/rule-sets & /api/v1/client/rule-sets/:name — Edge Cached 600s + ETag 304)
   if (method === 'GET' && path === '/api/v1/client/rule-sets') {
     return await withEdgeCache({
       cachePath: EDGE_CACHE_PATHS.RULE_SETS_INDEX,
       ttlSeconds: EDGE_TTL_METADATA_SECONDS,
       origin: request,
+      request,
+      etag: buildRevisionEtag(['rulesets-index', 'v3']),
       ctx,
       producer: async () =>
         jsonResponse({
@@ -2792,9 +2886,242 @@ export async function routeRequest(
       cachePath: `${EDGE_CACHE_PATHS.RULE_SETS_INDEX}/${setName}`,
       ttlSeconds: EDGE_TTL_METADATA_SECONDS,
       origin: request,
+      request,
+      etag: buildRevisionEtag(['ruleset', setName, 'v3']),
       ctx,
       producer: async () => jsonResponse(ruleSetPayload),
     });
+  }
+
+  // 20b. Unified Ecosystem Bootstrap (GET /api/v1/bootstrap)
+  // Single source of truth for both Telegram Mini App (`X-Telegram-Init-Data` / `Authorization: tma ...`)
+  // and SentraVPN Clients (`Authorization: Bearer ...` / `X-Subscription-Token` / `X-Connect-Code`).
+  // Returns instant `304 Not Modified` (`X-Sentra-Cache: HIT-304`) when `If-None-Match` matches
+  // `W/"<nodes_rev>-<account_rev>-<app_version>-<plan_tier>-<status>"`.
+  if (method === 'GET' && path === '/api/v1/bootstrap') {
+    const authHeader = (request.headers.get('Authorization') || '').trim();
+    const tmaHeader = authHeader.toLowerCase().startsWith('tma ')
+      ? authHeader.slice(4).trim()
+      : '';
+    const initData = (request.headers.get('X-Telegram-Init-Data') || '').trim() || tmaHeader;
+    const clientToken = extractAuthToken(request);
+    const connectCode =
+      (request.headers.get('X-Connect-Code') || '').trim() ||
+      (url.searchParams.get('connect_code') || '').trim();
+
+    let authSource: 'telegram_miniapp' | 'client_token' | 'connect_code' = 'client_token';
+    let user: UserRow;
+    let sub: SubscriptionRow;
+    let isNewUser = false;
+    let telegramUsername: string | null = null;
+
+    if (initData) {
+      const verified = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN || '');
+      if (!verified.ok) {
+        return errorResponse(
+          verified.code === 'BOT_TOKEN_NOT_CONFIGURED' ? 503 : 401,
+          verified.error,
+          verified.code
+        );
+      }
+      const ensured = await ensureMiniAppUserAndSubscription(env.DB, verified.data.user, env);
+      user = ensured.user;
+      sub = ensured.sub;
+      isNewUser = ensured.isNewUser;
+      telegramUsername = verified.data.user.username || null;
+      authSource = 'telegram_miniapp';
+    } else if (clientToken) {
+      const found = await getSubscriptionWithUser(env.DB, clientToken);
+      if (!found) {
+        return errorResponse(401, 'توکن اشتراک معتبر نیست.', 'INVALID_TOKEN');
+      }
+      if (found.user.status !== 'active' || found.sub.status !== 'active') {
+        return errorResponse(403, 'حساب کاربری یا اشتراک شما غیرفعال شده است.', 'ACCOUNT_SUSPENDED');
+      }
+      user = found.user;
+      sub = found.sub;
+      authSource = 'client_token';
+    } else if (connectCode) {
+      if (!isValidEightDigitConnectCode(connectCode)) {
+        return errorResponse(400, 'کد اتصال ۸ رقمی نامعتبر است.', 'INVALID_CONNECT_CODE');
+      }
+      const found = await getSubscriptionWithUserByConnectCode(env.DB, connectCode);
+      if (!found) {
+        return errorResponse(401, 'کد اتصال معتبر نیست.', 'INVALID_CONNECT_CODE');
+      }
+      if (found.user.status !== 'active' || found.sub.status !== 'active') {
+        return errorResponse(403, 'حساب کاربری یا اشتراک شما غیرفعال شده است.', 'ACCOUNT_SUSPENDED');
+      }
+      user = found.user;
+      sub = found.sub;
+      authSource = 'connect_code';
+    } else {
+      return errorResponse(
+        401,
+        'احراز هویت ارسال نشده است (initData تلگرام، توکن اشتراک یا کد اتصال الزامی است).',
+        'MISSING_AUTH'
+      );
+    }
+
+    const { snapshot, source: snapshotSource } = await getOrBuildNodesSnapshot(env, request, ctx);
+    const planTier = resolvePlanTier(sub);
+    const accountRev = Number(sub.account_rev ?? 1);
+
+    const baseReleaseUrl = 'https://github.com/parsa904/SentraVpn/releases/latest';
+    const baseDownloadUrl = `${baseReleaseUrl}/download`;
+    let androidUrl = `${baseDownloadUrl}/SentraVPN-Android-Universal.apk`;
+    let windowsUrl = `${baseDownloadUrl}/SentraVPN-Windows-Setup-x64.exe`;
+    let androidVersion = '1.0.0';
+    let windowsVersion = '1.0.0';
+    try {
+      const relRows = await env.DB.prepare(
+        'SELECT platform, version, github_url FROM app_release_files'
+      ).all<{ platform: string; version: string; github_url: string }>();
+      for (const r of relRows.results || []) {
+        if (r.platform === 'android') {
+          if (r.github_url) androidUrl = r.github_url;
+          if (r.version) androidVersion = r.version;
+        } else if (r.platform === 'windows') {
+          if (r.github_url) windowsUrl = r.github_url;
+          if (r.version) windowsVersion = r.version;
+        }
+      }
+    } catch {
+      // Fallback defaults already set
+    }
+    const appVersion =
+      androidVersion !== '1.0.0'
+        ? androidVersion
+        : windowsVersion !== '1.0.0'
+        ? windowsVersion
+        : '1.0.0';
+
+    const etag = buildRevisionEtag([
+      snapshot.nodes_rev,
+      accountRev,
+      appVersion,
+      planTier,
+      sub.status,
+    ]);
+
+    if (matchesWeakEtag(request.headers.get('If-None-Match'), etag)) {
+      return buildNotModifiedResponse(etag, 'private, max-age=60, must-revalidate');
+    }
+
+    const freeQuotas = await getFreeQuotaSettings(env.DB, env.SENTRA_KV);
+    const webUsedBytes = getEffectiveWebUsedBytes(sub);
+    const downloadUsedBytes = getEffectiveDownloadUsedBytes(sub);
+    const specialUsedBytes = getEffectiveSpecialUsedBytes(sub);
+    const specialQuotaBytes =
+      planTier === 'flow_plus'
+        ? Math.max(Number(sub.special_quota_bytes || 0), 50 * GIB_BYTES)
+        : planTier === 'pro'
+        ? Math.max(Number(sub.special_quota_bytes || 0), 30 * GIB_BYTES)
+        : Math.max(0, Number(sub.special_quota_bytes || 0));
+
+    const isUnlimitedGeneral = planTier === 'pro' || planTier === 'flow_plus';
+    const webLimitBytes = isUnlimitedGeneral ? 0 : freeQuotas.webQuotaBytes;
+    const downloadLimitBytes = isUnlimitedGeneral ? 0 : freeQuotas.downloadQuotaBytes;
+    const tierSelection = selectSnapshotTierForPlan(snapshot, planTier);
+    const botUsername = (env.BOT_USERNAME || 'SentraVPNBot').replace(/^@/, '').trim();
+    const referralLink = user.telegram_id
+      ? `https://t.me/${botUsername}?start=ref_${user.telegram_id}`
+      : `https://t.me/${botUsername}`;
+
+    return jsonResponse(
+      {
+        success: true,
+        auth_source: authSource,
+        is_new_user: isNewUser,
+        sync: {
+          nodes_rev: snapshot.nodes_rev,
+          account_rev: accountRev,
+          app_version: appVersion,
+          etag,
+          snapshot_source: snapshotSource,
+          updated_at: snapshot.updated_at,
+        },
+        user: {
+          id: user.id,
+          user_uuid: user.user_uuid,
+          telegram_id: user.telegram_id ?? null,
+          first_name: user.first_name,
+          last_name: user.last_name || '',
+          telegram_username: telegramUsername,
+          username: user.username || null,
+          email: user.email || null,
+          has_password: Boolean(user.password_hash),
+          role: user.role,
+        },
+        subscription: {
+          tier: sub.tier,
+          plan_tier: planTier,
+          plan_label:
+            planTier === 'flow_plus'
+              ? 'Flow+'
+              : planTier === 'pro'
+              ? 'Pro'
+              : 'Free',
+          status: sub.status,
+          connect_code: sub.connect_code,
+          account_rev: accountRev,
+          expires_at: sub.expires_at,
+          max_concurrent_devices: Number(sub.max_concurrent_devices || 2),
+          has_used_special_trial: Number(sub.has_used_special_trial || 0) === 1,
+        },
+        traffic: {
+          web: {
+            used_bytes: webUsedBytes,
+            limit_bytes: webLimitBytes,
+            unlimited: isUnlimitedGeneral,
+          },
+          download: {
+            used_bytes: downloadUsedBytes,
+            limit_bytes: downloadLimitBytes,
+            unlimited: isUnlimitedGeneral,
+          },
+          special: {
+            used_bytes: specialUsedBytes,
+            limit_bytes: specialQuotaBytes,
+            unlimited: false,
+          },
+        },
+        servers: {
+          online_nodes: snapshot.healthy_count,
+          countries_count: snapshot.countries_count,
+          has_active_gaming: snapshot.has_active_gaming,
+          locations: snapshot.locations,
+          checked_at: snapshot.updated_at,
+        },
+        nodes_snapshot: {
+          nodes_rev: snapshot.nodes_rev,
+          updated_at: snapshot.updated_at,
+          tier: tierSelection.tierKey,
+          node_count: tierSelection.bundle.node_count,
+          nodes: tierSelection.bundle.nodes,
+          singbox_config: tierSelection.bundle.singbox_config,
+        },
+        downloads: {
+          latest_version: appVersion,
+          release_url: baseReleaseUrl,
+          android_apk: androidUrl,
+          android_version: androidVersion,
+          windows_exe: windowsUrl,
+          windows_version: windowsVersion,
+          windows_portable_zip: `${baseDownloadUrl}/SentraVPN-Windows-Portable-x64.zip`,
+        },
+        referral: {
+          bot_username: botUsername,
+          invite_link: referralLink,
+        },
+      },
+      200,
+      {
+        ETag: etag,
+        'Cache-Control': 'private, max-age=60, must-revalidate',
+        'X-Sentra-Cache': snapshotSource.toUpperCase(),
+      }
+    );
   }
 
   // 21. Telegram Mini App Authenticated Profile & Live Status (POST /api/v1/miniapp/me)
@@ -2997,7 +3324,7 @@ export async function routeRequest(
       return errorResponse(400, emailCheck.error, 'INVALID_EMAIL');
     }
 
-    const { user } = await ensureMiniAppUserAndSubscription(env.DB, verified.data.user, env);
+    const { user, sub } = await ensureMiniAppUserAndSubscription(env.DB, verified.data.user, env);
 
     const conflict = await env.DB.prepare(
       'SELECT id FROM users WHERE LOWER(username) = LOWER(?) AND id != ? LIMIT 1'
@@ -3025,12 +3352,15 @@ export async function routeRequest(
       .bind(usernameCheck.username, passwordHash, emailCheck.email, user.id)
       .run();
 
+    const nextAccountRev = await bumpSubscriptionAccountRev(env.DB, sub.id);
+
     return jsonResponse({
       success: true,
       message: 'نام کاربری و رمز عبور شما با موفقیت ذخیره شد. اکنون می‌توانید در اپلیکیشن نیز وارد شوید.',
       username: usernameCheck.username,
       email: emailCheck.email ?? user.email ?? null,
       has_password: true,
+      account_rev: nextAccountRev,
     });
   }
 
